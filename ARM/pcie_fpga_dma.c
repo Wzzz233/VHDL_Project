@@ -1,0 +1,629 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * PCIe FPGA DMA Driver
+ *
+ * Driver for RK3568 to access FPGA registers via PCIe and perform DMA transfers
+ * for camera frame data (1280x720 RGB565)
+ *
+ * FPGA: PG2L50H (Pango) - PCIe Endpoint
+ * Vendor ID: 0x0755
+ * Device ID: 0x0755
+ */
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/pci.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/dma-mapping.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
+#include <linux/mutex.h>
+#include <linux/delay.h>
+#include <linux/version.h>
+
+#include "pcie_fpga_dma.h"
+
+#define DRIVER_NAME   "fpga_dma"
+#define DRIVER_AUTHOR "RK3568 FPGA DMA Driver"
+#define DRIVER_DESC   "PCIe DMA driver for PG2L50H FPGA camera frame transfer"
+
+#define FPGA_PCI_VENDOR_ID  0x0755
+#define FPGA_PCI_DEVICE_ID  0x0755
+
+/* Module parameters */
+static int major_num;
+static int dma_timeout_ms = 5000;  /* 5 seconds default timeout */
+
+module_param(major_num, int, 0);
+MODULE_PARM_DESC(major_num, "Major device number (0=dynamic)");
+module_param(dma_timeout_ms, int, 0644);
+MODULE_PARM_DESC(dma_timeout_ms, "DMA transfer timeout in milliseconds");
+
+/* Per-device structure */
+struct fpga_dma_dev {
+    struct pci_dev *pdev;
+    struct cdev cdev;
+    struct device *dev;
+
+    /* BAR mappings */
+    void __iomem *bar0;  /* 64KB for PIO/data readback */
+    void __iomem *bar1;  /* DMA control registers */
+    resource_size_t bar0_size;
+    resource_size_t bar1_size;
+
+    /* DMA buffer */
+    void *dma_buf;
+    dma_addr_t dma_handle;
+    size_t dma_buf_size;
+    struct mutex dma_lock;
+
+    /* Completion for DMA transfer */
+    struct completion dma_done;
+
+    /* Device info */
+    struct fpga_info info;
+
+    /* Character device */
+    int major;
+    int minor;
+};
+
+static struct class *fpga_dma_class;
+static dev_t fpga_dma_dev_t;
+
+/* Forward declarations */
+static int fpga_dma_open(struct inode *inode, struct file *file);
+static int fpga_dma_release(struct inode *inode, struct file *file);
+static long fpga_dma_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+static int fpga_dma_mmap(struct file *file, struct vm_area_struct *vma);
+
+static const struct file_operations fpga_dma_fops = {
+    .owner = THIS_MODULE,
+    .open = fpga_dma_open,
+    .release = fpga_dma_release,
+    .unlocked_ioctl = fpga_dma_ioctl,
+    .compat_ioctl = fpga_dma_ioctl,
+    .mmap = fpga_dma_mmap,
+    .llseek = no_llseek,
+};
+
+/* PCI device ID table */
+static const struct pci_device_id fpga_dma_pci_tbl[] = {
+    { PCI_DEVICE(FPGA_PCI_VENDOR_ID, FPGA_PCI_DEVICE_ID) },
+    { 0, }
+};
+MODULE_DEVICE_TABLE(pci, fpga_dma_pci_tbl);
+
+/**
+ * fpga_dma_read_reg - Read a 32-bit register from BAR1
+ */
+static u32 __maybe_unused fpga_dma_read_reg(struct fpga_dma_dev *dev, u32 offset)
+{
+    /* BAR1 is Write-Only in current FPGA RTL. Reading causes Bus Error. */
+    /* return ioread32(dev->bar1 + offset); */
+    return 0;
+}
+
+/**
+ * fpga_dma_write_reg - Write a 32-bit register to BAR1
+ *
+ * After writing, read BAR0 to flush the PCIe write posting buffer.
+ * PCIe ordering rules guarantee that a Non-Posted read (MRd) completes
+ * only after all prior Posted writes (MWr) have been delivered.
+ */
+static void fpga_dma_write_reg(struct fpga_dma_dev *dev, u32 offset, u32 value)
+{
+    iowrite32(value, dev->bar1 + offset);
+    (void)ioread32(dev->bar0);  /* flush: force MWr TLP out before continuing */
+}
+
+/**
+ * fpga_dma_perform_transfer - Perform a DMA read from FPGA
+ *
+ * This initiates a DMA read operation by programming the FPGA's DMA controller.
+ * The FPGA will read data from its DDR3 and write it to the RK3568's DMA buffer.
+ */
+static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
+{
+    u32 cmd_reg;
+    int ret = 0;
+    size_t remaining = size;
+    size_t chunk_size;
+    dma_addr_t current_addr = dev->dma_handle;
+    int chunk_num = 0;
+
+    dev_info(dev->dev, "=== DMA MWR Transfer Start ===\n");
+    dev_info(dev->dev, "  Total size: %zu bytes\n", size);
+    dev_info(dev->dev, "  DMA handle (bus addr): 0x%llx\n", (u64)dev->dma_handle);
+    dev_info(dev->dev, "  DMA buf (virt): %px\n", dev->dma_buf);
+    dev_info(dev->dev, "  BAR1 base (virt): %px\n", dev->bar1);
+
+    /* PIO read test: verify TLPs can reach FPGA via BAR0 read (MRd TLP) */
+    {
+        u32 bar0_val0 = ioread32(dev->bar0 + 0x00);
+        u32 bar0_val4 = ioread32(dev->bar0 + 0x04);
+        dev_info(dev->dev, "  BAR0 PIO read test: [0x00]=0x%08x [0x04]=0x%08x\n",
+                 bar0_val0, bar0_val4);
+        if (bar0_val0 == 0xFFFFFFFF && bar0_val4 == 0xFFFFFFFF)
+            dev_warn(dev->dev, "  >>> BAR0 reads all-F: TLPs may not reach FPGA! <<<\n");
+    }
+
+    /* Initialize completion */
+    reinit_completion(&dev->dma_done);
+
+    /* Process transfer in chunks to handle 4KB boundary */
+    while (remaining > 0 && chunk_num < 3) {  /* Limit to 3 chunks for debug */
+        /* Calculate chunk size (max 1024 DWORDs = 4096 bytes per FPGA limit) */
+        chunk_size = min(remaining, (size_t)DMA_MAX_LEN_BYTES);
+
+        /* Check for 4KB boundary crossing */
+        if ((current_addr & 0xFFF) + chunk_size > 0x1000) {
+            /* Reduce chunk size to avoid crossing 4KB boundary */
+            chunk_size = 0x1000 - (current_addr & 0xFFF);
+            if (chunk_size == 0) {
+                /* Address is exactly at boundary, align to next page */
+                current_addr = ALIGN(current_addr, 0x1000);
+                continue;
+            }
+        }
+
+        /* Calculate length in DWORDs minus 1 (FPGA expects this format) */
+        u32 length_in_dwords = (chunk_size + 3) / 4;  /* Round up to DWORDs */
+        u32 cmd_length = length_in_dwords - 1;
+
+        dev_info(dev->dev, "--- Chunk %d ---\n", chunk_num);
+        dev_info(dev->dev, "  Addr: 0x%llx (lo=0x%x hi=0x%x)\n",
+                 (u64)current_addr,
+                 lower_32_bits(current_addr),
+                 upper_32_bits(current_addr));
+        dev_info(dev->dev, "  Size: %zu bytes (%u DWORDs)\n",
+                 chunk_size, length_in_dwords);
+
+        /* Clear first 16 bytes of this chunk area to detect writes */
+        {
+            size_t buf_offset = (current_addr - dev->dma_handle);
+            u32 *chunk_buf = (u32 *)((u8 *)dev->dma_buf + buf_offset);
+            chunk_buf[0] = 0xAAAAAAAA;
+            chunk_buf[1] = 0xBBBBBBBB;
+            chunk_buf[2] = 0xCCCCCCCC;
+            chunk_buf[3] = 0xDDDDDDDD;
+            dev_info(dev->dev, "  Pre-fill: %08x %08x %08x %08x\n",
+                     chunk_buf[0], chunk_buf[1], chunk_buf[2], chunk_buf[3]);
+        }
+
+        /* Program DMA address registers */
+        dev_info(dev->dev, "  Writing BAR1+0x110 = 0x%x\n", lower_32_bits(current_addr));
+        fpga_dma_write_reg(dev, BAR1_DMA_L_ADDR, lower_32_bits(current_addr));
+
+        dev_info(dev->dev, "  Writing BAR1+0x120 = 0x%x\n", upper_32_bits(current_addr));
+        fpga_dma_write_reg(dev, BAR1_DMA_H_ADDR, upper_32_bits(current_addr));
+
+        /* Program command register
+         * Bits [9:0]: Length in DWORDs - 1
+         * Bit [16]: 1 = 64-bit address mode
+         * Bit [24]: 1 = Write (MWR) - FPGA writes frame data TO host memory
+         */
+        cmd_reg = (cmd_length & DMA_CMD_LEN_MASK) | DMA_CMD_64BIT_ADDR | DMA_CMD_WRITE;
+        dev_info(dev->dev, "  Writing BAR1+0x100 = 0x%08x (MWR, len=%u DW)\n",
+                 cmd_reg, length_in_dwords);
+        fpga_dma_write_reg(dev, BAR1_DMA_CMD_REG, cmd_reg);
+
+        /* Wait for FPGA to process */
+        msleep(50);  /* 50ms should be PLENTY for 4KB @ PCIe Gen2 */
+
+        /* Check if data arrived */
+        {
+            size_t buf_offset = (current_addr - dev->dma_handle);
+            u32 *chunk_buf = (u32 *)((u8 *)dev->dma_buf + buf_offset);
+            dev_info(dev->dev, "  Post-DMA: %08x %08x %08x %08x\n",
+                     chunk_buf[0], chunk_buf[1], chunk_buf[2], chunk_buf[3]);
+            if (chunk_buf[0] == 0xAAAAAAAA)
+                dev_info(dev->dev, "  >>> DATA NOT MODIFIED - FPGA did NOT write! <<<\n");
+            else
+                dev_info(dev->dev, "  >>> DATA CHANGED - FPGA wrote successfully! <<<\n");
+        }
+
+        /* Update remaining and address */
+        remaining -= chunk_size;
+        current_addr += chunk_size;
+        chunk_num++;
+    }
+
+    /* For remaining data, just sleep through it */
+    if (remaining > 0) {
+        dev_info(dev->dev, "Sleeping for remaining %zu bytes...\n", remaining);
+        msleep(remaining / 1024 + 10);
+    }
+
+    dev_info(dev->dev, "=== DMA Transfer Complete ===\n");
+    return ret;
+}
+
+/**
+ * fpga_dma_open - Open the device file
+ */
+static int fpga_dma_open(struct inode *inode, struct file *file)
+{
+    struct fpga_dma_dev *dev;
+    struct cdev *cdev = inode->i_cdev;
+
+    dev = container_of(cdev, struct fpga_dma_dev, cdev);
+    file->private_data = dev;
+
+    dev_dbg(dev->dev, "Device opened\n");
+    return 0;
+}
+
+/**
+ * fpga_dma_release - Close the device file
+ */
+static int fpga_dma_release(struct inode *inode, struct file *file)
+{
+    struct fpga_dma_dev *dev = file->private_data;
+
+    dev_dbg(dev->dev, "Device closed\n");
+    return 0;
+}
+
+/**
+ * fpga_dma_ioctl - Handle IOCTL commands
+ */
+static long fpga_dma_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct fpga_dma_dev *dev = file->private_data;
+    void __user *argp = (void __user *)arg;
+    int ret = 0;
+
+    switch (cmd) {
+    case FPGA_DMA_GET_INFO: {
+        struct fpga_info info = dev->info;
+
+        /* Update link status */
+        /* TODO: Read actual PCIe link status from capability registers */
+
+        if (copy_to_user(argp, &info, sizeof(info)))
+            ret = -EFAULT;
+        break;
+    }
+
+    case FPGA_DMA_READ_FRAME: {
+        struct dma_transfer transfer;
+        size_t size;
+
+        if (copy_from_user(&transfer, argp, sizeof(transfer))) {
+            ret = -EFAULT;
+            break;
+        }
+
+        /* Use default frame size if not specified */
+        size = transfer.size > 0 ? transfer.size : FPGA_FRAME_SIZE;
+
+        if (size > dev->dma_buf_size) {
+            dev_err(dev->dev, "Requested size %zu exceeds buffer size %zu\n",
+                    size, dev->dma_buf_size);
+            ret = -EINVAL;
+            break;
+        }
+
+        /* Perform DMA transfer */
+        mutex_lock(&dev->dma_lock);
+        ret = fpga_dma_perform_transfer(dev, size);
+        mutex_unlock(&dev->dma_lock);
+
+        if (!ret) {
+            transfer.result = 0;
+            if (copy_to_user(argp, &transfer, sizeof(transfer)))
+                ret = -EFAULT;
+        }
+        break;
+    }
+
+    case FPGA_DMA_MAP_BUFFER: {
+        struct buffer_map map;
+
+        if (copy_from_user(&map, argp, sizeof(map))) {
+            ret = -EFAULT;
+            break;
+        }
+
+        if (map.index != 0) {
+            ret = -EINVAL;
+            break;
+        }
+
+        map.size = dev->dma_buf_size;
+        map.offset = 0;  /* Offset for mmap */
+
+        if (copy_to_user(argp, &map, sizeof(map)))
+            ret = -EFAULT;
+        break;
+    }
+
+    default:
+        dev_dbg(dev->dev, "Unknown ioctl cmd=0x%x\n", cmd);
+        ret = -ENOTTY;
+        break;
+    }
+
+    return ret;
+}
+
+/**
+ * fpga_dma_mmap - Map DMA buffer to userspace
+ */
+static int fpga_dma_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    struct fpga_dma_dev *dev = file->private_data;
+    size_t size = vma->vm_end - vma->vm_start;
+
+    dev_dbg(dev->dev, "mmap requested: size=%zu\n", size);
+
+    if (size > dev->dma_buf_size) {
+        dev_err(dev->dev, "mmap size %zu exceeds DMA buffer size %zu\n",
+                size, dev->dma_buf_size);
+        return -EINVAL;
+    }
+
+    /* Map the DMA coherent buffer to userspace */
+    if (remap_pfn_range(vma, vma->vm_start,
+                        virt_to_phys(dev->dma_buf) >> PAGE_SHIFT,
+                        size, vma->vm_page_prot)) {
+        dev_err(dev->dev, "remap_pfn_range failed\n");
+        return -EAGAIN;
+    }
+
+    return 0;
+}
+
+/**
+ * fpga_dma_probe - PCI device probe callback
+ */
+static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+    struct fpga_dma_dev *dev;
+    int ret;
+    u16 pcie_cmd;
+
+    dev_info(&pdev->dev, "Probing FPGA DMA device\n");
+
+    /* Allocate device structure */
+    dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+    if (!dev)
+        return -ENOMEM;
+
+    dev->pdev = pdev;
+    dev->dev = &pdev->dev;
+    mutex_init(&dev->dma_lock);
+    init_completion(&dev->dma_done);
+
+    pci_set_drvdata(pdev, dev);
+
+    /* Enable PCI device */
+    ret = pci_enable_device(pdev);
+    if (ret) {
+        dev_err(&pdev->dev, "Cannot enable PCI device\n");
+        return ret;
+    }
+
+    /* Enable bus mastering */
+    pci_read_config_word(pdev, PCI_COMMAND, &pcie_cmd);
+    pcie_cmd |= PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY;
+    pci_write_config_word(pdev, PCI_COMMAND, pcie_cmd);
+
+    /* Set DMA mask - RK3568 supports 64-bit DMA */
+    ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+    if (ret) {
+        dev_warn(&pdev->dev, "Cannot set 64-bit DMA mask, trying 32-bit\n");
+        ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+        if (ret) {
+            dev_err(&pdev->dev, "Cannot set DMA mask\n");
+            goto err_disable_device;
+        }
+    }
+
+    /* Map BAR0 (64KB for PIO/data readback) */
+    ret = pci_request_region(pdev, 0, DRIVER_NAME);
+    if (ret) {
+        dev_err(&pdev->dev, "Cannot request BAR0\n");
+        goto err_disable_device;
+    }
+
+    dev->bar0 = pci_iomap(pdev, 0, 0);
+    if (!dev->bar0) {
+        dev_err(&pdev->dev, "Cannot map BAR0\n");
+        ret = -ENOMEM;
+        goto err_release_bar0;
+    }
+    dev->bar0_size = pci_resource_len(pdev, 0);
+    dev_info(&pdev->dev, "BAR0 mapped at %p, size=%pa\n",
+             dev->bar0, &dev->bar0_size);
+
+    /* Map BAR1 (DMA control registers) */
+    ret = pci_request_region(pdev, 1, DRIVER_NAME);
+    if (ret) {
+        dev_err(&pdev->dev, "Cannot request BAR1\n");
+        goto err_iounmap_bar0;
+    }
+
+    dev->bar1 = pci_iomap(pdev, 1, 0);
+    if (!dev->bar1) {
+        dev_err(&pdev->dev, "Cannot map BAR1\n");
+        ret = -ENOMEM;
+        goto err_release_bar1;
+    }
+    dev->bar1_size = pci_resource_len(pdev, 1);
+    dev_info(&pdev->dev, "BAR1 mapped at %p, size=%pa\n",
+             dev->bar1, &dev->bar1_size);
+
+    /* Allocate DMA buffer for frame transfer
+     * Allocate slightly more for alignment */
+    dev->dma_buf_size = PAGE_ALIGN(FPGA_FRAME_SIZE);
+    dev->dma_buf = dma_alloc_coherent(&pdev->dev, dev->dma_buf_size,
+                                      &dev->dma_handle, GFP_KERNEL);
+    if (!dev->dma_buf) {
+        dev_err(&pdev->dev, "Cannot allocate DMA buffer\n");
+        ret = -ENOMEM;
+        goto err_iounmap_bar1;
+    }
+
+    dev_info(&pdev->dev, "DMA buffer allocated: virt=%p phys=%pad size=%zu\n",
+             dev->dma_buf, &dev->dma_handle, dev->dma_buf_size);
+
+    /* Fill device info structure */
+    dev->info.vendor_id = FPGA_PCI_VENDOR_ID;
+    dev->info.device_id = FPGA_PCI_DEVICE_ID;
+    dev->info.bar0_size = dev->bar0_size;
+    dev->info.bar1_size = dev->bar1_size;
+    dev->info.link_width = 2;  /* PCIe x2 */
+    dev->info.link_speed = 2;  /* Gen2 */
+    dev->info.frame_width = FPGA_FRAME_WIDTH;
+    dev->info.frame_height = FPGA_FRAME_HEIGHT;
+    dev->info.frame_bpp = FPGA_FRAME_BPP;
+
+    /* Create character device */
+    if (major_num > 0) {
+        dev->major = major_num;
+        ret = register_chrdev_region(MKDEV(major_num, 0), 1, DRIVER_NAME);
+    } else {
+        ret = alloc_chrdev_region(&fpga_dma_dev_t, 0, 1, DRIVER_NAME);
+        dev->major = MAJOR(fpga_dma_dev_t);
+    }
+
+    if (ret) {
+        dev_err(&pdev->dev, "Cannot register chrdev region\n");
+        goto err_free_dma;
+    }
+
+    cdev_init(&dev->cdev, &fpga_dma_fops);
+    dev->cdev.owner = THIS_MODULE;
+
+    ret = cdev_add(&dev->cdev, MKDEV(dev->major, 0), 1);
+    if (ret) {
+        dev_err(&pdev->dev, "Cannot add cdev\n");
+        goto err_unregister_chrdev;
+    }
+
+    /* Create device node in sysfs */
+    dev->dev = device_create(fpga_dma_class, &pdev->dev,
+                             MKDEV(dev->major, 0), dev,
+                             FPGA_DMA_DEV_NAME);
+    if (IS_ERR(dev->dev)) {
+        ret = PTR_ERR(dev->dev);
+        dev_err(&pdev->dev, "Cannot create device\n");
+        goto err_cdev_del;
+    }
+
+    dev_info(&pdev->dev, "FPGA DMA driver loaded successfully\n");
+    dev_info(&pdev->dev, "Device file: /dev/%s\n", FPGA_DMA_DEV_NAME);
+
+    return 0;
+
+err_cdev_del:
+    cdev_del(&dev->cdev);
+err_unregister_chrdev:
+    unregister_chrdev_region(MKDEV(dev->major, 0), 1);
+err_free_dma:
+    dma_free_coherent(&pdev->dev, dev->dma_buf_size, dev->dma_buf, dev->dma_handle);
+err_iounmap_bar1:
+    pci_iounmap(pdev, dev->bar1);
+err_release_bar1:
+    pci_release_region(pdev, 1);
+err_iounmap_bar0:
+    pci_iounmap(pdev, dev->bar0);
+err_release_bar0:
+    pci_release_region(pdev, 0);
+err_disable_device:
+    pci_disable_device(pdev);
+
+    return ret;
+}
+
+/**
+ * fpga_dma_remove - PCI device remove callback
+ */
+static void fpga_dma_remove(struct pci_dev *pdev)
+{
+    struct fpga_dma_dev *dev = pci_get_drvdata(pdev);
+
+    dev_info(&pdev->dev, "Removing FPGA DMA driver\n");
+
+    /* Remove character device */
+    device_destroy(fpga_dma_class, MKDEV(dev->major, 0));
+    cdev_del(&dev->cdev);
+    unregister_chrdev_region(MKDEV(dev->major, 0), 1);
+
+    /* Free DMA buffer */
+    dma_free_coherent(&pdev->dev, dev->dma_buf_size, dev->dma_buf, dev->dma_handle);
+
+    /* Unmap and release BARs */
+    pci_iounmap(pdev, dev->bar1);
+    pci_release_region(pdev, 1);
+    pci_iounmap(pdev, dev->bar0);
+    pci_release_region(pdev, 0);
+
+    /* Disable PCI device */
+    pci_disable_device(pdev);
+
+    dev_info(&pdev->dev, "FPGA DMA driver removed\n");
+}
+
+static struct pci_driver fpga_dma_driver = {
+    .name = DRIVER_NAME,
+    .id_table = fpga_dma_pci_tbl,
+    .probe = fpga_dma_probe,
+    .remove = fpga_dma_remove,
+};
+
+/**
+ * fpga_dma_init - Module initialization
+ */
+static int __init fpga_dma_init(void)
+{
+    int ret;
+
+    pr_info("%s: %s\n", DRIVER_NAME, DRIVER_DESC);
+
+    /* Create device class */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    fpga_dma_class = class_create(DRIVER_NAME);
+#else
+    fpga_dma_class = class_create(THIS_MODULE, DRIVER_NAME);
+#endif
+    if (IS_ERR(fpga_dma_class)) {
+        pr_err("Cannot create class\n");
+        return PTR_ERR(fpga_dma_class);
+    }
+
+    /* Register PCI driver */
+    ret = pci_register_driver(&fpga_dma_driver);
+    if (ret) {
+        pr_err("Cannot register PCI driver\n");
+        class_destroy(fpga_dma_class);
+        return ret;
+    }
+
+    pr_info("%s: driver loaded\n", DRIVER_NAME);
+    return 0;
+}
+
+/**
+ * fpga_dma_exit - Module cleanup
+ */
+static void __exit fpga_dma_exit(void)
+{
+    pr_info("%s: driver unloaded\n", DRIVER_NAME);
+    pci_unregister_driver(&fpga_dma_driver);
+    class_destroy(fpga_dma_class);
+}
+
+module_init(fpga_dma_init);
+module_exit(fpga_dma_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR(DRIVER_AUTHOR);
+MODULE_DESCRIPTION(DRIVER_DESC);
+MODULE_VERSION("1.0");

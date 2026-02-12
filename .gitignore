@@ -1,0 +1,27 @@
+# Pango PDS project files
+*.pds
+*.pdc
+*.bit
+*.sbit
+*.fbit
+*.log
+*.rpt
+
+# IP core generated files (too large)
+ipcore/
+
+# Simulation
+sim/
+*.vcd
+*.wlf
+
+# Build outputs
+impl/
+synthesis/
+place/
+route/
+
+# Temp files
+*.bak
+*.orig
+~*
