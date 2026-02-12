@@ -39,8 +39,11 @@
 #define DMA_CMD_64BIT_ADDR   (1 << 16)  /* Bit [16] - 1=64-bit address, 0=32-bit */
 #define DMA_CMD_WRITE        (1 << 24)  /* Bit [24] - 1=Write (MWR), 0=Read (MRD) */
 
-/* Maximum DMA transfer size in DWORDs (from FPGA RTL) */
-#define DMA_MAX_LEN_DWORDS   1024
+/* Maximum DMA transfer size per chunk in DWORDs.
+ * FPGA controller does: o_req_length = cmd_reg[9:0] + 1 (10-bit).
+ * If cmd_reg[9:0] = 0x3FF (1023), then 1023+1 = 1024 = 0x400 overflows 10-bit to 0.
+ * Limit to 512 DW (2048B) to stay safely within 10-bit range. */
+#define DMA_MAX_LEN_DWORDS   512
 #define DMA_MAX_LEN_BYTES    (DMA_MAX_LEN_DWORDS * 4)
 
 /* IOCTL magic number */
