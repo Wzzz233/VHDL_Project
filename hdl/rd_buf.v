@@ -83,7 +83,12 @@ module rd_buf #(
     reg  [9:0] wr_addr;
     reg  [9:0] rd_addr; // Changed to 10-bit for 128-bit width
     reg  [9:0] rd_addr_ddr_1d, rd_addr_ddr_2d;
+    reg        wr_addr_wrap;
+    reg        rd_addr_wrap;
+    reg        rd_addr_wrap_ddr_1d, rd_addr_wrap_ddr_2d;
     wire [9:0] fill_level;
+    wire [10:0] fill_level_ext;
+    wire        rd_overtook_wr;
     reg        prefetch_enable;
     reg        prefetch_enable_d;
     reg        req_busy;
@@ -96,7 +101,10 @@ module rd_buf #(
     wire     issue_req;
     wire     can_issue_req;
 
-    assign fill_level = wr_addr - rd_addr_ddr_2d;
+    // Use wrap-bit pointers to avoid ambiguous modulo subtraction in 1024-depth ring.
+    assign fill_level_ext = {wr_addr_wrap, wr_addr} - {rd_addr_wrap_ddr_2d, rd_addr_ddr_2d};
+    assign rd_overtook_wr = fill_level_ext[10];
+    assign fill_level = rd_overtook_wr ? 10'd0 : fill_level_ext[9:0];
 
     always @(posedge ddr_clk)
     begin
@@ -146,11 +154,15 @@ module rd_buf #(
         begin
             rd_addr_ddr_1d <= 10'd0;
             rd_addr_ddr_2d <= 10'd0;
+            rd_addr_wrap_ddr_1d <= 1'b0;
+            rd_addr_wrap_ddr_2d <= 1'b0;
         end
         else
         begin
             rd_addr_ddr_1d <= rd_addr;
             rd_addr_ddr_2d <= rd_addr_ddr_1d;
+            rd_addr_wrap_ddr_1d <= rd_addr_wrap;
+            rd_addr_wrap_ddr_2d <= rd_addr_wrap_ddr_1d;
         end
     end
 
@@ -225,6 +237,16 @@ module rd_buf #(
             wr_addr <= wr_addr;
     end 
 
+    always @(posedge ddr_clk)
+    begin
+        if(wr_rst || (~ddr_rstn))
+            wr_addr_wrap <= 1'b0;
+        else if(ddr_rdata_en && (wr_addr == 10'h3ff))
+            wr_addr_wrap <= ~wr_addr_wrap;
+        else
+            wr_addr_wrap <= wr_addr_wrap;
+    end
+
     rd_fram_buf rd_fram_buf (
         .a_wr_data   (  ddr_rdata       ),// input [127:0]            
         .a_addr      (  wr_addr         ),// input [9:0]              
@@ -250,6 +272,16 @@ module rd_buf #(
         else
             rd_addr <= rd_addr;
     end 
+
+    always @(posedge vout_clk)
+    begin
+        if(rd_rst || (~ddr_rstn_2d))
+            rd_addr_wrap <= 1'b0;
+        else if(rd_en && (rd_addr == 10'h3ff))
+            rd_addr_wrap <= ~rd_addr_wrap;
+        else
+            rd_addr_wrap <= rd_addr_wrap;
+    end
     
     assign vout_de = rd_en_2d;
     assign vout_data = rd_data;
