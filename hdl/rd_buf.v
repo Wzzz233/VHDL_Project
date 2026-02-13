@@ -58,6 +58,8 @@ module rd_buf #(
     localparam RD_LINE_NUM    = WR_LINE_NUM * RAM_WIDTH / DDR_DATA_WIDTH;
     // Keep the same address unit conversion as the reference design.
     localparam DDR_ADDR_OFFSET = RD_LINE_NUM * DDR_DATA_WIDTH / DQ_WIDTH;
+    localparam [9:0] HIGH_WATER = 10'd640;
+    localparam [9:0] LOW_WATER  = 10'd320;
     
     //===========================================================================
     reg       rd_fsync_1d;
@@ -78,10 +80,20 @@ module rd_buf #(
     reg      wr_fsync_1d,wr_fsync_2d,wr_fsync_3d;
     wire     wr_rst;
     
+    reg  [9:0] wr_addr;
+    reg  [9:0] rd_addr; // Changed to 10-bit for 128-bit width
+    reg  [9:0] rd_addr_ddr_1d, rd_addr_ddr_2d;
+    wire [9:0] fill_level;
+    reg        prefetch_enable;
+    reg        req_busy;
+
     reg      wr_trig;
     reg [11:0] wr_line;
     reg      ddr_rdone_d;
     wire     ddr_rdone_rise;
+
+    assign fill_level = wr_addr - rd_addr_ddr_2d;
+
     always @(posedge ddr_clk)
     begin
         wr_fsync_1d <= rd_fsync;
@@ -92,7 +104,7 @@ module rd_buf #(
             wr_trig <= 1'b0;
         else
             // wr_line starts from 1, so use "< V_NUM" to avoid one extra line.
-            wr_trig <= wr_rst || (ddr_rdone_rise && (wr_line < V_NUM));
+            wr_trig <= wr_rst || (init_done && prefetch_enable && ~req_busy && (wr_line < V_NUM));
     end 
     
     always @(posedge ddr_clk)
@@ -104,6 +116,44 @@ module rd_buf #(
     end
     
     assign ddr_rdone_rise = ddr_rdone & ~ddr_rdone_d;
+
+    always @(posedge ddr_clk)
+    begin
+        if(~ddr_rstn || wr_rst)
+            req_busy <= 1'b0;
+        else if(wr_trig)
+            req_busy <= 1'b1;
+        else if(ddr_rdone_rise)
+            req_busy <= 1'b0;
+        else
+            req_busy <= req_busy;
+    end
+
+    always @(posedge ddr_clk)
+    begin
+        if(~ddr_rstn)
+        begin
+            rd_addr_ddr_1d <= 10'd0;
+            rd_addr_ddr_2d <= 10'd0;
+        end
+        else
+        begin
+            rd_addr_ddr_1d <= rd_addr;
+            rd_addr_ddr_2d <= rd_addr_ddr_1d;
+        end
+    end
+
+    always @(posedge ddr_clk)
+    begin
+        if(~ddr_rstn || wr_rst)
+            prefetch_enable <= 1'b1;
+        else if(fill_level >= HIGH_WATER)
+            prefetch_enable <= 1'b0;
+        else if(fill_level <= LOW_WATER)
+            prefetch_enable <= 1'b1;
+        else
+            prefetch_enable <= prefetch_enable;
+    end
 
     always @(posedge ddr_clk)
     begin
@@ -143,8 +193,6 @@ module rd_buf #(
     assign ddr_raddr = {locked_frame_bit,wr_cnt} + ADDR_OFFSET;
     assign ddr_rd_len = RD_LINE_NUM;
     
-    reg  [ 9:0]           wr_addr;
-    reg  [ 9:0]           rd_addr; // Changed to 10-bit for 128-bit width
     wire [127:0]          rd_data; // Changed to 128-bit
     
     //===========================================================================
