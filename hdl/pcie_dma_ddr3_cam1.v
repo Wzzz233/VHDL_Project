@@ -667,22 +667,20 @@ wire [127:0]               frame_rd_data;
 // Synchronize camera vsync from cmos1_pclk domain to pclk_div2 domain.
 reg                        cmos1_vsync_pclk_ff1;
 reg                        cmos1_vsync_pclk_ff2;
-reg                        cmos1_vsync_pclk_ff3;
 wire                       rd_fsync_pclk_div2;
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
         cmos1_vsync_pclk_ff1 <= 1'b0;
         cmos1_vsync_pclk_ff2 <= 1'b0;
-        cmos1_vsync_pclk_ff3 <= 1'b0;
     end else begin
         cmos1_vsync_pclk_ff1 <= cmos1_vsync_d0;
         cmos1_vsync_pclk_ff2 <= cmos1_vsync_pclk_ff1;
-        cmos1_vsync_pclk_ff3 <= cmos1_vsync_pclk_ff2;
     end
 end
 
-assign rd_fsync_pclk_div2 = cmos1_vsync_pclk_ff2 & ~cmos1_vsync_pclk_ff3;
+// Keep frame-sync level in vout clock domain; rd_buf does edge detect internally.
+assign rd_fsync_pclk_div2 = cmos1_vsync_pclk_ff2;
 
 //=============================================================================
 // MWR Data Source (frame data for DMA transfer to host)
