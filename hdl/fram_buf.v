@@ -78,7 +78,8 @@ module fram_buf #(
     parameter FRAME_CNT_WIDTH = CTRL_ADDR_WIDTH - LINE_ADDR_WIDTH;
     
     wire                        ddr_wreq;     
-    wire [CTRL_ADDR_WIDTH- 1'b1 : 0] ddr_waddr;    
+    wire [CTRL_ADDR_WIDTH- 1'b1 : 0] ddr_waddr_raw;
+    wire [CTRL_ADDR_WIDTH- 1'b1 : 0] ddr_waddr;
     wire [LEN_WIDTH- 1'b1 : 0]  ddr_wr_len;   
     wire                        ddr_wrdy;     
     wire                        ddr_wdone;    
@@ -96,6 +97,30 @@ module fram_buf #(
     wire                        read_en     ;
     wire                        ddr_wr_bac;
     wire [FRAME_CNT_WIDTH-1:0]  frame_wcnt;
+    wire [1:0]                  frame_widx;
+    localparam [CTRL_ADDR_WIDTH-1:0] FRAME_ADDR_STRIDE = ({{(CTRL_ADDR_WIDTH-1){1'b0}},1'b1} << LINE_ADDR_WIDTH);
+    wire [CTRL_ADDR_WIDTH-1:0]  wr_frame_base;
+
+    function [1:0] mod3_u;
+        input [FRAME_CNT_WIDTH-1:0] value;
+        integer i;
+        reg [1:0] rem;
+    begin
+        rem = 2'd0;
+        for (i = FRAME_CNT_WIDTH-1; i >= 0; i = i - 1) begin
+            rem = rem + {1'b0, value[i]};
+            if (rem >= 2'd3)
+                rem = rem - 2'd3;
+        end
+        mod3_u = rem;
+    end
+    endfunction
+
+    assign frame_widx = mod3_u(frame_wcnt);
+    assign wr_frame_base = (frame_widx == 2'd1) ? FRAME_ADDR_STRIDE :
+                           (frame_widx == 2'd2) ? (FRAME_ADDR_STRIDE << 1) :
+                           {CTRL_ADDR_WIDTH{1'b0}};
+    assign ddr_waddr = wr_frame_base + ddr_waddr_raw[LINE_ADDR_WIDTH-1:0];
 
     wr_buf #(
         .ADDR_WIDTH       (  CTRL_ADDR_WIDTH  ),//parameter                     ADDR_WIDTH      = 6'd27,
@@ -118,7 +143,7 @@ module fram_buf #(
         
         .rd_bac           (  ddr_wr_bac       ),//input                         rd_bac,                                      
         .ddr_wreq         (  ddr_wreq         ),//output                        ddr_wreq,
-        .ddr_waddr        (  ddr_waddr        ),//output [ADDR_WIDTH- 1'b1 : 0] ddr_waddr,
+        .ddr_waddr        (  ddr_waddr_raw    ),//output [ADDR_WIDTH- 1'b1 : 0] ddr_waddr,
         .ddr_wr_len       (  ddr_wr_len       ),//output [LEN_WIDTH- 1'b1 : 0]  ddr_wr_len,
         .ddr_wrdy         (  ddr_wrdy         ),//input                         ddr_wrdy,
         .ddr_wdone        (  ddr_wdone        ),//input                         ddr_wdone,
@@ -158,7 +183,7 @@ module fram_buf #(
         .vout_data       (  vout_data         ),//output [127 : 0]  vout_data,
         
         .init_done       (  init_done         ),//input                         init_done,
-        .i_wr_frame_bit  (  frame_wcnt[0]     ),//input                         i_wr_frame_bit,
+        .i_wr_frame_idx  (  frame_widx        ),//input  [1:0]                  i_wr_frame_idx,
       
         .ddr_rreq        (  rd_cmd_en         ),//output                        ddr_rreq,
         .ddr_raddr       (  rd_cmd_addr       ),//output [ADDR_WIDTH- 1'b1 : 0] ddr_raddr,

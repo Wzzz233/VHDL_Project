@@ -40,7 +40,7 @@ module rd_buf #(
     output [127:0]                vout_data, // Changed to 128-bit
     
     input                         init_done,
-    input                         i_wr_frame_bit,
+    input      [1:0]              i_wr_frame_idx,
     
     output                        ddr_rreq,
     output [ADDR_WIDTH- 1'b1 : 0] ddr_raddr,
@@ -60,6 +60,7 @@ module rd_buf #(
     localparam DDR_ADDR_OFFSET = RD_LINE_NUM * DDR_DATA_WIDTH / DQ_WIDTH;
     localparam [9:0] HIGH_WATER = 10'd640;
     localparam [9:0] LOW_WATER  = 10'd320;
+    localparam [ADDR_WIDTH-1:0] FRAME_ADDR_STRIDE = ({{(ADDR_WIDTH-1){1'b0}},1'b1} << LINE_ADDR_WIDTH);
     
     //===========================================================================
     reg       rd_fsync_1d;
@@ -94,12 +95,15 @@ module rd_buf #(
     reg        req_busy;
 
     reg      wr_trig;
+    reg      pending_req;
     reg [11:0] wr_line;
     reg      ddr_rdone_d;
     wire     ddr_rdone_rise;
     wire     prefetch_enable_rise;
-    wire     issue_req;
-    wire     can_issue_req;
+    wire     can_issue_now;
+    wire     can_issue_after_done;
+    wire     set_pending;
+    wire     req_accept;
 
     // Use wrap-bit pointers to avoid ambiguous modulo subtraction in 1024-depth ring.
     assign fill_level_ext = {wr_addr_wrap, wr_addr} - {rd_addr_wrap_ddr_2d, rd_addr_ddr_2d};
@@ -115,8 +119,8 @@ module rd_buf #(
         if(~ddr_rstn)
             wr_trig <= 1'b0;
         else
-            // Request is a one-cycle pulse and only issued on specific events.
-            wr_trig <= issue_req;
+            // ddr_rreq is only generated when the request is accepted by ddr_rrdy.
+            wr_trig <= req_accept;
     end 
     
     always @(posedge ddr_clk)
@@ -130,19 +134,35 @@ module rd_buf #(
     assign ddr_rdone_rise = ddr_rdone & ~ddr_rdone_d;
 
     assign prefetch_enable_rise = prefetch_enable & ~prefetch_enable_d;
-    assign can_issue_req = init_done && prefetch_enable && (wr_line < V_NUM);
-    // Session reset must always kick the first line request; later requests are flow-controlled.
-    assign issue_req = (wr_rst && init_done) ||
-                       (ddr_rdone_rise && can_issue_req) ||
-                       (prefetch_enable_rise && can_issue_req && ~req_busy);
+    assign can_issue_now = init_done && prefetch_enable && (wr_line < V_NUM);
+    assign can_issue_after_done = init_done && prefetch_enable && (wr_line + 12'd1 < V_NUM);
+    assign set_pending = (wr_rst && init_done) ||
+                         (ddr_rdone_rise && can_issue_after_done) ||
+                         (prefetch_enable_rise && can_issue_now && ~req_busy);
+    assign req_accept = pending_req && ddr_rrdy;
 
     always @(posedge ddr_clk)
     begin
         if(~ddr_rstn)
+            pending_req <= 1'b0;
+        else
+        begin
+            case ({set_pending, req_accept})
+                2'b10: pending_req <= 1'b1;
+                2'b01: pending_req <= 1'b0;
+                2'b11: pending_req <= 1'b1;
+                default: pending_req <= pending_req;
+            endcase
+        end
+    end
+
+    always @(posedge ddr_clk)
+    begin
+        if(~ddr_rstn || wr_rst)
             req_busy <= 1'b0;
-        else if(issue_req)
+        else if(req_accept)
             req_busy <= 1'b1;
-        else if(wr_rst || ddr_rdone_rise)
+        else if(ddr_rdone_rise)
             req_busy <= 1'b0;
         else
             req_busy <= req_busy;
@@ -197,17 +217,29 @@ module rd_buf #(
     assign wr_rst = ~wr_fsync_3d && wr_fsync_2d;
     
     //==========================================================================
-    reg locked_frame_bit;
+    reg [1:0] locked_frame_idx;
+    wire [ADDR_WIDTH-1:0] locked_frame_base;
+
     always @(posedge ddr_clk)
     begin 
         if(~ddr_rstn)
-            locked_frame_bit <= 1'b0;
+            locked_frame_idx <= 2'd0;
         else if(wr_rst)
-            // Lock to the opposite bank so read side uses a completed frame.
-            locked_frame_bit <= ~i_wr_frame_bit;
+        begin
+            // 3-bank mode: read the previously completed frame bank.
+            case (i_wr_frame_idx)
+                2'd0: locked_frame_idx <= 2'd2;
+                2'd1: locked_frame_idx <= 2'd0;
+                default: locked_frame_idx <= 2'd1;
+            endcase
+        end
         else
-            locked_frame_bit <= locked_frame_bit;
+            locked_frame_idx <= locked_frame_idx;
     end 
+
+    assign locked_frame_base = (locked_frame_idx == 2'd1) ? FRAME_ADDR_STRIDE :
+                               (locked_frame_idx == 2'd2) ? (FRAME_ADDR_STRIDE << 1) :
+                               {ADDR_WIDTH{1'b0}};
 
     reg [LINE_ADDR_WIDTH - 1'b1 :0] wr_cnt;
     always @(posedge ddr_clk)
@@ -221,7 +253,7 @@ module rd_buf #(
     end 
     
     assign ddr_rreq = wr_trig;
-    assign ddr_raddr = {locked_frame_bit,wr_cnt} + ADDR_OFFSET;
+    assign ddr_raddr = locked_frame_base + wr_cnt + ADDR_OFFSET;
     assign ddr_rd_len = RD_LINE_NUM;
     
     wire [127:0]          rd_data; // Changed to 128-bit
