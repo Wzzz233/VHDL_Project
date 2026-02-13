@@ -31,6 +31,13 @@
 static int g_device_fd = -1;
 static volatile sig_atomic_t g_running = 1;
 
+enum ppm_mode {
+    PPM_MODE_RGB565 = 0,
+    PPM_MODE_BGR565,
+    PPM_MODE_RGB565_SWAP16,
+    PPM_MODE_BGR565_SWAP16,
+};
+
 /**
  * print_color - Print colored output to terminal
  */
@@ -68,7 +75,8 @@ static void print_usage(const char *progname)
     printf("  --count <num>          Number of frames to read (default: 1)\n");
     printf("  --verify               Verify frame data (check for zeros)\n");
     printf("  --dump <bytes>         Dump first N bytes of frame (hex)\n");
-    printf("  --save-ppm <filename>  Save frame as PPM image converted from RGB565\n");
+    printf("  --save-ppm <filename>  Save frame as PPM image\n");
+    printf("  --ppm-mode <mode>      PPM decode mode: rgb565|bgr565|rgb565-swap|bgr565-swap\n");
     printf("  --mmap                 Test mmap buffer access\n");
     printf("  --help                 Show this help message\n");
     printf("\nExamples:\n");
@@ -220,7 +228,7 @@ static int save_frame(const char *filename, const void *buffer, size_t size)
  * save_ppm_rgb565 - Convert RGB565 buffer to PPM (P6)
  */
 static int save_ppm_rgb565(const char *filename, const void *buffer,
-                           uint32_t width, uint32_t height)
+                           uint32_t width, uint32_t height, enum ppm_mode mode)
 {
     const uint8_t *src = (const uint8_t *)buffer;
     uint32_t pixel_count = width * height;
@@ -236,12 +244,29 @@ static int save_ppm_rgb565(const char *filename, const void *buffer,
     fprintf(fp, "P6\n%u %u\n255\n", width, height);
 
     for (i = 0; i < pixel_count; i++) {
-        uint16_t pix = (uint16_t)src[i * 2] | ((uint16_t)src[i * 2 + 1] << 8);
-        /* Camera output is currently BGR565 on this platform. */
-        uint8_t r5 = pix & 0x1F;
-        uint8_t g6 = (pix >> 5) & 0x3F;
-        uint8_t b5 = (pix >> 11) & 0x1F;
+        uint8_t lo = src[i * 2];
+        uint8_t hi = src[i * 2 + 1];
+        uint8_t r5, g6, b5;
         uint8_t rgb[3];
+        uint16_t pix;
+
+        if (mode == PPM_MODE_RGB565_SWAP16 || mode == PPM_MODE_BGR565_SWAP16) {
+            uint8_t tmp = lo;
+            lo = hi;
+            hi = tmp;
+        }
+
+        pix = (uint16_t)lo | ((uint16_t)hi << 8);
+
+        if (mode == PPM_MODE_RGB565 || mode == PPM_MODE_RGB565_SWAP16) {
+            r5 = (pix >> 11) & 0x1F;
+            g6 = (pix >> 5) & 0x3F;
+            b5 = pix & 0x1F;
+        } else {
+            r5 = pix & 0x1F;
+            g6 = (pix >> 5) & 0x3F;
+            b5 = (pix >> 11) & 0x1F;
+        }
 
         rgb[0] = (uint8_t)((r5 << 3) | (r5 >> 2));
         rgb[1] = (uint8_t)((g6 << 2) | (g6 >> 4));
@@ -319,6 +344,7 @@ int main(int argc, char *argv[])
     const char *device_file = "/dev/" FPGA_DMA_DEV_NAME;
     const char *output_file = NULL;
     const char *ppm_file = NULL;
+    enum ppm_mode ppm_mode = PPM_MODE_BGR565;
     int do_info = 0;
     int do_read = 0;
     int do_continuous = 0;
@@ -372,6 +398,24 @@ int main(int argc, char *argv[])
                 ppm_file = argv[++i];
             } else {
                 fprintf(stderr, "Error: --save-ppm requires filename argument\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--ppm-mode") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --ppm-mode requires mode argument\n");
+                return 1;
+            }
+            i++;
+            if (strcmp(argv[i], "rgb565") == 0) {
+                ppm_mode = PPM_MODE_RGB565;
+            } else if (strcmp(argv[i], "bgr565") == 0) {
+                ppm_mode = PPM_MODE_BGR565;
+            } else if (strcmp(argv[i], "rgb565-swap") == 0) {
+                ppm_mode = PPM_MODE_RGB565_SWAP16;
+            } else if (strcmp(argv[i], "bgr565-swap") == 0) {
+                ppm_mode = PPM_MODE_BGR565_SWAP16;
+            } else {
+                fprintf(stderr, "Error: invalid --ppm-mode '%s'\n", argv[i]);
                 return 1;
             }
         } else if (strcmp(argv[i], "--mmap") == 0) {
@@ -482,7 +526,7 @@ int main(int argc, char *argv[])
                     snprintf(ppm_name, sizeof(ppm_name), "%s", ppm_file);
                 }
 
-                if (save_ppm_rgb565(ppm_name, buffer, FPGA_FRAME_WIDTH, FPGA_FRAME_HEIGHT) < 0) {
+                if (save_ppm_rgb565(ppm_name, buffer, FPGA_FRAME_WIDTH, FPGA_FRAME_HEIGHT, ppm_mode) < 0) {
                     free(buffer);
                     close(g_device_fd);
                     return 1;
