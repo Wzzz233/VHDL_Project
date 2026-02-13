@@ -37,11 +37,14 @@
 /* Module parameters */
 static int major_num;
 static int dma_timeout_ms = 5000;  /* 5 seconds default timeout */
+static int dma_chunk_delay_us = 20; /* inter-chunk pacing, default 20us */
 
 module_param(major_num, int, 0);
 MODULE_PARM_DESC(major_num, "Major device number (0=dynamic)");
 module_param(dma_timeout_ms, int, 0644);
 MODULE_PARM_DESC(dma_timeout_ms, "DMA transfer timeout in milliseconds");
+module_param(dma_chunk_delay_us, int, 0644);
+MODULE_PARM_DESC(dma_chunk_delay_us, "Delay in microseconds after each DMA chunk trigger");
 
 /* Per-device structure */
 struct fpga_dma_dev {
@@ -220,8 +223,11 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
         }
         fpga_dma_write_reg(dev, BAR1_DMA_CMD_REG, cmd_reg);
 
-        /* Wait for FPGA to process */
-        msleep(50);  /* 50ms should be PLENTY for 4KB @ PCIe Gen2 */
+        /* Small inter-chunk pacing; 50ms was only for bring-up debug. */
+        if (dma_chunk_delay_us >= 1000)
+            usleep_range(dma_chunk_delay_us, dma_chunk_delay_us + 100);
+        else if (dma_chunk_delay_us > 0)
+            udelay(dma_chunk_delay_us);
 
         if (verbose_chunk) {
             /* Check if data arrived */
