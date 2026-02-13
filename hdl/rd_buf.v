@@ -85,12 +85,15 @@ module rd_buf #(
     reg  [9:0] rd_addr_ddr_1d, rd_addr_ddr_2d;
     wire [9:0] fill_level;
     reg        prefetch_enable;
+    reg        prefetch_enable_d;
     reg        req_busy;
 
     reg      wr_trig;
     reg [11:0] wr_line;
     reg      ddr_rdone_d;
     wire     ddr_rdone_rise;
+    wire     prefetch_enable_rise;
+    wire     issue_req;
 
     assign fill_level = wr_addr - rd_addr_ddr_2d;
 
@@ -103,8 +106,8 @@ module rd_buf #(
         if(~ddr_rstn)
             wr_trig <= 1'b0;
         else
-            // wr_line starts from 1, so use "< V_NUM" to avoid one extra line.
-            wr_trig <= wr_rst || (init_done && prefetch_enable && ~req_busy && (wr_line < V_NUM));
+            // Request is a one-cycle pulse and only issued on specific events.
+            wr_trig <= issue_req;
     end 
     
     always @(posedge ddr_clk)
@@ -117,13 +120,17 @@ module rd_buf #(
     
     assign ddr_rdone_rise = ddr_rdone & ~ddr_rdone_d;
 
+    assign prefetch_enable_rise = prefetch_enable & ~prefetch_enable_d;
+    assign issue_req = (wr_rst || ddr_rdone_rise || prefetch_enable_rise) &&
+                       init_done && prefetch_enable && ~req_busy && (wr_line < V_NUM);
+
     always @(posedge ddr_clk)
     begin
-        if(~ddr_rstn || wr_rst)
+        if(~ddr_rstn)
             req_busy <= 1'b0;
-        else if(wr_trig)
+        else if(issue_req)
             req_busy <= 1'b1;
-        else if(ddr_rdone_rise)
+        else if(wr_rst || ddr_rdone_rise)
             req_busy <= 1'b0;
         else
             req_busy <= req_busy;
@@ -157,9 +164,17 @@ module rd_buf #(
 
     always @(posedge ddr_clk)
     begin
+        if(~ddr_rstn || wr_rst)
+            prefetch_enable_d <= 1'b1;
+        else
+            prefetch_enable_d <= prefetch_enable;
+    end
+
+    always @(posedge ddr_clk)
+    begin
         if(wr_rst || (~ddr_rstn))
-            wr_line <= 12'd1;
-        else if(wr_trig)
+            wr_line <= 12'd0;
+        else if(ddr_rdone_rise)
             wr_line <= wr_line + 12'd1;
     end 
     
