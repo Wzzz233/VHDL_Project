@@ -664,23 +664,45 @@ wire                       core_clk_ddr;
 wire                       fram_buf_init_done /*synthesis PAP_MARK_DEBUG="1"*/;
 wire [127:0]               frame_rd_data;
 
-// Synchronize camera vsync from cmos1_pclk domain to pclk_div2 domain.
-reg                        cmos1_vsync_pclk_ff1;
-reg                        cmos1_vsync_pclk_ff2;
+// Robust CDC for frame-sync:
+// 1) Detect vsync rise in cmos1_pclk domain and toggle a flag.
+// 2) Sync toggle into pclk_div2 domain and detect the change.
+// 3) Stretch to multiple pclk_div2 cycles so ddr_clk domain edge capture is reliable.
+reg                        cmos1_vsync_d1 = 1'b0;
+reg                        cmos1_vsync_toggle = 1'b0;
+reg                        cmos1_vsync_tgl_ff1;
+reg                        cmos1_vsync_tgl_ff2;
+reg                        cmos1_vsync_tgl_ff3;
+reg  [5:0]                 rd_fsync_stretch_cnt;
+wire                       rd_fsync_toggle_pulse;
 wire                       rd_fsync_pclk_div2;
+
+always @(posedge cmos1_pclk) begin
+    cmos1_vsync_d1 <= cmos1_vsync_d0;
+    if (~cmos1_vsync_d1 && cmos1_vsync_d0)
+        cmos1_vsync_toggle <= ~cmos1_vsync_toggle;
+end
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
-        cmos1_vsync_pclk_ff1 <= 1'b0;
-        cmos1_vsync_pclk_ff2 <= 1'b0;
+        cmos1_vsync_tgl_ff1 <= 1'b0;
+        cmos1_vsync_tgl_ff2 <= 1'b0;
+        cmos1_vsync_tgl_ff3 <= 1'b0;
+        rd_fsync_stretch_cnt <= 6'd0;
     end else begin
-        cmos1_vsync_pclk_ff1 <= cmos1_vsync_d0;
-        cmos1_vsync_pclk_ff2 <= cmos1_vsync_pclk_ff1;
+        cmos1_vsync_tgl_ff1 <= cmos1_vsync_toggle;
+        cmos1_vsync_tgl_ff2 <= cmos1_vsync_tgl_ff1;
+        cmos1_vsync_tgl_ff3 <= cmos1_vsync_tgl_ff2;
+
+        if (rd_fsync_toggle_pulse)
+            rd_fsync_stretch_cnt <= 6'd31;
+        else if (rd_fsync_stretch_cnt != 6'd0)
+            rd_fsync_stretch_cnt <= rd_fsync_stretch_cnt - 6'd1;
     end
 end
 
-// Keep frame-sync level in vout clock domain; rd_buf does edge detect internally.
-assign rd_fsync_pclk_div2 = cmos1_vsync_pclk_ff2;
+assign rd_fsync_toggle_pulse = cmos1_vsync_tgl_ff2 ^ cmos1_vsync_tgl_ff3;
+assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
 
 //=============================================================================
 // MWR Data Source (frame data for DMA transfer to host)

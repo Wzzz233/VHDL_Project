@@ -157,11 +157,14 @@ module rd_buf #(
     rd_fram_buf rd_fram_buf (
         .a_wr_data   (  ddr_rdata       ),// input [127:0]            
         .a_addr      (  wr_addr         ),// input [9:0]              
+        .a_rd_data   (                  ),
         .a_wr_en     (  ddr_rdata_en    ),// input                    
         .a_clk       (  ddr_clk         ),// input                    
         .a_rst       (  ~ddr_rstn       ),// input                    
         .b_addr      (  rd_addr         ),// input [9:0]             
+        .b_wr_data   (  128'd0          ),
         .b_rd_data   (  rd_data         ),// output [127:0]            
+        .b_wr_en     (  1'b0            ),
         .b_clk       (  vout_clk        ),// input                    
         .b_rst       (  ~ddr_rstn_2d    ) // input                    
     );
