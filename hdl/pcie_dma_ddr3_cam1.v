@@ -664,52 +664,54 @@ wire                       core_clk_ddr;
 wire                       fram_buf_init_done /*synthesis PAP_MARK_DEBUG="1"*/;
 wire [127:0]               frame_rd_data;
 
-// Robust CDC for frame-sync:
-// 1) Detect vsync rise in cmos1_pclk domain and toggle a flag.
-// 2) Sync toggle into pclk_div2 domain and detect the change.
-// 3) Stretch to multiple pclk_div2 cycles so ddr_clk domain edge capture is reliable.
-reg                        cmos1_vsync_d1 = 1'b0;
-reg                        cmos1_vsync_toggle = 1'b0;
-reg                        cmos1_vsync_tgl_ff1;
-reg                        cmos1_vsync_tgl_ff2;
-reg                        cmos1_vsync_tgl_ff3;
-reg  [5:0]                 rd_fsync_stretch_cnt;
-wire                       rd_fsync_toggle_pulse;
-wire                       rd_fsync_pclk_div2;
-
-always @(posedge cmos1_pclk) begin
-    cmos1_vsync_d1 <= cmos1_vsync_d0;
-    if (~cmos1_vsync_d1 && cmos1_vsync_d0)
-        cmos1_vsync_toggle <= ~cmos1_vsync_toggle;
-end
-
-always @(posedge pclk_div2 or negedge core_rst_n) begin
-    if (!core_rst_n) begin
-        cmos1_vsync_tgl_ff1 <= 1'b0;
-        cmos1_vsync_tgl_ff2 <= 1'b0;
-        cmos1_vsync_tgl_ff3 <= 1'b0;
-        rd_fsync_stretch_cnt <= 6'd0;
-    end else begin
-        cmos1_vsync_tgl_ff1 <= cmos1_vsync_toggle;
-        cmos1_vsync_tgl_ff2 <= cmos1_vsync_tgl_ff1;
-        cmos1_vsync_tgl_ff3 <= cmos1_vsync_tgl_ff2;
-
-        if (rd_fsync_toggle_pulse)
-            rd_fsync_stretch_cnt <= 6'd31;
-        else if (rd_fsync_stretch_cnt != 6'd0)
-            rd_fsync_stretch_cnt <= rd_fsync_stretch_cnt - 6'd1;
-    end
-end
-
-assign rd_fsync_toggle_pulse = cmos1_vsync_tgl_ff2 ^ cmos1_vsync_tgl_ff3;
-assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
-
 //=============================================================================
 // MWR Data Source (frame data for DMA transfer to host)
 //=============================================================================
 wire        mwr_rd_clk_en;
 wire [11:0] mwr_rd_addr;
 reg  [127:0] mwr_rd_data;
+
+// Start one read session on the first DMA read beat and keep the session
+// active across chunk gaps until a full frame has been consumed.
+localparam integer         FRAME_WORDS = (1280 * 720 * 16) / 128;
+reg                        mwr_rd_clk_en_d;
+reg                        dma_session_active;
+reg  [16:0]                dma_rd_word_count;
+reg  [5:0]                 rd_fsync_stretch_cnt;
+wire                       dma_session_start;
+wire                       rd_fsync_pclk_div2;
+
+always @(posedge pclk_div2 or negedge core_rst_n) begin
+    if (!core_rst_n) begin
+        mwr_rd_clk_en_d <= 1'b0;
+        dma_session_active <= 1'b0;
+        dma_rd_word_count <= 17'd0;
+        rd_fsync_stretch_cnt <= 6'd0;
+    end else begin
+        mwr_rd_clk_en_d <= mwr_rd_clk_en;
+
+        if (dma_session_start) begin
+            dma_session_active <= 1'b1;
+            dma_rd_word_count <= 17'd0;
+            rd_fsync_stretch_cnt <= 6'd31;
+        end else begin
+            if (dma_session_active && mwr_rd_clk_en) begin
+                if (dma_rd_word_count == FRAME_WORDS - 1) begin
+                    dma_rd_word_count <= 17'd0;
+                    dma_session_active <= 1'b0;
+                end else begin
+                    dma_rd_word_count <= dma_rd_word_count + 17'd1;
+                end
+            end
+
+            if (rd_fsync_stretch_cnt != 6'd0)
+                rd_fsync_stretch_cnt <= rd_fsync_stretch_cnt - 6'd1;
+        end
+    end
+end
+
+assign dma_session_start = mwr_rd_clk_en & ~mwr_rd_clk_en_d & ~dma_session_active;
+assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
 
 // Phase 1: Test pattern — incrementing address as data
 // Host can verify: data[31:0] should match sequential addresses
