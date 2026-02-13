@@ -121,6 +121,7 @@ static int read_frame(int fd, void *buffer, size_t size)
     transfer.size = size;
     transfer.flags = 0;
     transfer.result = -1;
+    transfer.user_buf = (uint64_t)(unsigned long)buffer;
 
     ret = ioctl(fd, FPGA_DMA_READ_FRAME, &transfer);
     if (ret < 0) {

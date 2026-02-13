@@ -315,6 +315,14 @@ static long fpga_dma_ioctl(struct file *file, unsigned int cmd, unsigned long ar
         mutex_unlock(&dev->dma_lock);
 
         if (!ret) {
+            /* Copy DMA buffer data to userspace */
+            if (transfer.user_buf) {
+                if (copy_to_user((void __user *)(unsigned long)transfer.user_buf,
+                                 dev->dma_buf, size)) {
+                    ret = -EFAULT;
+                    break;
+                }
+            }
             transfer.result = 0;
             if (copy_to_user(argp, &transfer, sizeof(transfer)))
                 ret = -EFAULT;

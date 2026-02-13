@@ -90,6 +90,7 @@ struct dma_transfer {
     __u32 offset;
     __u32 flags;
     __u32 result;
+    __u64 user_buf;   /* Userspace buffer address; driver copies DMA data here */
 };
 
 /**
