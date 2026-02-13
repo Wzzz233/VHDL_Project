@@ -237,9 +237,10 @@ static int save_ppm_rgb565(const char *filename, const void *buffer,
 
     for (i = 0; i < pixel_count; i++) {
         uint16_t pix = (uint16_t)src[i * 2] | ((uint16_t)src[i * 2 + 1] << 8);
-        uint8_t r5 = (pix >> 11) & 0x1F;
+        /* Camera output is currently BGR565 on this platform. */
+        uint8_t r5 = pix & 0x1F;
         uint8_t g6 = (pix >> 5) & 0x3F;
-        uint8_t b5 = pix & 0x1F;
+        uint8_t b5 = (pix >> 11) & 0x1F;
         uint8_t rgb[3];
 
         rgb[0] = (uint8_t)((r5 << 3) | (r5 >> 2));
