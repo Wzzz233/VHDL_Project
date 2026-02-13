@@ -359,6 +359,7 @@ ips2l_pcie_dma #(
 	.o_apb_prdy				(p_rdy_dma),				
 	.o_apb_prdata			(p_rdata_dma),				
 	.o_cross_4kb_boundary	(cross_4kb_boundary),	//4k边界
+	.o_tx_restart_ext		(mwr_cmd_start),
 	// External BAR2 read override for MWR frame data
 	.o_bar2_rd_clk_en_ext	(mwr_rd_clk_en),
 	.o_bar2_rd_addr_ext		(mwr_rd_addr),
@@ -670,11 +671,11 @@ wire [127:0]               frame_rd_data;
 wire        mwr_rd_clk_en;
 wire [11:0] mwr_rd_addr;
 reg  [127:0] mwr_rd_data;
+wire        mwr_cmd_start;
 
-// Start one read session on the first DMA read beat and keep the session
+// Start one read session on DMA command start and keep the session
 // active across chunk gaps until a full frame has been consumed.
 localparam integer         FRAME_WORDS = (1280 * 720 * 16) / 128;
-reg                        mwr_rd_clk_en_d;
 reg                        dma_session_active;
 reg  [16:0]                dma_rd_word_count;
 reg  [5:0]                 rd_fsync_stretch_cnt;
@@ -683,13 +684,10 @@ wire                       rd_fsync_pclk_div2;
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
-        mwr_rd_clk_en_d <= 1'b0;
         dma_session_active <= 1'b0;
         dma_rd_word_count <= 17'd0;
         rd_fsync_stretch_cnt <= 6'd0;
     end else begin
-        mwr_rd_clk_en_d <= mwr_rd_clk_en;
-
         if (dma_session_start) begin
             dma_session_active <= 1'b1;
             dma_rd_word_count <= 17'd0;
@@ -710,7 +708,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
     end
 end
 
-assign dma_session_start = mwr_rd_clk_en & ~mwr_rd_clk_en_d & ~dma_session_active;
+assign dma_session_start = mwr_cmd_start & ~dma_session_active;
 assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
 
 // Phase 1: Test pattern — incrementing address as data

@@ -77,6 +77,7 @@ module ips2l_pcie_dma #(
     output  wire    [31:0]              o_apb_prdata            ,
     //cross_4kb_boundary
     output  wire                        o_cross_4kb_boundary    ,
+    output  wire                        o_tx_restart_ext        ,
     //external BAR2 read data override (for frame data via MWR)
     output  wire                        o_bar2_rd_clk_en_ext    ,
     output  wire    [ADDR_WIDTH-1:0]    o_bar2_rd_addr_ext      ,
@@ -160,6 +161,7 @@ wire        [127:0]             bar2_rd_data;      // muxed: internal or externa
 assign o_bar2_rd_clk_en_ext = bar2_rd_clk_en;
 assign o_bar2_rd_addr_ext   = bar2_rd_addr;
 assign bar2_rd_data         = i_ext_bar2_rd_sel ? i_ext_bar2_rd_data : bar2_rd_data_int;
+assign o_tx_restart_ext     = tx_restart;
 //**********************************************************************
 //rst tlp cnt
 wire                            tx_restart;
