@@ -94,6 +94,7 @@ module rd_buf #(
     wire     ddr_rdone_rise;
     wire     prefetch_enable_rise;
     wire     issue_req;
+    wire     can_issue_req;
 
     assign fill_level = wr_addr - rd_addr_ddr_2d;
 
@@ -121,8 +122,11 @@ module rd_buf #(
     assign ddr_rdone_rise = ddr_rdone & ~ddr_rdone_d;
 
     assign prefetch_enable_rise = prefetch_enable & ~prefetch_enable_d;
-    assign issue_req = (wr_rst || ddr_rdone_rise || prefetch_enable_rise) &&
-                       init_done && prefetch_enable && ~req_busy && (wr_line < V_NUM);
+    assign can_issue_req = init_done && prefetch_enable && (wr_line < V_NUM);
+    // ddr_rdone_rise means current request is completed, so allow immediate next request.
+    assign issue_req = (wr_rst && can_issue_req) ||
+                       (ddr_rdone_rise && can_issue_req) ||
+                       (prefetch_enable_rise && can_issue_req && ~req_busy);
 
     always @(posedge ddr_clk)
     begin
