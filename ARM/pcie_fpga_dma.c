@@ -23,6 +23,7 @@
 #include <linux/sched.h>
 #include <linux/mutex.h>
 #include <linux/delay.h>
+#include <linux/jiffies.h>
 #include <linux/version.h>
 
 #include "pcie_fpga_dma.h"
@@ -161,6 +162,12 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
     /* Process transfer in chunks to handle 4KB boundary */
     while (remaining > 0) {
         bool verbose_chunk = (chunk_num < 3) || ((chunk_num % 100) == 0);
+        size_t buf_offset;
+        u32 *chunk_tail0;
+        u32 *chunk_tail1 = NULL;
+        const u32 tail_sentinel0 = 0xDEADBEEF;
+        const u32 tail_sentinel1 = 0xA5A55A5A;
+        unsigned long deadline;
 
         /* Calculate chunk size (max 1024 DWORDs = 4096 bytes per FPGA limit) */
         chunk_size = min(remaining, (size_t)DMA_MAX_LEN_BYTES);
@@ -190,9 +197,10 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
                      chunk_size, length_in_dwords);
         }
 
+        buf_offset = (size_t)(current_addr - dev->dma_handle);
+
         if (verbose_chunk) {
             /* Clear first 16 bytes of this chunk area to detect writes */
-            size_t buf_offset = (current_addr - dev->dma_handle);
             u32 *chunk_buf = (u32 *)((u8 *)dev->dma_buf + buf_offset);
             chunk_buf[0] = 0xAAAAAAAA;
             chunk_buf[1] = 0xBBBBBBBB;
@@ -201,6 +209,15 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
             dev_info(dev->dev, "  Pre-fill: %08x %08x %08x %08x\n",
                      chunk_buf[0], chunk_buf[1], chunk_buf[2], chunk_buf[3]);
         }
+
+        /* Set end-of-chunk sentinels and poll host RAM for overwrite completion. */
+        chunk_tail0 = (u32 *)((u8 *)dev->dma_buf + buf_offset + chunk_size - sizeof(u32));
+        WRITE_ONCE(*chunk_tail0, tail_sentinel0);
+        if (chunk_size >= 8) {
+            chunk_tail1 = (u32 *)((u8 *)chunk_tail0 - sizeof(u32));
+            WRITE_ONCE(*chunk_tail1, tail_sentinel1);
+        }
+        dma_wmb();
 
         /* Program DMA address registers */
         if (verbose_chunk)
@@ -223,7 +240,20 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
         }
         fpga_dma_write_reg(dev, BAR1_DMA_CMD_REG, cmd_reg);
 
-        /* Small inter-chunk pacing; 50ms was only for bring-up debug. */
+        deadline = jiffies + msecs_to_jiffies(dma_timeout_ms);
+        while ((READ_ONCE(*chunk_tail0) == tail_sentinel0) ||
+               (chunk_tail1 && (READ_ONCE(*chunk_tail1) == tail_sentinel1))) {
+            cpu_relax();
+            if (time_after(jiffies, deadline)) {
+                dev_err(dev->dev,
+                        "Chunk %d timeout waiting RAM overwrite (addr=0x%llx size=%zu)\n",
+                        chunk_num, (u64)current_addr, chunk_size);
+                return -ETIMEDOUT;
+            }
+        }
+        dma_rmb();
+
+        /* Optional extra pacing for stress testing */
         if (dma_chunk_delay_us >= 1000)
             usleep_range(dma_chunk_delay_us, dma_chunk_delay_us + 100);
         else if (dma_chunk_delay_us > 0)
@@ -231,7 +261,6 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
 
         if (verbose_chunk) {
             /* Check if data arrived */
-            size_t buf_offset = (current_addr - dev->dma_handle);
             u32 *chunk_buf = (u32 *)((u8 *)dev->dma_buf + buf_offset);
             dev_info(dev->dev, "  Post-DMA: %08x %08x %08x %08x\n",
                      chunk_buf[0], chunk_buf[1], chunk_buf[2], chunk_buf[3]);
