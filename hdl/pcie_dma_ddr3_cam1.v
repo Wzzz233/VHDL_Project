@@ -83,6 +83,7 @@ wire			dma_axis_slave0_tuser;
 
 // Reset debounce and sync
 wire			sync_button_rst_n; 			
+wire			sync_perst_n;
 wire			ref_core_rst_n;				
 wire			s_pclk_rstn;				
 
@@ -661,6 +662,27 @@ wire                       axi_rvalid;
 wire                       ddr_init_done /*synthesis PAP_MARK_DEBUG="1"*/;
 wire                       core_clk_ddr;
 wire                       fram_buf_init_done /*synthesis PAP_MARK_DEBUG="1"*/;
+wire [127:0]               frame_rd_data;
+
+// Synchronize camera vsync from cmos1_pclk domain to pclk_div2 domain.
+reg                        cmos1_vsync_pclk_ff1;
+reg                        cmos1_vsync_pclk_ff2;
+reg                        cmos1_vsync_pclk_ff3;
+wire                       rd_fsync_pclk_div2;
+
+always @(posedge pclk_div2 or negedge core_rst_n) begin
+    if (!core_rst_n) begin
+        cmos1_vsync_pclk_ff1 <= 1'b0;
+        cmos1_vsync_pclk_ff2 <= 1'b0;
+        cmos1_vsync_pclk_ff3 <= 1'b0;
+    end else begin
+        cmos1_vsync_pclk_ff1 <= cmos1_vsync_d0;
+        cmos1_vsync_pclk_ff2 <= cmos1_vsync_pclk_ff1;
+        cmos1_vsync_pclk_ff3 <= cmos1_vsync_pclk_ff2;
+    end
+end
+
+assign rd_fsync_pclk_div2 = cmos1_vsync_pclk_ff2 & ~cmos1_vsync_pclk_ff3;
 
 //=============================================================================
 // MWR Data Source (frame data for DMA transfer to host)
@@ -676,10 +698,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
         mwr_rd_data <= 128'h0;
     end else if (mwr_rd_clk_en) begin
-        mwr_rd_data <= {32'hCAFE_0000 | {20'h0, mwr_rd_addr},
-                        32'hBEEF_0000 | {20'h0, mwr_rd_addr},
-                        32'hDEAD_0000 | {20'h0, mwr_rd_addr},
-                        32'hFACE_0000 | {20'h0, mwr_rd_addr}};
+        mwr_rd_data <= frame_rd_data;
     end
 end
 
@@ -705,11 +724,11 @@ fram_buf #(
     .init_done          (fram_buf_init_done),
     
     // Read output (for future PCIe DMA) - tied off for now
-    .vout_clk           (core_clk_ddr),
-    .rd_fsync           (1'b0),         // No read for now
-    .rd_en              (1'b0),
+    .vout_clk           (pclk_div2),
+    .rd_fsync           (rd_fsync_pclk_div2),
+    .rd_en              (mwr_rd_clk_en),
     .vout_de            (),
-    .vout_data          (),
+    .vout_data          (frame_rd_data),
     
     // AXI Write channel
     .axi_awaddr         (axi_awaddr),

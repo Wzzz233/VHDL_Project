@@ -156,7 +156,9 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
     reinit_completion(&dev->dma_done);
 
     /* Process transfer in chunks to handle 4KB boundary */
-    while (remaining > 0 && chunk_num < 3) {  /* Limit to 3 chunks for debug */
+    while (remaining > 0) {
+        bool verbose_chunk = (chunk_num < 3) || ((chunk_num % 100) == 0);
+
         /* Calculate chunk size (max 1024 DWORDs = 4096 bytes per FPGA limit) */
         chunk_size = min(remaining, (size_t)DMA_MAX_LEN_BYTES);
 
@@ -175,16 +177,18 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
         u32 length_in_dwords = (chunk_size + 3) / 4;  /* Round up to DWORDs */
         u32 cmd_length = length_in_dwords - 1;
 
-        dev_info(dev->dev, "--- Chunk %d ---\n", chunk_num);
-        dev_info(dev->dev, "  Addr: 0x%llx (lo=0x%x hi=0x%x)\n",
-                 (u64)current_addr,
-                 lower_32_bits(current_addr),
-                 upper_32_bits(current_addr));
-        dev_info(dev->dev, "  Size: %zu bytes (%u DWORDs)\n",
-                 chunk_size, length_in_dwords);
+        if (verbose_chunk) {
+            dev_info(dev->dev, "--- Chunk %d ---\n", chunk_num);
+            dev_info(dev->dev, "  Addr: 0x%llx (lo=0x%x hi=0x%x)\n",
+                     (u64)current_addr,
+                     lower_32_bits(current_addr),
+                     upper_32_bits(current_addr));
+            dev_info(dev->dev, "  Size: %zu bytes (%u DWORDs)\n",
+                     chunk_size, length_in_dwords);
+        }
 
-        /* Clear first 16 bytes of this chunk area to detect writes */
-        {
+        if (verbose_chunk) {
+            /* Clear first 16 bytes of this chunk area to detect writes */
             size_t buf_offset = (current_addr - dev->dma_handle);
             u32 *chunk_buf = (u32 *)((u8 *)dev->dma_buf + buf_offset);
             chunk_buf[0] = 0xAAAAAAAA;
@@ -196,10 +200,12 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
         }
 
         /* Program DMA address registers */
-        dev_info(dev->dev, "  Writing BAR1+0x110 = 0x%x\n", lower_32_bits(current_addr));
+        if (verbose_chunk)
+            dev_info(dev->dev, "  Writing BAR1+0x110 = 0x%x\n", lower_32_bits(current_addr));
         fpga_dma_write_reg(dev, BAR1_DMA_L_ADDR, lower_32_bits(current_addr));
 
-        dev_info(dev->dev, "  Writing BAR1+0x120 = 0x%x\n", upper_32_bits(current_addr));
+        if (verbose_chunk)
+            dev_info(dev->dev, "  Writing BAR1+0x120 = 0x%x\n", upper_32_bits(current_addr));
         fpga_dma_write_reg(dev, BAR1_DMA_H_ADDR, upper_32_bits(current_addr));
 
         /* Program command register
@@ -208,15 +214,17 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
          * Bit [24]: 1 = Write (MWR) - FPGA writes frame data TO host memory
          */
         cmd_reg = (cmd_length & DMA_CMD_LEN_MASK) | DMA_CMD_64BIT_ADDR | DMA_CMD_WRITE;
-        dev_info(dev->dev, "  Writing BAR1+0x100 = 0x%08x (MWR, len=%u DW)\n",
-                 cmd_reg, length_in_dwords);
+        if (verbose_chunk) {
+            dev_info(dev->dev, "  Writing BAR1+0x100 = 0x%08x (MWR, len=%u DW)\n",
+                     cmd_reg, length_in_dwords);
+        }
         fpga_dma_write_reg(dev, BAR1_DMA_CMD_REG, cmd_reg);
 
         /* Wait for FPGA to process */
         msleep(50);  /* 50ms should be PLENTY for 4KB @ PCIe Gen2 */
 
-        /* Check if data arrived */
-        {
+        if (verbose_chunk) {
+            /* Check if data arrived */
             size_t buf_offset = (current_addr - dev->dma_handle);
             u32 *chunk_buf = (u32 *)((u8 *)dev->dma_buf + buf_offset);
             dev_info(dev->dev, "  Post-DMA: %08x %08x %08x %08x\n",
@@ -233,11 +241,7 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
         chunk_num++;
     }
 
-    /* For remaining data, just sleep through it */
-    if (remaining > 0) {
-        dev_info(dev->dev, "Sleeping for remaining %zu bytes...\n", remaining);
-        msleep(remaining / 1024 + 10);
-    }
+    dev_info(dev->dev, "  Processed chunks: %d\n", chunk_num);
 
     dev_info(dev->dev, "=== DMA Transfer Complete ===\n");
     return ret;

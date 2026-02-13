@@ -68,12 +68,14 @@ static void print_usage(const char *progname)
     printf("  --count <num>          Number of frames to read (default: 1)\n");
     printf("  --verify               Verify frame data (check for zeros)\n");
     printf("  --dump <bytes>         Dump first N bytes of frame (hex)\n");
+    printf("  --save-ppm <filename>  Save frame as PPM image converted from RGB565\n");
     printf("  --mmap                 Test mmap buffer access\n");
     printf("  --help                 Show this help message\n");
     printf("\nExamples:\n");
     printf("  %s --info\n", progname);
     printf("  %s --read frame.raw\n", progname);
     printf("  %s --read frame.raw --verify --dump 64\n", progname);
+    printf("  %s --read frame.raw --save-ppm frame.ppm\n", progname);
     printf("  %s --continuous --count 100\n", progname);
 }
 
@@ -215,6 +217,48 @@ static int save_frame(const char *filename, const void *buffer, size_t size)
 }
 
 /**
+ * save_ppm_rgb565 - Convert RGB565 buffer to PPM (P6)
+ */
+static int save_ppm_rgb565(const char *filename, const void *buffer,
+                           uint32_t width, uint32_t height)
+{
+    const uint8_t *src = (const uint8_t *)buffer;
+    uint32_t pixel_count = width * height;
+    FILE *fp;
+    uint32_t i;
+
+    fp = fopen(filename, "wb");
+    if (!fp) {
+        print_color(COLOR_RED, "Failed to open PPM file '%s': %s", filename, strerror(errno));
+        return -1;
+    }
+
+    fprintf(fp, "P6\n%u %u\n255\n", width, height);
+
+    for (i = 0; i < pixel_count; i++) {
+        uint16_t pix = (uint16_t)src[i * 2] | ((uint16_t)src[i * 2 + 1] << 8);
+        uint8_t r5 = (pix >> 11) & 0x1F;
+        uint8_t g6 = (pix >> 5) & 0x3F;
+        uint8_t b5 = pix & 0x1F;
+        uint8_t rgb[3];
+
+        rgb[0] = (uint8_t)((r5 << 3) | (r5 >> 2));
+        rgb[1] = (uint8_t)((g6 << 2) | (g6 >> 4));
+        rgb[2] = (uint8_t)((b5 << 3) | (b5 >> 2));
+
+        if (fwrite(rgb, 1, sizeof(rgb), fp) != sizeof(rgb)) {
+            print_color(COLOR_RED, "Failed to write PPM data: %s", strerror(errno));
+            fclose(fp);
+            return -1;
+        }
+    }
+
+    fclose(fp);
+    print_color(COLOR_GREEN, "PPM image saved to '%s' (%ux%u)", filename, width, height);
+    return 0;
+}
+
+/**
  * test_mmap - Test mmap buffer access
  */
 static int test_mmap(int fd)
@@ -273,6 +317,7 @@ int main(int argc, char *argv[])
 {
     const char *device_file = "/dev/" FPGA_DMA_DEV_NAME;
     const char *output_file = NULL;
+    const char *ppm_file = NULL;
     int do_info = 0;
     int do_read = 0;
     int do_continuous = 0;
@@ -318,6 +363,14 @@ int main(int argc, char *argv[])
                 dump_bytes = atoi(argv[++i]);
             } else {
                 fprintf(stderr, "Error: --dump requires byte count argument\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--save-ppm") == 0) {
+            do_read = 1;
+            if (i + 1 < argc) {
+                ppm_file = argv[++i];
+            } else {
+                fprintf(stderr, "Error: --save-ppm requires filename argument\n");
                 return 1;
             }
         } else if (strcmp(argv[i], "--mmap") == 0) {
@@ -417,6 +470,22 @@ int main(int argc, char *argv[])
                 }
 
                 save_frame(filename, buffer, FPGA_FRAME_SIZE);
+            }
+
+            if (ppm_file) {
+                char ppm_name[256];
+
+                if (do_continuous && frame_count > 1) {
+                    snprintf(ppm_name, sizeof(ppm_name), "%s_%04d.ppm", ppm_file, i);
+                } else {
+                    snprintf(ppm_name, sizeof(ppm_name), "%s", ppm_file);
+                }
+
+                if (save_ppm_rgb565(ppm_name, buffer, FPGA_FRAME_WIDTH, FPGA_FRAME_HEIGHT) < 0) {
+                    free(buffer);
+                    close(g_device_fd);
+                    return 1;
+                }
             }
 
             if (do_continuous && i < frame_count - 1 && g_running) {
