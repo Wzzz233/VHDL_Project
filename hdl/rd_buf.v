@@ -131,8 +131,8 @@ module rd_buf #(
 
     assign prefetch_enable_rise = prefetch_enable & ~prefetch_enable_d;
     assign can_issue_req = init_done && prefetch_enable && (wr_line < V_NUM);
-    // ddr_rdone_rise means current request is completed, so allow immediate next request.
-    assign issue_req = (wr_rst && can_issue_req) ||
+    // Session reset must always kick the first line request; later requests are flow-controlled.
+    assign issue_req = (wr_rst && init_done) ||
                        (ddr_rdone_rise && can_issue_req) ||
                        (prefetch_enable_rise && can_issue_req && ~req_busy);
 
