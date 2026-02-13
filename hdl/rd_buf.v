@@ -40,6 +40,7 @@ module rd_buf #(
     output [127:0]                vout_data, // Changed to 128-bit
     
     input                         init_done,
+    input                         i_wr_frame_bit,
     
     output                        ddr_rreq,
     output [ADDR_WIDTH- 1'b1 : 0] ddr_raddr,
@@ -115,13 +116,16 @@ module rd_buf #(
     assign wr_rst = ~wr_fsync_3d && wr_fsync_2d;
     
     //==========================================================================
-    reg [FRAME_CNT_WIDTH - 1'b1 :0] wr_frame_cnt=0;
+    reg locked_frame_bit;
     always @(posedge ddr_clk)
     begin 
-        if(wr_rst)
-            wr_frame_cnt <= wr_frame_cnt + 1'b1;
+        if(~ddr_rstn)
+            locked_frame_bit <= 1'b0;
+        else if(wr_rst)
+            // Lock to the opposite bank so read side uses a completed frame.
+            locked_frame_bit <= ~i_wr_frame_bit;
         else
-            wr_frame_cnt <= wr_frame_cnt;
+            locked_frame_bit <= locked_frame_bit;
     end 
 
     reg [LINE_ADDR_WIDTH - 1'b1 :0] wr_cnt;
@@ -136,7 +140,7 @@ module rd_buf #(
     end 
     
     assign ddr_rreq = wr_trig;
-    assign ddr_raddr = {wr_frame_cnt[0],wr_cnt} + ADDR_OFFSET;
+    assign ddr_raddr = {locked_frame_bit,wr_cnt} + ADDR_OFFSET;
     assign ddr_rd_len = RD_LINE_NUM;
     
     reg  [ 9:0]           wr_addr;
