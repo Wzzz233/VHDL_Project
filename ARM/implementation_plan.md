@@ -160,3 +160,31 @@ sudo ./fpga_dma_test --read frame.raw --save-ppm frame_rgb.ppm --ppm-mode rgb565
 ```bash
 sudo ./fpga_dma_test --continuous --count 20 --save-ppm seq_color --ppm-mode bgr565
 ```
+
+---
+
+## Phase 3: HDMI(KMS) Display Integration (Implemented)
+
+### Scope
+- Userspace path: `/dev/fpga_dma0` -> `GStreamer appsrc -> kmssink`.
+- No kernel ABI change and no FPGA RTL change.
+- Fixed 1280x720 RGB565/BGR565 path, target 10 FPS.
+
+### New Files
+- `fpga_hdmi_display.c`: DMA-trigger + mmap + appsrc/kmssink render loop.
+- `run_hdmi_kms.sh`: environment checks and launch wrapper.
+
+### Build
+```bash
+make displayapp
+```
+
+### Run
+```bash
+./run_hdmi_kms.sh
+```
+
+### Notes
+- Default pixel order is `bgr565`.
+- Input control supports exit keys `ESC` / `Q`.
+- Single-DMA-buffer zero-copy is guarded: next DMA starts only after previous GstBuffer release.
