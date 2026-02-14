@@ -267,3 +267,36 @@ sudo ./run_hdmi_kms.sh --fps 15 --io-mode copy --swap16 1 --copy-buffers 2 --que
 ### Result
 - Preserves the low-latency queue behavior.
 - Removes dependency on sink-side 16-bit format handling quality.
+
+---
+
+## Phase 4: Minimal LPR on RK3568 (Implemented)
+
+### Scope
+- Keep low-latency display path based on BGR565 direct output.
+- Add asynchronous RKNN inference for:
+- vehicle detection (YOLOv5s COCO, keep `car`)
+- plate detection (prebuilt RKNN model)
+- output overlays: car boxes + plate boxes + plate color label (BLUE/GREEN/UNK)
+- No OCR in this phase.
+
+### New Files
+- `fpga_lpr_display.c`: DMA capture + BGR565 overlay + GStreamer KMS + RKNN infer thread
+- `run_lpr_kms.sh`: launcher + env/model checks
+
+### Build
+```bash
+make lprapp
+```
+
+### Run
+```bash
+chmod +x run_lpr_kms.sh
+sudo ./run_lpr_kms.sh --veh-model <veh.rknn> --plate-model <plate.rknn> --labels <coco_labels.txt>
+```
+
+### Notes
+- Display path does not use `videoconvert`.
+- Overlays are drawn directly on BGR565 frame buffer.
+- Inference thread converts BGR565 -> RGB888 only for model input.
+- Plate-to-car association uses center-in-box / containment ratio rule.

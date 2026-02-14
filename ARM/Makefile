@@ -22,9 +22,16 @@ GST_LIBS ?= $(shell pkg-config --libs $(GST_PKGS))
 displayapp: fpga_hdmi_display.c
 	$(CROSS_COMPILE)gcc -Wall -O2 -o fpga_hdmi_display fpga_hdmi_display.c $(GST_CFLAGS) $(GST_LIBS)
 
+RKNN_CFLAGS ?=
+RKNN_LIBS ?= -lrknnrt
+
+lprapp: fpga_lpr_display.c
+	$(CROSS_COMPILE)gcc -Wall -O2 -o fpga_lpr_display fpga_lpr_display.c -pthread $(GST_CFLAGS) $(GST_LIBS) $(RKNN_CFLAGS) $(RKNN_LIBS) -lm
+
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f fpga_dma_test
 	rm -f fpga_hdmi_display
+	rm -f fpga_lpr_display
 	rm -f *.raw
 	rm -f Module.symvers modules.order *.mod.c *.o .*.cmd
