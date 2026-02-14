@@ -86,6 +86,7 @@ struct app_ctx {
     GstElement *pipeline;
     GstElement *appsrc;
     GstElement *convert;
+    GstElement *post_caps;
     GstElement *sink;
     GstBus *bus;
 
@@ -727,24 +728,55 @@ static void print_stats(struct app_ctx *ctx)
     ctx->last_stats_us = now;
 }
 
+static void print_pad_caps(const char *label, GstElement *elem, const char *pad_name)
+{
+    GstPad *pad;
+    GstCaps *caps;
+    gchar *caps_str;
+
+    pad = gst_element_get_static_pad(elem, pad_name);
+    if (!pad) {
+        fprintf(stderr, "%s caps: <no pad '%s'>\n", label, pad_name);
+        return;
+    }
+
+    caps = gst_pad_get_current_caps(pad);
+    if (!caps)
+        caps = gst_pad_query_caps(pad, NULL);
+
+    if (!caps) {
+        fprintf(stderr, "%s caps: <none>\n", label);
+        gst_object_unref(pad);
+        return;
+    }
+
+    caps_str = gst_caps_to_string(caps);
+    fprintf(stderr, "%s caps: %s\n", label, caps_str ? caps_str : "<null>");
+    g_free(caps_str);
+    gst_caps_unref(caps);
+    gst_object_unref(pad);
+}
+
 static int build_pipeline(struct app_ctx *ctx)
 {
     GstCaps *caps;
+    GstCaps *post_caps;
     GstStateChangeReturn sret;
     const char *fmt = (ctx->opt.pixel_order == PIXEL_ORDER_BGR565) ? "BGR16" : "RGB16";
 
     ctx->pipeline = gst_pipeline_new("fpga-hdmi");
     ctx->appsrc = gst_element_factory_make("appsrc", "src");
     ctx->convert = gst_element_factory_make("videoconvert", "convert");
+    ctx->post_caps = gst_element_factory_make("capsfilter", "postconvert_caps");
     ctx->sink = gst_element_factory_make("kmssink", "sink");
-    if (!ctx->pipeline || !ctx->appsrc || !ctx->convert || !ctx->sink) {
-        fprintf(stderr, "Failed to create GStreamer elements (appsrc/videoconvert/kmssink)\n");
+    if (!ctx->pipeline || !ctx->appsrc || !ctx->convert || !ctx->post_caps || !ctx->sink) {
+        fprintf(stderr, "Failed to create GStreamer elements (appsrc/videoconvert/capsfilter/kmssink)\n");
         return -1;
     }
 
-    gst_bin_add_many(GST_BIN(ctx->pipeline), ctx->appsrc, ctx->convert, ctx->sink, NULL);
-    if (!gst_element_link_many(ctx->appsrc, ctx->convert, ctx->sink, NULL)) {
-        fprintf(stderr, "Failed to link appsrc -> videoconvert -> kmssink\n");
+    gst_bin_add_many(GST_BIN(ctx->pipeline), ctx->appsrc, ctx->convert, ctx->post_caps, ctx->sink, NULL);
+    if (!gst_element_link_many(ctx->appsrc, ctx->convert, ctx->post_caps, ctx->sink, NULL)) {
+        fprintf(stderr, "Failed to link appsrc -> videoconvert -> capsfilter -> kmssink\n");
         return -1;
     }
 
@@ -769,6 +801,19 @@ static int build_pipeline(struct app_ctx *ctx)
                  NULL);
     gst_caps_unref(caps);
 
+    post_caps = gst_caps_new_simple("video/x-raw",
+                                    "format", G_TYPE_STRING, "BGRx",
+                                    "width", G_TYPE_INT, (int)ctx->frame_width,
+                                    "height", G_TYPE_INT, (int)ctx->frame_height,
+                                    "framerate", GST_TYPE_FRACTION, ctx->opt.fps, 1,
+                                    NULL);
+    if (!post_caps) {
+        fprintf(stderr, "Failed to create post-convert caps\n");
+        return -1;
+    }
+    g_object_set(ctx->post_caps, "caps", post_caps, NULL);
+    gst_caps_unref(post_caps);
+
     g_object_set(ctx->sink, "sync", FALSE, NULL);
     if (ctx->opt.connector_id >= 0)
         g_object_set(ctx->sink, "connector-id", ctx->opt.connector_id, NULL);
@@ -791,8 +836,10 @@ static int build_pipeline(struct app_ctx *ctx)
     }
 
     fprintf(stderr,
-            "Pipeline started: appsrc(format=%s) -> videoconvert -> kmssink (copy_buffers=%d queue_depth=%d)\n",
+            "Pipeline started: appsrc(format=%s) -> videoconvert -> capsfilter(BGRx) -> kmssink (copy_buffers=%d queue_depth=%d)\n",
             fmt, ctx->opt.copy_buffers, ctx->opt.queue_depth);
+    print_pad_caps("videoconvert:src", ctx->convert, "src");
+    print_pad_caps("kmssink:sink", ctx->sink, "sink");
     return 0;
 }
 

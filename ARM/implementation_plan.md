@@ -166,7 +166,7 @@ sudo ./fpga_dma_test --continuous --count 20 --save-ppm seq_color --ppm-mode bgr
 ## Phase 3: HDMI(KMS) Display Integration (Implemented)
 
 ### Scope
-- Userspace path: `/dev/fpga_dma0` -> `GStreamer appsrc -> videoconvert -> kmssink`.
+- Userspace path: `/dev/fpga_dma0` -> `GStreamer appsrc -> videoconvert -> capsfilter(BGRx) -> kmssink`.
 - No kernel ABI change and no FPGA RTL change.
 - Fixed 1280x720 RGB565/BGR565 path, target 10 FPS.
 
@@ -189,3 +189,4 @@ make displayapp
 - Input control supports exit keys `ESC` / `Q`.
 - Added copy-ring options: `--copy-buffers` and `--queue-depth`.
 - Copy ring solves single-buffer hold deadlock; `videoconvert` handles downstream buffer pool handoff for KMS.
+- Added post-convert `capsfilter` to force `BGRx` output and disable `videoconvert` passthrough on 16-bit input.
