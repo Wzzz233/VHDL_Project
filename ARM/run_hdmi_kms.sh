@@ -12,6 +12,7 @@ STATS_INTERVAL="1"
 COPY_BUFFERS="3"
 QUEUE_DEPTH="2"
 IO_MODE="mmap"
+SWAP16="1"
 
 usage() {
   cat <<EOF
@@ -27,6 +28,7 @@ Usage: $0 [options]
   --copy-buffers <num>    Copy ring size (default: ${COPY_BUFFERS})
   --queue-depth <num>     appsrc queue depth (default: ${QUEUE_DEPTH})
   --io-mode <mode>        mmap|copy (default: ${IO_MODE})
+  --swap16 <0|1>          Swap bytes in each 16-bit pixel (default: ${SWAP16})
   -h, --help              Show this help
 EOF
 }
@@ -44,6 +46,7 @@ while [[ $# -gt 0 ]]; do
     --copy-buffers) COPY_BUFFERS="$2"; shift 2 ;;
     --queue-depth) QUEUE_DEPTH="$2"; shift 2 ;;
     --io-mode) IO_MODE="$2"; shift 2 ;;
+    --swap16) SWAP16="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "Unknown option: $1" >&2
@@ -90,7 +93,8 @@ CMD=(./fpga_hdmi_display
   --stats-interval "$STATS_INTERVAL"
   --copy-buffers "$COPY_BUFFERS"
   --queue-depth "$QUEUE_DEPTH"
-  --io-mode "$IO_MODE")
+  --io-mode "$IO_MODE"
+  --swap16 "$SWAP16")
 
 if [[ -n "$CONNECTOR_ID" ]]; then
   CMD+=(--connector-id "$CONNECTOR_ID")

@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
@@ -61,6 +62,7 @@ struct options {
     int copy_buffers;
     int queue_depth;
     enum io_mode io_mode;
+    bool swap16;
 };
 
 struct frame_slot {
@@ -155,6 +157,7 @@ static void print_usage(const char *prog)
             "  --copy-buffers <num>    Copy ring size (default: %d, range: %d..%d)\n"
             "  --queue-depth <num>     appsrc max frame queue (default: %d)\n"
             "  --io-mode <mode>        mmap|copy (default: mmap)\n"
+            "  --swap16 <0|1>          Swap bytes in each 16-bit pixel (default: 1)\n"
             "  --help                  Show this message\n",
             prog,
             DEFAULT_DEVICE,
@@ -182,6 +185,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"copy-buffers", required_argument, NULL, 9},
         {"queue-depth", required_argument, NULL, 10},
         {"io-mode", required_argument, NULL, 11},
+        {"swap16", required_argument, NULL, 12},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -199,6 +203,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->copy_buffers = DEFAULT_COPY_BUFFERS;
     opt->queue_depth = DEFAULT_QUEUE_DEPTH;
     opt->io_mode = IO_MODE_MMAP;
+    opt->swap16 = true;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
         switch (c) {
@@ -267,6 +272,18 @@ static int parse_options(int argc, char **argv, struct options *opt)
                 opt->io_mode = IO_MODE_COPY;
             } else {
                 fprintf(stderr, "Invalid --io-mode: %s\n", optarg);
+                return -1;
+            }
+            break;
+        case 12:
+            if (strcmp(optarg, "1") == 0 || strcasecmp(optarg, "on") == 0 ||
+                strcasecmp(optarg, "true") == 0) {
+                opt->swap16 = true;
+            } else if (strcmp(optarg, "0") == 0 || strcasecmp(optarg, "off") == 0 ||
+                       strcasecmp(optarg, "false") == 0) {
+                opt->swap16 = false;
+            } else {
+                fprintf(stderr, "Invalid --swap16: %s (use 0|1)\n", optarg);
                 return -1;
             }
             break;
@@ -544,9 +561,10 @@ static int init_fpga_dma(struct app_ctx *ctx)
         }
     }
 
-    fprintf(stderr, "FPGA DMA ready: %ux%u bpp=%u frame=%zu bytes (io-mode=%s)\n",
+    fprintf(stderr, "FPGA DMA ready: %ux%u bpp=%u frame=%zu bytes (io-mode=%s swap16=%s)\n",
             ctx->frame_width, ctx->frame_height, ctx->frame_bpp, ctx->frame_size,
-            (ctx->opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy");
+            (ctx->opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy",
+            ctx->opt.swap16 ? "on" : "off");
     return 0;
 }
 
@@ -593,6 +611,23 @@ static int trigger_frame_dma(struct app_ctx *ctx)
     }
 
     return 0;
+}
+
+static void copy_frame_to_slot(struct app_ctx *ctx, uint8_t *dst, const uint8_t *src)
+{
+    size_t i;
+
+    if (!ctx->opt.swap16) {
+        memcpy(dst, src, ctx->frame_size);
+        return;
+    }
+
+    for (i = 0; i + 1 < ctx->frame_size; i += 2) {
+        dst[i] = src[i + 1];
+        dst[i + 1] = src[i];
+    }
+    if (i < ctx->frame_size)
+        dst[i] = src[i];
 }
 
 static void release_slot_ticket(struct app_ctx *ctx, const struct slot_ticket *ticket, bool count_release)
@@ -957,10 +992,11 @@ int main(int argc, char **argv)
         goto out;
 
     fprintf(stderr,
-            "Start display loop: fps=%d pixel-order=%s io-mode=%s timeout=%dms copy_buffers=%d queue_depth=%d\n",
+            "Start display loop: fps=%d pixel-order=%s io-mode=%s swap16=%s timeout=%dms copy_buffers=%d queue_depth=%d\n",
             ctx.opt.fps,
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
             (ctx.opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy",
+            ctx.opt.swap16 ? "on" : "off",
             ctx.opt.timeout_ms,
             ctx.opt.copy_buffers,
             ctx.opt.queue_depth);
@@ -1000,7 +1036,7 @@ int main(int argc, char **argv)
             release_slot_ticket(&ctx, &ticket, false);
             break;
         }
-        memcpy(ctx.slots[ticket.idx].data, frame_src, ctx.frame_size);
+        copy_frame_to_slot(&ctx, ctx.slots[ticket.idx].data, frame_src);
 
         buf = build_frame_buffer(&ctx, &ticket);
         if (!buf) {
