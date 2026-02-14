@@ -44,6 +44,11 @@ enum pixel_order {
     PIXEL_ORDER_RGB565,
 };
 
+enum io_mode {
+    IO_MODE_MMAP = 0,
+    IO_MODE_COPY,
+};
+
 struct options {
     const char *device_path;
     const char *drm_card_path;
@@ -55,6 +60,7 @@ struct options {
     int stats_interval;
     int copy_buffers;
     int queue_depth;
+    enum io_mode io_mode;
 };
 
 struct frame_slot {
@@ -73,6 +79,7 @@ struct app_ctx {
 
     void *dma_map;
     size_t dma_map_size;
+    uint8_t *dma_copy;
     uint32_t frame_width;
     uint32_t frame_height;
     uint32_t frame_bpp;
@@ -147,6 +154,7 @@ static void print_usage(const char *prog)
             "  --stats-interval <sec>  Stats print interval (default: %d)\n"
             "  --copy-buffers <num>    Copy ring size (default: %d, range: %d..%d)\n"
             "  --queue-depth <num>     appsrc max frame queue (default: %d)\n"
+            "  --io-mode <mode>        mmap|copy (default: mmap)\n"
             "  --help                  Show this message\n",
             prog,
             DEFAULT_DEVICE,
@@ -173,6 +181,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"stats-interval", required_argument, NULL, 8},
         {"copy-buffers", required_argument, NULL, 9},
         {"queue-depth", required_argument, NULL, 10},
+        {"io-mode", required_argument, NULL, 11},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -189,6 +198,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->stats_interval = DEFAULT_STATS_INTERVAL;
     opt->copy_buffers = DEFAULT_COPY_BUFFERS;
     opt->queue_depth = DEFAULT_QUEUE_DEPTH;
+    opt->io_mode = IO_MODE_MMAP;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
         switch (c) {
@@ -247,6 +257,16 @@ static int parse_options(int argc, char **argv, struct options *opt)
             opt->queue_depth = atoi(optarg);
             if (opt->queue_depth <= 0) {
                 fprintf(stderr, "Invalid --queue-depth: %s\n", optarg);
+                return -1;
+            }
+            break;
+        case 11:
+            if (strcmp(optarg, "mmap") == 0) {
+                opt->io_mode = IO_MODE_MMAP;
+            } else if (strcmp(optarg, "copy") == 0) {
+                opt->io_mode = IO_MODE_COPY;
+            } else {
+                fprintf(stderr, "Invalid --io-mode: %s\n", optarg);
                 return -1;
             }
             break;
@@ -470,7 +490,6 @@ static int process_events(struct app_ctx *ctx, int wait_ms)
 static int init_fpga_dma(struct app_ctx *ctx)
 {
     struct fpga_info info;
-    struct buffer_map map;
 
     ctx->dev_fd = open(ctx->opt.device_path, O_RDWR | O_CLOEXEC);
     if (ctx->dev_fd < 0) {
@@ -495,28 +514,39 @@ static int init_fpga_dma(struct app_ctx *ctx)
     ctx->frame_bpp = info.frame_bpp;
     ctx->frame_size = (size_t)ctx->frame_width * ctx->frame_height * ctx->frame_bpp;
 
-    memset(&map, 0, sizeof(map));
-    map.index = 0;
-    if (ioctl(ctx->dev_fd, FPGA_DMA_MAP_BUFFER, &map) < 0) {
-        fprintf(stderr, "FPGA_DMA_MAP_BUFFER failed: %s\n", strerror(errno));
-        return -1;
+    if (ctx->opt.io_mode == IO_MODE_MMAP) {
+        struct buffer_map map;
+
+        memset(&map, 0, sizeof(map));
+        map.index = 0;
+        if (ioctl(ctx->dev_fd, FPGA_DMA_MAP_BUFFER, &map) < 0) {
+            fprintf(stderr, "FPGA_DMA_MAP_BUFFER failed: %s\n", strerror(errno));
+            return -1;
+        }
+
+        if (map.size < ctx->frame_size) {
+            fprintf(stderr, "Mapped DMA buffer too small: %u < %zu\n", map.size, ctx->frame_size);
+            return -1;
+        }
+
+        ctx->dma_map_size = map.size;
+        ctx->dma_map = mmap(NULL, ctx->dma_map_size, PROT_READ, MAP_SHARED, ctx->dev_fd, 0);
+        if (ctx->dma_map == MAP_FAILED) {
+            ctx->dma_map = NULL;
+            fprintf(stderr, "mmap DMA buffer failed: %s\n", strerror(errno));
+            return -1;
+        }
+    } else {
+        ctx->dma_copy = malloc(ctx->frame_size);
+        if (!ctx->dma_copy) {
+            fprintf(stderr, "Failed to allocate copy IO frame buffer (%zu bytes)\n", ctx->frame_size);
+            return -1;
+        }
     }
 
-    if (map.size < ctx->frame_size) {
-        fprintf(stderr, "Mapped DMA buffer too small: %u < %zu\n", map.size, ctx->frame_size);
-        return -1;
-    }
-
-    ctx->dma_map_size = map.size;
-    ctx->dma_map = mmap(NULL, ctx->dma_map_size, PROT_READ, MAP_SHARED, ctx->dev_fd, 0);
-    if (ctx->dma_map == MAP_FAILED) {
-        ctx->dma_map = NULL;
-        fprintf(stderr, "mmap DMA buffer failed: %s\n", strerror(errno));
-        return -1;
-    }
-
-    fprintf(stderr, "FPGA DMA ready: %ux%u bpp=%u frame=%zu bytes\n",
-            ctx->frame_width, ctx->frame_height, ctx->frame_bpp, ctx->frame_size);
+    fprintf(stderr, "FPGA DMA ready: %ux%u bpp=%u frame=%zu bytes (io-mode=%s)\n",
+            ctx->frame_width, ctx->frame_height, ctx->frame_bpp, ctx->frame_size,
+            (ctx->opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy");
     return 0;
 }
 
@@ -548,7 +578,9 @@ static int trigger_frame_dma(struct app_ctx *ctx)
 
     memset(&transfer, 0, sizeof(transfer));
     transfer.size = (uint32_t)ctx->frame_size;
-    transfer.user_buf = 0;
+    transfer.user_buf = (ctx->opt.io_mode == IO_MODE_COPY)
+        ? (uint64_t)(uintptr_t)ctx->dma_copy
+        : 0;
 
     if (ioctl(ctx->dev_fd, FPGA_DMA_READ_FRAME, &transfer) < 0) {
         fprintf(stderr, "FPGA_DMA_READ_FRAME failed: %s\n", strerror(errno));
@@ -860,6 +892,8 @@ static void cleanup(struct app_ctx *ctx)
 
     if (ctx->dma_map)
         munmap(ctx->dma_map, ctx->dma_map_size);
+    if (ctx->dma_copy)
+        free(ctx->dma_copy);
 
     if (ctx->slots) {
         for (i = 0; i < ctx->slot_count; i++)
@@ -923,9 +957,10 @@ int main(int argc, char **argv)
         goto out;
 
     fprintf(stderr,
-            "Start display loop: fps=%d pixel-order=%s timeout=%dms copy_buffers=%d queue_depth=%d\n",
+            "Start display loop: fps=%d pixel-order=%s io-mode=%s timeout=%dms copy_buffers=%d queue_depth=%d\n",
             ctx.opt.fps,
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
+            (ctx.opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy",
             ctx.opt.timeout_ms,
             ctx.opt.copy_buffers,
             ctx.opt.queue_depth);
@@ -937,6 +972,7 @@ int main(int argc, char **argv)
         struct slot_ticket ticket;
         GstBuffer *buf;
         GstFlowReturn flow;
+        const uint8_t *frame_src;
         int64_t t0;
         int64_t t1;
         int64_t target_us = 1000000LL / ctx.opt.fps;
@@ -957,7 +993,14 @@ int main(int argc, char **argv)
         if (acquire_free_slot(&ctx, &ticket) < 0)
             break;
 
-        memcpy(ctx.slots[ticket.idx].data, ctx.dma_map, ctx.frame_size);
+        frame_src = (ctx.opt.io_mode == IO_MODE_COPY) ? ctx.dma_copy : (const uint8_t *)ctx.dma_map;
+        if (!frame_src) {
+            fprintf(stderr, "Frame source is null in io-mode=%s\n",
+                    (ctx.opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy");
+            release_slot_ticket(&ctx, &ticket, false);
+            break;
+        }
+        memcpy(ctx.slots[ticket.idx].data, frame_src, ctx.frame_size);
 
         buf = build_frame_buffer(&ctx, &ticket);
         if (!buf) {

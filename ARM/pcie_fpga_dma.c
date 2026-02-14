@@ -406,6 +406,7 @@ static int fpga_dma_mmap(struct file *file, struct vm_area_struct *vma)
 {
     struct fpga_dma_dev *dev = file->private_data;
     size_t size = vma->vm_end - vma->vm_start;
+    int ret;
 
     dev_dbg(dev->dev, "mmap requested: size=%zu\n", size);
 
@@ -415,12 +416,11 @@ static int fpga_dma_mmap(struct file *file, struct vm_area_struct *vma)
         return -EINVAL;
     }
 
-    /* Map the DMA coherent buffer to userspace */
-    if (remap_pfn_range(vma, vma->vm_start,
-                        virt_to_phys(dev->dma_buf) >> PAGE_SHIFT,
-                        size, vma->vm_page_prot)) {
-        dev_err(dev->dev, "remap_pfn_range failed\n");
-        return -EAGAIN;
+    /* Map coherent DMA memory with the DMA API helper to avoid wrong PFN mapping. */
+    ret = dma_mmap_coherent(&dev->pdev->dev, vma, dev->dma_buf, dev->dma_handle, size);
+    if (ret) {
+        dev_err(dev->dev, "dma_mmap_coherent failed: %d\n", ret);
+        return ret;
     }
 
     return 0;

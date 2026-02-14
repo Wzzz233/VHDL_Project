@@ -190,3 +190,5 @@ make displayapp
 - Added copy-ring options: `--copy-buffers` and `--queue-depth`.
 - Copy ring solves single-buffer hold deadlock; `videoconvert` handles downstream buffer pool handoff for KMS.
 - Added post-convert `capsfilter` to force `BGRx` output and disable `videoconvert` passthrough on 16-bit input.
+- Added `--io-mode` (`mmap`/`copy`) to isolate mmap path issues during bring-up.
+- Driver mmap path uses `dma_mmap_coherent` for coherent DMA buffer mapping.

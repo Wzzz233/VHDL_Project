@@ -11,6 +11,7 @@ TIMEOUT_MS="5000"
 STATS_INTERVAL="1"
 COPY_BUFFERS="3"
 QUEUE_DEPTH="2"
+IO_MODE="mmap"
 
 usage() {
   cat <<EOF
@@ -25,6 +26,7 @@ Usage: $0 [options]
   --stats-interval <sec>  Stats interval (default: ${STATS_INTERVAL})
   --copy-buffers <num>    Copy ring size (default: ${COPY_BUFFERS})
   --queue-depth <num>     appsrc queue depth (default: ${QUEUE_DEPTH})
+  --io-mode <mode>        mmap|copy (default: ${IO_MODE})
   -h, --help              Show this help
 EOF
 }
@@ -41,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     --stats-interval) STATS_INTERVAL="$2"; shift 2 ;;
     --copy-buffers) COPY_BUFFERS="$2"; shift 2 ;;
     --queue-depth) QUEUE_DEPTH="$2"; shift 2 ;;
+    --io-mode) IO_MODE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "Unknown option: $1" >&2
@@ -86,7 +89,8 @@ CMD=(./fpga_hdmi_display
   --timeout-ms "$TIMEOUT_MS"
   --stats-interval "$STATS_INTERVAL"
   --copy-buffers "$COPY_BUFFERS"
-  --queue-depth "$QUEUE_DEPTH")
+  --queue-depth "$QUEUE_DEPTH"
+  --io-mode "$IO_MODE")
 
 if [[ -n "$CONNECTOR_ID" ]]; then
   CMD+=(--connector-id "$CONNECTOR_ID")
