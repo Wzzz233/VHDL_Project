@@ -38,7 +38,8 @@
 /* Module parameters */
 static int major_num;
 static int dma_timeout_ms = 5000;  /* 5 seconds default timeout */
-static int dma_chunk_delay_us = 20; /* inter-chunk pacing, default 20us */
+static int dma_chunk_delay_us = 2; /* inter-chunk pacing, default 2us */
+static bool dma_verbose = false;   /* verbose transfer logs */
 
 module_param(major_num, int, 0);
 MODULE_PARM_DESC(major_num, "Major device number (0=dynamic)");
@@ -46,6 +47,8 @@ module_param(dma_timeout_ms, int, 0644);
 MODULE_PARM_DESC(dma_timeout_ms, "DMA transfer timeout in milliseconds");
 module_param(dma_chunk_delay_us, int, 0644);
 MODULE_PARM_DESC(dma_chunk_delay_us, "Delay in microseconds after each DMA chunk trigger");
+module_param(dma_verbose, bool, 0644);
+MODULE_PARM_DESC(dma_verbose, "Enable verbose DMA transfer logs");
 
 /* Per-device structure */
 struct fpga_dma_dev {
@@ -140,18 +143,21 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
     dma_addr_t current_addr = dev->dma_handle;
     int chunk_num = 0;
 
-    dev_info(dev->dev, "=== DMA MWR Transfer Start ===\n");
-    dev_info(dev->dev, "  Total size: %zu bytes\n", size);
-    dev_info(dev->dev, "  DMA handle (bus addr): 0x%llx\n", (u64)dev->dma_handle);
-    dev_info(dev->dev, "  DMA buf (virt): %px\n", dev->dma_buf);
-    dev_info(dev->dev, "  BAR1 base (virt): %px\n", dev->bar1);
+    if (dma_verbose) {
+        dev_info(dev->dev, "=== DMA MWR Transfer Start ===\n");
+        dev_info(dev->dev, "  Total size: %zu bytes\n", size);
+        dev_info(dev->dev, "  DMA handle (bus addr): 0x%llx\n", (u64)dev->dma_handle);
+        dev_info(dev->dev, "  DMA buf (virt): %px\n", dev->dma_buf);
+        dev_info(dev->dev, "  BAR1 base (virt): %px\n", dev->bar1);
+    }
 
     /* PIO read test: verify TLPs can reach FPGA via BAR0 read (MRd TLP) */
     {
         u32 bar0_val0 = ioread32(dev->bar0 + 0x00);
         u32 bar0_val4 = ioread32(dev->bar0 + 0x04);
-        dev_info(dev->dev, "  BAR0 PIO read test: [0x00]=0x%08x [0x04]=0x%08x\n",
-                 bar0_val0, bar0_val4);
+        if (dma_verbose)
+            dev_info(dev->dev, "  BAR0 PIO read test: [0x00]=0x%08x [0x04]=0x%08x\n",
+                     bar0_val0, bar0_val4);
         if (bar0_val0 == 0xFFFFFFFF && bar0_val4 == 0xFFFFFFFF)
             dev_warn(dev->dev, "  >>> BAR0 reads all-F: TLPs may not reach FPGA! <<<\n");
     }
@@ -161,7 +167,7 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
 
     /* Process transfer in chunks to handle 4KB boundary */
     while (remaining > 0) {
-        bool verbose_chunk = (chunk_num < 3) || ((chunk_num % 100) == 0);
+        bool verbose_chunk = dma_verbose && ((chunk_num < 3) || ((chunk_num % 100) == 0));
         size_t buf_offset;
         u32 *chunk_tail0;
         u32 *chunk_tail1 = NULL;
@@ -276,9 +282,10 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
         chunk_num++;
     }
 
-    dev_info(dev->dev, "  Processed chunks: %d\n", chunk_num);
-
-    dev_info(dev->dev, "=== DMA Transfer Complete ===\n");
+    if (dma_verbose) {
+        dev_info(dev->dev, "  Processed chunks: %d\n", chunk_num);
+        dev_info(dev->dev, "=== DMA Transfer Complete ===\n");
+    }
     return ret;
 }
 
