@@ -192,3 +192,33 @@ make displayapp
 - Added post-convert `capsfilter` to force `BGRx` output and disable `videoconvert` passthrough on 16-bit input.
 - Added `--io-mode` (`mmap`/`copy`) to isolate mmap path issues during bring-up.
 - Driver mmap path uses `dma_mmap_coherent` for coherent DMA buffer mapping.
+
+---
+
+## Phase 3.2: Slow-Refresh Root Cause Probe (Implemented)
+
+### Scope
+- Diagnostic-only phase.
+- No kernel ABI change, no FPGA RTL change, no display CLI behavior change.
+- Goal: classify slow-refresh symptom into:
+1. Source frame stale/slow update
+2. Display-side buffering/latency
+
+### Added Tools
+- `analyze_frame_diff.py`
+: Computes adjacent-frame byte-diff ratio and SHA256 uniqueness summary.
+- `run_phase32_probe.sh`
+: One-command capture + diff analysis for 60-frame motion sequence.
+
+### Run
+```bash
+chmod +x run_phase32_probe.sh
+sudo ./run_phase32_probe.sh --count 60 --prefix /tmp/fprobe/motion --ppm-mode bgr565
+```
+
+### Module parameter path note
+Current module is `pcie_fpga_dma`, so runtime params are:
+```bash
+cat /sys/module/pcie_fpga_dma/parameters/dma_chunk_delay_us
+cat /sys/module/pcie_fpga_dma/parameters/dma_verbose
+```
