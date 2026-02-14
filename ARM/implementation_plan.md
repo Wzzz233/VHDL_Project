@@ -166,12 +166,12 @@ sudo ./fpga_dma_test --continuous --count 20 --save-ppm seq_color --ppm-mode bgr
 ## Phase 3: HDMI(KMS) Display Integration (Implemented)
 
 ### Scope
-- Userspace path: `/dev/fpga_dma0` -> `GStreamer appsrc -> kmssink`.
+- Userspace path: `/dev/fpga_dma0` -> `GStreamer appsrc -> videoconvert -> kmssink`.
 - No kernel ABI change and no FPGA RTL change.
 - Fixed 1280x720 RGB565/BGR565 path, target 10 FPS.
 
 ### New Files
-- `fpga_hdmi_display.c`: DMA-trigger + mmap + appsrc/kmssink render loop.
+- `fpga_hdmi_display.c`: DMA-trigger + mmap + copy-ring + appsrc/videoconvert/kmssink render loop.
 - `run_hdmi_kms.sh`: environment checks and launch wrapper.
 
 ### Build
@@ -187,4 +187,5 @@ make displayapp
 ### Notes
 - Default pixel order is `bgr565`.
 - Input control supports exit keys `ESC` / `Q`.
-- Single-DMA-buffer zero-copy is guarded: next DMA starts only after previous GstBuffer release.
+- Added copy-ring options: `--copy-buffers` and `--queue-depth`.
+- Copy ring solves single-buffer hold deadlock; `videoconvert` handles downstream buffer pool handoff for KMS.

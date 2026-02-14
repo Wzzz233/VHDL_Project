@@ -9,6 +9,8 @@ PIXEL_ORDER="bgr565"
 CONNECTOR_ID=""
 TIMEOUT_MS="5000"
 STATS_INTERVAL="1"
+COPY_BUFFERS="3"
+QUEUE_DEPTH="2"
 
 usage() {
   cat <<EOF
@@ -21,6 +23,8 @@ Usage: $0 [options]
   --pixel-order <mode>    bgr565|rgb565 (default: ${PIXEL_ORDER})
   --timeout-ms <ms>       Frame timeout (default: ${TIMEOUT_MS})
   --stats-interval <sec>  Stats interval (default: ${STATS_INTERVAL})
+  --copy-buffers <num>    Copy ring size (default: ${COPY_BUFFERS})
+  --queue-depth <num>     appsrc queue depth (default: ${QUEUE_DEPTH})
   -h, --help              Show this help
 EOF
 }
@@ -35,6 +39,8 @@ while [[ $# -gt 0 ]]; do
     --pixel-order) PIXEL_ORDER="$2"; shift 2 ;;
     --timeout-ms) TIMEOUT_MS="$2"; shift 2 ;;
     --stats-interval) STATS_INTERVAL="$2"; shift 2 ;;
+    --copy-buffers) COPY_BUFFERS="$2"; shift 2 ;;
+    --queue-depth) QUEUE_DEPTH="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "Unknown option: $1" >&2
@@ -49,7 +55,7 @@ if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
   exit 2
 fi
 
-for plugin in appsrc kmssink; do
+for plugin in appsrc videoconvert kmssink; do
   if ! gst-inspect-1.0 "$plugin" >/dev/null 2>&1; then
     echo "Missing GStreamer plugin: $plugin" >&2
     exit 2
@@ -78,7 +84,9 @@ CMD=(./fpga_hdmi_display
   --fps "$FPS"
   --pixel-order "$PIXEL_ORDER"
   --timeout-ms "$TIMEOUT_MS"
-  --stats-interval "$STATS_INTERVAL")
+  --stats-interval "$STATS_INTERVAL"
+  --copy-buffers "$COPY_BUFFERS"
+  --queue-depth "$QUEUE_DEPTH")
 
 if [[ -n "$CONNECTOR_ID" ]]; then
   CMD+=(--connector-id "$CONNECTOR_ID")

@@ -3,14 +3,16 @@
  * FPGA HDMI KMS Display Application
  *
  * Capture frames from /dev/fpga_dma0 and render to HDMI via
- * GStreamer appsrc -> kmssink.
+ * GStreamer appsrc -> videoconvert -> kmssink.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <linux/input.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -19,12 +21,8 @@
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
-#include <dirent.h>
-#include <signal.h>
 
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
@@ -36,6 +34,10 @@
 #define DEFAULT_FPS 10
 #define DEFAULT_TIMEOUT_MS 5000
 #define DEFAULT_STATS_INTERVAL 1
+#define DEFAULT_COPY_BUFFERS 3
+#define DEFAULT_QUEUE_DEPTH 2
+#define MIN_COPY_BUFFERS 2
+#define MAX_COPY_BUFFERS 6
 
 enum pixel_order {
     PIXEL_ORDER_BGR565 = 0,
@@ -51,6 +53,14 @@ struct options {
     enum pixel_order pixel_order;
     int timeout_ms;
     int stats_interval;
+    int copy_buffers;
+    int queue_depth;
+};
+
+struct frame_slot {
+    uint8_t *data;
+    bool in_use;
+    uint64_t generation;
 };
 
 struct app_ctx {
@@ -68,15 +78,16 @@ struct app_ctx {
     uint32_t frame_bpp;
     size_t frame_size;
 
+    struct frame_slot *slots;
+    int slot_count;
+    GMutex slots_lock;
+    GCond slots_cond;
+
     GstElement *pipeline;
     GstElement *appsrc;
+    GstElement *convert;
     GstElement *sink;
     GstBus *bus;
-
-    GMutex frame_lock;
-    GCond frame_cond;
-    bool frame_in_flight;
-    uint64_t frame_id;
 
     bool running;
     uint64_t captured_frames;
@@ -87,24 +98,31 @@ struct app_ctx {
     double total_loop_ms;
     uint64_t loop_samples;
 
+    uint64_t slot_wait_timeout_count;
+    uint64_t slot_wait_total_us;
+    uint64_t slot_wait_samples;
+
     int64_t start_us;
     int64_t last_stats_us;
     uint64_t last_stats_captured;
     uint64_t last_stats_released;
 };
 
+struct slot_ticket {
+    int idx;
+    uint64_t generation;
+};
+
 struct frame_cookie {
     struct app_ctx *ctx;
-    uint64_t id;
+    struct slot_ticket ticket;
 };
 
 static volatile sig_atomic_t g_stop = 0;
 
-static int64_t now_us(void)
+static int64_t mono_us(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
+    return g_get_monotonic_time();
 }
 
 static void signal_handler(int signo)
@@ -126,13 +144,19 @@ static void print_usage(const char *prog)
             "  --pixel-order <mode>    bgr565|rgb565 (default: bgr565)\n"
             "  --timeout-ms <ms>       Frame timeout (default: %d)\n"
             "  --stats-interval <sec>  Stats print interval (default: %d)\n"
+            "  --copy-buffers <num>    Copy ring size (default: %d, range: %d..%d)\n"
+            "  --queue-depth <num>     appsrc max frame queue (default: %d)\n"
             "  --help                  Show this message\n",
             prog,
             DEFAULT_DEVICE,
             DEFAULT_DRM_CARD,
             DEFAULT_FPS,
             DEFAULT_TIMEOUT_MS,
-            DEFAULT_STATS_INTERVAL);
+            DEFAULT_STATS_INTERVAL,
+            DEFAULT_COPY_BUFFERS,
+            MIN_COPY_BUFFERS,
+            MAX_COPY_BUFFERS,
+            DEFAULT_QUEUE_DEPTH);
 }
 
 static int parse_options(int argc, char **argv, struct options *opt)
@@ -146,6 +170,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"pixel-order", required_argument, NULL, 6},
         {"timeout-ms", required_argument, NULL, 7},
         {"stats-interval", required_argument, NULL, 8},
+        {"copy-buffers", required_argument, NULL, 9},
+        {"queue-depth", required_argument, NULL, 10},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -160,6 +186,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->pixel_order = PIXEL_ORDER_BGR565;
     opt->timeout_ms = DEFAULT_TIMEOUT_MS;
     opt->stats_interval = DEFAULT_STATS_INTERVAL;
+    opt->copy_buffers = DEFAULT_COPY_BUFFERS;
+    opt->queue_depth = DEFAULT_QUEUE_DEPTH;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
         switch (c) {
@@ -203,6 +231,21 @@ static int parse_options(int argc, char **argv, struct options *opt)
             opt->stats_interval = atoi(optarg);
             if (opt->stats_interval <= 0) {
                 fprintf(stderr, "Invalid --stats-interval: %s\n", optarg);
+                return -1;
+            }
+            break;
+        case 9:
+            opt->copy_buffers = atoi(optarg);
+            if (opt->copy_buffers < MIN_COPY_BUFFERS || opt->copy_buffers > MAX_COPY_BUFFERS) {
+                fprintf(stderr, "Invalid --copy-buffers: %s (range %d..%d)\n",
+                        optarg, MIN_COPY_BUFFERS, MAX_COPY_BUFFERS);
+                return -1;
+            }
+            break;
+        case 10:
+            opt->queue_depth = atoi(optarg);
+            if (opt->queue_depth <= 0) {
+                fprintf(stderr, "Invalid --queue-depth: %s\n", optarg);
                 return -1;
             }
             break;
@@ -261,6 +304,7 @@ static int open_input_auto(void)
 
         if (snprintf(path, sizeof(path), "/dev/input/%.244s", ent->d_name) >= (int)sizeof(path))
             continue;
+
         fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0)
             continue;
@@ -327,12 +371,14 @@ static void drain_input_events(struct app_ctx *ctx)
         return;
 
     for (;;) {
+        size_t count;
+        size_t i;
+
         n = read(ctx->input_fd, ev, sizeof(ev));
         if (n <= 0)
             break;
 
-        size_t count = (size_t)n / sizeof(ev[0]);
-        size_t i;
+        count = (size_t)n / sizeof(ev[0]);
         for (i = 0; i < count; i++) {
             if (ev[i].type == EV_KEY && ev[i].value == 1 &&
                 (ev[i].code == KEY_ESC || ev[i].code == KEY_Q)) {
@@ -344,136 +390,6 @@ static void drain_input_events(struct app_ctx *ctx)
 
     if (n < 0 && errno != EAGAIN)
         fprintf(stderr, "Input read error: %s\n", strerror(errno));
-}
-
-static int init_fpga_dma(struct app_ctx *ctx)
-{
-    struct fpga_info info;
-    struct buffer_map map;
-
-    ctx->dev_fd = open(ctx->opt.device_path, O_RDWR | O_CLOEXEC);
-    if (ctx->dev_fd < 0) {
-        fprintf(stderr, "Failed to open %s: %s\n", ctx->opt.device_path, strerror(errno));
-        return -1;
-    }
-
-    if (ioctl(ctx->dev_fd, FPGA_DMA_GET_INFO, &info) < 0) {
-        fprintf(stderr, "FPGA_DMA_GET_INFO failed: %s\n", strerror(errno));
-        return -1;
-    }
-
-    if (info.frame_width != 1280 || info.frame_height != 720 || info.frame_bpp != 2) {
-        fprintf(stderr,
-                "Unsupported frame format: %ux%u bpp=%u (expected 1280x720 bpp=2)\n",
-                info.frame_width, info.frame_height, info.frame_bpp);
-        return -1;
-    }
-
-    ctx->frame_width = info.frame_width;
-    ctx->frame_height = info.frame_height;
-    ctx->frame_bpp = info.frame_bpp;
-    ctx->frame_size = (size_t)ctx->frame_width * ctx->frame_height * ctx->frame_bpp;
-
-    memset(&map, 0, sizeof(map));
-    map.index = 0;
-    if (ioctl(ctx->dev_fd, FPGA_DMA_MAP_BUFFER, &map) < 0) {
-        fprintf(stderr, "FPGA_DMA_MAP_BUFFER failed: %s\n", strerror(errno));
-        return -1;
-    }
-
-    if (map.size < ctx->frame_size) {
-        fprintf(stderr, "Mapped DMA buffer too small: %u < %zu\n", map.size, ctx->frame_size);
-        return -1;
-    }
-
-    ctx->dma_map_size = map.size;
-    ctx->dma_map = mmap(NULL, ctx->dma_map_size, PROT_READ, MAP_SHARED, ctx->dev_fd, 0);
-    if (ctx->dma_map == MAP_FAILED) {
-        ctx->dma_map = NULL;
-        fprintf(stderr, "mmap DMA buffer failed: %s\n", strerror(errno));
-        return -1;
-    }
-
-    fprintf(stderr, "FPGA DMA ready: %ux%u bpp=%u frame=%zu bytes\n",
-            ctx->frame_width, ctx->frame_height, ctx->frame_bpp, ctx->frame_size);
-    return 0;
-}
-
-static int trigger_frame_dma(struct app_ctx *ctx)
-{
-    struct dma_transfer transfer;
-
-    memset(&transfer, 0, sizeof(transfer));
-    transfer.size = (uint32_t)ctx->frame_size;
-    transfer.user_buf = 0;
-
-    if (ioctl(ctx->dev_fd, FPGA_DMA_READ_FRAME, &transfer) < 0) {
-        fprintf(stderr, "FPGA_DMA_READ_FRAME failed: %s\n", strerror(errno));
-        return -1;
-    }
-
-    if (transfer.result != 0) {
-        fprintf(stderr, "FPGA_DMA_READ_FRAME result error: %u\n", transfer.result);
-        return -1;
-    }
-
-    return 0;
-}
-
-static void frame_release_notify(gpointer user_data)
-{
-    struct frame_cookie *cookie = (struct frame_cookie *)user_data;
-    struct app_ctx *ctx = cookie->ctx;
-
-    g_mutex_lock(&ctx->frame_lock);
-    if (ctx->frame_in_flight && ctx->frame_id == cookie->id) {
-        ctx->frame_in_flight = false;
-        ctx->released_frames++;
-        g_cond_signal(&ctx->frame_cond);
-    }
-    g_mutex_unlock(&ctx->frame_lock);
-
-    g_free(cookie);
-}
-
-static GstBuffer *build_frame_buffer(struct app_ctx *ctx)
-{
-    struct frame_cookie *cookie;
-    GstBuffer *buf;
-
-    cookie = g_new0(struct frame_cookie, 1);
-    if (!cookie)
-        return NULL;
-
-    cookie->ctx = ctx;
-
-    g_mutex_lock(&ctx->frame_lock);
-    ctx->frame_id++;
-    cookie->id = ctx->frame_id;
-    ctx->frame_in_flight = true;
-    g_mutex_unlock(&ctx->frame_lock);
-
-    buf = gst_buffer_new_wrapped_full((GstMemoryFlags)0,
-                                      ctx->dma_map,
-                                      ctx->frame_size,
-                                      0,
-                                      ctx->frame_size,
-                                      cookie,
-                                      frame_release_notify);
-    if (!buf) {
-        g_mutex_lock(&ctx->frame_lock);
-        ctx->frame_in_flight = false;
-        g_cond_signal(&ctx->frame_cond);
-        g_mutex_unlock(&ctx->frame_lock);
-        g_free(cookie);
-        return NULL;
-    }
-
-    GST_BUFFER_PTS(buf) = ctx->next_pts_ns;
-    GST_BUFFER_DURATION(buf) = (guint64)(GST_SECOND / ctx->opt.fps);
-    ctx->next_pts_ns += GST_BUFFER_DURATION(buf);
-
-    return buf;
 }
 
 static int handle_bus_messages(struct app_ctx *ctx)
@@ -550,61 +466,261 @@ static int process_events(struct app_ctx *ctx, int wait_ms)
     return 0;
 }
 
-static int wait_previous_frame_done(struct app_ctx *ctx)
+static int init_fpga_dma(struct app_ctx *ctx)
 {
-    int64_t deadline_us = now_us() + (int64_t)ctx->opt.timeout_ms * 1000LL;
+    struct fpga_info info;
+    struct buffer_map map;
+
+    ctx->dev_fd = open(ctx->opt.device_path, O_RDWR | O_CLOEXEC);
+    if (ctx->dev_fd < 0) {
+        fprintf(stderr, "Failed to open %s: %s\n", ctx->opt.device_path, strerror(errno));
+        return -1;
+    }
+
+    if (ioctl(ctx->dev_fd, FPGA_DMA_GET_INFO, &info) < 0) {
+        fprintf(stderr, "FPGA_DMA_GET_INFO failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (info.frame_width != 1280 || info.frame_height != 720 || info.frame_bpp != 2) {
+        fprintf(stderr,
+                "Unsupported frame format: %ux%u bpp=%u (expected 1280x720 bpp=2)\n",
+                info.frame_width, info.frame_height, info.frame_bpp);
+        return -1;
+    }
+
+    ctx->frame_width = info.frame_width;
+    ctx->frame_height = info.frame_height;
+    ctx->frame_bpp = info.frame_bpp;
+    ctx->frame_size = (size_t)ctx->frame_width * ctx->frame_height * ctx->frame_bpp;
+
+    memset(&map, 0, sizeof(map));
+    map.index = 0;
+    if (ioctl(ctx->dev_fd, FPGA_DMA_MAP_BUFFER, &map) < 0) {
+        fprintf(stderr, "FPGA_DMA_MAP_BUFFER failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (map.size < ctx->frame_size) {
+        fprintf(stderr, "Mapped DMA buffer too small: %u < %zu\n", map.size, ctx->frame_size);
+        return -1;
+    }
+
+    ctx->dma_map_size = map.size;
+    ctx->dma_map = mmap(NULL, ctx->dma_map_size, PROT_READ, MAP_SHARED, ctx->dev_fd, 0);
+    if (ctx->dma_map == MAP_FAILED) {
+        ctx->dma_map = NULL;
+        fprintf(stderr, "mmap DMA buffer failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    fprintf(stderr, "FPGA DMA ready: %ux%u bpp=%u frame=%zu bytes\n",
+            ctx->frame_width, ctx->frame_height, ctx->frame_bpp, ctx->frame_size);
+    return 0;
+}
+
+static int init_copy_slots(struct app_ctx *ctx)
+{
+    int i;
+
+    ctx->slots = calloc((size_t)ctx->opt.copy_buffers, sizeof(*ctx->slots));
+    if (!ctx->slots) {
+        fprintf(stderr, "Failed to allocate slot metadata\n");
+        return -1;
+    }
+
+    ctx->slot_count = ctx->opt.copy_buffers;
+    for (i = 0; i < ctx->slot_count; i++) {
+        ctx->slots[i].data = malloc(ctx->frame_size);
+        if (!ctx->slots[i].data) {
+            fprintf(stderr, "Failed to allocate copy slot %d\n", i);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int trigger_frame_dma(struct app_ctx *ctx)
+{
+    struct dma_transfer transfer;
+
+    memset(&transfer, 0, sizeof(transfer));
+    transfer.size = (uint32_t)ctx->frame_size;
+    transfer.user_buf = 0;
+
+    if (ioctl(ctx->dev_fd, FPGA_DMA_READ_FRAME, &transfer) < 0) {
+        fprintf(stderr, "FPGA_DMA_READ_FRAME failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (transfer.result != 0) {
+        fprintf(stderr, "FPGA_DMA_READ_FRAME result error: %u\n", transfer.result);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void release_slot_ticket(struct app_ctx *ctx, const struct slot_ticket *ticket, bool count_release)
+{
+    if (!ctx || !ticket || ticket->idx < 0 || ticket->idx >= ctx->slot_count)
+        return;
+
+    g_mutex_lock(&ctx->slots_lock);
+    if (ctx->slots[ticket->idx].in_use &&
+        ctx->slots[ticket->idx].generation == ticket->generation) {
+        ctx->slots[ticket->idx].in_use = false;
+        if (count_release)
+            ctx->released_frames++;
+        g_cond_signal(&ctx->slots_cond);
+    }
+    g_mutex_unlock(&ctx->slots_lock);
+}
+
+static void frame_release_notify(gpointer user_data)
+{
+    struct frame_cookie *cookie = (struct frame_cookie *)user_data;
+
+    release_slot_ticket(cookie->ctx, &cookie->ticket, true);
+    g_free(cookie);
+}
+
+static int acquire_free_slot(struct app_ctx *ctx, struct slot_ticket *ticket)
+{
+    int64_t deadline_us = mono_us() + (int64_t)ctx->opt.timeout_ms * 1000LL;
+    int64_t wait_start = mono_us();
+
+    memset(ticket, 0, sizeof(*ticket));
+    ticket->idx = -1;
 
     for (;;) {
-        bool in_flight;
-        int64_t slice_deadline;
+        int i;
+        int64_t now;
+        int64_t wake_us;
 
         if (process_events(ctx, 10) < 0)
             return -1;
         if (!ctx->running)
             return -1;
 
-        g_mutex_lock(&ctx->frame_lock);
-        in_flight = ctx->frame_in_flight;
-        g_mutex_unlock(&ctx->frame_lock);
-        if (!in_flight)
-            return 0;
+        g_mutex_lock(&ctx->slots_lock);
+        for (i = 0; i < ctx->slot_count; i++) {
+            if (!ctx->slots[i].in_use) {
+                ctx->slots[i].in_use = true;
+                ctx->slots[i].generation++;
+                ticket->idx = i;
+                ticket->generation = ctx->slots[i].generation;
+                g_mutex_unlock(&ctx->slots_lock);
 
-        if (now_us() >= deadline_us) {
-            fprintf(stderr, "Timeout waiting previous frame release (%d ms)\n", ctx->opt.timeout_ms);
+                ctx->slot_wait_total_us += (uint64_t)(mono_us() - wait_start);
+                ctx->slot_wait_samples++;
+                return 0;
+            }
+        }
+
+        now = mono_us();
+        if (now >= deadline_us) {
+            ctx->slot_wait_timeout_count++;
+            g_mutex_unlock(&ctx->slots_lock);
+            fprintf(stderr, "Timeout waiting free copy slot (%d ms)\n", ctx->opt.timeout_ms);
             return -1;
         }
 
-        slice_deadline = now_us() + 20000; /* 20ms */
-        if (slice_deadline > deadline_us)
-            slice_deadline = deadline_us;
-
-        g_mutex_lock(&ctx->frame_lock);
-        if (ctx->frame_in_flight)
-            g_cond_wait_until(&ctx->frame_cond, &ctx->frame_lock, slice_deadline);
-        g_mutex_unlock(&ctx->frame_lock);
+        wake_us = now + 20000;
+        if (wake_us > deadline_us)
+            wake_us = deadline_us;
+        g_cond_wait_until(&ctx->slots_cond, &ctx->slots_lock, wake_us);
+        g_mutex_unlock(&ctx->slots_lock);
     }
+}
+
+static GstBuffer *build_frame_buffer(struct app_ctx *ctx, const struct slot_ticket *ticket)
+{
+    struct frame_cookie *cookie;
+    GstBuffer *buf;
+
+    cookie = g_new0(struct frame_cookie, 1);
+    if (!cookie)
+        return NULL;
+
+    cookie->ctx = ctx;
+    cookie->ticket = *ticket;
+
+    buf = gst_buffer_new_wrapped_full((GstMemoryFlags)0,
+                                      ctx->slots[ticket->idx].data,
+                                      ctx->frame_size,
+                                      0,
+                                      ctx->frame_size,
+                                      cookie,
+                                      frame_release_notify);
+    if (!buf) {
+        release_slot_ticket(ctx, ticket, false);
+        g_free(cookie);
+        return NULL;
+    }
+
+    GST_BUFFER_PTS(buf) = ctx->next_pts_ns;
+    GST_BUFFER_DURATION(buf) = (guint64)(GST_SECOND / ctx->opt.fps);
+    ctx->next_pts_ns += GST_BUFFER_DURATION(buf);
+
+    return buf;
+}
+
+static void get_slot_counts(struct app_ctx *ctx, int *free_slots, int *used_slots)
+{
+    int i;
+    int free_cnt = 0;
+    int used_cnt = 0;
+
+    g_mutex_lock(&ctx->slots_lock);
+    for (i = 0; i < ctx->slot_count; i++) {
+        if (ctx->slots[i].in_use)
+            used_cnt++;
+        else
+            free_cnt++;
+    }
+    g_mutex_unlock(&ctx->slots_lock);
+
+    if (free_slots)
+        *free_slots = free_cnt;
+    if (used_slots)
+        *used_slots = used_cnt;
 }
 
 static void print_stats(struct app_ctx *ctx)
 {
-    int64_t now = now_us();
+    int64_t now = mono_us();
     int64_t dt = now - ctx->last_stats_us;
     double avg_ms;
+    double avg_slot_wait_ms;
+    int free_slots;
+    int used_slots;
 
     if (dt < (int64_t)ctx->opt.stats_interval * 1000000LL)
         return;
 
     avg_ms = ctx->loop_samples ? (ctx->total_loop_ms / (double)ctx->loop_samples) : 0.0;
+    avg_slot_wait_ms = ctx->slot_wait_samples
+        ? ((double)ctx->slot_wait_total_us / (double)ctx->slot_wait_samples / 1000.0)
+        : 0.0;
+
+    get_slot_counts(ctx, &free_slots, &used_slots);
 
     fprintf(stderr,
             "[stats] cap=%" PRIu64 " push=%" PRIu64 " rel=%" PRIu64
-            "  interval_fps=%.2f rel_fps=%.2f avg_loop=%.2fms\n",
+            " free=%d used=%d timeout=%" PRIu64
+            " fps=%.2f rel_fps=%.2f avg_loop=%.2fms avg_slot_wait=%.2fms\n",
             ctx->captured_frames,
             ctx->pushed_frames,
             ctx->released_frames,
+            free_slots,
+            used_slots,
+            ctx->slot_wait_timeout_count,
             (double)(ctx->captured_frames - ctx->last_stats_captured) * 1000000.0 / (double)dt,
             (double)(ctx->released_frames - ctx->last_stats_released) * 1000000.0 / (double)dt,
-            avg_ms);
+            avg_ms,
+            avg_slot_wait_ms);
 
     ctx->last_stats_captured = ctx->captured_frames;
     ctx->last_stats_released = ctx->released_frames;
@@ -619,15 +735,16 @@ static int build_pipeline(struct app_ctx *ctx)
 
     ctx->pipeline = gst_pipeline_new("fpga-hdmi");
     ctx->appsrc = gst_element_factory_make("appsrc", "src");
+    ctx->convert = gst_element_factory_make("videoconvert", "convert");
     ctx->sink = gst_element_factory_make("kmssink", "sink");
-    if (!ctx->pipeline || !ctx->appsrc || !ctx->sink) {
-        fprintf(stderr, "Failed to create GStreamer elements (appsrc/kmssink)\n");
+    if (!ctx->pipeline || !ctx->appsrc || !ctx->convert || !ctx->sink) {
+        fprintf(stderr, "Failed to create GStreamer elements (appsrc/videoconvert/kmssink)\n");
         return -1;
     }
 
-    gst_bin_add_many(GST_BIN(ctx->pipeline), ctx->appsrc, ctx->sink, NULL);
-    if (!gst_element_link(ctx->appsrc, ctx->sink)) {
-        fprintf(stderr, "Failed to link appsrc -> kmssink\n");
+    gst_bin_add_many(GST_BIN(ctx->pipeline), ctx->appsrc, ctx->convert, ctx->sink, NULL);
+    if (!gst_element_link_many(ctx->appsrc, ctx->convert, ctx->sink, NULL)) {
+        fprintf(stderr, "Failed to link appsrc -> videoconvert -> kmssink\n");
         return -1;
     }
 
@@ -648,6 +765,7 @@ static int build_pipeline(struct app_ctx *ctx)
                  "do-timestamp", TRUE,
                  "format", GST_FORMAT_TIME,
                  "block", TRUE,
+                 "max-bytes", (guint64)ctx->frame_size * (guint64)ctx->opt.queue_depth,
                  NULL);
     gst_caps_unref(caps);
 
@@ -672,12 +790,16 @@ static int build_pipeline(struct app_ctx *ctx)
         return -1;
     }
 
-    fprintf(stderr, "Pipeline started: appsrc(format=%s) -> kmssink\n", fmt);
+    fprintf(stderr,
+            "Pipeline started: appsrc(format=%s) -> videoconvert -> kmssink (copy_buffers=%d queue_depth=%d)\n",
+            fmt, ctx->opt.copy_buffers, ctx->opt.queue_depth);
     return 0;
 }
 
 static void cleanup(struct app_ctx *ctx)
 {
+    int i;
+
     if (ctx->appsrc)
         gst_app_src_end_of_stream(GST_APP_SRC(ctx->appsrc));
 
@@ -692,6 +814,12 @@ static void cleanup(struct app_ctx *ctx)
     if (ctx->dma_map)
         munmap(ctx->dma_map, ctx->dma_map_size);
 
+    if (ctx->slots) {
+        for (i = 0; i < ctx->slot_count; i++)
+            free(ctx->slots[i].data);
+        free(ctx->slots);
+    }
+
     if (ctx->dev_fd >= 0)
         close(ctx->dev_fd);
     if (ctx->drm_fd >= 0)
@@ -701,8 +829,8 @@ static void cleanup(struct app_ctx *ctx)
     if (ctx->epoll_fd >= 0)
         close(ctx->epoll_fd);
 
-    g_cond_clear(&ctx->frame_cond);
-    g_mutex_clear(&ctx->frame_lock);
+    g_cond_clear(&ctx->slots_cond);
+    g_mutex_clear(&ctx->slots_lock);
 }
 
 int main(int argc, char **argv)
@@ -717,8 +845,8 @@ int main(int argc, char **argv)
     ctx.epoll_fd = -1;
     ctx.running = true;
 
-    g_mutex_init(&ctx.frame_lock);
-    g_cond_init(&ctx.frame_cond);
+    g_mutex_init(&ctx.slots_lock);
+    g_cond_init(&ctx.slots_cond);
 
     if (parse_options(argc, argv, &ctx.opt) < 0)
         goto out;
@@ -741,34 +869,37 @@ int main(int argc, char **argv)
     if (init_fpga_dma(&ctx) < 0)
         goto out;
 
+    if (init_copy_slots(&ctx) < 0)
+        goto out;
+
     if (build_pipeline(&ctx) < 0)
         goto out;
 
     fprintf(stderr,
-            "Start display loop: fps=%d pixel-order=%s timeout=%dms\n",
+            "Start display loop: fps=%d pixel-order=%s timeout=%dms copy_buffers=%d queue_depth=%d\n",
             ctx.opt.fps,
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
-            ctx.opt.timeout_ms);
+            ctx.opt.timeout_ms,
+            ctx.opt.copy_buffers,
+            ctx.opt.queue_depth);
 
-    ctx.start_us = now_us();
+    ctx.start_us = mono_us();
     ctx.last_stats_us = ctx.start_us;
 
     while (ctx.running) {
+        struct slot_ticket ticket;
         GstBuffer *buf;
         GstFlowReturn flow;
         int64_t t0;
         int64_t t1;
         int64_t target_us = 1000000LL / ctx.opt.fps;
 
-        if (wait_previous_frame_done(&ctx) < 0)
-            break;
-
         if (process_events(&ctx, 0) < 0)
             break;
         if (!ctx.running)
             break;
 
-        t0 = now_us();
+        t0 = mono_us();
 
         if (trigger_frame_dma(&ctx) < 0) {
             fprintf(stderr, "DMA trigger failed\n");
@@ -776,24 +907,26 @@ int main(int argc, char **argv)
         }
         ctx.captured_frames++;
 
-        buf = build_frame_buffer(&ctx);
+        if (acquire_free_slot(&ctx, &ticket) < 0)
+            break;
+
+        memcpy(ctx.slots[ticket.idx].data, ctx.dma_map, ctx.frame_size);
+
+        buf = build_frame_buffer(&ctx, &ticket);
         if (!buf) {
-            fprintf(stderr, "Failed to wrap DMA frame into GstBuffer\n");
+            fprintf(stderr, "Failed to build GstBuffer for slot %d\n", ticket.idx);
             break;
         }
 
         flow = gst_app_src_push_buffer(GST_APP_SRC(ctx.appsrc), buf);
         if (flow != GST_FLOW_OK) {
             fprintf(stderr, "gst_app_src_push_buffer failed: %d\n", flow);
-            g_mutex_lock(&ctx.frame_lock);
-            ctx.frame_in_flight = false;
-            g_cond_signal(&ctx.frame_cond);
-            g_mutex_unlock(&ctx.frame_lock);
+            release_slot_ticket(&ctx, &ticket, false);
             break;
         }
         ctx.pushed_frames++;
 
-        t1 = now_us();
+        t1 = mono_us();
         ctx.total_loop_ms += (double)(t1 - t0) / 1000.0;
         ctx.loop_samples++;
 
@@ -804,10 +937,11 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr,
-            "Exit: captured=%" PRIu64 " pushed=%" PRIu64 " released=%" PRIu64 "\n",
+            "Exit: captured=%" PRIu64 " pushed=%" PRIu64 " released=%" PRIu64 " slot_timeout=%" PRIu64 "\n",
             ctx.captured_frames,
             ctx.pushed_frames,
-            ctx.released_frames);
+            ctx.released_frames,
+            ctx.slot_wait_timeout_count);
 
     ret = 0;
 
