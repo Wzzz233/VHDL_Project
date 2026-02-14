@@ -55,9 +55,8 @@ echo "[1/3] Capture ${COUNT} motion frames (please move object by hand)..."
   --ppm-mode "$PPM_MODE"
 
 echo "[2/3] Analyze adjacent frame diffs..."
-python3 "$PY_SCRIPT" --pattern "${PREFIX}"_*.raw
+python3 "$PY_SCRIPT" --pattern "${PREFIX}_*.raw"
 
 echo "[3/3] Done."
 echo "Suggested manual visual check:"
 echo "  ${PREFIX}_0000.ppm ${PREFIX}_0010.ppm ${PREFIX}_0020.ppm ${PREFIX}_0030.ppm ${PREFIX}_0040.ppm ${PREFIX}_0050.ppm"
-
