@@ -61,7 +61,7 @@ if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
   exit 2
 fi
 
-for plugin in appsrc videoconvert queue kmssink; do
+for plugin in appsrc queue kmssink; do
   if ! gst-inspect-1.0 "$plugin" >/dev/null 2>&1; then
     echo "Missing GStreamer plugin: $plugin" >&2
     exit 2

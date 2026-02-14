@@ -223,3 +223,30 @@ Current module is `pcie_fpga_dma`, so runtime params are:
 cat /sys/module/pcie_fpga_dma/parameters/dma_chunk_delay_us
 cat /sys/module/pcie_fpga_dma/parameters/dma_verbose
 ```
+
+---
+
+## Phase 3.3: Low-Latency Display Path (Implemented)
+
+### Scope
+- Keep FPGA and kernel ABI unchanged.
+- Remove costly/variable userspace color-convert stage from live display path.
+- Prioritize real-time freshness over guaranteed no-drop delivery.
+
+### Display Pipeline Update
+- Replaced pipeline:
+- Old: `appsrc -> videoconvert -> capsfilter(BGRx) -> queue -> kmssink`
+- New: `appsrc -> queue -> kmssink`
+
+### Runtime Behavior Changes
+- `appsrc block=false` to avoid backpressure stalling DMA capture loop.
+- Keep queue in low-latency mode:
+- `max-size-buffers=1`
+- `leaky=downstream`
+- `max-size-bytes=0`
+- `max-size-time=0`
+
+### Validation Command
+```bash
+sudo ./run_hdmi_kms.sh --fps 15 --io-mode copy --swap16 1 --copy-buffers 2 --queue-depth 1
+```

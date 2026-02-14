@@ -3,7 +3,7 @@
  * FPGA HDMI KMS Display Application
  *
  * Capture frames from /dev/fpga_dma0 and render to HDMI via
- * GStreamer appsrc -> videoconvert -> kmssink.
+ * GStreamer appsrc -> queue -> kmssink.
  */
 
 #include <dirent.h>
@@ -94,8 +94,6 @@ struct app_ctx {
 
     GstElement *pipeline;
     GstElement *appsrc;
-    GstElement *convert;
-    GstElement *post_caps;
     GstElement *queue;
     GstElement *sink;
     GstBus *bus;
@@ -828,24 +826,21 @@ static void print_pad_caps(const char *label, GstElement *elem, const char *pad_
 static int build_pipeline(struct app_ctx *ctx)
 {
     GstCaps *caps;
-    GstCaps *post_caps;
     GstStateChangeReturn sret;
     const char *fmt = (ctx->opt.pixel_order == PIXEL_ORDER_BGR565) ? "BGR16" : "RGB16";
 
     ctx->pipeline = gst_pipeline_new("fpga-hdmi");
     ctx->appsrc = gst_element_factory_make("appsrc", "src");
-    ctx->convert = gst_element_factory_make("videoconvert", "convert");
-    ctx->post_caps = gst_element_factory_make("capsfilter", "postconvert_caps");
     ctx->queue = gst_element_factory_make("queue", "latency_queue");
     ctx->sink = gst_element_factory_make("kmssink", "sink");
-    if (!ctx->pipeline || !ctx->appsrc || !ctx->convert || !ctx->post_caps || !ctx->queue || !ctx->sink) {
-        fprintf(stderr, "Failed to create GStreamer elements (appsrc/videoconvert/capsfilter/queue/kmssink)\n");
+    if (!ctx->pipeline || !ctx->appsrc || !ctx->queue || !ctx->sink) {
+        fprintf(stderr, "Failed to create GStreamer elements (appsrc/queue/kmssink)\n");
         return -1;
     }
 
-    gst_bin_add_many(GST_BIN(ctx->pipeline), ctx->appsrc, ctx->convert, ctx->post_caps, ctx->queue, ctx->sink, NULL);
-    if (!gst_element_link_many(ctx->appsrc, ctx->convert, ctx->post_caps, ctx->queue, ctx->sink, NULL)) {
-        fprintf(stderr, "Failed to link appsrc -> videoconvert -> capsfilter -> queue -> kmssink\n");
+    gst_bin_add_many(GST_BIN(ctx->pipeline), ctx->appsrc, ctx->queue, ctx->sink, NULL);
+    if (!gst_element_link_many(ctx->appsrc, ctx->queue, ctx->sink, NULL)) {
+        fprintf(stderr, "Failed to link appsrc -> queue -> kmssink\n");
         return -1;
     }
 
@@ -865,23 +860,10 @@ static int build_pipeline(struct app_ctx *ctx)
                  "is-live", TRUE,
                  "do-timestamp", TRUE,
                  "format", GST_FORMAT_TIME,
-                 "block", TRUE,
+                 "block", FALSE,
                  "max-bytes", (guint64)ctx->frame_size * (guint64)ctx->opt.queue_depth,
                  NULL);
     gst_caps_unref(caps);
-
-    post_caps = gst_caps_new_simple("video/x-raw",
-                                    "format", G_TYPE_STRING, "BGRx",
-                                    "width", G_TYPE_INT, (int)ctx->frame_width,
-                                    "height", G_TYPE_INT, (int)ctx->frame_height,
-                                    "framerate", GST_TYPE_FRACTION, ctx->opt.fps, 1,
-                                    NULL);
-    if (!post_caps) {
-        fprintf(stderr, "Failed to create post-convert caps\n");
-        return -1;
-    }
-    g_object_set(ctx->post_caps, "caps", post_caps, NULL);
-    gst_caps_unref(post_caps);
 
     /* Drop stale frames aggressively to keep live latency bounded. */
     g_object_set(ctx->queue,
@@ -913,9 +895,9 @@ static int build_pipeline(struct app_ctx *ctx)
     }
 
     fprintf(stderr,
-            "Pipeline started: appsrc(format=%s) -> videoconvert -> capsfilter(BGRx) -> queue(leaky=downstream,1) -> kmssink (copy_buffers=%d queue_depth=%d)\n",
+            "Pipeline started: appsrc(format=%s,block=false) -> queue(leaky=downstream,1) -> kmssink (copy_buffers=%d queue_depth=%d)\n",
             fmt, ctx->opt.copy_buffers, ctx->opt.queue_depth);
-    print_pad_caps("videoconvert:src", ctx->convert, "src");
+    print_pad_caps("appsrc:src", ctx->appsrc, "src");
     print_pad_caps("kmssink:sink", ctx->sink, "sink");
     return 0;
 }
