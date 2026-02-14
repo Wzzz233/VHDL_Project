@@ -192,6 +192,7 @@ make displayapp
 - Added post-convert `capsfilter` to force `BGRx` output and disable `videoconvert` passthrough on 16-bit input.
 - Added `--io-mode` (`mmap`/`copy`) to isolate mmap path issues during bring-up.
 - Driver mmap path uses `dma_mmap_coherent` for coherent DMA buffer mapping.
+- Added downstream `queue` (`max-size-buffers=1`, `leaky=downstream`) before `kmssink` to cap live display latency.
 
 ---
 
