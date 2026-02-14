@@ -259,7 +259,8 @@ static int open_input_auto(void)
         if (strncmp(ent->d_name, "event", 5) != 0)
             continue;
 
-        snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+        if (snprintf(path, sizeof(path), "/dev/input/%.244s", ent->d_name) >= (int)sizeof(path))
+            continue;
         fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0)
             continue;
