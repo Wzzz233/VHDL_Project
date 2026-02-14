@@ -250,3 +250,20 @@ cat /sys/module/pcie_fpga_dma/parameters/dma_verbose
 ```bash
 sudo ./run_hdmi_kms.sh --fps 15 --io-mode copy --swap16 1 --copy-buffers 2 --queue-depth 1
 ```
+
+---
+
+## Phase 3.4: Display Noise Reduction (Implemented)
+
+### Scope
+- Keep low-latency path (`appsrc -> queue -> kmssink`) and avoid `videoconvert`.
+- Fix panel-side noise seen when kmssink directly consumes 16-bit format.
+
+### Change
+- `fpga_hdmi_display` now converts source 16-bit pixels in userspace to `BGRx` before push.
+- `appsrc` caps changed to `video/x-raw,format=BGRx`.
+- `--pixel-order` + `--swap16` are still honored during 565 decode.
+
+### Result
+- Preserves the low-latency queue behavior.
+- Removes dependency on sink-side 16-bit format handling quality.

@@ -4,14 +4,14 @@ set -euo pipefail
 DEVICE="/dev/fpga_dma0"
 DRM_CARD="/dev/dri/card0"
 INPUT_DEV=""
-FPS="10"
+FPS="15"
 PIXEL_ORDER="bgr565"
 CONNECTOR_ID=""
 TIMEOUT_MS="5000"
 STATS_INTERVAL="1"
-COPY_BUFFERS="3"
-QUEUE_DEPTH="2"
-IO_MODE="mmap"
+COPY_BUFFERS="2"
+QUEUE_DEPTH="1"
+IO_MODE="copy"
 SWAP16="1"
 
 usage() {

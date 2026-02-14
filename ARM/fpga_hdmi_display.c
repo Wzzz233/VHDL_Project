@@ -86,6 +86,7 @@ struct app_ctx {
     uint32_t frame_height;
     uint32_t frame_bpp;
     size_t frame_size;
+    size_t display_frame_size;
 
     struct frame_slot *slots;
     int slot_count;
@@ -529,6 +530,7 @@ static int init_fpga_dma(struct app_ctx *ctx)
     ctx->frame_height = info.frame_height;
     ctx->frame_bpp = info.frame_bpp;
     ctx->frame_size = (size_t)ctx->frame_width * ctx->frame_height * ctx->frame_bpp;
+    ctx->display_frame_size = (size_t)ctx->frame_width * ctx->frame_height * 4U; /* BGRx */
 
     if (ctx->opt.io_mode == IO_MODE_MMAP) {
         struct buffer_map map;
@@ -579,7 +581,7 @@ static int init_copy_slots(struct app_ctx *ctx)
 
     ctx->slot_count = ctx->opt.copy_buffers;
     for (i = 0; i < ctx->slot_count; i++) {
-        ctx->slots[i].data = malloc(ctx->frame_size);
+        ctx->slots[i].data = malloc(ctx->display_frame_size);
         if (!ctx->slots[i].data) {
             fprintf(stderr, "Failed to allocate copy slot %d\n", i);
             return -1;
@@ -612,21 +614,49 @@ static int trigger_frame_dma(struct app_ctx *ctx)
     return 0;
 }
 
-static void copy_frame_to_slot(struct app_ctx *ctx, uint8_t *dst, const uint8_t *src)
+static void convert_frame_to_bgrx(struct app_ctx *ctx, uint8_t *dst, const uint8_t *src)
 {
     size_t i;
+    size_t pixel_count = (size_t)ctx->frame_width * ctx->frame_height;
 
-    if (!ctx->opt.swap16) {
-        memcpy(dst, src, ctx->frame_size);
-        return;
-    }
+    for (i = 0; i < pixel_count; i++) {
+        uint8_t lo = src[(i << 1)];
+        uint8_t hi = src[(i << 1) + 1];
+        uint16_t pix;
+        uint8_t r5;
+        uint8_t g6;
+        uint8_t b5;
+        uint8_t r8;
+        uint8_t g8;
+        uint8_t b8;
+        size_t out = i << 2;
 
-    for (i = 0; i + 1 < ctx->frame_size; i += 2) {
-        dst[i] = src[i + 1];
-        dst[i + 1] = src[i];
+        if (ctx->opt.swap16) {
+            uint8_t tmp = lo;
+            lo = hi;
+            hi = tmp;
+        }
+
+        pix = (uint16_t)lo | ((uint16_t)hi << 8);
+        if (ctx->opt.pixel_order == PIXEL_ORDER_BGR565) {
+            r5 = pix & 0x1F;
+            g6 = (pix >> 5) & 0x3F;
+            b5 = (pix >> 11) & 0x1F;
+        } else {
+            r5 = (pix >> 11) & 0x1F;
+            g6 = (pix >> 5) & 0x3F;
+            b5 = pix & 0x1F;
+        }
+
+        r8 = (uint8_t)((r5 << 3) | (r5 >> 2));
+        g8 = (uint8_t)((g6 << 2) | (g6 >> 4));
+        b8 = (uint8_t)((b5 << 3) | (b5 >> 2));
+
+        dst[out + 0] = b8;
+        dst[out + 1] = g8;
+        dst[out + 2] = r8;
+        dst[out + 3] = 0xFF;
     }
-    if (i < ctx->frame_size)
-        dst[i] = src[i];
 }
 
 static void release_slot_ticket(struct app_ctx *ctx, const struct slot_ticket *ticket, bool count_release)
@@ -716,9 +746,9 @@ static GstBuffer *build_frame_buffer(struct app_ctx *ctx, const struct slot_tick
 
     buf = gst_buffer_new_wrapped_full((GstMemoryFlags)0,
                                       ctx->slots[ticket->idx].data,
-                                      ctx->frame_size,
+                                      ctx->display_frame_size,
                                       0,
-                                      ctx->frame_size,
+                                      ctx->display_frame_size,
                                       cookie,
                                       frame_release_notify);
     if (!buf) {
@@ -827,7 +857,7 @@ static int build_pipeline(struct app_ctx *ctx)
 {
     GstCaps *caps;
     GstStateChangeReturn sret;
-    const char *fmt = (ctx->opt.pixel_order == PIXEL_ORDER_BGR565) ? "BGR16" : "RGB16";
+    const char *fmt = "BGRx";
 
     ctx->pipeline = gst_pipeline_new("fpga-hdmi");
     ctx->appsrc = gst_element_factory_make("appsrc", "src");
@@ -861,7 +891,7 @@ static int build_pipeline(struct app_ctx *ctx)
                  "do-timestamp", TRUE,
                  "format", GST_FORMAT_TIME,
                  "block", FALSE,
-                 "max-bytes", (guint64)ctx->frame_size * (guint64)ctx->opt.queue_depth,
+                 "max-bytes", (guint64)ctx->display_frame_size * (guint64)ctx->opt.queue_depth,
                  NULL);
     gst_caps_unref(caps);
 
@@ -1028,7 +1058,7 @@ int main(int argc, char **argv)
             release_slot_ticket(&ctx, &ticket, false);
             break;
         }
-        copy_frame_to_slot(&ctx, ctx.slots[ticket.idx].data, frame_src);
+        convert_frame_to_bgrx(&ctx, ctx.slots[ticket.idx].data, frame_src);
 
         buf = build_frame_buffer(&ctx, &ticket);
         if (!buf) {
