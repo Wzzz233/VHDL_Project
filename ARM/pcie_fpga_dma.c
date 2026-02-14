@@ -118,14 +118,17 @@ static u32 __maybe_unused fpga_dma_read_reg(struct fpga_dma_dev *dev, u32 offset
 /**
  * fpga_dma_write_reg - Write a 32-bit register to BAR1
  *
- * After writing, read BAR0 to flush the PCIe write posting buffer.
- * PCIe ordering rules guarantee that a Non-Posted read (MRd) completes
- * only after all prior Posted writes (MWr) have been delivered.
+ * Keep writes posted; caller can flush once per chunk when needed.
  */
 static void fpga_dma_write_reg(struct fpga_dma_dev *dev, u32 offset, u32 value)
 {
     iowrite32(value, dev->bar1 + offset);
-    (void)ioread32(dev->bar0);  /* flush: force MWr TLP out before continuing */
+}
+
+static inline void fpga_dma_flush_posted_writes(struct fpga_dma_dev *dev)
+{
+    /* One non-posted read flushes prior posted BAR1 writes on PCIe. */
+    (void)ioread32(dev->bar0);
 }
 
 /**
@@ -245,6 +248,7 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
                      cmd_reg, length_in_dwords);
         }
         fpga_dma_write_reg(dev, BAR1_DMA_CMD_REG, cmd_reg);
+        fpga_dma_flush_posted_writes(dev);
 
         deadline = jiffies + msecs_to_jiffies(dma_timeout_ms);
         while ((READ_ONCE(*chunk_tail0) == tail_sentinel0) ||
