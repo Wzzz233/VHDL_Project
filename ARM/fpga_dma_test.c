@@ -38,6 +38,60 @@ enum ppm_mode {
     PPM_MODE_BGR565_SWAP16,
 };
 
+static const char *ppm_mode_to_string(enum ppm_mode mode)
+{
+    switch (mode) {
+    case PPM_MODE_RGB565:
+        return "rgb565";
+    case PPM_MODE_BGR565:
+        return "bgr565";
+    case PPM_MODE_RGB565_SWAP16:
+        return "rgb565-swap";
+    case PPM_MODE_BGR565_SWAP16:
+        return "bgr565-swap";
+    default:
+        return "unknown";
+    }
+}
+
+static int decode_565_to_rgb888(uint8_t lo, uint8_t hi, enum ppm_mode mode, uint8_t rgb[3])
+{
+    uint8_t r5;
+    uint8_t g6;
+    uint8_t b5;
+    uint16_t pix;
+
+    if (mode == PPM_MODE_RGB565_SWAP16 || mode == PPM_MODE_BGR565_SWAP16) {
+        uint8_t tmp = lo;
+        lo = hi;
+        hi = tmp;
+    }
+
+    pix = (uint16_t)lo | ((uint16_t)hi << 8);
+
+    switch (mode) {
+    case PPM_MODE_RGB565:
+    case PPM_MODE_RGB565_SWAP16:
+        r5 = (pix >> 11) & 0x1F;
+        g6 = (pix >> 5) & 0x3F;
+        b5 = pix & 0x1F;
+        break;
+    case PPM_MODE_BGR565:
+    case PPM_MODE_BGR565_SWAP16:
+        r5 = pix & 0x1F;
+        g6 = (pix >> 5) & 0x3F;
+        b5 = (pix >> 11) & 0x1F;
+        break;
+    default:
+        return -1;
+    }
+
+    rgb[0] = (uint8_t)((r5 << 3) | (r5 >> 2));
+    rgb[1] = (uint8_t)((g6 << 2) | (g6 >> 4));
+    rgb[2] = (uint8_t)((b5 << 3) | (b5 >> 2));
+    return 0;
+}
+
 /**
  * print_color - Print colored output to terminal
  */
@@ -76,7 +130,7 @@ static void print_usage(const char *progname)
     printf("  --verify               Verify frame data (check for zeros)\n");
     printf("  --dump <bytes>         Dump first N bytes of frame (hex)\n");
     printf("  --save-ppm <filename>  Save frame as PPM image\n");
-    printf("  --ppm-mode <mode>      PPM decode mode: rgb565|bgr565|rgb565-swap|bgr565-swap\n");
+    printf("  --ppm-mode <mode>      PPM decode mode (default: bgr565): rgb565|bgr565|rgb565-swap|bgr565-swap\n");
     printf("  --mmap                 Test mmap buffer access\n");
     printf("  --help                 Show this help message\n");
     printf("\nExamples:\n");
@@ -246,31 +300,13 @@ static int save_ppm_rgb565(const char *filename, const void *buffer,
     for (i = 0; i < pixel_count; i++) {
         uint8_t lo = src[i * 2];
         uint8_t hi = src[i * 2 + 1];
-        uint8_t r5, g6, b5;
         uint8_t rgb[3];
-        uint16_t pix;
 
-        if (mode == PPM_MODE_RGB565_SWAP16 || mode == PPM_MODE_BGR565_SWAP16) {
-            uint8_t tmp = lo;
-            lo = hi;
-            hi = tmp;
+        if (decode_565_to_rgb888(lo, hi, mode, rgb) < 0) {
+            print_color(COLOR_RED, "Invalid PPM mode %d", mode);
+            fclose(fp);
+            return -1;
         }
-
-        pix = (uint16_t)lo | ((uint16_t)hi << 8);
-
-        if (mode == PPM_MODE_RGB565 || mode == PPM_MODE_RGB565_SWAP16) {
-            r5 = (pix >> 11) & 0x1F;
-            g6 = (pix >> 5) & 0x3F;
-            b5 = pix & 0x1F;
-        } else {
-            r5 = pix & 0x1F;
-            g6 = (pix >> 5) & 0x3F;
-            b5 = (pix >> 11) & 0x1F;
-        }
-
-        rgb[0] = (uint8_t)((r5 << 3) | (r5 >> 2));
-        rgb[1] = (uint8_t)((g6 << 2) | (g6 >> 4));
-        rgb[2] = (uint8_t)((b5 << 3) | (b5 >> 2));
 
         if (fwrite(rgb, 1, sizeof(rgb), fp) != sizeof(rgb)) {
             print_color(COLOR_RED, "Failed to write PPM data: %s", strerror(errno));
@@ -472,6 +508,9 @@ int main(int argc, char *argv[])
         }
 
         print_color(COLOR_BLUE, "Reading %d frame(s)...", do_continuous ? frame_count : 1);
+        if (ppm_file) {
+            print_color(COLOR_BLUE, "PPM mode: %s", ppm_mode_to_string(ppm_mode));
+        }
 
         /* Read frames */
         for (i = 0; i < frame_count && g_running; i++) {
