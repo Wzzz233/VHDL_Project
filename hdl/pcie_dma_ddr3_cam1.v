@@ -648,7 +648,7 @@ wire [15:0] cmos1_rgb565_fmt = CAM_SWAP_RB ?
 
 // Color bar debug mode: force perfect test pattern before DDR write.
 // Set to 1'b0 to return to camera data.
-localparam FORCE_COLOR_BAR_TEST = 1'b1;
+localparam FORCE_COLOR_BAR_TEST = 1'b0;
 
 reg [11:0] cmos1_bar_x;
 reg        cmos1_href_16bit_d;
