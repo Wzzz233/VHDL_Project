@@ -347,10 +347,13 @@ static int load_labels(struct app_ctx *ctx, const char *path)
     }
     while (fgets(line, sizeof(line), fp) && idx < MAX_LABELS) {
         char *nl = strchr(line, '\n');
+        size_t n;
         if (nl) *nl = '\0';
         if (line[0] == '\0')
             continue;
-        snprintf(ctx->labels[idx], MAX_LABEL_LEN, "%s", line);
+        n = strnlen(line, MAX_LABEL_LEN - 1);
+        memcpy(ctx->labels[idx], line, n);
+        ctx->labels[idx][n] = '\0';
         idx++;
     }
     fclose(fp);
