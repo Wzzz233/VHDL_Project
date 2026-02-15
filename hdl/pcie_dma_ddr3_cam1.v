@@ -646,6 +646,53 @@ wire [15:0] cmos1_rgb565_fmt = CAM_SWAP_RB ?
     {cmos1_d_16bit[4:0], cmos1_d_16bit[10:5], cmos1_d_16bit[15:11]} :
     cmos1_d_16bit;
 
+// Color bar debug mode: force perfect test pattern before DDR write.
+// Set to 1'b0 to return to camera data.
+localparam FORCE_COLOR_BAR_TEST = 1'b1;
+
+reg [11:0] cmos1_bar_x;
+reg        cmos1_href_16bit_d;
+reg        cmos1_vsync_d0_d;
+
+function [15:0] color_bar_bgr565;
+    input [11:0] x;
+begin
+    if (x < 12'd160)       color_bar_bgr565 = 16'h001F; // Red
+    else if (x < 12'd320)  color_bar_bgr565 = 16'h07E0; // Green
+    else if (x < 12'd480)  color_bar_bgr565 = 16'hF800; // Blue
+    else if (x < 12'd640)  color_bar_bgr565 = 16'h07FF; // Yellow
+    else if (x < 12'd800)  color_bar_bgr565 = 16'hFFE0; // Cyan
+    else if (x < 12'd960)  color_bar_bgr565 = 16'hF81F; // Magenta
+    else if (x < 12'd1120) color_bar_bgr565 = 16'hFFFF; // White
+    else                   color_bar_bgr565 = 16'h0000; // Black
+end
+endfunction
+
+always @(posedge cmos1_pclk_16bit or negedge cmos1_init_done) begin
+    if (!cmos1_init_done) begin
+        cmos1_bar_x <= 12'd0;
+        cmos1_href_16bit_d <= 1'b0;
+        cmos1_vsync_d0_d <= 1'b0;
+    end else begin
+        cmos1_href_16bit_d <= cmos1_href_16bit;
+        cmos1_vsync_d0_d <= cmos1_vsync_d0;
+
+        if ((~cmos1_vsync_d0_d) && cmos1_vsync_d0) begin
+            cmos1_bar_x <= 12'd0;
+        end else if ((~cmos1_href_16bit_d) && cmos1_href_16bit) begin
+            cmos1_bar_x <= 12'd0;
+        end else if (cmos1_href_16bit) begin
+            if (cmos1_bar_x == 12'd1279)
+                cmos1_bar_x <= 12'd0;
+            else
+                cmos1_bar_x <= cmos1_bar_x + 12'd1;
+        end
+    end
+end
+
+wire [15:0] cmos1_bar_data = color_bar_bgr565(cmos1_bar_x);
+wire [15:0] cmos1_wr_data = FORCE_COLOR_BAR_TEST ? cmos1_bar_data : cmos1_rgb565_fmt;
+
 //=============================================================================
 // Frame Buffer (Camera → DDR3)
 //=============================================================================
@@ -747,7 +794,7 @@ fram_buf #(
     .vin_clk            (cmos1_pclk_16bit),
     .wr_fsync           (cmos1_vsync_d0),
     .wr_en              (cmos1_href_16bit),
-    .wr_data            (cmos1_rgb565_fmt),
+    .wr_data            (cmos1_wr_data),
     .init_done          (fram_buf_init_done),
     
     // Read output (for future PCIe DMA) - tied off for now
