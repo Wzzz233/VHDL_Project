@@ -103,8 +103,10 @@ struct frame_slot {
 struct lpr_results {
     struct det_box cars[MAX_DETS];
     int car_count;
+    int car_raw_count;
     struct plate_det plates[MAX_DETS];
     int plate_count;
+    int plate_raw_count;
     uint64_t frame_seq;
     double infer_ms_last;
     uint64_t infer_frames_total;
@@ -744,6 +746,46 @@ static void nms_inplace(struct det_box *dets, int *count, float iou_thr)
     *count = out;
 }
 
+static const char *tensor_fmt_name(rknn_tensor_format fmt)
+{
+    switch (fmt) {
+    case RKNN_TENSOR_NCHW: return "NCHW";
+    case RKNN_TENSOR_NHWC: return "NHWC";
+    default: return "UNSPEC";
+    }
+}
+
+static const char *tensor_type_name(rknn_tensor_type t)
+{
+    switch (t) {
+#ifdef RKNN_TENSOR_FLOAT32
+    case RKNN_TENSOR_FLOAT32: return "f32";
+#endif
+#ifdef RKNN_TENSOR_FLOAT16
+    case RKNN_TENSOR_FLOAT16: return "f16";
+#endif
+#ifdef RKNN_TENSOR_INT8
+    case RKNN_TENSOR_INT8: return "i8";
+#endif
+#ifdef RKNN_TENSOR_UINT8
+    case RKNN_TENSOR_UINT8: return "u8";
+#endif
+#ifdef RKNN_TENSOR_INT16
+    case RKNN_TENSOR_INT16: return "i16";
+#endif
+#ifdef RKNN_TENSOR_UINT16
+    case RKNN_TENSOR_UINT16: return "u16";
+#endif
+#ifdef RKNN_TENSOR_INT32
+    case RKNN_TENSOR_INT32: return "i32";
+#endif
+#ifdef RKNN_TENSOR_UINT32
+    case RKNN_TENSOR_UINT32: return "u32";
+#endif
+    default: return "other";
+    }
+}
+
 static int rknn_model_load(struct yolo_model *m, const char *name, const char *path, int class_count)
 {
     FILE *fp;
@@ -791,6 +833,14 @@ static int rknn_model_load(struct yolo_model *m, const char *name, const char *p
     }
     fprintf(stderr, "[%s] loaded input=%ux%ux%u outputs=%u\n",
             name, m->in_w, m->in_h, m->in_c, m->io_num.n_output);
+    for (i = 0; i < m->io_num.n_output; i++) {
+        const rknn_tensor_attr *a = &m->output_attrs[i];
+        fprintf(stderr,
+                "  out[%u]: dims=%u x %u x %u x %u n_dims=%u fmt=%s type=%s qnt=%d zp=%d scale=%.6f\n",
+                i,
+                a->dims[0], a->dims[1], a->dims[2], a->dims[3], a->n_dims,
+                tensor_fmt_name(a->fmt), tensor_type_name(a->type), a->qnt_type, a->zp, a->scale);
+    }
     return 0;
 }
 
@@ -845,15 +895,20 @@ static void decode_rows_output(const float *rows, int n_rows, int n_cols, int cl
                                struct det_box *out, int *out_count)
 {
     int i;
+    int cls_lim = class_count;
+    if (n_cols < 6)
+        return;
+    if (cls_lim > n_cols - 5)
+        cls_lim = n_cols - 5;
     for (i = 0; i < n_rows && *out_count < MAX_DETS; i++) {
         const float *r = rows + i * n_cols;
         float obj = r[4];
-        float best = 0.0f;
+        float best = (cls_lim > 0) ? 0.0f : 1.0f;
         int best_id = 0;
         int c;
         float cx = r[0], cy = r[1], bw = r[2], bh = r[3];
         struct det_box b;
-        for (c = 0; c < class_count; c++) {
+        for (c = 0; c < cls_lim; c++) {
             float p = r[5 + c];
             if (p > best) { best = p; best_id = c; }
         }
@@ -872,6 +927,258 @@ static void decode_rows_output(const float *rows, int n_rows, int n_cols, int cl
         b.cls = best_id;
         clamp_box(&b, src_w, src_h);
         out[(*out_count)++] = b;
+    }
+}
+
+static void decode_rows_output_transposed(const float *rows_t, int n_cols, int n_rows, int class_count,
+                                          float conf_thr, int src_w, int src_h, int in_w, int in_h,
+                                          struct det_box *out, int *out_count)
+{
+    int i;
+    int c;
+    int cls_lim = class_count;
+    if (n_cols < 6)
+        return;
+    if (cls_lim > n_cols - 5)
+        cls_lim = n_cols - 5;
+    for (i = 0; i < n_rows && *out_count < MAX_DETS; i++) {
+        float obj = rows_t[4 * n_rows + i];
+        float best = (cls_lim > 0) ? 0.0f : 1.0f;
+        int best_id = 0;
+        float cx = rows_t[0 * n_rows + i];
+        float cy = rows_t[1 * n_rows + i];
+        float bw = rows_t[2 * n_rows + i];
+        float bh = rows_t[3 * n_rows + i];
+        struct det_box b;
+        for (c = 0; c < cls_lim; c++) {
+            float p = rows_t[(5 + c) * n_rows + i];
+            if (p > best) { best = p; best_id = c; }
+        }
+        if (obj <= 1.0f) obj = sigmoidf_local(obj);
+        if (best <= 1.0f) best = sigmoidf_local(best);
+        if (obj * best < conf_thr)
+            continue;
+        if (bw <= 2.0f && bh <= 2.0f) {
+            cx *= (float)in_w; cy *= (float)in_h; bw *= (float)in_w; bh *= (float)in_h;
+        }
+        b.x1 = (int)((cx - bw * 0.5f) * ((float)src_w / (float)in_w));
+        b.y1 = (int)((cy - bh * 0.5f) * ((float)src_h / (float)in_h));
+        b.x2 = (int)((cx + bw * 0.5f) * ((float)src_w / (float)in_w));
+        b.y2 = (int)((cy + bh * 0.5f) * ((float)src_h / (float)in_h));
+        b.conf = obj * best;
+        b.cls = best_id;
+        clamp_box(&b, src_w, src_h);
+        out[(*out_count)++] = b;
+    }
+}
+
+static void decode_rows_tensor_output(const rknn_tensor_attr *a, const float *buf, int class_count,
+                                      float conf_thr, int src_w, int src_h, int in_w, int in_h,
+                                      struct det_box *out, int *out_count)
+{
+    int n1 = (int)a->dims[1];
+    int n2 = (int)a->dims[2];
+    if (a->n_dims != 3)
+        return;
+    if (n2 >= 6 && n2 <= 512) {
+        decode_rows_output(buf, n1, n2, class_count, conf_thr, src_w, src_h, in_w, in_h, out, out_count);
+        return;
+    }
+    if (n1 >= 6 && n1 <= 512) {
+        decode_rows_output_transposed(buf, n1, n2, class_count, conf_thr, src_w, src_h, in_w, in_h, out, out_count);
+    }
+}
+
+struct yolo_head_view {
+    uint32_t out_idx;
+    int h;
+    int w;
+    int c;
+    int stride;
+    bool nchw;
+};
+
+static bool parse_yolo_head_view(const struct yolo_model *m, uint32_t out_idx, struct yolo_head_view *hv)
+{
+    const rknn_tensor_attr *a = &m->output_attrs[out_idx];
+    int h = 0;
+    int w = 0;
+    int c = 0;
+    bool nchw = false;
+
+    if (a->n_dims != 4)
+        return false;
+    if (a->fmt == RKNN_TENSOR_NCHW) {
+        c = (int)a->dims[1];
+        h = (int)a->dims[2];
+        w = (int)a->dims[3];
+        nchw = true;
+    } else if (a->fmt == RKNN_TENSOR_NHWC) {
+        h = (int)a->dims[1];
+        w = (int)a->dims[2];
+        c = (int)a->dims[3];
+        nchw = false;
+    } else {
+        if (a->dims[2] == a->dims[3] && a->dims[1] >= 18) {
+            c = (int)a->dims[1];
+            h = (int)a->dims[2];
+            w = (int)a->dims[3];
+            nchw = true;
+        } else if (a->dims[1] == a->dims[2] && a->dims[3] >= 18) {
+            h = (int)a->dims[1];
+            w = (int)a->dims[2];
+            c = (int)a->dims[3];
+            nchw = false;
+        } else {
+            return false;
+        }
+    }
+
+    if (h <= 0 || w <= 0 || c <= 0 || c % 3 != 0 || c / 3 < 6)
+        return false;
+
+    hv->out_idx = out_idx;
+    hv->h = h;
+    hv->w = w;
+    hv->c = c;
+    hv->nchw = nchw;
+    hv->stride = (h > 0) ? ((int)m->in_h / h) : 0;
+    return hv->stride > 0;
+}
+
+static void sort_heads_by_stride(struct yolo_head_view *heads, int n)
+{
+    int i;
+    int j;
+    for (i = 0; i < n; i++) {
+        for (j = i + 1; j < n; j++) {
+            if (heads[i].stride > heads[j].stride) {
+                struct yolo_head_view t = heads[i];
+                heads[i] = heads[j];
+                heads[j] = t;
+            }
+        }
+    }
+}
+
+static float head_read(const float *buf, const struct yolo_head_view *hv, int a, int gy, int gx, int k)
+{
+    int attrs = hv->c / 3;
+    int ch = a * attrs + k;
+    if (hv->nchw)
+        return buf[((ch * hv->h + gy) * hv->w) + gx];
+    return buf[((gy * hv->w + gx) * hv->c) + ch];
+}
+
+static void decode_yolo_head_output(const float *buf, const struct yolo_head_view *hv,
+                                    const float anchors[3][2], int class_count, float conf_thr,
+                                    int src_w, int src_h, int in_w, int in_h,
+                                    struct det_box *out, int *out_count)
+{
+    int gy;
+    int gx;
+    int a;
+    int attrs = hv->c / 3;
+    int classes = attrs - 5;
+    int cls_lim = class_count;
+    if (classes <= 0)
+        return;
+    if (cls_lim > classes)
+        cls_lim = classes;
+
+    for (gy = 0; gy < hv->h && *out_count < MAX_DETS; gy++) {
+        for (gx = 0; gx < hv->w && *out_count < MAX_DETS; gx++) {
+            for (a = 0; a < 3 && *out_count < MAX_DETS; a++) {
+                float tx = head_read(buf, hv, a, gy, gx, 0);
+                float ty = head_read(buf, hv, a, gy, gx, 1);
+                float tw = head_read(buf, hv, a, gy, gx, 2);
+                float th = head_read(buf, hv, a, gy, gx, 3);
+                float to = head_read(buf, hv, a, gy, gx, 4);
+                float obj = sigmoidf_local(to);
+                float best = (cls_lim > 0) ? 0.0f : 1.0f;
+                int best_id = 0;
+                int c;
+                struct det_box b;
+                float bx;
+                float by;
+                float bw;
+                float bh;
+                float conf;
+
+                if (obj < conf_thr * 0.5f)
+                    continue;
+
+                for (c = 0; c < cls_lim; c++) {
+                    float p = sigmoidf_local(head_read(buf, hv, a, gy, gx, 5 + c));
+                    if (p > best) {
+                        best = p;
+                        best_id = c;
+                    }
+                }
+
+                conf = obj * best;
+                if (conf < conf_thr)
+                    continue;
+
+                bx = ((sigmoidf_local(tx) * 2.0f - 0.5f) + (float)gx) * (float)hv->stride;
+                by = ((sigmoidf_local(ty) * 2.0f - 0.5f) + (float)gy) * (float)hv->stride;
+                bw = powf(sigmoidf_local(tw) * 2.0f, 2.0f) * anchors[a][0];
+                bh = powf(sigmoidf_local(th) * 2.0f, 2.0f) * anchors[a][1];
+
+                b.x1 = (int)((bx - bw * 0.5f) * ((float)src_w / (float)in_w));
+                b.y1 = (int)((by - bh * 0.5f) * ((float)src_h / (float)in_h));
+                b.x2 = (int)((bx + bw * 0.5f) * ((float)src_w / (float)in_w));
+                b.y2 = (int)((by + bh * 0.5f) * ((float)src_h / (float)in_h));
+                b.conf = conf;
+                b.cls = best_id;
+                clamp_box(&b, src_w, src_h);
+                out[(*out_count)++] = b;
+            }
+        }
+    }
+}
+
+static void decode_yolo_heads_outputs(const struct yolo_model *m, const rknn_output *outs,
+                                      float conf_thr, int src_w, int src_h,
+                                      struct det_box *out, int *out_count)
+{
+    static const float anchors_p5[3][3][2] = {
+        {{10.0f, 13.0f}, {16.0f, 30.0f}, {33.0f, 23.0f}},
+        {{30.0f, 61.0f}, {62.0f, 45.0f}, {59.0f, 119.0f}},
+        {{116.0f, 90.0f}, {156.0f, 198.0f}, {373.0f, 326.0f}},
+    };
+    static const float anchors_p6[4][3][2] = {
+        {{19.0f, 27.0f}, {44.0f, 40.0f}, {38.0f, 94.0f}},
+        {{96.0f, 68.0f}, {86.0f, 152.0f}, {180.0f, 137.0f}},
+        {{140.0f, 301.0f}, {303.0f, 264.0f}, {238.0f, 542.0f}},
+        {{436.0f, 615.0f}, {739.0f, 380.0f}, {925.0f, 792.0f}},
+    };
+    struct yolo_head_view heads[8];
+    int head_count = 0;
+    uint32_t i;
+
+    for (i = 0; i < m->io_num.n_output && head_count < 8; i++) {
+        if (parse_yolo_head_view(m, i, &heads[head_count]))
+            head_count++;
+    }
+    if (head_count == 0)
+        return;
+
+    sort_heads_by_stride(heads, head_count);
+    for (i = 0; i < (uint32_t)head_count && *out_count < MAX_DETS; i++) {
+        const float (*anchors)[2] = NULL;
+        if (head_count == 3 && i < 3)
+            anchors = anchors_p5[i];
+        else if (head_count == 4 && i < 4)
+            anchors = anchors_p6[i];
+        else if (i < 3)
+            anchors = anchors_p5[i];
+        if (!anchors)
+            continue;
+
+        decode_yolo_head_output((const float *)outs[heads[i].out_idx].buf, &heads[i], anchors,
+                                m->class_count, conf_thr, src_w, src_h,
+                                (int)m->in_w, (int)m->in_h, out, out_count);
     }
 }
 
@@ -903,11 +1210,13 @@ static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src
 
     for (i = 0; i < m->io_num.n_output; i++) {
         rknn_tensor_attr *a = &m->output_attrs[i];
-        if (a->n_dims == 3 && a->dims[2] >= 6)
-            decode_rows_output((float *)outs[i].buf, (int)a->dims[1], (int)a->dims[2],
-                               m->class_count, conf_thr, src_w, src_h,
-                               (int)m->in_w, (int)m->in_h, out, out_count);
+        if (a->n_dims == 3)
+            decode_rows_tensor_output(a, (const float *)outs[i].buf, m->class_count,
+                                      conf_thr, src_w, src_h, (int)m->in_w, (int)m->in_h,
+                                      out, out_count);
     }
+    if (*out_count == 0)
+        decode_yolo_heads_outputs(m, outs, conf_thr, src_w, src_h, out, out_count);
 
     if (*out_count > MAX_DETS) *out_count = MAX_DETS;
     nms_inplace(out, out_count, 0.45f);
@@ -1043,6 +1352,8 @@ static void *infer_thread_main(void *arg)
         t1 = mono_us();
 
         memset(&r, 0, sizeof(r));
+        r.car_raw_count = car_count;
+        r.plate_raw_count = plate_count;
         for (i = 0; i < car_count && r.car_count < MAX_DETS; i++) {
             if (cars[i].cls == ctx->car_class_id)
                 r.cars[r.car_count++] = cars[i];
@@ -1116,9 +1427,12 @@ static void print_stats(struct app_ctx *ctx)
     pthread_mutex_unlock(&ctx->result_lock);
     fprintf(stderr,
             "[stats] cap=%" PRIu64 " push=%" PRIu64 " rel=%" PRIu64
-            " infer=%" PRIu64 " infer_ms=%.2f drop=%" PRIu64 " cap_fps=%.2f disp_fps=%.2f infer_fps=%.2f\n",
+            " infer=%" PRIu64 " infer_ms=%.2f cars=%d(raw=%d) plates=%d(raw=%d) drop=%" PRIu64
+            " cap_fps=%.2f disp_fps=%.2f infer_fps=%.2f\n",
             ctx->captured_frames, ctx->pushed_frames, ctx->released_frames,
-            r.infer_frames_total, r.infer_ms_last, ctx->infer_overwrite_count,
+            r.infer_frames_total, r.infer_ms_last,
+            r.car_count, r.car_raw_count, r.plate_count, r.plate_raw_count,
+            ctx->infer_overwrite_count,
             (double)(ctx->captured_frames - ctx->last_stats_cap) * 1000000.0 / (double)dt,
             (double)(ctx->released_frames - ctx->last_stats_rel) * 1000000.0 / (double)dt,
             (double)(r.infer_frames_total - ctx->last_stats_infer) * 1000000.0 / (double)dt);
@@ -1277,4 +1591,3 @@ out:
     cleanup(&ctx);
     return ret;
 }
-
