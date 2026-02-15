@@ -300,3 +300,40 @@ sudo ./run_lpr_kms.sh --veh-model <veh.rknn> --plate-model <plate.rknn> --labels
 - Overlays are drawn directly on BGR565 frame buffer.
 - Inference thread converts BGR565 -> RGB888 only for model input.
 - Plate-to-car association uses center-in-box / containment ratio rule.
+
+---
+
+## Phase S: Camera Source Root-Cause Diagnostics (Implemented, No RTL/ABI Change)
+
+### Scope
+- Diagnostic-only phase.
+- No driver ABI change, no FPGA RTL change, no application API/CLI change.
+- Goal: classify image-quality issues by source path:
+1. Sensor init-table integrity blocker
+2. Spatial sharpness/aliasing risk in capture path
+3. AWB/AEC drift or exposure/gain instability
+
+### Added Tools
+- `audit_reg_config.py`
+: Audits `hdl/reg_config.v` for index continuity, duplicate register writes, key-register final values, and trust verdict.
+- `analyze_ppm_metrics.py`
+: Computes sharpness and photometric metrics from PPM sequences (Laplacian variance, edge density, HF ratio, RGB/luma drift, clipping).
+- `run_phaseS_probe.sh`
+: One-command blocker audit + frame capture + metric report.
+
+### Run
+```bash
+chmod +x run_phaseS_probe.sh
+sudo ./run_phaseS_probe.sh --label static_texture --prefix /tmp/fprobe/phaseS_static
+```
+
+### Multi-light AWB/AEC comparison (fixed framing)
+```bash
+sudo ./run_phaseS_probe.sh --label gray_indoor --prefix /tmp/fprobe/gray_indoor
+sudo ./run_phaseS_probe.sh --label gray_daylight --prefix /tmp/fprobe/gray_daylight
+sudo ./run_phaseS_probe.sh --label gray_filllight --prefix /tmp/fprobe/gray_filllight
+```
+
+### Notes
+- Default behavior is strict blocker mode: if init-table audit is untrusted, probe stops.
+- Use `--force-run` only for temporary exploratory metrics when blocker is not yet fixed.
