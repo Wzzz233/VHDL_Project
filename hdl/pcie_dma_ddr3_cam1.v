@@ -175,6 +175,12 @@ wire			p_rdy_pcie;
 wire			p_rdy_cfg;			
 wire			p_rdy_dma;			
 
+// External BAR2 read override for MWR frame data
+wire			mwr_rd_clk_en;
+wire	[11:0]	mwr_rd_addr;
+reg		[127:0]	mwr_rd_data;
+wire			mwr_cmd_start;
+
 assign cfg_ido_req_en	=	1'b0;	
 assign cfg_ido_cpl_en	=	1'b0;	
 assign xadm_ph_cdts		=	8'b0;	
@@ -580,7 +586,7 @@ wire camera_pwnd;
 wire initial_en;
 
 power_on_delay u_power_on_delay (
-    .clk_50M        (cfg_clk),      // Use PLL output clock
+    .clk_50M        (sys_clk),      // Stage 1: keep delay logic in 25MHz system clock domain
     .reset_n        (ddr_rstn),
     .camera1_rstn   (camera_rstn),
     .camera2_rstn   (),
@@ -596,7 +602,7 @@ assign cmos_reset = camera_rstn;
 wire cmos1_init_done /*synthesis PAP_MARK_DEBUG="1"*/;
 
 reg_config u_cmos1_config (
-    .clk_25M        (cfg_clk),          // Use PLL output clock (~50MHz but works)
+    .clk_25M        (sys_clk),          // Stage 1: force camera config logic to 25MHz
     .camera_rstn    (camera_rstn),      // From power_on_delay
     .initial_en     (initial_en),       // From power_on_delay
     .i2c_sclk       (cmos1_scl),        // I2C clock output
@@ -634,6 +640,12 @@ cmos_8_16bit u_cmos1_8_16bit (
     .de_o       (cmos1_href_16bit)      // Output: data enable
 );
 
+// Stage 1 color normalization: keep hardware output explicitly defined.
+localparam CAM_SWAP_RB = 1'b0;
+wire [15:0] cmos1_rgb565_fmt = CAM_SWAP_RB ?
+    {cmos1_d_16bit[4:0], cmos1_d_16bit[10:5], cmos1_d_16bit[15:11]} :
+    cmos1_d_16bit;
+
 //=============================================================================
 // Frame Buffer (Camera → DDR3)
 //=============================================================================
@@ -668,11 +680,6 @@ wire [127:0]               frame_rd_data;
 //=============================================================================
 // MWR Data Source (frame data for DMA transfer to host)
 //=============================================================================
-wire        mwr_rd_clk_en;
-wire [11:0] mwr_rd_addr;
-reg  [127:0] mwr_rd_data;
-wire        mwr_cmd_start;
-
 // Start one read session on DMA command start and keep the session
 // active across chunk gaps until a full frame has been consumed.
 localparam integer         FRAME_WORDS = (1280 * 720 * 16) / 128;
@@ -740,7 +747,7 @@ fram_buf #(
     .vin_clk            (cmos1_pclk_16bit),
     .wr_fsync           (cmos1_vsync_d0),
     .wr_en              (cmos1_href_16bit),
-    .wr_data            (cmos1_d_16bit),
+    .wr_data            (cmos1_rgb565_fmt),
     .init_done          (fram_buf_init_done),
     
     // Read output (for future PCIe DMA) - tied off for now
