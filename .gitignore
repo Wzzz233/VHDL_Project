@@ -20,6 +20,17 @@ impl/
 synthesis/
 place/
 route/
+compile/
+constraint_check/
+device_map/
+generate_bitstream/
+place_route/
+report_timing/
+synthesize/
+work/
+*.pds.lock
+data.wf
+multiseed_summary.csv
 
 # Temp files
 *.bak
