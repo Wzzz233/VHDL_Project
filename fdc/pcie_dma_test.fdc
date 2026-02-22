@@ -494,7 +494,7 @@ define_attribute {p:cmos1_data[4]} {PAP_IO_DIRECTION} {INPUT}
 define_attribute {p:cmos1_data[4]} {PAP_IO_LOC} {W19}
 define_attribute {p:cmos1_data[4]} {PAP_IO_VCCIO} {3.3}
 define_attribute {p:cmos1_data[4]} {PAP_IO_STANDARD} {LVCMOS33}
-define_attribute {p:cmos1_data[4]} {PAP_IO_UNUSED} {TRUE}
+define_attribute {p:cmos1_data[4]} {PAP_IO_NONE} {TRUE}
 define_attribute {p:cmos1_data[3]} {PAP_IO_DIRECTION} {INPUT}
 define_attribute {p:cmos1_data[3]} {PAP_IO_LOC} {P15}
 define_attribute {p:cmos1_data[3]} {PAP_IO_VCCIO} {3.3}
