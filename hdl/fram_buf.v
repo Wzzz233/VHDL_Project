@@ -32,6 +32,7 @@ module fram_buf #(
     input                         vin_clk,
     input                         wr_fsync,
     input                         wr_en,
+    input                         wr_data_vld,
     input  [PIX_WIDTH- 1'b1 : 0]  wr_data,
     output reg                    init_done=0,
     
@@ -139,6 +140,7 @@ module fram_buf #(
         .wr_clk           (  vin_clk          ),//input                         wr_clk,
         .wr_fsync         (  wr_fsync         ),//input                         wr_fsync,
         .wr_en            (  wr_en            ),//input                         wr_en,
+        .wr_data_vld      (  wr_data_vld      ),//input                         wr_data_vld,
         .wr_data          (  wr_data          ),//input  [PIX_WIDTH- 1'b1 : 0]  wr_data,
         
         .rd_bac           (  ddr_wr_bac       ),//input                         rd_bac,                                      
