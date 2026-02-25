@@ -45,7 +45,9 @@ always @(posedge pclk or negedge rst_n) begin
         end else if (!byte_phase) begin
             byte_hi <= pdata_i;
             byte_phase <= 1'b1;
-            de_pair <= 1'b0;
+            // Keep de_pair asserted within an active line so pixel_clk-domain
+            // sampling does not miss a one-pclk pulse due to phase offset.
+            de_pair <= de_pair;
         end else begin
             data_pair <= {byte_hi, pdata_i};
             byte_phase <= 1'b0;
