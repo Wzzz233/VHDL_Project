@@ -13,6 +13,8 @@ set_clock_uncertainty {0.200} [get_clocks {cmos1_pclk}] -setup -hold
 set_clock_groups -name {async_domains} -asynchronous -group [get_clocks {pclk pclk_div2 ref_clk}] -group [get_clocks {sys_clk cfg_clk}] -group [get_clocks {cmos1_pclk}]
 ###==== END "set_clock_groups"
 ###==== BEGIN "set_input_delay"
+set_input_delay -clock [get_clocks {cmos1_pclk}] -max 2.5 [get_ports {cmos1_data[0] cmos1_data[1] cmos1_data[2] cmos1_data[3] cmos1_data[4] cmos1_data[5] cmos1_data[6] cmos1_data[7] cmos1_href cmos1_vsync}]
+set_input_delay -clock [get_clocks {cmos1_pclk}] -min 0.5 [get_ports {cmos1_data[0] cmos1_data[1] cmos1_data[2] cmos1_data[3] cmos1_data[4] cmos1_data[5] cmos1_data[6] cmos1_data[7] cmos1_href cmos1_vsync}]
 ###==== END "set_input_delay"
 
 ###==== BEGIN "set_output_delay"
