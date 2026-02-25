@@ -668,7 +668,7 @@ begin
 end
 endfunction
 
-always @(posedge cmos1_pclk or negedge cmos1_init_done) begin
+always @(posedge cmos1_pclk_16bit or negedge cmos1_init_done) begin
     if (!cmos1_init_done) begin
         cmos1_bar_x <= 12'd0;
         cmos1_href_16bit_d <= 1'b0;
@@ -791,7 +791,7 @@ fram_buf #(
     .ddr_rstn           (ddr_init_done),
     
     // Camera input (write to DDR)
-    .vin_clk            (cmos1_pclk),
+    .vin_clk            (cmos1_pclk_16bit),
     .wr_fsync           (cmos1_vsync_d0),
     .wr_en              (cmos1_href_16bit),
     .wr_data            (cmos1_wr_data),
