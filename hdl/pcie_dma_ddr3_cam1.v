@@ -745,8 +745,7 @@ wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
 wire [11:0]                post_ddr_x_pix = {post_ddr_word_x, 3'b000};
 wire [15:0]                post_ddr_color_base = color_bar_bgr565(post_ddr_x_pix);
-wire [15:0]                post_ddr_color_data =
-                            (post_ddr_line_y[5:0] == 6'd0) ? 16'hFFFF : post_ddr_color_base;
+wire [15:0]                post_ddr_color_data = post_ddr_color_base;
 wire [127:0]               post_ddr_pattern_data = {8{post_ddr_color_data}};
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
