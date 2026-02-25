@@ -622,6 +622,7 @@ wire [15:0] cmos1_d_16bit;
 wire        cmos1_href_16bit;
 wire        cmos1_pclk_16bit;
 wire        cmos1_pix_vld;
+localparam  CMOS1_CAPTURE_NEGEDGE = 1'b0;
 
 // Register input signals
 always @(posedge cmos1_pclk) begin
@@ -630,7 +631,9 @@ always @(posedge cmos1_pclk) begin
     cmos1_vsync_d0 <= cmos1_vsync;
 end
 
-cmos_8_16bit u_cmos1_8_16bit (
+cmos_8_16bit #(
+    .CAPTURE_ON_NEGEDGE (CMOS1_CAPTURE_NEGEDGE)
+) u_cmos1_8_16bit (
     .pclk       (cmos1_pclk),           // Pixel clock from camera
     .rst_n      (cmos1_init_done),      // Reset after I2C config done
     .pdata_i    (cmos1_data_d0),        // 8-bit input data
@@ -736,10 +739,15 @@ localparam integer         FRAME_WORDS = (1280 * 720 * 16) / 128;
 reg                        dma_session_active;
 reg  [16:0]                dma_rd_word_count;
 reg  [5:0]                 rd_fsync_stretch_cnt;
-reg  [31:0]                post_ddr_pattern_cnt;
+reg  [7:0]                 post_ddr_word_x;
+reg  [9:0]                 post_ddr_line_y;
 wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
-wire [127:0]               post_ddr_pattern_data = {post_ddr_pattern_cnt, post_ddr_pattern_cnt, post_ddr_pattern_cnt, post_ddr_pattern_cnt};
+wire [11:0]                post_ddr_x_pix = {post_ddr_word_x, 3'b000};
+wire [15:0]                post_ddr_color_base = color_bar_bgr565(post_ddr_x_pix);
+wire [15:0]                post_ddr_color_data =
+                            (post_ddr_line_y[5:0] == 6'd0) ? 16'hFFFF : post_ddr_color_base;
+wire [127:0]               post_ddr_pattern_data = {8{post_ddr_color_data}};
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
@@ -776,9 +784,22 @@ assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
         mwr_rd_data <= 128'h0;
-        post_ddr_pattern_cnt <= 32'h0;
+        post_ddr_word_x <= 8'd0;
+        post_ddr_line_y <= 10'd0;
+    end else if (dma_session_start) begin
+        post_ddr_word_x <= 8'd0;
+        post_ddr_line_y <= 10'd0;
     end else if (mwr_rd_clk_en) begin
-        post_ddr_pattern_cnt <= post_ddr_pattern_cnt + 32'd1;
+        if (post_ddr_word_x == 8'd159) begin
+            post_ddr_word_x <= 8'd0;
+            if (post_ddr_line_y == 10'd719)
+                post_ddr_line_y <= 10'd0;
+            else
+                post_ddr_line_y <= post_ddr_line_y + 10'd1;
+        end else begin
+            post_ddr_word_x <= post_ddr_word_x + 8'd1;
+            post_ddr_line_y <= post_ddr_line_y;
+        end
         mwr_rd_data <= FORCE_PATTERN_POST_DDR ? post_ddr_pattern_data : frame_rd_data;
     end
 end
