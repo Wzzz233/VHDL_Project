@@ -621,6 +621,7 @@ reg         cmos1_vsync_d0;
 wire [15:0] cmos1_d_16bit;
 wire        cmos1_href_16bit;
 wire        cmos1_pclk_16bit;
+wire        cmos1_pix_vld;
 
 // Register input signals
 always @(posedge cmos1_pclk) begin
@@ -636,8 +637,9 @@ cmos_8_16bit u_cmos1_8_16bit (
     .de_i       (cmos1_href_d0),        // Data enable (href)
     .vs_i       (cmos1_vsync_d0),       // Vsync
     .pixel_clk  (cmos1_pclk_16bit),     // Output: divided pixel clock
+    .pix_vld_o  (cmos1_pix_vld),        // Output: 16-bit pixel valid pulse
     .pdata_o    (cmos1_d_16bit),        // Output: 16-bit RGB565
-    .de_o       (cmos1_href_16bit)      // Output: data enable
+    .de_o       (cmos1_href_16bit)      // Output: line active
 );
 
 // Stage 1 color normalization: keep hardware output explicitly defined.
@@ -646,9 +648,9 @@ wire [15:0] cmos1_rgb565_fmt = CAM_SWAP_RB ?
     {cmos1_d_16bit[4:0], cmos1_d_16bit[10:5], cmos1_d_16bit[15:11]} :
     cmos1_d_16bit;
 
-// Color bar debug mode: force perfect test pattern before DDR write.
-// Set to 1'b0 to return to camera data.
-localparam FORCE_COLOR_BAR_TEST = 1'b0;
+// Debug injection switches (default disabled).
+localparam FORCE_COLOR_BAR_PRE_DDR = 1'b0;
+localparam FORCE_PATTERN_POST_DDR  = 1'b0;
 
 reg [11:0] cmos1_bar_x;
 reg        cmos1_href_16bit_d;
@@ -668,7 +670,7 @@ begin
 end
 endfunction
 
-always @(posedge cmos1_pclk_16bit or negedge cmos1_init_done) begin
+always @(posedge cmos1_pclk or negedge cmos1_init_done) begin
     if (!cmos1_init_done) begin
         cmos1_bar_x <= 12'd0;
         cmos1_href_16bit_d <= 1'b0;
@@ -681,7 +683,7 @@ always @(posedge cmos1_pclk_16bit or negedge cmos1_init_done) begin
             cmos1_bar_x <= 12'd0;
         end else if ((~cmos1_href_16bit_d) && cmos1_href_16bit) begin
             cmos1_bar_x <= 12'd0;
-        end else if (cmos1_href_16bit) begin
+        end else if (cmos1_pix_vld) begin
             if (cmos1_bar_x == 12'd1279)
                 cmos1_bar_x <= 12'd0;
             else
@@ -691,7 +693,8 @@ always @(posedge cmos1_pclk_16bit or negedge cmos1_init_done) begin
 end
 
 wire [15:0] cmos1_bar_data = color_bar_bgr565(cmos1_bar_x);
-wire [15:0] cmos1_wr_data = FORCE_COLOR_BAR_TEST ? cmos1_bar_data : cmos1_rgb565_fmt;
+wire [15:0] cmos1_wr_data_pre = FORCE_COLOR_BAR_PRE_DDR ? cmos1_bar_data : cmos1_rgb565_fmt;
+wire [15:0] cmos1_wr_data = cmos1_wr_data_pre;
 
 //=============================================================================
 // Frame Buffer (Camera → DDR3)
@@ -733,8 +736,10 @@ localparam integer         FRAME_WORDS = (1280 * 720 * 16) / 128;
 reg                        dma_session_active;
 reg  [16:0]                dma_rd_word_count;
 reg  [5:0]                 rd_fsync_stretch_cnt;
+reg  [31:0]                post_ddr_pattern_cnt;
 wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
+wire [127:0]               post_ddr_pattern_data = {post_ddr_pattern_cnt, post_ddr_pattern_cnt, post_ddr_pattern_cnt, post_ddr_pattern_cnt};
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
@@ -771,8 +776,10 @@ assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
         mwr_rd_data <= 128'h0;
+        post_ddr_pattern_cnt <= 32'h0;
     end else if (mwr_rd_clk_en) begin
-        mwr_rd_data <= frame_rd_data;
+        post_ddr_pattern_cnt <= post_ddr_pattern_cnt + 32'd1;
+        mwr_rd_data <= FORCE_PATTERN_POST_DDR ? post_ddr_pattern_data : frame_rd_data;
     end
 end
 
@@ -791,9 +798,10 @@ fram_buf #(
     .ddr_rstn           (ddr_init_done),
     
     // Camera input (write to DDR)
-    .vin_clk            (cmos1_pclk_16bit),
+    .vin_clk            (cmos1_pclk),
     .wr_fsync           (cmos1_vsync_d0),
     .wr_en              (cmos1_href_16bit),
+    .wr_data_vld        (cmos1_pix_vld),
     .wr_data            (cmos1_wr_data),
     .init_done          (fram_buf_init_done),
     
