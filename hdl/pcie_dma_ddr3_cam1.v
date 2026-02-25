@@ -615,34 +615,26 @@ reg_config u_cmos1_config (
 //=============================================================================
 // Camera 1 Data Capture (8-bit to 16-bit RGB565)
 //=============================================================================
-reg  [7:0]  cmos1_data_d0;
-reg         cmos1_href_d0;
-reg         cmos1_vsync_d0;
 wire [15:0] cmos1_d_16bit;
 wire        cmos1_href_16bit;
+wire        cmos1_vsync_16bit;
 wire        cmos1_pclk_16bit;
 wire        cmos1_pix_vld;
 localparam  CMOS1_CAPTURE_NEGEDGE = 1'b0;
-
-// Register input signals
-always @(posedge cmos1_pclk) begin
-    cmos1_data_d0  <= cmos1_data;
-    cmos1_href_d0  <= cmos1_href;
-    cmos1_vsync_d0 <= cmos1_vsync;
-end
 
 cmos_8_16bit #(
     .CAPTURE_ON_NEGEDGE (CMOS1_CAPTURE_NEGEDGE)
 ) u_cmos1_8_16bit (
     .pclk       (cmos1_pclk),           // Pixel clock from camera
     .rst_n      (cmos1_init_done),      // Reset after I2C config done
-    .pdata_i    (cmos1_data_d0),        // 8-bit input data
-    .de_i       (cmos1_href_d0),        // Data enable (href)
-    .vs_i       (cmos1_vsync_d0),       // Vsync
+    .pdata_i    (cmos1_data),           // 8-bit input data
+    .de_i       (cmos1_href),           // Data enable (href)
+    .vs_i       (cmos1_vsync),          // Vsync
     .pixel_clk  (cmos1_pclk_16bit),     // Output: divided pixel clock
     .pix_vld_o  (cmos1_pix_vld),        // Output: 16-bit pixel valid pulse
     .pdata_o    (cmos1_d_16bit),        // Output: 16-bit RGB565
-    .de_o       (cmos1_href_16bit)      // Output: line active
+    .de_o       (cmos1_href_16bit),     // Output: line active
+    .vs_o       (cmos1_vsync_16bit)     // Output: frame sync aligned to capture domain
 );
 
 // Stage 1 color normalization: keep hardware output explicitly defined.
@@ -657,7 +649,7 @@ localparam FORCE_PATTERN_POST_DDR  = 1'b0;
 
 reg [11:0] cmos1_bar_x;
 reg        cmos1_href_16bit_d;
-reg        cmos1_vsync_d0_d;
+reg        cmos1_vsync_16bit_d;
 
 function [15:0] color_bar_bgr565;
     input [11:0] x;
@@ -677,12 +669,12 @@ always @(posedge cmos1_pclk or negedge cmos1_init_done) begin
     if (!cmos1_init_done) begin
         cmos1_bar_x <= 12'd0;
         cmos1_href_16bit_d <= 1'b0;
-        cmos1_vsync_d0_d <= 1'b0;
+        cmos1_vsync_16bit_d <= 1'b0;
     end else begin
         cmos1_href_16bit_d <= cmos1_href_16bit;
-        cmos1_vsync_d0_d <= cmos1_vsync_d0;
+        cmos1_vsync_16bit_d <= cmos1_vsync_16bit;
 
-        if ((~cmos1_vsync_d0_d) && cmos1_vsync_d0) begin
+        if ((~cmos1_vsync_16bit_d) && cmos1_vsync_16bit) begin
             cmos1_bar_x <= 12'd0;
         end else if ((~cmos1_href_16bit_d) && cmos1_href_16bit) begin
             cmos1_bar_x <= 12'd0;
@@ -819,7 +811,7 @@ fram_buf #(
     
     // Camera input (write to DDR)
     .vin_clk            (cmos1_pclk),
-    .wr_fsync           (cmos1_vsync_d0),
+    .wr_fsync           (cmos1_vsync_16bit),
     .wr_en              (cmos1_href_16bit),
     .wr_data_vld        (cmos1_pix_vld),
     .wr_data            (cmos1_wr_data),

@@ -13,6 +13,7 @@ module cmos_8_16bit #(
     output reg          pixel_clk,
     output reg          de_o,
     output reg          pix_vld_o,
+    output reg          vs_o,
     output reg  [15:0]  pdata_o
 );
 
@@ -63,6 +64,7 @@ always @(posedge pclk or negedge rst_n) begin
         byte_hi    <= 8'd0;
         de_o       <= 1'b0;
         pix_vld_o  <= 1'b0;
+        vs_o       <= 1'b0;
         pdata_o    <= 16'd0;
     end else begin
         pixel_clk <= ~pixel_clk;
@@ -70,6 +72,7 @@ always @(posedge pclk or negedge rst_n) begin
         vs_src_d <= vs_src;
         de_o <= de_src;
         pix_vld_o <= 1'b0;
+        vs_o <= vs_src;
 
         if (frame_start) begin
             byte_phase <= 1'b0;
