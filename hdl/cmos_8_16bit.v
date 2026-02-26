@@ -30,6 +30,9 @@ reg [7:0]   byte_hi;
 
 wire line_start = (~de_src_d) & de_src;
 wire frame_start = (~vs_src_d) & vs_src;
+assign pdata_src = pdata_cap;
+assign de_src = de_cap;
+assign vs_src = vs_cap;
 
 generate
     if (CAPTURE_ON_NEGEDGE) begin : g_negedge_capture
@@ -44,14 +47,18 @@ generate
                 vs_cap    <= vs_i;
             end
         end
-
-        assign pdata_src = pdata_cap;
-        assign de_src = de_cap;
-        assign vs_src = vs_cap;
-    end else begin : g_posedge_direct
-        assign pdata_src = pdata_i;
-        assign de_src = de_i;
-        assign vs_src = vs_i;
+    end else begin : g_posedge_capture
+        always @(posedge pclk or negedge rst_n) begin
+            if (!rst_n) begin
+                pdata_cap <= 8'd0;
+                de_cap    <= 1'b0;
+                vs_cap    <= 1'b0;
+            end else begin
+                pdata_cap <= pdata_i;
+                de_cap    <= de_i;
+                vs_cap    <= vs_i;
+            end
+        end
     end
 endgenerate
 
