@@ -620,7 +620,7 @@ wire        cmos1_href_16bit;
 wire        cmos1_vsync_16bit;
 wire        cmos1_pclk_16bit;
 wire        cmos1_pix_vld;
-localparam  CMOS1_CAPTURE_NEGEDGE = 1'b0;
+localparam  CMOS1_CAPTURE_NEGEDGE = 1'b1;
 
 cmos_8_16bit #(
     .CAPTURE_ON_NEGEDGE (CMOS1_CAPTURE_NEGEDGE)
