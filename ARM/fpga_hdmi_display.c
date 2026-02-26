@@ -836,6 +836,27 @@ static GstBuffer *build_frame_buffer(struct app_ctx *ctx, const struct slot_tick
     return buf;
 }
 
+static GstBuffer *build_zero_copy_buffer(struct app_ctx *ctx, const uint8_t *frame_src)
+{
+    GstBuffer *buf;
+
+    buf = gst_buffer_new_wrapped_full((GstMemoryFlags)0,
+                                      (gpointer)frame_src,
+                                      ctx->display_frame_size,
+                                      0,
+                                      ctx->display_frame_size,
+                                      NULL,
+                                      NULL);
+    if (!buf)
+        return NULL;
+
+    GST_BUFFER_PTS(buf) = ctx->next_pts_ns;
+    GST_BUFFER_DURATION(buf) = (guint64)(GST_SECOND / ctx->opt.fps);
+    ctx->next_pts_ns += GST_BUFFER_DURATION(buf);
+
+    return buf;
+}
+
 static void get_slot_counts(struct app_ctx *ctx, int *free_slots, int *used_slots)
 {
     int i;
@@ -1103,6 +1124,7 @@ int main(int argc, char **argv)
 
     while (ctx.running) {
         struct slot_ticket ticket;
+        bool ticket_valid = false;
         GstBuffer *buf;
         GstFlowReturn flow;
         const uint8_t *frame_src;
@@ -1118,12 +1140,8 @@ int main(int argc, char **argv)
         t0 = mono_us();
 
         if (ctx.zero_copy_mode) {
-            if (acquire_free_slot(&ctx, &ticket) < 0)
-                break;
-
             if (trigger_frame_dma(&ctx) < 0) {
                 fprintf(stderr, "DMA trigger failed\n");
-                release_slot_ticket(&ctx, &ticket, false);
                 break;
             }
             ctx.captured_frames++;
@@ -1131,10 +1149,13 @@ int main(int argc, char **argv)
             frame_src = (const uint8_t *)ctx.dma_map;
             if (!frame_src) {
                 fprintf(stderr, "Frame source is null in io-mode=mmap\n");
-                release_slot_ticket(&ctx, &ticket, false);
                 break;
             }
-            prepare_display_frame(&ctx, ctx.slots[ticket.idx].data, frame_src);
+            buf = build_zero_copy_buffer(&ctx, frame_src);
+            if (!buf) {
+                fprintf(stderr, "Failed to build zero-copy GstBuffer\n");
+                break;
+            }
         } else {
             if (trigger_frame_dma(&ctx) < 0) {
                 fprintf(stderr, "DMA trigger failed\n");
@@ -1144,6 +1165,7 @@ int main(int argc, char **argv)
 
             if (acquire_free_slot(&ctx, &ticket) < 0)
                 break;
+            ticket_valid = true;
 
             frame_src = (ctx.opt.io_mode == IO_MODE_COPY) ? ctx.dma_copy : (const uint8_t *)ctx.dma_map;
             if (!frame_src) {
@@ -1153,18 +1175,18 @@ int main(int argc, char **argv)
                 break;
             }
             prepare_display_frame(&ctx, ctx.slots[ticket.idx].data, frame_src);
-        }
-
-        buf = build_frame_buffer(&ctx, &ticket);
-        if (!buf) {
-            fprintf(stderr, "Failed to build GstBuffer for slot %d\n", ticket.idx);
-            break;
+            buf = build_frame_buffer(&ctx, &ticket);
+            if (!buf) {
+                fprintf(stderr, "Failed to build GstBuffer for slot %d\n", ticket.idx);
+                break;
+            }
         }
 
         flow = gst_app_src_push_buffer(GST_APP_SRC(ctx.appsrc), buf);
         if (flow != GST_FLOW_OK) {
             fprintf(stderr, "gst_app_src_push_buffer failed: %d\n", flow);
-            release_slot_ticket(&ctx, &ticket, false);
+            if (ticket_valid)
+                release_slot_ticket(&ctx, &ticket, false);
             break;
         }
         ctx.pushed_frames++;
