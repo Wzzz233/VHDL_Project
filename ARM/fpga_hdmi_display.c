@@ -67,6 +67,7 @@ struct options {
 
 struct frame_slot {
     uint8_t *data;
+    bool owns_data;
     bool in_use;
     uint64_t generation;
 };
@@ -85,8 +86,12 @@ struct app_ctx {
     uint32_t frame_width;
     uint32_t frame_height;
     uint32_t frame_bpp;
+    uint32_t frame_stride;
+    uint32_t pixel_format;
     size_t frame_size;
     size_t display_frame_size;
+    bool source_is_bgrx;
+    bool zero_copy_mode;
 
     struct frame_slot *slots;
     int slot_count;
@@ -504,9 +509,22 @@ static int process_events(struct app_ctx *ctx, int wait_ms)
     return 0;
 }
 
+static const char *pixel_format_name(uint32_t pixel_format)
+{
+    switch (pixel_format) {
+    case FPGA_PIXEL_FORMAT_BGRX8888:
+        return "BGRX8888";
+    case FPGA_PIXEL_FORMAT_BGR565:
+        return "BGR565";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 static int init_fpga_dma(struct app_ctx *ctx)
 {
     struct fpga_info info;
+    uint32_t min_stride;
 
     ctx->dev_fd = open(ctx->opt.device_path, O_RDWR | O_CLOEXEC);
     if (ctx->dev_fd < 0) {
@@ -519,18 +537,42 @@ static int init_fpga_dma(struct app_ctx *ctx)
         return -1;
     }
 
-    if (info.frame_width != 1280 || info.frame_height != 720 || info.frame_bpp != 2) {
+    if (info.frame_width != 1280 || info.frame_height != 720) {
         fprintf(stderr,
-                "Unsupported frame format: %ux%u bpp=%u (expected 1280x720 bpp=2)\n",
-                info.frame_width, info.frame_height, info.frame_bpp);
+                "Unsupported frame geometry: %ux%u (expected 1280x720)\n",
+                info.frame_width, info.frame_height);
         return -1;
     }
+
+    if (info.pixel_format == FPGA_PIXEL_FORMAT_BGRX8888)
+        info.frame_bpp = 4;
+    else if (info.pixel_format == FPGA_PIXEL_FORMAT_BGR565)
+        info.frame_bpp = 2;
+    else if (info.frame_bpp == 4)
+        info.pixel_format = FPGA_PIXEL_FORMAT_BGRX8888;
+    else if (info.frame_bpp == 2)
+        info.pixel_format = FPGA_PIXEL_FORMAT_BGR565;
+
+    if (info.frame_bpp != 2 && info.frame_bpp != 4) {
+        fprintf(stderr, "Unsupported frame_bpp=%u (expected 2 or 4)\n", info.frame_bpp);
+        return -1;
+    }
+
+    min_stride = info.frame_width * info.frame_bpp;
+    if (info.frame_stride < min_stride)
+        info.frame_stride = min_stride;
 
     ctx->frame_width = info.frame_width;
     ctx->frame_height = info.frame_height;
     ctx->frame_bpp = info.frame_bpp;
-    ctx->frame_size = (size_t)ctx->frame_width * ctx->frame_height * ctx->frame_bpp;
-    ctx->display_frame_size = (size_t)ctx->frame_width * ctx->frame_height * 4U; /* BGRx */
+    ctx->frame_stride = info.frame_stride;
+    ctx->pixel_format = info.pixel_format;
+    ctx->frame_size = (size_t)ctx->frame_stride * ctx->frame_height;
+    ctx->source_is_bgrx = (ctx->pixel_format == FPGA_PIXEL_FORMAT_BGRX8888) || (ctx->frame_bpp == 4);
+    ctx->display_frame_size = ctx->source_is_bgrx
+        ? ctx->frame_size
+        : ((size_t)ctx->frame_width * ctx->frame_height * 4U);
+    ctx->zero_copy_mode = ctx->source_is_bgrx && (ctx->opt.io_mode == IO_MODE_MMAP);
 
     if (ctx->opt.io_mode == IO_MODE_MMAP) {
         struct buffer_map map;
@@ -562,10 +604,19 @@ static int init_fpga_dma(struct app_ctx *ctx)
         }
     }
 
-    fprintf(stderr, "FPGA DMA ready: %ux%u bpp=%u frame=%zu bytes (io-mode=%s swap16=%s)\n",
-            ctx->frame_width, ctx->frame_height, ctx->frame_bpp, ctx->frame_size,
+    if (ctx->source_is_bgrx && (ctx->opt.swap16 || ctx->opt.pixel_order != PIXEL_ORDER_BGR565))
+        fprintf(stderr, "Note: --pixel-order/--swap16 are ignored for BGRX source frames\n");
+
+    fprintf(stderr,
+            "FPGA DMA ready: %ux%u fmt=%s bpp=%u stride=%u frame=%zu bytes (io-mode=%s zero-copy=%s)\n",
+            ctx->frame_width,
+            ctx->frame_height,
+            pixel_format_name(ctx->pixel_format),
+            ctx->frame_bpp,
+            ctx->frame_stride,
+            ctx->frame_size,
             (ctx->opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy",
-            ctx->opt.swap16 ? "on" : "off");
+            ctx->zero_copy_mode ? "on" : "off");
     return 0;
 }
 
@@ -573,19 +624,30 @@ static int init_copy_slots(struct app_ctx *ctx)
 {
     int i;
 
-    ctx->slots = calloc((size_t)ctx->opt.copy_buffers, sizeof(*ctx->slots));
+    if (ctx->zero_copy_mode)
+        ctx->slot_count = 1;
+    else
+        ctx->slot_count = ctx->opt.copy_buffers;
+
+    ctx->slots = calloc((size_t)ctx->slot_count, sizeof(*ctx->slots));
     if (!ctx->slots) {
         fprintf(stderr, "Failed to allocate slot metadata\n");
         return -1;
     }
 
-    ctx->slot_count = ctx->opt.copy_buffers;
+    if (ctx->zero_copy_mode) {
+        ctx->slots[0].data = (uint8_t *)ctx->dma_map;
+        ctx->slots[0].owns_data = false;
+        return 0;
+    }
+
     for (i = 0; i < ctx->slot_count; i++) {
         ctx->slots[i].data = malloc(ctx->display_frame_size);
         if (!ctx->slots[i].data) {
             fprintf(stderr, "Failed to allocate copy slot %d\n", i);
             return -1;
         }
+        ctx->slots[i].owns_data = true;
     }
 
     return 0;
@@ -657,6 +719,16 @@ static void convert_frame_to_bgrx(struct app_ctx *ctx, uint8_t *dst, const uint8
         dst[out + 2] = r8;
         dst[out + 3] = 0xFF;
     }
+}
+
+static void prepare_display_frame(struct app_ctx *ctx, uint8_t *dst, const uint8_t *src)
+{
+    if (ctx->source_is_bgrx) {
+        if (dst != src)
+            memcpy(dst, src, ctx->display_frame_size);
+        return;
+    }
+    convert_frame_to_bgrx(ctx, dst, src);
 }
 
 static void release_slot_ticket(struct app_ctx *ctx, const struct slot_ticket *ticket, bool count_release)
@@ -954,7 +1026,8 @@ static void cleanup(struct app_ctx *ctx)
 
     if (ctx->slots) {
         for (i = 0; i < ctx->slot_count; i++)
-            free(ctx->slots[i].data);
+            if (ctx->slots[i].owns_data)
+                free(ctx->slots[i].data);
         free(ctx->slots);
     }
 
@@ -1014,10 +1087,12 @@ int main(int argc, char **argv)
         goto out;
 
     fprintf(stderr,
-            "Start display loop: fps=%d pixel-order=%s io-mode=%s swap16=%s timeout=%dms copy_buffers=%d queue_depth=%d\n",
+            "Start display loop: fps=%d src_fmt=%s io-mode=%s zero-copy=%s pixel-order=%s swap16=%s timeout=%dms copy_buffers=%d queue_depth=%d\n",
             ctx.opt.fps,
-            (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
+            pixel_format_name(ctx.pixel_format),
             (ctx.opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy",
+            ctx.zero_copy_mode ? "on" : "off",
+            (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
             ctx.opt.swap16 ? "on" : "off",
             ctx.opt.timeout_ms,
             ctx.opt.copy_buffers,
@@ -1042,23 +1117,43 @@ int main(int argc, char **argv)
 
         t0 = mono_us();
 
-        if (trigger_frame_dma(&ctx) < 0) {
-            fprintf(stderr, "DMA trigger failed\n");
-            break;
-        }
-        ctx.captured_frames++;
+        if (ctx.zero_copy_mode) {
+            if (acquire_free_slot(&ctx, &ticket) < 0)
+                break;
 
-        if (acquire_free_slot(&ctx, &ticket) < 0)
-            break;
+            if (trigger_frame_dma(&ctx) < 0) {
+                fprintf(stderr, "DMA trigger failed\n");
+                release_slot_ticket(&ctx, &ticket, false);
+                break;
+            }
+            ctx.captured_frames++;
 
-        frame_src = (ctx.opt.io_mode == IO_MODE_COPY) ? ctx.dma_copy : (const uint8_t *)ctx.dma_map;
-        if (!frame_src) {
-            fprintf(stderr, "Frame source is null in io-mode=%s\n",
-                    (ctx.opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy");
-            release_slot_ticket(&ctx, &ticket, false);
-            break;
+            frame_src = (const uint8_t *)ctx.dma_map;
+            if (!frame_src) {
+                fprintf(stderr, "Frame source is null in io-mode=mmap\n");
+                release_slot_ticket(&ctx, &ticket, false);
+                break;
+            }
+            prepare_display_frame(&ctx, ctx.slots[ticket.idx].data, frame_src);
+        } else {
+            if (trigger_frame_dma(&ctx) < 0) {
+                fprintf(stderr, "DMA trigger failed\n");
+                break;
+            }
+            ctx.captured_frames++;
+
+            if (acquire_free_slot(&ctx, &ticket) < 0)
+                break;
+
+            frame_src = (ctx.opt.io_mode == IO_MODE_COPY) ? ctx.dma_copy : (const uint8_t *)ctx.dma_map;
+            if (!frame_src) {
+                fprintf(stderr, "Frame source is null in io-mode=%s\n",
+                        (ctx.opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy");
+                release_slot_ticket(&ctx, &ticket, false);
+                break;
+            }
+            prepare_display_frame(&ctx, ctx.slots[ticket.idx].data, frame_src);
         }
-        convert_frame_to_bgrx(&ctx, ctx.slots[ticket.idx].data, frame_src);
 
         buf = build_frame_buffer(&ctx, &ticket);
         if (!buf) {

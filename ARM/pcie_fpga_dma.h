@@ -24,10 +24,20 @@
 #define FPGA_DMA_DEV_NAME    "fpga_dma0"
 
 /* Frame buffer parameters (matching FPGA fram_buf.v) */
-#define FPGA_FRAME_WIDTH     1280
-#define FPGA_FRAME_HEIGHT    720
-#define FPGA_FRAME_BPP       2  /* RGB565 = 2 bytes per pixel */
-#define FPGA_FRAME_SIZE      (FPGA_FRAME_WIDTH * FPGA_FRAME_HEIGHT * FPGA_FRAME_BPP)  /* 1,843,200 bytes */
+#define FPGA_FRAME_WIDTH           1280
+#define FPGA_FRAME_HEIGHT          720
+#define FPGA_FRAME_BPP_BGR565      2U
+#define FPGA_FRAME_BPP_BGRX8888    4U
+#define FPGA_FRAME_SIZE_BGR565     (FPGA_FRAME_WIDTH * FPGA_FRAME_HEIGHT * FPGA_FRAME_BPP_BGR565)
+#define FPGA_FRAME_SIZE_BGRX8888   (FPGA_FRAME_WIDTH * FPGA_FRAME_HEIGHT * FPGA_FRAME_BPP_BGRX8888)
+#define FPGA_FRAME_MAX_BPP         FPGA_FRAME_BPP_BGRX8888
+#define FPGA_FRAME_MAX_SIZE        FPGA_FRAME_SIZE_BGRX8888
+/* Keep a conservative default size for legacy callers. */
+#define FPGA_FRAME_SIZE            FPGA_FRAME_MAX_SIZE
+
+/* Pixel format reported by fpga_info.pixel_format */
+#define FPGA_PIXEL_FORMAT_BGR565    0U
+#define FPGA_PIXEL_FORMAT_BGRX8888  1U
 
 /* BAR1 DMA Control Register Offsets (from ips2l_pcie_dma_controller.v) */
 #define BAR1_DMA_CMD_REG     0x100  /* DMA command register */
@@ -65,6 +75,8 @@
  * @frame_width: Frame width in pixels
  * @frame_height: Frame height in pixels
  * @frame_bpp: Bytes per pixel
+ * @frame_stride: Bytes per line
+ * @pixel_format: Pixel format enum (FPGA_PIXEL_FORMAT_*)
  */
 struct fpga_info {
     __u32 vendor_id;
@@ -76,6 +88,8 @@ struct fpga_info {
     __u32 frame_width;
     __u32 frame_height;
     __u32 frame_bpp;
+    __u32 frame_stride;
+    __u32 pixel_format;
 };
 
 /**

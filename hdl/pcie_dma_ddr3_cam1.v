@@ -649,6 +649,7 @@ wire [15:0] cmos1_rgb565_fmt = CAM_SWAP_RB ?
 // Debug injection switches (default disabled).
 localparam FORCE_COLOR_BAR_PRE_DDR = 1'b0;
 localparam FORCE_PATTERN_POST_DDR  = 1'b0;
+localparam DMA_OUTPUT_BGRX         = 1'b1;
 
 reg [11:0] cmos1_bar_x;
 reg        cmos1_href_16bit_d;
@@ -730,38 +731,107 @@ wire [127:0]               frame_rd_data;
 //=============================================================================
 // Start one read session on DMA command start and keep the session
 // active across chunk gaps until a full frame has been consumed.
-localparam integer         FRAME_WORDS = (1280 * 720 * 16) / 128;
+localparam [17:0]          FRAME_WORDS_565  = (1280 * 720 * 16) / 128;
+localparam [17:0]          FRAME_WORDS_BGRX = (1280 * 720 * 32) / 128;
 reg                        dma_session_active;
-reg  [16:0]                dma_rd_word_count;
+reg  [17:0]                dma_rd_word_count;
 reg  [5:0]                 rd_fsync_stretch_cnt;
-reg  [7:0]                 post_ddr_word_x;
+reg  [8:0]                 post_ddr_word_x;
 reg  [9:0]                 post_ddr_line_y;
+reg                        dma_expand_phase;
+reg  [127:0]               frame_rd_data_hold;
 wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
-wire [11:0]                post_ddr_x_pix = {post_ddr_word_x, 3'b000};
+wire                       dma_expand_mode = DMA_OUTPUT_BGRX;
+wire [17:0]                frame_words_cfg = dma_expand_mode ? FRAME_WORDS_BGRX : FRAME_WORDS_565;
+wire                       frame_rd_fetch_en = mwr_rd_clk_en & (~dma_expand_mode | ~dma_expand_phase);
+wire [11:0]                post_ddr_x_pix = dma_expand_mode ? {1'b0, post_ddr_word_x, 2'b00}
+                                                             : {post_ddr_word_x, 3'b000};
 wire [15:0]                post_ddr_color_base = color_bar_bgr565(post_ddr_x_pix);
 wire [15:0]                post_ddr_color_data = post_ddr_color_base;
-wire [127:0]               post_ddr_pattern_data = {8{post_ddr_color_data}};
+wire [8:0]                 post_ddr_words_per_line = dma_expand_mode ? 9'd320 : 9'd160;
+
+function [7:0] expand5_to_8;
+    input [4:0] value5;
+begin
+    expand5_to_8 = {value5, value5[4:2]};
+end
+endfunction
+
+function [7:0] expand6_to_8;
+    input [5:0] value6;
+begin
+    expand6_to_8 = {value6, value6[5:4]};
+end
+endfunction
+
+function [31:0] bgr565_to_bgrx32;
+    input [15:0] pix565;
+    reg [4:0] r5;
+    reg [5:0] g6;
+    reg [4:0] b5;
+begin
+    r5 = pix565[4:0];
+    g6 = pix565[10:5];
+    b5 = pix565[15:11];
+    bgr565_to_bgrx32 = {8'h08, expand5_to_8(r5), expand6_to_8(g6), expand5_to_8(b5)};
+end
+endfunction
+
+function [127:0] pack_4pix_bgrx;
+    input [15:0] p0;
+    input [15:0] p1;
+    input [15:0] p2;
+    input [15:0] p3;
+begin
+    pack_4pix_bgrx = {
+        bgr565_to_bgrx32(p3),
+        bgr565_to_bgrx32(p2),
+        bgr565_to_bgrx32(p1),
+        bgr565_to_bgrx32(p0)
+    };
+end
+endfunction
+
+wire [127:0] frame_rd_data_bgrx_lo = pack_4pix_bgrx(
+    frame_rd_data[15:0], frame_rd_data[31:16], frame_rd_data[47:32], frame_rd_data[63:48]);
+wire [127:0] frame_rd_hold_bgrx_hi = pack_4pix_bgrx(
+    frame_rd_data_hold[79:64], frame_rd_data_hold[95:80], frame_rd_data_hold[111:96], frame_rd_data_hold[127:112]);
+wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
+wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data)}};
+wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
+wire [127:0] frame_dma_data = dma_expand_mode
+    ? (dma_expand_phase ? frame_rd_hold_bgrx_hi : frame_rd_data_bgrx_lo)
+    : frame_rd_data;
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
         dma_session_active <= 1'b0;
-        dma_rd_word_count <= 17'd0;
+        dma_rd_word_count <= 18'd0;
         rd_fsync_stretch_cnt <= 6'd0;
+        dma_expand_phase <= 1'b0;
+        frame_rd_data_hold <= 128'd0;
     end else begin
         if (dma_session_start) begin
             dma_session_active <= 1'b1;
-            dma_rd_word_count <= 17'd0;
+            dma_rd_word_count <= 18'd0;
             rd_fsync_stretch_cnt <= 6'd31;
+            dma_expand_phase <= 1'b0;
         end else begin
             if (dma_session_active && mwr_rd_clk_en) begin
-                if (dma_rd_word_count == FRAME_WORDS - 1) begin
-                    dma_rd_word_count <= 17'd0;
+                if (dma_rd_word_count == frame_words_cfg - 1'b1) begin
+                    dma_rd_word_count <= 18'd0;
                     dma_session_active <= 1'b0;
                 end else begin
-                    dma_rd_word_count <= dma_rd_word_count + 17'd1;
+                    dma_rd_word_count <= dma_rd_word_count + 18'd1;
                 end
             end
+
+            if (dma_expand_mode && dma_session_active && mwr_rd_clk_en)
+                dma_expand_phase <= ~dma_expand_phase;
+
+            if (frame_rd_fetch_en)
+                frame_rd_data_hold <= frame_rd_data;
 
             if (rd_fsync_stretch_cnt != 6'd0)
                 rd_fsync_stretch_cnt <= rd_fsync_stretch_cnt - 6'd1;
@@ -771,30 +841,25 @@ end
 
 assign dma_session_start = mwr_cmd_start & ~dma_session_active;
 assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
-
-// MWR data source: direct combinational path to match DMA's expected
-// 1-cycle read latency (same as original BAR2 BRAM timing).
-// DO NOT register mwr_rd_data on mwr_rd_clk_en — that adds a 2nd
-// pipeline stage which causes word duplication at every TLP boundary.
-assign mwr_rd_data = FORCE_PATTERN_POST_DDR ? post_ddr_pattern_data : frame_rd_data;
+assign mwr_rd_data = FORCE_PATTERN_POST_DDR ? post_ddr_pattern_data : frame_dma_data;
 
 // Post-DDR pattern coordinate counters (only used when FORCE_PATTERN_POST_DDR=1)
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
-        post_ddr_word_x <= 8'd0;
+        post_ddr_word_x <= 9'd0;
         post_ddr_line_y <= 10'd0;
     end else if (dma_session_start) begin
-        post_ddr_word_x <= 8'd0;
+        post_ddr_word_x <= 9'd0;
         post_ddr_line_y <= 10'd0;
     end else if (mwr_rd_clk_en) begin
-        if (post_ddr_word_x == 8'd159) begin
-            post_ddr_word_x <= 8'd0;
+        if (post_ddr_word_x == post_ddr_words_per_line - 1'b1) begin
+            post_ddr_word_x <= 9'd0;
             if (post_ddr_line_y == 10'd719)
                 post_ddr_line_y <= 10'd0;
             else
                 post_ddr_line_y <= post_ddr_line_y + 10'd1;
         end else begin
-            post_ddr_word_x <= post_ddr_word_x + 8'd1;
+            post_ddr_word_x <= post_ddr_word_x + 9'd1;
         end
     end
 end
@@ -824,7 +889,7 @@ fram_buf #(
     // Read output (for future PCIe DMA) - tied off for now
     .vout_clk           (pclk_div2),
     .rd_fsync           (rd_fsync_pclk_div2),
-    .rd_en              (mwr_rd_clk_en),
+    .rd_en              (frame_rd_fetch_en),
     .vout_de            (),
     .vout_data          (frame_rd_data),
     

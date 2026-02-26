@@ -11,7 +11,7 @@ TIMEOUT_MS="5000"
 STATS_INTERVAL="1"
 COPY_BUFFERS="2"
 QUEUE_DEPTH="1"
-IO_MODE="copy"
+IO_MODE="mmap"
 SWAP16="1"
 
 usage() {
@@ -27,7 +27,7 @@ Usage: $0 [options]
   --stats-interval <sec>  Stats interval (default: ${STATS_INTERVAL})
   --copy-buffers <num>    Copy ring size (default: ${COPY_BUFFERS})
   --queue-depth <num>     appsrc queue depth (default: ${QUEUE_DEPTH})
-  --io-mode <mode>        mmap|copy (default: ${IO_MODE})
+  --io-mode <mode>        mmap|copy (default: ${IO_MODE}, mmap enables zero-copy when FPGA outputs BGRX)
   --swap16 <0|1>          Swap bytes in each 16-bit pixel (default: ${SWAP16})
   -h, --help              Show this help
 EOF

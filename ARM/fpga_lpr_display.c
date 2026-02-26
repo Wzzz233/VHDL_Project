@@ -45,6 +45,9 @@
 #define MAX_LABELS 256
 #define MAX_LABEL_LEN 64
 #define MAX_DETS 128
+#define ALGO_STREAM_SIZE 640
+#define OCR_CROP_WIDTH 150
+#define OCR_CROP_HEIGHT 50
 
 #define COLOR_YELLOW_565 0xFFE0
 #define COLOR_CYAN_565 0x07FF
@@ -90,8 +93,11 @@ struct det_box {
 
 struct plate_det {
     struct det_box box;
+    struct det_box crop_box;
     enum plate_color color;
     int parent_car;
+    char ocr_text[24];
+    float ocr_conf;
 };
 
 struct frame_slot {
@@ -135,6 +141,9 @@ struct app_ctx {
     uint8_t *dma_copy;
     uint32_t frame_width;
     uint32_t frame_height;
+    uint32_t src_frame_bpp;
+    size_t src_frame_size;
+    bool src_is_bgrx;
     uint32_t frame_bpp;
     size_t frame_size;
 
@@ -372,21 +381,47 @@ static int init_fpga_dma(struct app_ctx *ctx)
 {
     struct fpga_info info;
     struct buffer_map map;
+    uint32_t inferred_format;
+
     ctx->dev_fd = open(ctx->opt.device_path, O_RDWR | O_CLOEXEC);
     if (ctx->dev_fd < 0)
         return -1;
     if (ioctl(ctx->dev_fd, FPGA_DMA_GET_INFO, &info) < 0)
         return -1;
-    if (info.frame_width != 1280 || info.frame_height != 720 || info.frame_bpp != 2)
+    if (info.frame_width != 1280 || info.frame_height != 720)
         return -1;
+
+    inferred_format = info.pixel_format;
+
+    if (inferred_format != FPGA_PIXEL_FORMAT_BGR565 &&
+        inferred_format != FPGA_PIXEL_FORMAT_BGRX8888) {
+        if (info.frame_bpp == 4)
+            inferred_format = FPGA_PIXEL_FORMAT_BGRX8888;
+        else
+            inferred_format = FPGA_PIXEL_FORMAT_BGR565;
+    }
+    if (inferred_format == FPGA_PIXEL_FORMAT_BGRX8888)
+        info.frame_bpp = 4;
+    else
+        info.frame_bpp = 2;
+
     ctx->frame_width = info.frame_width;
     ctx->frame_height = info.frame_height;
-    ctx->frame_bpp = info.frame_bpp;
+    ctx->src_frame_bpp = info.frame_bpp;
+    ctx->src_is_bgrx = (inferred_format == FPGA_PIXEL_FORMAT_BGRX8888) || (info.frame_bpp == 4);
+    ctx->src_frame_size = (size_t)ctx->frame_width * ctx->frame_height * ctx->src_frame_bpp;
+    /* Internal pipeline keeps BGR565 for overlay and drawing. */
+    ctx->frame_bpp = 2;
     ctx->frame_size = (size_t)ctx->frame_width * ctx->frame_height * ctx->frame_bpp;
+
+    if (ctx->src_is_bgrx)
+        ctx->opt.swap16 = false;
 
     memset(&map, 0, sizeof(map));
     map.index = 0;
     if (ioctl(ctx->dev_fd, FPGA_DMA_MAP_BUFFER, &map) < 0)
+        return -1;
+    if (map.size < ctx->src_frame_size)
         return -1;
     ctx->dma_map_size = map.size;
     ctx->dma_map = mmap(NULL, ctx->dma_map_size, PROT_READ, MAP_SHARED, ctx->dev_fd, 0);
@@ -395,7 +430,7 @@ static int init_fpga_dma(struct app_ctx *ctx)
         return -1;
     }
 
-    ctx->dma_copy = malloc(ctx->frame_size);
+    ctx->dma_copy = malloc(ctx->src_frame_size);
     if (!ctx->dma_copy)
         return -1;
     return 0;
@@ -405,7 +440,7 @@ static int trigger_frame_dma(struct app_ctx *ctx)
 {
     struct dma_transfer t;
     memset(&t, 0, sizeof(t));
-    t.size = (uint32_t)ctx->frame_size;
+    t.size = (uint32_t)ctx->src_frame_size;
     t.user_buf = (uint64_t)(uintptr_t)ctx->dma_copy;
     if (ioctl(ctx->dev_fd, FPGA_DMA_READ_FRAME, &t) < 0)
         return -1;
@@ -430,6 +465,27 @@ static int init_copy_slots(struct app_ctx *ctx)
 static void copy_frame_to_slot565(struct app_ctx *ctx, uint8_t *dst, const uint8_t *src)
 {
     size_t i;
+    size_t pixels = (size_t)ctx->frame_width * ctx->frame_height;
+
+    if (ctx->src_is_bgrx) {
+        for (i = 0; i < pixels; i++) {
+            const uint8_t *p = src + i * 4U;
+            uint8_t b = p[0];
+            uint8_t g = p[1];
+            uint8_t r = p[2];
+            uint16_t pix565;
+
+            if (ctx->opt.pixel_order == PIXEL_ORDER_BGR565)
+                pix565 = (uint16_t)(((b >> 3) << 11) | ((g >> 2) << 5) | (r >> 3));
+            else
+                pix565 = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+
+            dst[i * 2U + 0] = (uint8_t)(pix565 & 0xFF);
+            dst[i * 2U + 1] = (uint8_t)(pix565 >> 8);
+        }
+        return;
+    }
+
     if (!ctx->opt.swap16) {
         memcpy(dst, src, ctx->frame_size);
         return;
@@ -893,6 +949,66 @@ static void clamp_box(struct det_box *b, int w, int h)
     if (b->y2 < b->y1) b->y2 = b->y1;
 }
 
+static void map_box_between_spaces(struct det_box *b, int src_w, int src_h, int dst_w, int dst_h)
+{
+    b->x1 = (int)((int64_t)b->x1 * dst_w / src_w);
+    b->x2 = (int)((int64_t)b->x2 * dst_w / src_w);
+    b->y1 = (int)((int64_t)b->y1 * dst_h / src_h);
+    b->y2 = (int)((int64_t)b->y2 * dst_h / src_h);
+    clamp_box(b, dst_w, dst_h);
+}
+
+static void compute_center_crop_box(const struct det_box *src, int img_w, int img_h,
+                                    int crop_w, int crop_h, struct det_box *crop)
+{
+    int cx = (src->x1 + src->x2) / 2;
+    int cy = (src->y1 + src->y2) / 2;
+    int x1 = cx - crop_w / 2;
+    int y1 = cy - crop_h / 2;
+
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x1 + crop_w > img_w) x1 = img_w - crop_w;
+    if (y1 + crop_h > img_h) y1 = img_h - crop_h;
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+
+    crop->x1 = x1;
+    crop->y1 = y1;
+    crop->x2 = x1 + crop_w - 1;
+    crop->y2 = y1 + crop_h - 1;
+    clamp_box(crop, img_w, img_h);
+}
+
+static void copy_crop_rgb888(const uint8_t *rgb, int img_w, const struct det_box *crop, uint8_t *dst)
+{
+    int y;
+    int crop_w = crop->x2 - crop->x1 + 1;
+    int crop_h = crop->y2 - crop->y1 + 1;
+    for (y = 0; y < crop_h; y++) {
+        const uint8_t *src_row = rgb + ((crop->y1 + y) * img_w + crop->x1) * 3;
+        uint8_t *dst_row = dst + y * crop_w * 3;
+        memcpy(dst_row, src_row, (size_t)crop_w * 3U);
+    }
+}
+
+static void ocr_stub_predict(const uint8_t *crop, int crop_w, int crop_h,
+                             char *text, size_t text_len, float *conf_out)
+{
+    uint32_t hash = 2166136261u;
+    size_t i;
+    size_t n = (size_t)crop_w * (size_t)crop_h * 3U;
+    size_t step = n / 128U;
+    if (step == 0)
+        step = 1;
+    for (i = 0; i < n; i += step) {
+        hash ^= crop[i];
+        hash *= 16777619u;
+    }
+    snprintf(text, text_len, "PLATE_%06X", hash & 0xFFFFFFu);
+    *conf_out = 0.10f;
+}
+
 static void decode_rows_output(const float *rows, int n_rows, int n_cols, int class_count,
                                float conf_thr, int src_w, int src_h, int in_w, int in_h,
                                struct det_box *out, int *out_count)
@@ -1312,10 +1428,13 @@ static void *infer_thread_main(void *arg)
     struct app_ctx *ctx = (struct app_ctx *)arg;
     uint8_t *raw_local = malloc(ctx->frame_size);
     uint8_t *rgb_full = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
+    uint8_t *algo_rgb = malloc((size_t)ALGO_STREAM_SIZE * ALGO_STREAM_SIZE * 3U);
     uint8_t *veh_in = malloc((size_t)ctx->veh_model.in_w * ctx->veh_model.in_h * 3U);
     uint8_t *plate_in = malloc((size_t)ctx->plate_model.in_w * ctx->plate_model.in_h * 3U);
-    if (!raw_local || !rgb_full || !veh_in || !plate_in) {
-        free(raw_local); free(rgb_full); free(veh_in); free(plate_in);
+    uint8_t *plate_crop = malloc((size_t)OCR_CROP_WIDTH * OCR_CROP_HEIGHT * 3U);
+    if (!raw_local || !rgb_full || !algo_rgb || !veh_in || !plate_in || !plate_crop) {
+        free(raw_local); free(rgb_full); free(algo_rgb);
+        free(veh_in); free(plate_in); free(plate_crop);
         return NULL;
     }
 
@@ -1342,16 +1461,33 @@ static void *infer_thread_main(void *arg)
         t0 = mono_us();
         raw565_to_rgb888_full(ctx, raw_local, rgb_full);
         resize_rgb888_nn(rgb_full, (int)ctx->frame_width, (int)ctx->frame_height,
-                         veh_in, (int)ctx->veh_model.in_w, (int)ctx->veh_model.in_h);
-        resize_rgb888_nn(rgb_full, (int)ctx->frame_width, (int)ctx->frame_height,
-                         plate_in, (int)ctx->plate_model.in_w, (int)ctx->plate_model.in_h);
+                         algo_rgb, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE);
 
-        if (run_model_detect(&ctx->veh_model, veh_in, (int)ctx->frame_width, (int)ctx->frame_height,
+        if (ctx->veh_model.in_w == ALGO_STREAM_SIZE && ctx->veh_model.in_h == ALGO_STREAM_SIZE)
+            memcpy(veh_in, algo_rgb, (size_t)ALGO_STREAM_SIZE * ALGO_STREAM_SIZE * 3U);
+        else
+            resize_rgb888_nn(algo_rgb, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
+                             veh_in, (int)ctx->veh_model.in_w, (int)ctx->veh_model.in_h);
+
+        if (ctx->plate_model.in_w == ALGO_STREAM_SIZE && ctx->plate_model.in_h == ALGO_STREAM_SIZE)
+            memcpy(plate_in, algo_rgb, (size_t)ALGO_STREAM_SIZE * ALGO_STREAM_SIZE * 3U);
+        else
+            resize_rgb888_nn(algo_rgb, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
+                             plate_in, (int)ctx->plate_model.in_w, (int)ctx->plate_model.in_h);
+
+        if (run_model_detect(&ctx->veh_model, veh_in, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
                              ctx->opt.min_car_conf, cars, &car_count) < 0)
             car_count = 0;
-        if (run_model_detect(&ctx->plate_model, plate_in, (int)ctx->frame_width, (int)ctx->frame_height,
+        if (run_model_detect(&ctx->plate_model, plate_in, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
                              ctx->opt.min_plate_conf, plates, &plate_count) < 0)
             plate_count = 0;
+
+        for (i = 0; i < car_count; i++)
+            map_box_between_spaces(&cars[i], ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
+                                  (int)ctx->frame_width, (int)ctx->frame_height);
+        for (i = 0; i < plate_count; i++)
+            map_box_between_spaces(&plates[i], ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
+                                  (int)ctx->frame_width, (int)ctx->frame_height);
         t1 = mono_us();
 
         memset(&r, 0, sizeof(r));
@@ -1364,11 +1500,28 @@ static void *infer_thread_main(void *arg)
         for (i = 0; i < plate_count && r.plate_count < MAX_DETS; i++) {
             struct plate_det pd;
             int parent = find_parent_car(&plates[i], r.cars, r.car_count);
+            int crop_w;
+            int crop_h;
             if (parent < 0)
                 continue;
             pd.box = plates[i];
             pd.parent_car = parent;
             pd.color = classify_plate_color_rgb(rgb_full, (int)ctx->frame_width, (int)ctx->frame_height, &plates[i]);
+            compute_center_crop_box(&pd.box, (int)ctx->frame_width, (int)ctx->frame_height,
+                                    OCR_CROP_WIDTH, OCR_CROP_HEIGHT, &pd.crop_box);
+            crop_w = pd.crop_box.x2 - pd.crop_box.x1 + 1;
+            crop_h = pd.crop_box.y2 - pd.crop_box.y1 + 1;
+            copy_crop_rgb888(rgb_full, (int)ctx->frame_width, &pd.crop_box, plate_crop);
+            ocr_stub_predict(plate_crop, crop_w, crop_h,
+                             pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf);
+            fprintf(stderr,
+                    "[ocr] ts_us=%" PRId64 " frame=%" PRIu64 " plate=%d text=%s conf=%.2f crop=[%d,%d,%d,%d]\n",
+                    mono_us(),
+                    seq,
+                    r.plate_count,
+                    pd.ocr_text,
+                    pd.ocr_conf,
+                    pd.crop_box.x1, pd.crop_box.y1, pd.crop_box.x2, pd.crop_box.y2);
             r.plates[r.plate_count++] = pd;
         }
         r.frame_seq = seq;
@@ -1380,7 +1533,8 @@ static void *infer_thread_main(void *arg)
         pthread_mutex_unlock(&ctx->result_lock);
     }
 
-    free(raw_local); free(rgb_full); free(veh_in); free(plate_in);
+    free(raw_local); free(rgb_full); free(algo_rgb);
+    free(veh_in); free(plate_in); free(plate_crop);
     return NULL;
 }
 
@@ -1537,8 +1691,9 @@ int main(int argc, char **argv)
         goto out;
 
     fprintf(stderr,
-            "Start LPR loop: fps=%d pixel=%s swap16=%s min_car=%.2f min_plate=%.2f\n",
+            "Start LPR loop: fps=%d src=%s pixel=%s swap16=%s min_car=%.2f min_plate=%.2f\n",
             ctx.opt.fps,
+            ctx.src_is_bgrx ? "bgrx8888" : "bgr565",
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
             ctx.opt.swap16 ? "on" : "off",
             ctx.opt.min_car_conf, ctx.opt.min_plate_conf);
@@ -1564,11 +1719,14 @@ int main(int argc, char **argv)
         if (trigger_frame_dma(&ctx) < 0)
             break;
         ctx.captured_frames++;
-        push_latest_to_infer(&ctx, ctx.dma_copy);
 
         if (acquire_free_slot(&ctx, &ticket) < 0)
             break;
         copy_frame_to_slot565(&ctx, ctx.slots[ticket.idx].data, ctx.dma_copy);
+        if (ctx.src_is_bgrx)
+            push_latest_to_infer(&ctx, ctx.slots[ticket.idx].data);
+        else
+            push_latest_to_infer(&ctx, ctx.dma_copy);
         overlay_results_on_slot(&ctx, ctx.slots[ticket.idx].data);
 
         buf = build_frame_buffer(&ctx, &ticket);

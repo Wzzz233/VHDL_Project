@@ -3,7 +3,7 @@
  * PCIe FPGA DMA Driver
  *
  * Driver for RK3568 to access FPGA registers via PCIe and perform DMA transfers
- * for camera frame data (1280x720 RGB565)
+ * for camera frame data (1280x720, format selected at runtime).
  *
  * FPGA: PG2L50H (Pango) - PCIe Endpoint
  * Vendor ID: 0x0755
@@ -40,6 +40,7 @@ static int major_num;
 static int dma_timeout_ms = 5000;  /* 5 seconds default timeout */
 static int dma_chunk_delay_us = 2; /* inter-chunk pacing, default 2us */
 static bool dma_verbose = false;   /* verbose transfer logs */
+static int dma_pixel_format = FPGA_PIXEL_FORMAT_BGRX8888;
 
 module_param(major_num, int, 0);
 MODULE_PARM_DESC(major_num, "Major device number (0=dynamic)");
@@ -49,6 +50,8 @@ module_param(dma_chunk_delay_us, int, 0644);
 MODULE_PARM_DESC(dma_chunk_delay_us, "Delay in microseconds after each DMA chunk trigger");
 module_param(dma_verbose, bool, 0644);
 MODULE_PARM_DESC(dma_verbose, "Enable verbose DMA transfer logs");
+module_param(dma_pixel_format, int, 0644);
+MODULE_PARM_DESC(dma_pixel_format, "Frame format: 0=BGR565, 1=BGRX8888");
 
 /* Per-device structure */
 struct fpga_dma_dev {
@@ -104,6 +107,35 @@ static const struct pci_device_id fpga_dma_pci_tbl[] = {
     { 0, }
 };
 MODULE_DEVICE_TABLE(pci, fpga_dma_pci_tbl);
+
+static u32 fpga_dma_bpp_from_format(u32 pixel_format)
+{
+    switch (pixel_format) {
+    case FPGA_PIXEL_FORMAT_BGRX8888:
+        return FPGA_FRAME_BPP_BGRX8888;
+    case FPGA_PIXEL_FORMAT_BGR565:
+    default:
+        return FPGA_FRAME_BPP_BGR565;
+    }
+}
+
+static void fpga_dma_normalize_info_layout(struct fpga_info *info)
+{
+    u32 bpp;
+
+    if (info->pixel_format != FPGA_PIXEL_FORMAT_BGR565 &&
+        info->pixel_format != FPGA_PIXEL_FORMAT_BGRX8888)
+        info->pixel_format = FPGA_PIXEL_FORMAT_BGR565;
+
+    bpp = fpga_dma_bpp_from_format(info->pixel_format);
+    info->frame_bpp = bpp;
+    info->frame_stride = info->frame_width * bpp;
+}
+
+static size_t fpga_dma_default_frame_size(const struct fpga_info *info)
+{
+    return (size_t)info->frame_stride * (size_t)info->frame_height;
+}
 
 /**
  * fpga_dma_read_reg - Read a 32-bit register from BAR1
@@ -334,6 +366,7 @@ static long fpga_dma_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 
         /* Update link status */
         /* TODO: Read actual PCIe link status from capability registers */
+        fpga_dma_normalize_info_layout(&info);
 
         if (copy_to_user(argp, &info, sizeof(info)))
             ret = -EFAULT;
@@ -343,14 +376,18 @@ static long fpga_dma_ioctl(struct file *file, unsigned int cmd, unsigned long ar
     case FPGA_DMA_READ_FRAME: {
         struct dma_transfer transfer;
         size_t size;
+        size_t default_size;
 
         if (copy_from_user(&transfer, argp, sizeof(transfer))) {
             ret = -EFAULT;
             break;
         }
 
+        fpga_dma_normalize_info_layout(&dev->info);
+        default_size = fpga_dma_default_frame_size(&dev->info);
+
         /* Use default frame size if not specified */
-        size = transfer.size > 0 ? transfer.size : FPGA_FRAME_SIZE;
+        size = transfer.size > 0 ? transfer.size : default_size;
 
         if (size > dev->dma_buf_size) {
             dev_err(dev->dev, "Requested size %zu exceeds buffer size %zu\n",
@@ -517,9 +554,8 @@ static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     dev_info(&pdev->dev, "BAR1 mapped at %p, size=%pa\n",
              dev->bar1, &dev->bar1_size);
 
-    /* Allocate DMA buffer for frame transfer
-     * Allocate slightly more for alignment */
-    dev->dma_buf_size = PAGE_ALIGN(FPGA_FRAME_SIZE);
+    /* Allocate enough space for the largest supported frame format. */
+    dev->dma_buf_size = PAGE_ALIGN((size_t)FPGA_FRAME_MAX_SIZE);
     dev->dma_buf = dma_alloc_coherent(&pdev->dev, dev->dma_buf_size,
                                       &dev->dma_handle, GFP_KERNEL);
     if (!dev->dma_buf) {
@@ -540,7 +576,17 @@ static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     dev->info.link_speed = 2;  /* Gen2 */
     dev->info.frame_width = FPGA_FRAME_WIDTH;
     dev->info.frame_height = FPGA_FRAME_HEIGHT;
-    dev->info.frame_bpp = FPGA_FRAME_BPP;
+    dev->info.pixel_format = (dma_pixel_format == FPGA_PIXEL_FORMAT_BGR565)
+        ? FPGA_PIXEL_FORMAT_BGR565
+        : FPGA_PIXEL_FORMAT_BGRX8888;
+    fpga_dma_normalize_info_layout(&dev->info);
+    dev_info(&pdev->dev,
+             "Frame layout: %ux%u format=%u bpp=%u stride=%u bytes\n",
+             dev->info.frame_width,
+             dev->info.frame_height,
+             dev->info.pixel_format,
+             dev->info.frame_bpp,
+             dev->info.frame_stride);
 
     /* Create character device */
     if (major_num > 0) {

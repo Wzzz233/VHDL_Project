@@ -164,10 +164,12 @@ static int print_fpga_info(int fd)
     printf("  PCIe Link Speed:       Gen%u\n", info.link_speed);
     printf("  Frame Width:           %u pixels\n", info.frame_width);
     printf("  Frame Height:          %u pixels\n", info.frame_height);
+    printf("  Pixel Format:          %u\n", info.pixel_format);
     printf("  Frame Bytes/Pixel:     %u\n", info.frame_bpp);
+    printf("  Frame Stride:          %u bytes\n", info.frame_stride);
     printf("  Frame Size:            %u bytes (%.2f MB)\n",
-           info.frame_width * info.frame_height * info.frame_bpp,
-           (float)(info.frame_width * info.frame_height * info.frame_bpp) / (1024 * 1024));
+           info.frame_stride * info.frame_height,
+           (float)(info.frame_stride * info.frame_height) / (1024 * 1024));
     print_color(COLOR_BLUE, "===============================");
 
     return 0;
