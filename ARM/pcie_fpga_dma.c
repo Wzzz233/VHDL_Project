@@ -42,6 +42,7 @@ static int dma_chunk_delay_us = 0; /* inter-chunk pacing, default 0us */
 static int dma_poll_sleep_us = 5;      /* initial sleep in wait loop (0=busy poll) */
 static int dma_poll_sleep_max_us = 80; /* adaptive backoff upper bound */
 static int dma_poll_backoff_polls = 8; /* bump sleep every N polls */
+static int dma_max_len_dwords = 1023;  /* safe for legacy bitstream; 1024 needs updated RTL */
 static bool dma_verbose = false;   /* verbose transfer logs */
 static int dma_pixel_format = FPGA_PIXEL_FORMAT_BGRX8888;
 
@@ -57,6 +58,8 @@ module_param(dma_poll_sleep_max_us, int, 0644);
 MODULE_PARM_DESC(dma_poll_sleep_max_us, "Maximum sleep in microseconds for adaptive DMA polling backoff");
 module_param(dma_poll_backoff_polls, int, 0644);
 MODULE_PARM_DESC(dma_poll_backoff_polls, "Increase poll sleep every N polls while waiting DMA completion");
+module_param(dma_max_len_dwords, int, 0644);
+MODULE_PARM_DESC(dma_max_len_dwords, "DMA chunk DWORDs (1..1024). Use 1024 only with updated FPGA DMA TX RTL");
 module_param(dma_verbose, bool, 0644);
 MODULE_PARM_DESC(dma_verbose, "Enable verbose DMA transfer logs");
 module_param(dma_pixel_format, int, 0644);
@@ -217,14 +220,19 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
         u32 *chunk_tail1 = NULL;
         const u32 tail_sentinel0 = 0xDEADBEEF;
         const u32 tail_sentinel1 = 0xA5A55A5A;
+        u32 max_len_dwords = dma_max_len_dwords;
         int poll_sleep_cur_us = dma_poll_sleep_us;
         int poll_sleep_max_us = dma_poll_sleep_max_us;
         int poll_backoff_polls = dma_poll_backoff_polls;
         int poll_count = 0;
         unsigned long deadline;
 
-        /* Calculate chunk size (max 1024 DWORDs = 4096 bytes). */
-        chunk_size = min(remaining, (size_t)DMA_MAX_LEN_BYTES);
+        if (max_len_dwords == 0)
+            max_len_dwords = 1;
+        if (max_len_dwords > DMA_MAX_LEN_DWORDS)
+            max_len_dwords = DMA_MAX_LEN_DWORDS;
+
+        chunk_size = min(remaining, (size_t)max_len_dwords * sizeof(u32));
 
         /* Check for 4KB boundary crossing */
         if ((current_addr & 0xFFF) + chunk_size > 0x1000) {
