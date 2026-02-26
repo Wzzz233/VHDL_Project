@@ -178,7 +178,7 @@ wire			p_rdy_dma;
 // External BAR2 read override for MWR frame data
 wire			mwr_rd_clk_en;
 wire	[11:0]	mwr_rd_addr;
-reg		[127:0]	mwr_rd_data;
+wire	[127:0]	mwr_rd_data;
 wire			mwr_cmd_start;
 
 assign cfg_ido_req_en	=	1'b0;	
@@ -772,12 +772,15 @@ end
 assign dma_session_start = mwr_cmd_start & ~dma_session_active;
 assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
 
-// Phase 1: Test pattern — incrementing address as data
-// Host can verify: data[31:0] should match sequential addresses
-// Must be synchronous (1-cycle latency) to match BAR2 RAM timing
+// MWR data source: direct combinational path to match DMA's expected
+// 1-cycle read latency (same as original BAR2 BRAM timing).
+// DO NOT register mwr_rd_data on mwr_rd_clk_en — that adds a 2nd
+// pipeline stage which causes word duplication at every TLP boundary.
+assign mwr_rd_data = FORCE_PATTERN_POST_DDR ? post_ddr_pattern_data : frame_rd_data;
+
+// Post-DDR pattern coordinate counters (only used when FORCE_PATTERN_POST_DDR=1)
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
-        mwr_rd_data <= 128'h0;
         post_ddr_word_x <= 8'd0;
         post_ddr_line_y <= 10'd0;
     end else if (dma_session_start) begin
@@ -792,9 +795,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 post_ddr_line_y <= post_ddr_line_y + 10'd1;
         end else begin
             post_ddr_word_x <= post_ddr_word_x + 8'd1;
-            post_ddr_line_y <= post_ddr_line_y;
         end
-        mwr_rd_data <= FORCE_PATTERN_POST_DDR ? post_ddr_pattern_data : frame_rd_data;
     end
 end
 
