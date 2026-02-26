@@ -600,8 +600,11 @@ assign cmos_reset = camera_rstn;
 // Camera 1 I2C Configuration (OV5640)
 //=============================================================================
 wire cmos1_init_done /*synthesis PAP_MARK_DEBUG="1"*/;
+localparam SENSOR_TEST_PATTERN_EN = 1'b0;
 
-reg_config u_cmos1_config (
+reg_config #(
+    .SENSOR_TEST_PATTERN_EN (SENSOR_TEST_PATTERN_EN)
+) u_cmos1_config (
     .clk_25M        (sys_clk),          // Stage 1: force camera config logic to 25MHz
     .camera_rstn    (camera_rstn),      // From power_on_delay
     .initial_en     (initial_en),       // From power_on_delay
