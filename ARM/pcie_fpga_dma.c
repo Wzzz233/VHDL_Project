@@ -39,7 +39,9 @@
 static int major_num;
 static int dma_timeout_ms = 5000;  /* 5 seconds default timeout */
 static int dma_chunk_delay_us = 0; /* inter-chunk pacing, default 0us */
-static int dma_poll_sleep_us = 5;  /* per-poll sleep in wait loop */
+static int dma_poll_sleep_us = 5;      /* initial sleep in wait loop (0=busy poll) */
+static int dma_poll_sleep_max_us = 80; /* adaptive backoff upper bound */
+static int dma_poll_backoff_polls = 8; /* bump sleep every N polls */
 static bool dma_verbose = false;   /* verbose transfer logs */
 static int dma_pixel_format = FPGA_PIXEL_FORMAT_BGRX8888;
 
@@ -50,7 +52,11 @@ MODULE_PARM_DESC(dma_timeout_ms, "DMA transfer timeout in milliseconds");
 module_param(dma_chunk_delay_us, int, 0644);
 MODULE_PARM_DESC(dma_chunk_delay_us, "Delay in microseconds after each DMA chunk trigger");
 module_param(dma_poll_sleep_us, int, 0644);
-MODULE_PARM_DESC(dma_poll_sleep_us, "Sleep in microseconds while polling DMA completion (0=busy)");
+MODULE_PARM_DESC(dma_poll_sleep_us, "Initial sleep in microseconds while polling DMA completion (0=busy)");
+module_param(dma_poll_sleep_max_us, int, 0644);
+MODULE_PARM_DESC(dma_poll_sleep_max_us, "Maximum sleep in microseconds for adaptive DMA polling backoff");
+module_param(dma_poll_backoff_polls, int, 0644);
+MODULE_PARM_DESC(dma_poll_backoff_polls, "Increase poll sleep every N polls while waiting DMA completion");
 module_param(dma_verbose, bool, 0644);
 MODULE_PARM_DESC(dma_verbose, "Enable verbose DMA transfer logs");
 module_param(dma_pixel_format, int, 0644);
@@ -211,9 +217,13 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
         u32 *chunk_tail1 = NULL;
         const u32 tail_sentinel0 = 0xDEADBEEF;
         const u32 tail_sentinel1 = 0xA5A55A5A;
+        int poll_sleep_cur_us = dma_poll_sleep_us;
+        int poll_sleep_max_us = dma_poll_sleep_max_us;
+        int poll_backoff_polls = dma_poll_backoff_polls;
+        int poll_count = 0;
         unsigned long deadline;
 
-        /* Calculate chunk size (max 1023 DWORDs = 4092 bytes due 10-bit +1 bug). */
+        /* Calculate chunk size (max 1024 DWORDs = 4096 bytes). */
         chunk_size = min(remaining, (size_t)DMA_MAX_LEN_BYTES);
 
         /* Check for 4KB boundary crossing */
@@ -294,10 +304,26 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
                         chunk_num, (u64)current_addr, chunk_size);
                 return -ETIMEDOUT;
             }
-            if (dma_poll_sleep_us > 0)
-                usleep_range(dma_poll_sleep_us, dma_poll_sleep_us + 5);
-            else
+            if (poll_sleep_cur_us <= 0) {
                 cpu_relax();
+                continue;
+            }
+
+            if (poll_sleep_max_us > 0 && poll_sleep_cur_us > poll_sleep_max_us)
+                poll_sleep_cur_us = poll_sleep_max_us;
+
+            usleep_range(poll_sleep_cur_us, poll_sleep_cur_us + 5);
+
+            if (poll_backoff_polls > 0 && poll_sleep_max_us > 0 &&
+                poll_sleep_cur_us < poll_sleep_max_us) {
+                poll_count++;
+                if (poll_count >= poll_backoff_polls) {
+                    poll_count = 0;
+                    poll_sleep_cur_us <<= 1;
+                    if (poll_sleep_cur_us > poll_sleep_max_us)
+                        poll_sleep_cur_us = poll_sleep_max_us;
+                }
+            }
         }
         dma_rmb();
 

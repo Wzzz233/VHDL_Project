@@ -61,10 +61,11 @@ localparam      DATA_TX     = 2'd2;
 reg     [63:0]  mwr_addr;
 reg     [31:0]  mwr_data;
 wire    [9:0]   mwr_length_tx;
+wire    [10:0]  mwr_length_tx_dw;
 
 wire            mwr_req_start;
 reg             mwr_req_start_ff;
-reg     [9:0]   mwr_length;
+reg     [10:0]  mwr_length;
 
 reg             mwr32_req_tx;
 reg             mwr64_req_tx;
@@ -96,7 +97,8 @@ wire            mwr_req_ack;
 
 wire            tx_done;
 
-wire [9:0]      max_payload_size;
+wire [10:0]     req_length_dw;
+wire [10:0]     max_payload_size;
 
 //when i_axis_slave2_trdy down,hold all tx logic
 assign o_mwr_tx_hold  = ~i_axis_slave2_trdy && o_axis_slave2_tvld;
@@ -115,6 +117,7 @@ assign max_payload_size = (i_cfg_max_payload_size == 3'd0) ? 10'h20 :
                           (i_cfg_max_payload_size == 3'd1) ? 10'h40 :
                           (i_cfg_max_payload_size == 3'd2) ? 10'h80 :
                           (i_cfg_max_payload_size == 3'd3) ? 10'h100 : 10'd20;
+assign req_length_dw = (i_req_length == 10'b0) ? 11'd1024 : {1'b0, i_req_length};
 
 always@(posedge clk or negedge rst_n)
 begin
@@ -129,17 +132,18 @@ end
 always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
-        mwr_length <= 10'd0;
+        mwr_length <= 11'd0;
     else if(mwr_req_start && !o_mwr_tx_busy)
-        mwr_length <= i_req_length;
+        mwr_length <= req_length_dw;
     else if(mwr_length >  max_payload_size && state == HEADER_TX && !o_mwr_tx_hold) //header tx
         mwr_length <= mwr_length - max_payload_size;
     else if(mwr_length <= max_payload_size && state == HEADER_TX && !o_mwr_tx_hold)
-        mwr_length <= 10'd0;
+        mwr_length <= 11'd0;
 end
 
 //the true length to be transmitted
-assign mwr_length_tx = (mwr_length > max_payload_size) ? max_payload_size : mwr_length ;
+assign mwr_length_tx_dw = (mwr_length > max_payload_size) ? max_payload_size : mwr_length;
+assign mwr_length_tx = (mwr_length_tx_dw == 11'd1024) ? 10'd0 : mwr_length_tx_dw[9:0];
 
 always@(posedge clk or negedge rst_n)
 begin
@@ -147,8 +151,8 @@ begin
         mwr_addr <= 64'd0;
     else if(mwr_req_start && !o_mwr_tx_busy)
         mwr_addr <= i_req_addr;
-    else if(|mwr_length && tx_done)
-        mwr_addr <= mwr_addr + {52'b0,max_payload_size,2'b0};
+    else if(mwr_length != 11'd0 && tx_done)
+        mwr_addr <= mwr_addr + {51'b0,max_payload_size,2'b0};
 end
 
 always@(posedge clk or negedge rst_n)
@@ -166,7 +170,7 @@ begin
         o_rd_en <= 1'b0;
     else if(tx_done)
         o_rd_en <= 1'b0;
-    else if(|mwr_length && ~i_user_define_data_flag)
+    else if(mwr_length != 11'd0 && ~i_user_define_data_flag)
         o_rd_en <= 1'b1;
 end
 
@@ -176,7 +180,7 @@ always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
         mwr32_req_tx <= 1'b0;
-    else if(tx_done && ~(|mwr_length))
+    else if(tx_done && (mwr_length == 11'd0))
         mwr32_req_tx <= 1'b0;
     else if(mwr_req_start)
         mwr32_req_tx <= i_mwr32_req;
@@ -185,7 +189,7 @@ always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
         mwr64_req_tx <= 1'b0;
-    else if(tx_done && ~(|mwr_length))
+    else if(tx_done && (mwr_length == 11'd0))
         mwr64_req_tx <= 1'b0;
     else if(mwr_req_start)
         mwr64_req_tx <= i_mwr64_req;
@@ -312,7 +316,7 @@ always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
         o_mwr_tx_busy <= 1'b0;
-    else if(~(|mwr_length) && tx_done)
+    else if((mwr_length == 11'd0) && tx_done)
         o_mwr_tx_busy <= 1'b0;
     else if(mwr_req_start)
         o_mwr_tx_busy <= 1'b1;

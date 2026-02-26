@@ -50,10 +50,9 @@
 #define DMA_CMD_WRITE        (1 << 24)  /* Bit [24] - 1=Write (MWR), 0=Read (MRD) */
 
 /* Maximum DMA transfer size per chunk in DWORDs.
- * FPGA controller does: o_req_length = cmd_reg[9:0] + 1 (10-bit).
- * cmd_reg[9:0] must not be 0x3FF (1023), otherwise +1 overflows to 0.
- * Safe max payload length is 1023 DW, so cmd_reg max is 1022 DW. */
-#define DMA_MAX_LEN_DWORDS   1023
+ * cmd_reg[9:0] encodes (length - 1); 0x3FF encodes 1024 DW.
+ * The RTL uses 10-bit length where value 0 represents 1024 DW. */
+#define DMA_MAX_LEN_DWORDS   1024
 #define DMA_MAX_LEN_BYTES    (DMA_MAX_LEN_DWORDS * 4)
 
 /* IOCTL magic number */
