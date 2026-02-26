@@ -180,6 +180,15 @@ wire			mwr_rd_clk_en;
 wire	[11:0]	mwr_rd_addr;
 wire	[127:0]	mwr_rd_data;
 wire			mwr_cmd_start;
+wire			frame_done_pulse;
+
+wire			cfg_msi_en;
+wire			ven_msi_grant;
+wire			ven_msi_req;
+wire	[4:0]	ven_msi_vector;
+wire	[2:0]	ven_msi_tc;
+wire	[31:0]	cfg_msi_pending;
+reg				msi_pending;
 
 assign cfg_ido_req_en	=	1'b0;	
 assign cfg_ido_cpl_en	=	1'b0;	
@@ -189,6 +198,21 @@ assign xadm_nph_cdts	=	8'b0;
 assign xadm_npd_cdts	=	12'b0;	
 assign xadm_cplh_cdts	=	8'b0;	
 assign xadm_cpld_cdts	=	12'b0;	
+assign ven_msi_vector	=	5'd0;
+assign ven_msi_tc		=	3'd0;
+assign cfg_msi_pending	=	32'd0;
+assign ven_msi_req		=	msi_pending & cfg_msi_en;
+
+always @(posedge pclk_div2 or negedge core_rst_n) begin
+	if (!core_rst_n) begin
+		msi_pending <= 1'b0;
+	end else begin
+		if (ven_msi_grant)
+			msi_pending <= 1'b0;
+		if (frame_done_pulse)
+			msi_pending <= 1'b1;
+	end
+end
 
 // Rst debounce
 hsst_rst_cross_sync_v1_0 #(
@@ -366,6 +390,7 @@ ips2l_pcie_dma #(
 	.o_apb_prdata			(p_rdata_dma),				
 	.o_cross_4kb_boundary	(cross_4kb_boundary),	//4k边界
 	.o_tx_restart_ext		(mwr_cmd_start),
+	.o_frame_done_pulse_ext	(frame_done_pulse),
 	// External BAR2 read override for MWR frame data
 	.o_bar2_rd_clk_en_ext	(mwr_rd_clk_en),
 	.o_bar2_rd_addr_ext		(mwr_rd_addr),
@@ -496,16 +521,23 @@ pcie_test u_ips2l_pcie_wrap (
 	.axis_slave1_tlast			(axis_slave1_tlast),	
 	.axis_slave1_tuser			(axis_slave1_tuser),	
 
-	// AXI4-Stream slave 2 interface
-	.axis_slave2_tready			(axis_slave2_tready),	
-	.axis_slave2_tvalid			(axis_slave2_tvalid),	
-	.axis_slave2_tdata			(axis_slave2_tdata),	
-	.axis_slave2_tlast			(axis_slave2_tlast),	
-	.axis_slave2_tuser			(axis_slave2_tuser),	
+		// AXI4-Stream slave 2 interface
+		.axis_slave2_tready			(axis_slave2_tready),	
+		.axis_slave2_tvalid			(axis_slave2_tvalid),	
+		.axis_slave2_tdata			(axis_slave2_tdata),	
+		.axis_slave2_tlast			(axis_slave2_tlast),	
+		.axis_slave2_tuser			(axis_slave2_tuser),	
 
-	.pm_xtlh_block_tlp			(),						
+		.pm_xtlh_block_tlp			(),						
 
-	.cfg_send_cor_err_mux		(),						
+		.ven_msi_vector				(ven_msi_vector),
+		.cfg_msi_pending			(cfg_msi_pending),
+		.cfg_msi_en					(cfg_msi_en),
+		.ven_msi_req				(ven_msi_req),
+		.ven_msi_tc					(ven_msi_tc),
+		.ven_msi_grant				(ven_msi_grant),
+
+		.cfg_send_cor_err_mux		(),						
 	.cfg_send_nf_err_mux		(),						
 	.cfg_send_f_err_mux			(),						
 	.cfg_sys_err_rc				(),						

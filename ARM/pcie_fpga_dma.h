@@ -48,6 +48,9 @@
 #define DMA_CMD_LEN_MASK     0x3FF  /* Bits [9:0] - Transfer length in DWORDs minus 1 */
 #define DMA_CMD_64BIT_ADDR   (1 << 16)  /* Bit [16] - 1=64-bit address, 0=32-bit */
 #define DMA_CMD_WRITE        (1 << 24)  /* Bit [24] - 1=Write (MWR), 0=Read (MRD) */
+/* Frame mode command (bit31=1): bits[23:0] carry total dwords for one frame transfer. */
+#define DMA_CMD_FRAME_MODE        (1U << 31)
+#define DMA_CMD_FRAME_DWORDS_MASK 0x00FFFFFFU
 
 /* Maximum DMA transfer size per chunk in DWORDs.
  * cmd_reg[9:0] encodes (length - 1); 0x3FF encodes 1024 DW.

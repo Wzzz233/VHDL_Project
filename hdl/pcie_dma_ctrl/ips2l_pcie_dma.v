@@ -78,6 +78,7 @@ module ips2l_pcie_dma #(
     //cross_4kb_boundary
     output  wire                        o_cross_4kb_boundary    ,
     output  wire                        o_tx_restart_ext        ,
+    output  wire                        o_frame_done_pulse_ext  ,
     //external BAR2 read data override (for frame data via MWR)
     output  wire                        o_bar2_rd_clk_en_ext    ,
     output  wire    [ADDR_WIDTH-1:0]    o_bar2_rd_addr_ext      ,
@@ -162,10 +163,13 @@ assign o_bar2_rd_clk_en_ext = bar2_rd_clk_en;
 assign o_bar2_rd_addr_ext   = bar2_rd_addr;
 assign bar2_rd_data         = i_ext_bar2_rd_sel ? i_ext_bar2_rd_data : bar2_rd_data_int;
 assign o_tx_restart_ext     = tx_restart;
+assign o_frame_done_pulse_ext = frame_done_pulse;
 //**********************************************************************
 //rst tlp cnt
 wire                            tx_restart;
 wire        [63:0]              dma_check_result;
+wire                            mwr_tx_busy;
+wire                            frame_done_pulse;
 //debug bus
 //wire        [42:0]              dbg_bus_rx_ctrl;
 //wire        [43:0]              dbg_bus_mrd_tx;
@@ -278,6 +282,8 @@ u_ips2l_pcie_dma_controller
     .o_req_addr                 (req_addr                   ),
     .o_req_data                 (req_data                   ),
     .o_cross_4kb_boundary       (o_cross_4kb_boundary       ),
+    .i_mwr_tx_busy              (mwr_tx_busy                ),
+    .o_frame_done_pulse         (frame_done_pulse           ),
     //rst tlp cnt
     .i_dma_check_result         (dma_check_result           ),
     .o_tx_restart               (tx_restart                 )
@@ -359,7 +365,8 @@ u_ips2l_pcie_dma_tx_top
     .i_cpld_tag                 (cpld_tag                   ),
     .o_tag_full                 (tag_full                   ),
     //rst tlp cnt
-    .i_tx_restart               (tx_restart                 )
+    .i_tx_restart               (tx_restart                 ),
+    .o_mwr_tx_busy              (mwr_tx_busy                )
     //debug
     //.o_dbg_bus_mrd_tx           (dbg_bus_mrd_tx             ),
     //.o_dbg_bus_mwr_tx           (dbg_bus_mwr_tx             )

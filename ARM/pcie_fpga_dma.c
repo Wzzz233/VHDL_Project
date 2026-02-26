@@ -23,6 +23,7 @@
 #include <linux/sched.h>
 #include <linux/mutex.h>
 #include <linux/delay.h>
+#include <linux/interrupt.h>
 #include <linux/jiffies.h>
 #include <linux/version.h>
 
@@ -45,6 +46,7 @@ static int dma_poll_backoff_polls = 8; /* bump sleep every N polls */
 static int dma_max_len_dwords = 1023;  /* safe for legacy bitstream; 1024 needs updated RTL */
 static bool dma_verbose = false;   /* verbose transfer logs */
 static int dma_pixel_format = FPGA_PIXEL_FORMAT_BGRX8888;
+static int dma_allow_poll_fallback = 0;
 
 module_param(major_num, int, 0);
 MODULE_PARM_DESC(major_num, "Major device number (0=dynamic)");
@@ -64,6 +66,8 @@ module_param(dma_verbose, bool, 0644);
 MODULE_PARM_DESC(dma_verbose, "Enable verbose DMA transfer logs");
 module_param(dma_pixel_format, int, 0644);
 MODULE_PARM_DESC(dma_pixel_format, "Frame format: 0=BGR565, 1=BGRX8888");
+module_param(dma_allow_poll_fallback, int, 0644);
+MODULE_PARM_DESC(dma_allow_poll_fallback, "Allow legacy polling fallback when MSI setup fails (0=strict IRQ, 1=allow polling)");
 
 /* Per-device structure */
 struct fpga_dma_dev {
@@ -85,6 +89,10 @@ struct fpga_dma_dev {
 
     /* Completion for DMA transfer */
     struct completion dma_done;
+    bool irq_enabled;
+    bool use_poll_fallback;
+    int irq_vector;
+    u64 irq_count;
 
     /* Device info */
     struct fpga_info info;
@@ -175,13 +183,17 @@ static inline void fpga_dma_flush_posted_writes(struct fpga_dma_dev *dev)
     (void)ioread32(dev->bar0);
 }
 
-/**
- * fpga_dma_perform_transfer - Perform a DMA read from FPGA
- *
- * This initiates a DMA read operation by programming the FPGA's DMA controller.
- * The FPGA will read data from its DDR3 and write it to the RK3568's DMA buffer.
- */
-static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
+static irqreturn_t fpga_dma_irq_handler(int irq, void *data)
+{
+    struct fpga_dma_dev *dev = data;
+    (void)irq;
+
+    dev->irq_count++;
+    complete(&dev->dma_done);
+    return IRQ_HANDLED;
+}
+
+static int fpga_dma_perform_transfer_polling(struct fpga_dma_dev *dev, size_t size)
 {
     u32 cmd_reg;
     int ret = 0;
@@ -191,28 +203,13 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
     int chunk_num = 0;
 
     if (dma_verbose) {
-        dev_info(dev->dev, "=== DMA MWR Transfer Start ===\n");
+        dev_info(dev->dev, "=== DMA MWR Transfer Start (poll fallback) ===\n");
         dev_info(dev->dev, "  Total size: %zu bytes\n", size);
         dev_info(dev->dev, "  DMA handle (bus addr): 0x%llx\n", (u64)dev->dma_handle);
         dev_info(dev->dev, "  DMA buf (virt): %px\n", dev->dma_buf);
         dev_info(dev->dev, "  BAR1 base (virt): %px\n", dev->bar1);
     }
 
-    /* PIO read test: verify TLPs can reach FPGA via BAR0 read (MRd TLP) */
-    {
-        u32 bar0_val0 = ioread32(dev->bar0 + 0x00);
-        u32 bar0_val4 = ioread32(dev->bar0 + 0x04);
-        if (dma_verbose)
-            dev_info(dev->dev, "  BAR0 PIO read test: [0x00]=0x%08x [0x04]=0x%08x\n",
-                     bar0_val0, bar0_val4);
-        if (bar0_val0 == 0xFFFFFFFF && bar0_val4 == 0xFFFFFFFF)
-            dev_warn(dev->dev, "  >>> BAR0 reads all-F: TLPs may not reach FPGA! <<<\n");
-    }
-
-    /* Initialize completion */
-    reinit_completion(&dev->dma_done);
-
-    /* Process transfer in chunks to handle 4KB boundary */
     while (remaining > 0) {
         bool verbose_chunk = dma_verbose && ((chunk_num < 3) || ((chunk_num % 100) == 0));
         size_t buf_offset;
@@ -226,6 +223,8 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
         int poll_backoff_polls = dma_poll_backoff_polls;
         int poll_count = 0;
         unsigned long deadline;
+        u32 length_in_dwords;
+        u32 cmd_length;
 
         if (max_len_dwords == 0)
             max_len_dwords = 1;
@@ -234,20 +233,16 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
 
         chunk_size = min(remaining, (size_t)max_len_dwords * sizeof(u32));
 
-        /* Check for 4KB boundary crossing */
         if ((current_addr & 0xFFF) + chunk_size > 0x1000) {
-            /* Reduce chunk size to avoid crossing 4KB boundary */
             chunk_size = 0x1000 - (current_addr & 0xFFF);
             if (chunk_size == 0) {
-                /* Address is exactly at boundary, align to next page */
                 current_addr = ALIGN(current_addr, 0x1000);
                 continue;
             }
         }
 
-        /* Calculate length in DWORDs minus 1 (FPGA expects this format) */
-        u32 length_in_dwords = (chunk_size + 3) / 4;  /* Round up to DWORDs */
-        u32 cmd_length = length_in_dwords - 1;
+        length_in_dwords = (chunk_size + 3) / 4;
+        cmd_length = length_in_dwords - 1;
 
         if (verbose_chunk) {
             dev_info(dev->dev, "--- Chunk %d ---\n", chunk_num);
@@ -261,18 +256,6 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
 
         buf_offset = (size_t)(current_addr - dev->dma_handle);
 
-        if (verbose_chunk) {
-            /* Clear first 16 bytes of this chunk area to detect writes */
-            u32 *chunk_buf = (u32 *)((u8 *)dev->dma_buf + buf_offset);
-            chunk_buf[0] = 0xAAAAAAAA;
-            chunk_buf[1] = 0xBBBBBBBB;
-            chunk_buf[2] = 0xCCCCCCCC;
-            chunk_buf[3] = 0xDDDDDDDD;
-            dev_info(dev->dev, "  Pre-fill: %08x %08x %08x %08x\n",
-                     chunk_buf[0], chunk_buf[1], chunk_buf[2], chunk_buf[3]);
-        }
-
-        /* Set end-of-chunk sentinels and poll host RAM for overwrite completion. */
         chunk_tail0 = (u32 *)((u8 *)dev->dma_buf + buf_offset + chunk_size - sizeof(u32));
         WRITE_ONCE(*chunk_tail0, tail_sentinel0);
         if (chunk_size >= 8) {
@@ -281,25 +264,10 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
         }
         dma_wmb();
 
-        /* Program DMA address registers */
-        if (verbose_chunk)
-            dev_info(dev->dev, "  Writing BAR1+0x110 = 0x%x\n", lower_32_bits(current_addr));
-        fpga_dma_write_reg(dev, BAR1_DMA_L_ADDR, lower_32_bits(current_addr));
-
-        if (verbose_chunk)
-            dev_info(dev->dev, "  Writing BAR1+0x120 = 0x%x\n", upper_32_bits(current_addr));
+        /* Keep BAR write sequence fixed: 0x120 -> 0x110 -> 0x100. */
         fpga_dma_write_reg(dev, BAR1_DMA_H_ADDR, upper_32_bits(current_addr));
-
-        /* Program command register
-         * Bits [9:0]: Length in DWORDs - 1
-         * Bit [16]: 1 = 64-bit address mode
-         * Bit [24]: 1 = Write (MWR) - FPGA writes frame data TO host memory
-         */
+        fpga_dma_write_reg(dev, BAR1_DMA_L_ADDR, lower_32_bits(current_addr));
         cmd_reg = (cmd_length & DMA_CMD_LEN_MASK) | DMA_CMD_64BIT_ADDR | DMA_CMD_WRITE;
-        if (verbose_chunk) {
-            dev_info(dev->dev, "  Writing BAR1+0x100 = 0x%08x (MWR, len=%u DW)\n",
-                     cmd_reg, length_in_dwords);
-        }
         fpga_dma_write_reg(dev, BAR1_DMA_CMD_REG, cmd_reg);
         fpga_dma_flush_posted_writes(dev);
 
@@ -335,34 +303,69 @@ static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
         }
         dma_rmb();
 
-        /* Optional extra pacing for stress testing */
         if (dma_chunk_delay_us >= 1000)
             usleep_range(dma_chunk_delay_us, dma_chunk_delay_us + 100);
         else if (dma_chunk_delay_us > 0)
             udelay(dma_chunk_delay_us);
 
-        if (verbose_chunk) {
-            /* Check if data arrived */
-            u32 *chunk_buf = (u32 *)((u8 *)dev->dma_buf + buf_offset);
-            dev_info(dev->dev, "  Post-DMA: %08x %08x %08x %08x\n",
-                     chunk_buf[0], chunk_buf[1], chunk_buf[2], chunk_buf[3]);
-            if (chunk_buf[0] == 0xAAAAAAAA)
-                dev_info(dev->dev, "  >>> DATA NOT MODIFIED - FPGA did NOT write! <<<\n");
-            else
-                dev_info(dev->dev, "  >>> DATA CHANGED - FPGA wrote successfully! <<<\n");
-        }
-
-        /* Update remaining and address */
         remaining -= chunk_size;
         current_addr += chunk_size;
         chunk_num++;
     }
 
-    if (dma_verbose) {
-        dev_info(dev->dev, "  Processed chunks: %d\n", chunk_num);
-        dev_info(dev->dev, "=== DMA Transfer Complete ===\n");
-    }
+    if (dma_verbose)
+        dev_info(dev->dev, "=== DMA Transfer Complete (poll fallback) chunks=%d ===\n", chunk_num);
+
     return ret;
+}
+
+static int fpga_dma_perform_transfer_irq(struct fpga_dma_dev *dev, size_t size)
+{
+    u32 total_dwords;
+    u32 cmd_reg;
+    unsigned long wait_ret;
+
+    if (!size)
+        return -EINVAL;
+
+    total_dwords = DIV_ROUND_UP((u32)size, 4U);
+    if (total_dwords == 0 || total_dwords > DMA_CMD_FRAME_DWORDS_MASK) {
+        dev_err(dev->dev, "Invalid frame size for frame-mode DMA: %zu bytes (%u dwords)\n",
+                size, total_dwords);
+        return -EINVAL;
+    }
+
+    reinit_completion(&dev->dma_done);
+
+    /* Fixed write order: BAR1+0x120 -> BAR1+0x110 -> BAR1+0x100. */
+    fpga_dma_write_reg(dev, BAR1_DMA_H_ADDR, upper_32_bits(dev->dma_handle));
+    fpga_dma_write_reg(dev, BAR1_DMA_L_ADDR, lower_32_bits(dev->dma_handle));
+    cmd_reg = DMA_CMD_FRAME_MODE | (total_dwords & DMA_CMD_FRAME_DWORDS_MASK);
+    fpga_dma_write_reg(dev, BAR1_DMA_CMD_REG, cmd_reg);
+    fpga_dma_flush_posted_writes(dev);
+
+    wait_ret = wait_for_completion_timeout(&dev->dma_done, msecs_to_jiffies(dma_timeout_ms));
+    if (!wait_ret) {
+        dev_err(dev->dev, "Frame-mode DMA timeout (size=%zu bytes, dwords=%u)\n",
+                size, total_dwords);
+        return -ETIMEDOUT;
+    }
+
+    return 0;
+}
+
+/**
+ * fpga_dma_perform_transfer - Perform a DMA read from FPGA
+ */
+static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
+{
+    if (dev->irq_enabled)
+        return fpga_dma_perform_transfer_irq(dev, size);
+    if (dev->use_poll_fallback)
+        return fpga_dma_perform_transfer_polling(dev, size);
+
+    dev_err(dev->dev, "DMA requested but neither IRQ nor fallback path is available\n");
+    return -EIO;
 }
 
 /**
@@ -534,6 +537,10 @@ static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     dev->dev = &pdev->dev;
     mutex_init(&dev->dma_lock);
     init_completion(&dev->dma_done);
+    dev->irq_enabled = false;
+    dev->use_poll_fallback = false;
+    dev->irq_vector = -1;
+    dev->irq_count = 0;
 
     pci_set_drvdata(pdev, dev);
 
@@ -607,6 +614,36 @@ static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     dev_info(&pdev->dev, "DMA buffer allocated: virt=%p phys=%pad size=%zu\n",
              dev->dma_buf, &dev->dma_handle, dev->dma_buf_size);
 
+    ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
+    if (ret < 0) {
+        if (!dma_allow_poll_fallback) {
+            dev_err(&pdev->dev, "MSI setup failed (%d) and fallback is disabled\n", ret);
+            goto err_free_dma;
+        }
+        dev_warn(&pdev->dev, "MSI setup failed (%d), falling back to polling path\n", ret);
+        dev->use_poll_fallback = true;
+    } else {
+        dev->irq_vector = pci_irq_vector(pdev, 0);
+        ret = request_irq(dev->irq_vector, fpga_dma_irq_handler, 0, DRIVER_NAME, dev);
+        if (ret) {
+            pci_free_irq_vectors(pdev);
+            dev->irq_vector = -1;
+            if (!dma_allow_poll_fallback) {
+                dev_err(&pdev->dev,
+                        "request_irq failed (%d) and fallback is disabled\n", ret);
+                goto err_free_dma;
+            }
+            dev_warn(&pdev->dev,
+                     "request_irq failed (%d), falling back to polling path\n", ret);
+            dev->use_poll_fallback = true;
+        } else {
+            dev->irq_enabled = true;
+            dev->use_poll_fallback = false;
+            dev_info(&pdev->dev, "MSI enabled on vector %d (strict IRQ path)\n",
+                     dev->irq_vector);
+        }
+    }
+
     /* Fill device info structure */
     dev->info.vendor_id = FPGA_PCI_VENDOR_ID;
     dev->info.device_id = FPGA_PCI_DEVICE_ID;
@@ -639,7 +676,7 @@ static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
     if (ret) {
         dev_err(&pdev->dev, "Cannot register chrdev region\n");
-        goto err_free_dma;
+        goto err_free_irq;
     }
 
     cdev_init(&dev->cdev, &fpga_dma_fops);
@@ -663,6 +700,8 @@ static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
     dev_info(&pdev->dev, "FPGA DMA driver loaded successfully\n");
     dev_info(&pdev->dev, "Device file: /dev/%s\n", FPGA_DMA_DEV_NAME);
+    if (dev->use_poll_fallback)
+        dev_warn(&pdev->dev, "DMA running in polling fallback mode\n");
 
     return 0;
 
@@ -670,6 +709,13 @@ err_cdev_del:
     cdev_del(&dev->cdev);
 err_unregister_chrdev:
     unregister_chrdev_region(MKDEV(dev->major, 0), 1);
+err_free_irq:
+    if (dev->irq_enabled) {
+        free_irq(dev->irq_vector, dev);
+        pci_free_irq_vectors(pdev);
+        dev->irq_enabled = false;
+        dev->irq_vector = -1;
+    }
 err_free_dma:
     dma_free_coherent(&pdev->dev, dev->dma_buf_size, dev->dma_buf, dev->dma_handle);
 err_iounmap_bar1:
@@ -699,6 +745,13 @@ static void fpga_dma_remove(struct pci_dev *pdev)
     device_destroy(fpga_dma_class, MKDEV(dev->major, 0));
     cdev_del(&dev->cdev);
     unregister_chrdev_region(MKDEV(dev->major, 0), 1);
+
+    if (dev->irq_enabled) {
+        free_irq(dev->irq_vector, dev);
+        pci_free_irq_vectors(pdev);
+        dev->irq_enabled = false;
+        dev->irq_vector = -1;
+    }
 
     /* Free DMA buffer */
     dma_free_coherent(&pdev->dev, dev->dma_buf_size, dev->dma_buf, dev->dma_handle);

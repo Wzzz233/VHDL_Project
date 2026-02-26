@@ -52,9 +52,11 @@ module ips2l_pcie_dma_controller #(
     output  reg     [63:0]              o_req_addr              ,
     output  reg     [31:0]              o_req_data              ,
 
+    input                               i_mwr_tx_busy           ,
     input           [63:0]              i_dma_check_result      ,
     output  wire                        o_tx_restart            ,
-    output  reg                         o_cross_4kb_boundary
+    output  reg                         o_cross_4kb_boundary    ,
+    output  reg                         o_frame_done_pulse
 
 );
 //apb register for rc
@@ -108,11 +110,38 @@ wire                apb_read;
 wire                cmd_reg_cfg_done;
 wire                l_addr_cfg_done;
 wire                h_addr_cfg_done;
+wire                cmd_reg_cfg_done_legacy;
 
 wire                mwr32_req_vld /*synthesis PAP_MARK_DEBUG="1"*/;
 wire                mwr64_req_vld /*synthesis PAP_MARK_DEBUG="1"*/;
 wire                mrd32_req_vld;
 wire                mrd64_req_vld;
+
+localparam  [1:0]   FRAME_IDLE          = 2'd0;
+localparam  [1:0]   FRAME_REQ_START     = 2'd1;
+localparam  [1:0]   FRAME_WAIT_ACK      = 2'd2;
+localparam  [1:0]   FRAME_WAIT_DONE     = 2'd3;
+
+reg     [1:0]       frame_state;
+reg                 frame_active;
+reg     [63:0]      frame_cur_addr;
+reg     [23:0]      frame_remaining_dwords;
+reg     [10:0]      frame_chunk_dwords;
+reg                 frame_req_vld;
+reg     [9:0]       frame_req_length;
+reg     [63:0]      frame_req_addr;
+reg                 mwr_tx_busy_ff;
+
+wire                frame_mode_cmd_vld;
+wire    [23:0]      frame_mode_total_dwords;
+wire                frame_mode_cfg_done;
+wire                frame_cfg_hold;
+wire                mwr_tx_busy_fall;
+wire    [10:0]      frame_dwords_to_4kb_raw;
+wire    [10:0]      frame_dwords_to_4kb;
+wire    [10:0]      frame_dwords_limited;
+wire    [10:0]      frame_chunk_dwords_next;
+wire    [9:0]       frame_chunk_len_code_next;
 
 //4KB boundary
 wire    [12:0]      req_l_addr;
@@ -127,6 +156,25 @@ assign device_ep = (DEVICE_TYPE == 3'b000 || DEVICE_TYPE == 3'b001) ? 1'b1 : 1'b
 
 //req_ack
 assign ack_rcv = i_mwr32_req_ack | i_mwr64_req_ack | i_mrd32_req_ack | i_mrd64_req_ack;
+assign frame_mode_cmd_vld = device_ep && dma_cmd_reg_vld && dma_wr_data[31];
+assign frame_mode_total_dwords = dma_wr_data[23:0];
+assign frame_mode_cfg_done = device_ep && dma_ctrl_cfg_done && dma_cmd_reg[31];
+assign frame_cfg_hold = frame_active;
+assign mwr_tx_busy_fall = mwr_tx_busy_ff && !i_mwr_tx_busy;
+
+assign frame_dwords_to_4kb_raw = (frame_cur_addr[11:0] == 12'd0) ?
+                                 11'd1024 :
+                                 ((13'd4096 - {1'b0, frame_cur_addr[11:0]}) >> 2);
+assign frame_dwords_to_4kb = (frame_dwords_to_4kb_raw == 11'd0) ? 11'd1 : frame_dwords_to_4kb_raw;
+assign frame_dwords_limited = (frame_remaining_dwords > 24'd1024) ?
+                              11'd1024 :
+                              {1'b0, frame_remaining_dwords[9:0]};
+assign frame_chunk_dwords_next = (frame_dwords_limited > frame_dwords_to_4kb) ?
+                                 frame_dwords_to_4kb :
+                                 frame_dwords_limited;
+assign frame_chunk_len_code_next = (frame_chunk_dwords_next == 11'd1024) ?
+                                   10'd0 :
+                                   frame_chunk_dwords_next[9:0];
 
 //********************************************************************dma controller register*********************************************************************
 //dma_wr_data
@@ -161,7 +209,7 @@ always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
         dma_ctrl_cfg_done <= 1'b0;
-    else if (ack_rcv || cross_4kb_boundary)
+    else if (!frame_cfg_hold && (ack_rcv || cross_4kb_boundary))
         dma_ctrl_cfg_done <= 1'b0;
     else if(dma_cmd_reg_vld)
         dma_ctrl_cfg_done <= 1'b1;
@@ -191,7 +239,7 @@ always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
         dma_l_addr_cfg_done <= 1'b0;
-    else if (ack_rcv || cross_4kb_boundary)
+    else if (!frame_cfg_hold && (ack_rcv || cross_4kb_boundary))
         dma_l_addr_cfg_done <= 1'b0;
     else if(dma_cmd_l_addr_vld)
         dma_l_addr_cfg_done <= 1'b1;
@@ -220,10 +268,112 @@ always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
         dma_h_addr_cfg_done <= 1'b0;
-    else if (ack_rcv || cross_4kb_boundary)
+    else if (!frame_cfg_hold && (ack_rcv || cross_4kb_boundary))
         dma_h_addr_cfg_done <= 1'b0;
     else if(dma_cmd_h_addr_vld)
         dma_h_addr_cfg_done <= 1'b1;
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        mwr_tx_busy_ff <= 1'b0;
+    else
+        mwr_tx_busy_ff <= i_mwr_tx_busy;
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+    begin
+        frame_state <= FRAME_IDLE;
+        frame_active <= 1'b0;
+        frame_cur_addr <= 64'd0;
+        frame_remaining_dwords <= 24'd0;
+        frame_chunk_dwords <= 11'd0;
+        frame_req_vld <= 1'b0;
+        frame_req_length <= 10'd0;
+        frame_req_addr <= 64'd0;
+        o_frame_done_pulse <= 1'b0;
+    end
+    else
+    begin
+        frame_req_vld <= 1'b0;
+        o_frame_done_pulse <= 1'b0;
+
+        if(frame_mode_cmd_vld)
+        begin
+            frame_state <= FRAME_IDLE;
+            frame_chunk_dwords <= 11'd0;
+            if(frame_mode_total_dwords != 24'd0)
+            begin
+                frame_active <= 1'b1;
+                frame_cur_addr <= {dma_cmd_h_addr, dma_cmd_l_addr};
+                frame_remaining_dwords <= frame_mode_total_dwords;
+                frame_state <= FRAME_REQ_START;
+            end
+            else
+            begin
+                frame_active <= 1'b0;
+                frame_remaining_dwords <= 24'd0;
+                o_frame_done_pulse <= 1'b1;
+            end
+        end
+        else if(frame_active && dma_cmd_reg_vld)
+        begin
+            frame_active <= 1'b0;
+            frame_state <= FRAME_IDLE;
+            frame_remaining_dwords <= 24'd0;
+            frame_chunk_dwords <= 11'd0;
+        end
+        else if(frame_active)
+        begin
+            case(frame_state)
+                FRAME_REQ_START:
+                begin
+                    frame_chunk_dwords <= frame_chunk_dwords_next;
+                    frame_req_length <= frame_chunk_len_code_next;
+                    frame_req_addr <= frame_cur_addr;
+                    frame_req_vld <= (frame_chunk_dwords_next != 11'd0);
+                    frame_state <= FRAME_WAIT_ACK;
+                end
+                FRAME_WAIT_ACK:
+                begin
+                    if(i_mwr64_req_ack)
+                        frame_state <= FRAME_WAIT_DONE;
+                end
+                FRAME_WAIT_DONE:
+                begin
+                    if(mwr_tx_busy_fall)
+                    begin
+                        if(frame_remaining_dwords <= {13'd0, frame_chunk_dwords})
+                        begin
+                            frame_active <= 1'b0;
+                            frame_state <= FRAME_IDLE;
+                            frame_remaining_dwords <= 24'd0;
+                            frame_chunk_dwords <= 11'd0;
+                            o_frame_done_pulse <= 1'b1;
+                        end
+                        else
+                        begin
+                            frame_remaining_dwords <= frame_remaining_dwords - {13'd0, frame_chunk_dwords};
+                            frame_cur_addr <= frame_cur_addr + {51'd0, frame_chunk_dwords, 2'b0};
+                            frame_state <= FRAME_REQ_START;
+                        end
+                    end
+                end
+                default:
+                begin
+                    frame_state <= FRAME_IDLE;
+                end
+            endcase
+        end
+        else
+        begin
+            frame_state <= FRAME_IDLE;
+            frame_chunk_dwords <= 11'd0;
+        end
+    end
 end
 
 //********************************************************************apb controller register*********************************************************************
@@ -383,6 +533,7 @@ begin
 end
 
 assign cmd_reg_cfg_done = (device_ep && dma_ctrl_cfg_done)   || (device_rc && apb_ctrl_cfg_done);
+assign cmd_reg_cfg_done_legacy = cmd_reg_cfg_done && !frame_mode_cfg_done && !frame_active;
 
 assign l_addr_cfg_done  = (device_ep && dma_l_addr_cfg_done) || (device_rc && apb_l_addr_cfg_done);
 
@@ -393,7 +544,9 @@ always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
         o_req_length <= 10'd0;
-    else if(cmd_reg_cfg_done)
+    else if(frame_req_vld)
+        o_req_length <= frame_req_length;
+    else if(cmd_reg_cfg_done_legacy)
     begin
         if(device_ep)
             o_req_length <= dma_cmd_reg[9:0] + 10'h1;
@@ -407,6 +560,8 @@ always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
         o_req_addr[31:0] <= 32'd0;
+    else if(frame_req_vld)
+        o_req_addr[31:0] <= frame_req_addr[31:0];
     else if(l_addr_cfg_done)
         if(device_ep)
             o_req_addr[31:0] <= dma_cmd_l_addr;
@@ -418,6 +573,8 @@ always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
         o_req_addr[63:32] <= 32'd0;
+    else if(frame_req_vld)
+        o_req_addr[63:32] <= frame_req_addr[63:32];
     else if(h_addr_cfg_done)
         if(device_ep)
             o_req_addr[63:32] <= dma_cmd_h_addr;
@@ -448,10 +605,18 @@ begin
 end
 
 //gen req valid
-assign mwr32_req_vld = !dma_32_64_addr_cmd_flag &&  dma_wr_rd_cmd_flag && cmd_reg_cfg_done && l_addr_cfg_done && !cross_4kb_boundary;
-assign mwr64_req_vld =  dma_32_64_addr_cmd_flag &&  dma_wr_rd_cmd_flag && cmd_reg_cfg_done && l_addr_cfg_done && h_addr_cfg_done && !cross_4kb_boundary;
-assign mrd32_req_vld = !dma_32_64_addr_cmd_flag && !dma_wr_rd_cmd_flag && cmd_reg_cfg_done && l_addr_cfg_done && !cross_4kb_boundary;
-assign mrd64_req_vld =  dma_32_64_addr_cmd_flag && !dma_wr_rd_cmd_flag && cmd_reg_cfg_done && l_addr_cfg_done && h_addr_cfg_done && !cross_4kb_boundary;
+assign mwr32_req_vld = !frame_active && !frame_mode_cfg_done &&
+                       !dma_32_64_addr_cmd_flag && dma_wr_rd_cmd_flag &&
+                       cmd_reg_cfg_done_legacy && l_addr_cfg_done && !cross_4kb_boundary;
+assign mwr64_req_vld = !frame_active && !frame_mode_cfg_done &&
+                        dma_32_64_addr_cmd_flag && dma_wr_rd_cmd_flag &&
+                        cmd_reg_cfg_done_legacy && l_addr_cfg_done && h_addr_cfg_done && !cross_4kb_boundary;
+assign mrd32_req_vld = !frame_active && !frame_mode_cfg_done &&
+                       !dma_32_64_addr_cmd_flag && !dma_wr_rd_cmd_flag &&
+                       cmd_reg_cfg_done_legacy && l_addr_cfg_done && !cross_4kb_boundary;
+assign mrd64_req_vld = !frame_active && !frame_mode_cfg_done &&
+                        dma_32_64_addr_cmd_flag && !dma_wr_rd_cmd_flag &&
+                        cmd_reg_cfg_done_legacy && l_addr_cfg_done && h_addr_cfg_done && !cross_4kb_boundary;
 
 //mwr_32_req
 always@(posedge clk or negedge rst_n)
@@ -478,6 +643,8 @@ begin
         o_mwr64_req <= 1'b0;
     else if(i_mwr64_req_ack)
         o_mwr64_req <= 1'b0;
+    else if(frame_req_vld)
+        o_mwr64_req <= 1'b1;
     else if(mwr64_req_vld)
     begin
         if(!user_define_data_flag)
@@ -551,13 +718,14 @@ assign o_tx_restart = i_bar1_wr_en && (i_bar1_wr_addr[8:0] == 9'h110);
 //detect 4-KB boundary
 assign req_l_addr = device_rc ? apb_cmd_l_addr[12:0] : dma_cmd_l_addr[12:0];
 
-assign total_data   = ~((device_rc && apb_length_cfg_done) || (device_ep && dma_ctrl_cfg_done)) ? 13'd0 :
+assign total_data   = ~((device_rc && apb_length_cfg_done) || (device_ep && cmd_reg_cfg_done_legacy)) ? 13'd0 :
                         (o_req_length[9:0] == 10'b0) ? 13'h1000 : {1'b0,o_req_length[9:0],2'b0}; //total byte data
 
 assign target_addr  = ~l_addr_cfg_done ? 13'd0 : (req_l_addr[12:0] + total_data);
 
-assign cross_4kb_boundary = ~l_addr_cfg_done ? 1'b0 :
-                            (target_addr[12] == req_l_addr[12]) ? 1'b0 : |target_addr[11:0];
+assign cross_4kb_boundary = frame_active ? 1'b0 :
+                            (~l_addr_cfg_done ? 1'b0 :
+                             (target_addr[12] == req_l_addr[12]) ? 1'b0 : |target_addr[11:0]);
 
 //4-KB boundary flag
 always@(posedge clk or negedge rst_n)
@@ -566,7 +734,7 @@ begin
         o_cross_4kb_boundary <= 1'b0;
     else if(cross_4kb_boundary)
         o_cross_4kb_boundary <= 1'b1;
-    else if(cmd_reg_cfg_done)
+    else if(cmd_reg_cfg_done_legacy || frame_mode_cmd_vld)
         o_cross_4kb_boundary <= 1'b0;
 end
 
