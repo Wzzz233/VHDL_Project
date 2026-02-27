@@ -113,7 +113,8 @@ wire	[127:0]	axis_slave1_tdata;
 wire			axis_slave1_tlast;
 wire			axis_slave1_tuser;
 // AXI4-Stream slave 2 interface
-wire			axis_slave2_tready;
+wire			axis_slave2_tready_raw;
+wire			axis_slave2_tready_fc;
 wire			axis_slave2_tvalid;
 wire	[127:0]	axis_slave2_tdata;
 wire			axis_slave2_tlast;
@@ -363,7 +364,7 @@ ips2l_pcie_dma #(
 	.o_axis_slave1_tuser	(axis_slave1_tuser),		
 
 	// AXI4-Stream slave2 interface
-	.i_axis_slave2_trdy		(axis_slave2_tready),		
+	.i_axis_slave2_trdy		(axis_slave2_tready_fc),		
 	.o_axis_slave2_tvld		(axis_slave2_tvalid),		
 	.o_axis_slave2_tdata	(axis_slave2_tdata),		
 	.o_axis_slave2_tlast	(axis_slave2_tlast),		
@@ -522,7 +523,7 @@ pcie_test u_ips2l_pcie_wrap (
 	.axis_slave1_tuser			(axis_slave1_tuser),	
 
 		// AXI4-Stream slave 2 interface
-		.axis_slave2_tready			(axis_slave2_tready),	
+		.axis_slave2_tready			(axis_slave2_tready_raw),	
 		.axis_slave2_tvalid			(axis_slave2_tvalid),	
 		.axis_slave2_tdata			(axis_slave2_tdata),	
 		.axis_slave2_tlast			(axis_slave2_tlast),	
@@ -757,6 +758,7 @@ wire                       ddr_init_done /*synthesis PAP_MARK_DEBUG="1"*/;
 wire                       core_clk_ddr;
 wire                       fram_buf_init_done /*synthesis PAP_MARK_DEBUG="1"*/;
 wire [127:0]               frame_rd_data;
+wire                       frame_rd_data_ready;
 
 //=============================================================================
 // MWR Data Source (frame data for DMA transfer to host)
@@ -835,6 +837,9 @@ wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgr
 wire [127:0] frame_dma_data = dma_expand_mode
     ? (dma_expand_phase ? frame_rd_hold_bgrx_hi : frame_rd_data_bgrx_lo)
     : frame_rd_data;
+wire        frame_stream_ready = frame_rd_data_ready | ~dma_session_active;
+
+assign axis_slave2_tready_fc = axis_slave2_tready_raw & frame_stream_ready;
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
@@ -843,6 +848,11 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         rd_fsync_stretch_cnt <= 6'd0;
         dma_expand_phase <= 1'b0;
         frame_rd_data_hold <= 128'd0;
+    end else if (frame_done_pulse) begin
+        dma_session_active <= 1'b0;
+        dma_rd_word_count <= 18'd0;
+        rd_fsync_stretch_cnt <= 6'd0;
+        dma_expand_phase <= 1'b0;
     end else begin
         if (dma_session_start) begin
             dma_session_active <= 1'b1;
@@ -924,6 +934,7 @@ fram_buf #(
     .rd_en              (frame_rd_fetch_en),
     .vout_de            (),
     .vout_data          (frame_rd_data),
+    .rd_data_ready      (frame_rd_data_ready),
     
     // AXI Write channel
     .axi_awaddr         (axi_awaddr),

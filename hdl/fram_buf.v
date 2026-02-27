@@ -44,6 +44,7 @@ module fram_buf #(
     input                         rd_en,
     output                        vout_de,
     output [127 : 0]              vout_data, // Changed from [PIX_WIDTH-1:0]
+    output                        rd_data_ready,
     
     output [CTRL_ADDR_WIDTH-1:0]  axi_awaddr     ,
     output [3:0]                  axi_awid       ,
@@ -183,6 +184,7 @@ module fram_buf #(
         .rd_en           (  rd_en             ),//input                         rd_en,
         .vout_de         (  vout_de           ),//output                        vout_de,
         .vout_data       (  vout_data         ),//output [127 : 0]  vout_data,
+        .o_data_ready    (  rd_data_ready     ),//output                        o_data_ready,
         
         .init_done       (  init_done         ),//input                         init_done,
         .i_wr_frame_idx  (  frame_widx        ),//input  [1:0]                  i_wr_frame_idx,

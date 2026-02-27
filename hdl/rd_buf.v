@@ -38,6 +38,7 @@ module rd_buf #(
     input                         rd_en,
     output                        vout_de,
     output [127:0]                vout_data, // Changed to 128-bit
+    output                        o_data_ready,
     
     input                         init_done,
     input      [1:0]              i_wr_frame_idx,
@@ -60,6 +61,8 @@ module rd_buf #(
     localparam DDR_ADDR_OFFSET = RD_LINE_NUM * DDR_DATA_WIDTH / DQ_WIDTH;
     localparam [9:0] HIGH_WATER = 10'd640;
     localparam [9:0] LOW_WATER  = 10'd320;
+    localparam [9:0] READY_HI_WATER = 10'd64;
+    localparam [9:0] READY_LO_WATER = 10'd32;
     localparam [ADDR_WIDTH-1:0] FRAME_ADDR_STRIDE = ({{(ADDR_WIDTH-1){1'b0}},1'b1} << LINE_ADDR_WIDTH);
     
     //===========================================================================
@@ -98,6 +101,9 @@ module rd_buf #(
     reg      pending_req;
     reg [11:0] wr_line;
     reg      ddr_rdone_d;
+    reg      data_ready_ddr;
+    reg      data_ready_sync1;
+    reg      data_ready_sync2;
     wire     ddr_rdone_rise;
     wire     prefetch_enable_rise;
     wire     can_issue_now;
@@ -204,6 +210,19 @@ module rd_buf #(
             prefetch_enable_d <= 1'b1;
         else
             prefetch_enable_d <= prefetch_enable;
+    end
+
+    // Export read data readiness with hysteresis to avoid fast oscillation.
+    always @(posedge ddr_clk)
+    begin
+        if(~ddr_rstn || wr_rst)
+            data_ready_ddr <= 1'b0;
+        else if(fill_level >= READY_HI_WATER)
+            data_ready_ddr <= 1'b1;
+        else if(fill_level <= READY_LO_WATER)
+            data_ready_ddr <= 1'b0;
+        else
+            data_ready_ddr <= data_ready_ddr;
     end
 
     always @(posedge ddr_clk)
@@ -314,8 +333,24 @@ module rd_buf #(
         else
             rd_addr_wrap <= rd_addr_wrap;
     end
+
+    // Synchronize data-ready level into the read clock domain.
+    always @(posedge vout_clk)
+    begin
+        if(rd_rst || (~ddr_rstn_2d))
+        begin
+            data_ready_sync1 <= 1'b0;
+            data_ready_sync2 <= 1'b0;
+        end
+        else
+        begin
+            data_ready_sync1 <= data_ready_ddr;
+            data_ready_sync2 <= data_ready_sync1;
+        end
+    end
     
     assign vout_de = rd_en_2d;
     assign vout_data = rd_data;
+    assign o_data_ready = data_ready_sync2;
 
 endmodule
