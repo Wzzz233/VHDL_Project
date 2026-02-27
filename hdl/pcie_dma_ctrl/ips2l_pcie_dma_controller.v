@@ -166,7 +166,7 @@ assign frame_dwords_to_4kb_raw = (frame_cur_addr[11:0] == 12'd0) ?
                                  11'd1024 :
                                  ((13'd4096 - {1'b0, frame_cur_addr[11:0]}) >> 2);
 assign frame_dwords_to_4kb = (frame_dwords_to_4kb_raw == 11'd0) ? 11'd1 : frame_dwords_to_4kb_raw;
-assign frame_dwords_limited = (frame_remaining_dwords > 24'd1024) ?
+assign frame_dwords_limited = (frame_remaining_dwords >= 24'd1024) ?
                               11'd1024 :
                               {1'b0, frame_remaining_dwords[9:0]};
 assign frame_chunk_dwords_next = (frame_dwords_limited > frame_dwords_to_4kb) ?
@@ -334,8 +334,19 @@ begin
                     frame_chunk_dwords <= frame_chunk_dwords_next;
                     frame_req_length <= frame_chunk_len_code_next;
                     frame_req_addr <= frame_cur_addr;
-                    frame_req_vld <= (frame_chunk_dwords_next != 11'd0);
-                    frame_state <= FRAME_WAIT_ACK;
+                    if (frame_chunk_dwords_next != 11'd0)
+                    begin
+                        frame_req_vld <= 1'b1;
+                        frame_state <= FRAME_WAIT_ACK;
+                    end
+                    else
+                    begin
+                        frame_active <= 1'b0;
+                        frame_state <= FRAME_IDLE;
+                        frame_remaining_dwords <= 24'd0;
+                        frame_chunk_dwords <= 11'd0;
+                        o_frame_done_pulse <= 1'b1;
+                    end
                 end
                 FRAME_WAIT_ACK:
                 begin
