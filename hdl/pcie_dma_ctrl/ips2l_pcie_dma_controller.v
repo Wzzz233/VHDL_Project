@@ -166,8 +166,10 @@ assign frame_dwords_to_4kb_raw = (frame_cur_addr[11:0] == 12'd0) ?
                                  11'd1024 :
                                  ((13'd4096 - {1'b0, frame_cur_addr[11:0]}) >> 2);
 assign frame_dwords_to_4kb = (frame_dwords_to_4kb_raw == 11'd0) ? 11'd1 : frame_dwords_to_4kb_raw;
-assign frame_dwords_limited = (frame_remaining_dwords >= 24'd1024) ?
-                              11'd1024 :
+// Downstream MWR read control uses 10-bit length counters and cannot safely
+// represent 1024DW as "0". Keep frame chunks <= 1023DW for data-path alignment.
+assign frame_dwords_limited = (frame_remaining_dwords >= 24'd1023) ?
+                              11'd1023 :
                               {1'b0, frame_remaining_dwords[9:0]};
 assign frame_chunk_dwords_next = (frame_dwords_limited > frame_dwords_to_4kb) ?
                                  frame_dwords_to_4kb :
