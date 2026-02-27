@@ -39,6 +39,8 @@ module fram_buf #(
     input                         ddr_clk,
     input                         ddr_rstn,
     
+    input                         ddr_init_ready,
+
     input                         vout_clk,
     input                         rd_fsync,
     input                         rd_en,
@@ -186,7 +188,7 @@ module fram_buf #(
         .vout_data       (  vout_data         ),//output [127 : 0]  vout_data,
         .o_data_ready    (  rd_data_ready     ),//output                        o_data_ready,
         
-        .init_done       (  init_done         ),//input                         init_done,
+        .init_done       (  ddr_init_ready    ),//input - use DDR3 init directly, not camera-dependent init_done
         .i_wr_frame_idx  (  frame_widx        ),//input  [1:0]                  i_wr_frame_idx,
       
         .ddr_rreq        (  rd_cmd_en         ),//output                        ddr_rreq,

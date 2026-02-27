@@ -47,6 +47,7 @@ static int dma_max_len_dwords = 1023;  /* safe for legacy bitstream; 1024 needs 
 static bool dma_verbose = false;   /* verbose transfer logs */
 static int dma_pixel_format = FPGA_PIXEL_FORMAT_BGRX8888;
 static int dma_allow_poll_fallback = 0;
+static int dma_irq_timeout_retry_poll = 1;
 
 module_param(major_num, int, 0);
 MODULE_PARM_DESC(major_num, "Major device number (0=dynamic)");
@@ -68,6 +69,8 @@ module_param(dma_pixel_format, int, 0644);
 MODULE_PARM_DESC(dma_pixel_format, "Frame format: 0=BGR565, 1=BGRX8888");
 module_param(dma_allow_poll_fallback, int, 0644);
 MODULE_PARM_DESC(dma_allow_poll_fallback, "Allow legacy polling fallback when MSI setup fails (0=strict IRQ, 1=allow polling)");
+module_param(dma_irq_timeout_retry_poll, int, 0644);
+MODULE_PARM_DESC(dma_irq_timeout_retry_poll, "Retry once with polling path on IRQ timeout (0=disabled, 1=enabled)");
 
 /* Per-device structure */
 struct fpga_dma_dev {
@@ -359,8 +362,15 @@ static int fpga_dma_perform_transfer_irq(struct fpga_dma_dev *dev, size_t size)
  */
 static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
 {
-    if (dev->irq_enabled)
-        return fpga_dma_perform_transfer_irq(dev, size);
+    if (dev->irq_enabled) {
+        int ret = fpga_dma_perform_transfer_irq(dev, size);
+
+        if (ret == -ETIMEDOUT && dma_irq_timeout_retry_poll) {
+            dev_warn(dev->dev, "IRQ timeout, retrying DMA transfer with polling path\n");
+            ret = fpga_dma_perform_transfer_polling(dev, size);
+        }
+        return ret;
+    }
     if (dev->use_poll_fallback)
         return fpga_dma_perform_transfer_polling(dev, size);
 

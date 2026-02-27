@@ -364,7 +364,7 @@ ips2l_pcie_dma #(
 	.o_axis_slave1_tuser	(axis_slave1_tuser),		
 
 	// AXI4-Stream slave2 interface
-	.i_axis_slave2_trdy		(axis_slave2_tready_fc),		
+	.i_axis_slave2_trdy		(axis_slave2_tready_raw),
 	.o_axis_slave2_tvld		(axis_slave2_tvalid),		
 	.o_axis_slave2_tdata	(axis_slave2_tdata),		
 	.o_axis_slave2_tlast	(axis_slave2_tlast),		
@@ -811,7 +811,7 @@ begin
     r5 = pix565[4:0];
     g6 = pix565[10:5];
     b5 = pix565[15:11];
-    bgr565_to_bgrx32 = {8'h08, expand5_to_8(r5), expand6_to_8(g6), expand5_to_8(b5)};
+    bgr565_to_bgrx32 = {8'hFF, expand5_to_8(r5), expand6_to_8(g6), expand5_to_8(b5)};
 end
 endfunction
 
@@ -873,7 +873,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             dma_expand_phase <= 1'b0;
             mwr_first_beat_seen <= 1'b0;
         end else begin
-            if (dma_session_active && axis_slave2_tvalid && axis_slave2_tready_raw)
+            if (dma_session_active && bar2_addr_step)
                 mwr_first_beat_seen <= 1'b1;
 
             if (dma_session_active && bar2_addr_step) begin
@@ -935,6 +935,7 @@ fram_buf #(
     // DDR clock domain
     .ddr_clk            (core_clk_ddr),
     .ddr_rstn           (ddr_init_done),
+    .ddr_init_ready     (ddr_init_done),
     
     // Camera input (write to DDR)
     .vin_clk            (cmos1_pclk),
