@@ -364,7 +364,7 @@ ips2l_pcie_dma #(
 	.o_axis_slave1_tuser	(axis_slave1_tuser),		
 
 	// AXI4-Stream slave2 interface
-	.i_axis_slave2_trdy		(axis_slave2_tready_fc),		
+	.i_axis_slave2_trdy		(axis_slave2_tready_raw),		
 	.o_axis_slave2_tvld		(axis_slave2_tvalid),		
 	.o_axis_slave2_tdata	(axis_slave2_tdata),		
 	.o_axis_slave2_tlast	(axis_slave2_tlast),		
