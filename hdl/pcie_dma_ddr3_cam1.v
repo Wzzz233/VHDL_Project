@@ -364,7 +364,7 @@ ips2l_pcie_dma #(
 	.o_axis_slave1_tuser	(axis_slave1_tuser),		
 
 	// AXI4-Stream slave2 interface
-	.i_axis_slave2_trdy		(axis_slave2_tready_raw),		
+	.i_axis_slave2_trdy		(axis_slave2_tready_fc),		
 	.o_axis_slave2_tvld		(axis_slave2_tvalid),		
 	.o_axis_slave2_tdata	(axis_slave2_tdata),		
 	.o_axis_slave2_tlast	(axis_slave2_tlast),		
@@ -773,12 +773,15 @@ reg  [5:0]                 rd_fsync_stretch_cnt;
 reg  [8:0]                 post_ddr_word_x;
 reg  [9:0]                 post_ddr_line_y;
 reg                        dma_expand_phase;
+reg                        mwr_first_beat_seen;
+reg  [11:0]                mwr_rd_addr_d;
 reg  [127:0]               frame_rd_data_hold;
 wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
 wire                       dma_expand_mode = DMA_OUTPUT_BGRX;
 wire [17:0]                frame_words_cfg = dma_expand_mode ? FRAME_WORDS_BGRX : FRAME_WORDS_565;
-wire                       frame_rd_fetch_en = mwr_rd_clk_en & (~dma_expand_mode | ~dma_expand_phase);
+wire                       bar2_addr_step = mwr_rd_clk_en && (mwr_rd_addr != mwr_rd_addr_d);
+wire                       frame_rd_fetch_en = bar2_addr_step & (~dma_expand_mode | ~dma_expand_phase);
 wire [11:0]                post_ddr_x_pix = dma_expand_mode ? {1'b0, post_ddr_word_x, 2'b00}
                                                              : {post_ddr_word_x, 3'b000};
 wire [15:0]                post_ddr_color_base = color_bar_bgr565(post_ddr_x_pix);
@@ -837,9 +840,16 @@ wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgr
 wire [127:0] frame_dma_data = dma_expand_mode
     ? (dma_expand_phase ? frame_rd_hold_bgrx_hi : frame_rd_data_bgrx_lo)
     : frame_rd_data;
-wire        frame_stream_ready = frame_rd_data_ready | ~dma_session_active;
+wire        frame_stream_ready = ~dma_session_active | ~mwr_first_beat_seen | frame_rd_data_ready;
 
 assign axis_slave2_tready_fc = axis_slave2_tready_raw & frame_stream_ready;
+
+always @(posedge pclk_div2 or negedge core_rst_n) begin
+    if (!core_rst_n)
+        mwr_rd_addr_d <= 12'd0;
+    else
+        mwr_rd_addr_d <= mwr_rd_addr;
+end
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
@@ -847,20 +857,26 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         dma_rd_word_count <= 18'd0;
         rd_fsync_stretch_cnt <= 6'd0;
         dma_expand_phase <= 1'b0;
+        mwr_first_beat_seen <= 1'b0;
         frame_rd_data_hold <= 128'd0;
     end else if (frame_done_pulse) begin
         dma_session_active <= 1'b0;
         dma_rd_word_count <= 18'd0;
         rd_fsync_stretch_cnt <= 6'd0;
         dma_expand_phase <= 1'b0;
+        mwr_first_beat_seen <= 1'b0;
     end else begin
         if (dma_session_start) begin
             dma_session_active <= 1'b1;
             dma_rd_word_count <= 18'd0;
             rd_fsync_stretch_cnt <= 6'd31;
             dma_expand_phase <= 1'b0;
+            mwr_first_beat_seen <= 1'b0;
         end else begin
-            if (dma_session_active && mwr_rd_clk_en) begin
+            if (dma_session_active && axis_slave2_tvalid && axis_slave2_tready_raw)
+                mwr_first_beat_seen <= 1'b1;
+
+            if (dma_session_active && bar2_addr_step) begin
                 if (dma_rd_word_count == frame_words_cfg - 1'b1) begin
                     dma_rd_word_count <= 18'd0;
                     dma_session_active <= 1'b0;
@@ -869,7 +885,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 end
             end
 
-            if (dma_expand_mode && dma_session_active && mwr_rd_clk_en)
+            if (dma_expand_mode && dma_session_active && bar2_addr_step)
                 dma_expand_phase <= ~dma_expand_phase;
 
             if (frame_rd_fetch_en)
@@ -893,7 +909,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
     end else if (dma_session_start) begin
         post_ddr_word_x <= 9'd0;
         post_ddr_line_y <= 10'd0;
-    end else if (mwr_rd_clk_en) begin
+    end else if (bar2_addr_step) begin
         if (post_ddr_word_x == post_ddr_words_per_line - 1'b1) begin
             post_ddr_word_x <= 9'd0;
             if (post_ddr_line_y == 10'd719)

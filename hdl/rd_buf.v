@@ -61,8 +61,8 @@ module rd_buf #(
     localparam DDR_ADDR_OFFSET = RD_LINE_NUM * DDR_DATA_WIDTH / DQ_WIDTH;
     localparam [9:0] HIGH_WATER = 10'd640;
     localparam [9:0] LOW_WATER  = 10'd320;
-    localparam [9:0] READY_HI_WATER = 10'd64;
-    localparam [9:0] READY_LO_WATER = 10'd32;
+    localparam [9:0] READY_HI_WATER = 10'd256;
+    localparam [9:0] READY_LO_WATER = 10'd128;
     localparam [ADDR_WIDTH-1:0] FRAME_ADDR_STRIDE = ({{(ADDR_WIDTH-1){1'b0}},1'b1} << LINE_ADDR_WIDTH);
     
     //===========================================================================
