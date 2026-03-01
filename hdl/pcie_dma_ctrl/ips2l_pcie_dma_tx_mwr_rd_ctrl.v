@@ -36,10 +36,11 @@ module ips2l_pcie_dma_tx_mwr_rd_ctrl #(
 
 reg                 rd_en_ff;
 wire                rd_start;
+wire    [10:0]      rd_length_dw;
 
 reg     [10:0]      rd_addr;
-reg     [9:0]       data_remain_cnt;
-reg     [9:0]       data_remain_cnt_ff;
+reg     [10:0]      data_remain_cnt;
+reg     [10:0]      data_remain_cnt_ff;
 
 wire                rd_ram_hold;
 
@@ -52,21 +53,22 @@ begin
 end
 
 assign rd_start = ~rd_en_ff && i_rd_en;
+assign rd_length_dw = (i_rd_length == 10'd0) ? 11'd1024 : {1'b0, i_rd_length};
 
 //calculating rd addr from rd length
 //data need to read
 always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
-        data_remain_cnt <= 10'b0;
+        data_remain_cnt <= 11'b0;
     else if(rd_start)
-        data_remain_cnt <= i_rd_length;
+        data_remain_cnt <= rd_length_dw;
     else if(!rd_ram_hold)
     begin
-        if(data_remain_cnt >= 10'd4)
-            data_remain_cnt <= data_remain_cnt - 10'd4;
-        else if(data_remain_cnt < 10'd4)
-            data_remain_cnt <= 10'b0;
+        if(data_remain_cnt >= 11'd4)
+            data_remain_cnt <= data_remain_cnt - 11'd4;
+        else if(data_remain_cnt < 11'd4)
+            data_remain_cnt <= 11'b0;
     end
 end
 
@@ -74,7 +76,7 @@ end
 always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
-        data_remain_cnt_ff <= 10'b0;
+        data_remain_cnt_ff <= 11'b0;
     else if(!rd_ram_hold)
         data_remain_cnt_ff <= data_remain_cnt;
 end
@@ -88,7 +90,7 @@ begin
         rd_addr <= 11'b0;
     else if(o_bar_rd_clk_en && !rd_ram_hold)
     begin
-        if(data_remain_cnt_ff >= 10'd4 )
+        if(data_remain_cnt_ff >= 11'd4 )
             rd_addr <= rd_addr +11'd4;
         else
             rd_addr <= rd_addr + {9'b0+data_remain_cnt_ff[1:0]};
