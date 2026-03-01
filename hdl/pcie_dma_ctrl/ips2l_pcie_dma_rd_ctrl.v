@@ -39,6 +39,7 @@ localparam FIFO_DEEP = 8'd128;    //should be 2^N  real_deep = deep < 16 ? 16 : 
 
 reg                         rd_en_ff;
 wire                        rd_start;
+wire    [10:0]              rd_length_dw;
 
 reg     [ADDR_WIDTH-1:0]    rd_addr;
 
@@ -49,8 +50,8 @@ reg     [127:0]             rd_data_ff;
 wire    [255:0]             data_shift;
 reg     [127:0]             data_shift_out;
 
-reg     [9:0]               shift_data_cnt;
-reg     [9:0]               shift_data_cnt_ff;
+reg     [10:0]              shift_data_cnt;
+reg     [10:0]              shift_data_cnt_ff;
 
 reg                         shift_data_out_valid;
 reg                         ram_data_out_vld;
@@ -63,7 +64,7 @@ reg     [7:0]               fifo_data_cnt;
 reg                         rd_ram_hold_ff;
 wire                        data_out_ready;
 wire                        data_out_valid;
-reg     [9:0]               tx_data_cnt;
+reg     [10:0]              tx_data_cnt;
 
 wire    [127:0]             data_out;
 
@@ -76,6 +77,7 @@ begin
 end
 //rd ctrl start
 assign rd_start = ~rd_en_ff && i_rd_en;
+assign rd_length_dw = (i_rd_length == 10'd0) ? 11'd1024 : {1'b0, i_rd_length};
 
 //total dw data need read
 always@(posedge clk or negedge rst_n)
@@ -83,7 +85,7 @@ begin
     if(!rst_n)
         data_read_cnt <= 11'b0;
     else if(rd_start)
-        data_read_cnt <= {1'b0,i_rd_length} + {9'b0,i_rd_addr[3:2]};
+        data_read_cnt <= rd_length_dw + {9'b0,i_rd_addr[3:2]};
     else if(!o_rd_ram_hold)
     begin
         if(data_read_cnt > 11'h4)
@@ -150,22 +152,22 @@ end
 always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
-        shift_data_cnt <= 10'b0;
+        shift_data_cnt <= 11'b0;
     else if(rd_start)
-        shift_data_cnt <= i_rd_length;
+        shift_data_cnt <= rd_length_dw;
     else if(!o_rd_ram_hold)
     begin
-        if(shift_data_cnt >= 10'd4)
-            shift_data_cnt <= shift_data_cnt - 10'd4;
-        else if(shift_data_cnt < 10'd4)
-            shift_data_cnt <= 10'b0;
+        if(shift_data_cnt >= 11'd4)
+            shift_data_cnt <= shift_data_cnt - 11'd4;
+        else if(shift_data_cnt < 11'd4)
+            shift_data_cnt <= 11'b0;
     end
 end
 
 always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
-        shift_data_cnt_ff  <= 10'b0;
+        shift_data_cnt_ff  <= 11'b0;
     else
         shift_data_cnt_ff  <= shift_data_cnt;
 end
@@ -188,7 +190,7 @@ begin
         shift_data_out_valid <= 1'b0;
     else if(!o_rd_ram_hold)
     begin
-        if(shift_data_cnt_ff > 10'b0)
+        if(shift_data_cnt_ff > 11'b0)
             shift_data_out_valid <= 1'b1;
         else if(~(|shift_data_cnt_ff) && fifo_data_in)
             shift_data_out_valid <= 1'b0;
@@ -257,11 +259,11 @@ assign data_out_ready  = i_tlp_tx && !i_tx_hold;
 always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
-        tx_data_cnt <= 10'b0;
+        tx_data_cnt <= 11'b0;
     else if(rd_start)
-        tx_data_cnt <= (i_rd_length >= 10'd4) ? i_rd_length - 10'd4 :  10'd0;
+        tx_data_cnt <= (rd_length_dw >= 11'd4) ? rd_length_dw - 11'd4 :  11'd0;
     else if(fifo_data_out && |tx_data_cnt)
-        tx_data_cnt <= (tx_data_cnt >= 10'd4) ? tx_data_cnt - 10'd4 :  10'd0;
+        tx_data_cnt <= (tx_data_cnt >= 11'd4) ? tx_data_cnt - 11'd4 :  11'd0;
 end
 
 //read fifo last data flag
