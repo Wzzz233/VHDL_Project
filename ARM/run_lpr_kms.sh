@@ -21,6 +21,14 @@ MIN_CAR_CONF="0.35"
 MIN_PLATE_CONF="0.45"
 PLATE_ON_CAR_ONLY="0"
 PLATE_ONLY="1"
+SW_PREPROC="0"
+FPGA_A_MASK="0"
+A_PROJ_RATIO="0.35"
+A_ROI_IOU_MIN="0.05"
+PED_EVENT="0"
+RED_STABLE_FRAMES="5"
+RED_RATIO_THR="0.002"
+STOPLINE_RATIO="0.55"
 
 usage() {
   cat <<EOF
@@ -45,6 +53,14 @@ Usage: $0 --veh-model <path> --plate-model <path> --ocr-model <path> --ocr-keys 
   --min-plate-conf <v>       Plate conf threshold (default: ${MIN_PLATE_CONF})
   --plate-on-car-only <0|1>  Reserve switch (default: ${PLATE_ON_CAR_ONLY})
   --plate-only <0|1>         Disable vehicle dependency for plate output (default: ${PLATE_ONLY})
+  --sw-preproc <0|1>         Enable software preproc A/B path (default: ${SW_PREPROC})
+  --fpga-a-mask <0|1>        Enable FPGA A-channel ROI fusion (default: ${FPGA_A_MASK})
+  --a-proj-ratio <v>         A-channel projection threshold ratio (default: ${A_PROJ_RATIO})
+  --a-roi-iou-min <v>        Min IoU for A-ROI filtering (default: ${A_ROI_IOU_MIN})
+  --ped-event <0|1>          Enable pedestrian red-light event (default: ${PED_EVENT})
+  --red-stable-frames <n>    Red light debounce frames (default: ${RED_STABLE_FRAMES})
+  --red-ratio-thr <v>        A-channel red ratio threshold (default: ${RED_RATIO_THR})
+  --stopline-ratio <v>       Stopline Y ratio [0,1] (default: ${STOPLINE_RATIO})
 EOF
 }
 
@@ -70,6 +86,14 @@ while [[ $# -gt 0 ]]; do
     --min-plate-conf) MIN_PLATE_CONF="$2"; shift 2 ;;
     --plate-on-car-only) PLATE_ON_CAR_ONLY="$2"; shift 2 ;;
     --plate-only) PLATE_ONLY="$2"; shift 2 ;;
+    --sw-preproc) SW_PREPROC="$2"; shift 2 ;;
+    --fpga-a-mask) FPGA_A_MASK="$2"; shift 2 ;;
+    --a-proj-ratio) A_PROJ_RATIO="$2"; shift 2 ;;
+    --a-roi-iou-min) A_ROI_IOU_MIN="$2"; shift 2 ;;
+    --ped-event) PED_EVENT="$2"; shift 2 ;;
+    --red-stable-frames) RED_STABLE_FRAMES="$2"; shift 2 ;;
+    --red-ratio-thr) RED_RATIO_THR="$2"; shift 2 ;;
+    --stopline-ratio) STOPLINE_RATIO="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -128,7 +152,15 @@ CMD=(./fpga_lpr_display
   --min-car-conf "$MIN_CAR_CONF"
   --min-plate-conf "$MIN_PLATE_CONF"
   --plate-on-car-only "$PLATE_ON_CAR_ONLY"
-  --plate-only "$PLATE_ONLY")
+  --plate-only "$PLATE_ONLY"
+  --sw-preproc "$SW_PREPROC"
+  --fpga-a-mask "$FPGA_A_MASK"
+  --a-proj-ratio "$A_PROJ_RATIO"
+  --a-roi-iou-min "$A_ROI_IOU_MIN"
+  --ped-event "$PED_EVENT"
+  --red-stable-frames "$RED_STABLE_FRAMES"
+  --red-ratio-thr "$RED_RATIO_THR"
+  --stopline-ratio "$STOPLINE_RATIO")
 
 if [[ -n "$CONNECTOR_ID" ]]; then
   CMD+=(--connector-id "$CONNECTOR_ID")

@@ -53,6 +53,8 @@
 
 #define COLOR_YELLOW_565 0xFFE0
 #define COLOR_CYAN_565 0x07FF
+#define COLOR_RED_565 0xF800
+#define COLOR_GREEN_565 0x07E0
 
 enum pixel_order {
     PIXEL_ORDER_BGR565 = 0,
@@ -96,6 +98,14 @@ struct options {
     float min_plate_conf;
     int plate_on_car_only;
     int plate_only;
+    int sw_preproc;
+    int fpga_a_mask;
+    float a_proj_ratio;
+    float a_roi_iou_min;
+    int ped_event;
+    int red_stable_frames;
+    float red_ratio_thr;
+    float stopline_ratio;
     bool swap16;
 };
 
@@ -128,9 +138,17 @@ struct lpr_results {
     struct det_box cars[MAX_DETS];
     int car_count;
     int car_raw_count;
+    struct det_box persons[MAX_DETS];
+    int person_count;
+    int person_raw_count;
     struct plate_det plates[MAX_DETS];
     int plate_count;
     int plate_raw_count;
+    struct det_box a_roi;
+    int a_roi_valid;
+    int light_red;
+    uint64_t ped_event_total;
+    uint64_t ped_event_last_frame;
     uint64_t frame_seq;
     double infer_ms_last;
     uint64_t infer_frames_total;
@@ -221,11 +239,23 @@ struct app_ctx {
     char labels[MAX_LABELS][MAX_LABEL_LEN];
     int label_count;
     int car_class_id;
+    int person_class_id;
 
     struct det_box plate_hist1[MAX_DETS];
     int plate_hist1_count;
     struct det_box plate_hist2[MAX_DETS];
     int plate_hist2_count;
+
+    uint64_t pred_rows_total;
+    uint64_t gate_plate_raw_positive_frames;
+    uint64_t gate_plate_raw_positive_streak;
+
+    struct det_box ped_track_box[MAX_DETS];
+    int ped_track_id[MAX_DETS];
+    int ped_track_ttl[MAX_DETS];
+    int ped_track_count;
+    int ped_next_track_id;
+    int ped_red_streak;
 };
 
 struct slot_ticket {
@@ -241,6 +271,7 @@ struct frame_cookie {
 static volatile sig_atomic_t g_stop = 0;
 
 static void resize_rgb888_nn(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh);
+static float box_iou(const struct det_box *a, const struct det_box *b);
 
 static int64_t mono_us(void)
 {
@@ -277,6 +308,14 @@ static void print_usage(const char *prog)
             "  --min-plate-conf <v>    Plate confidence threshold (default: 0.45)\n"
             "  --plate-on-car-only <0|1>  Reserve switch (default: 0)\n"
             "  --plate-only <0|1>      Disable vehicle dependency for plate output (default: 1)\n"
+            "  --sw-preproc <0|1>      Enable software preproc A/B path (default: 0)\n"
+            "  --fpga-a-mask <0|1>     Enable FPGA A-channel ROI fusion (default: 0)\n"
+            "  --a-proj-ratio <v>      A-channel projection threshold ratio (default: 0.35)\n"
+            "  --a-roi-iou-min <v>     Min IoU for A-ROI filtering (default: 0.05)\n"
+            "  --ped-event <0|1>       Enable pedestrian red-light event (default: 0)\n"
+            "  --red-stable-frames <n> Red light debounce frames (default: 5)\n"
+            "  --red-ratio-thr <v>     A-channel red ratio threshold (default: 0.002)\n"
+            "  --stopline-ratio <v>    Stopline Y ratio [0,1] (default: 0.55)\n"
             "  --help                  Show this help\n",
             prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD, DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
             DEFAULT_STATS_INTERVAL, DEFAULT_COPY_BUFFERS, DEFAULT_QUEUE_DEPTH);
@@ -305,6 +344,14 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"min-plate-conf", required_argument, NULL, 18},
         {"plate-on-car-only", required_argument, NULL, 19},
         {"plate-only", required_argument, NULL, 20},
+        {"sw-preproc", required_argument, NULL, 21},
+        {"fpga-a-mask", required_argument, NULL, 22},
+        {"a-proj-ratio", required_argument, NULL, 23},
+        {"a-roi-iou-min", required_argument, NULL, 24},
+        {"ped-event", required_argument, NULL, 25},
+        {"red-stable-frames", required_argument, NULL, 26},
+        {"red-ratio-thr", required_argument, NULL, 27},
+        {"stopline-ratio", required_argument, NULL, 28},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -325,6 +372,14 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->min_plate_conf = 0.45f;
     opt->plate_on_car_only = 0;
     opt->plate_only = 1;
+    opt->sw_preproc = 0;
+    opt->fpga_a_mask = 0;
+    opt->a_proj_ratio = 0.35f;
+    opt->a_roi_iou_min = 0.05f;
+    opt->ped_event = 0;
+    opt->red_stable_frames = 5;
+    opt->red_ratio_thr = 0.002f;
+    opt->stopline_ratio = 0.55f;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
         switch (c) {
@@ -355,6 +410,14 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 18: opt->min_plate_conf = (float)atof(optarg); break;
         case 19: opt->plate_on_car_only = atoi(optarg) ? 1 : 0; break;
         case 20: opt->plate_only = atoi(optarg) ? 1 : 0; break;
+        case 21: opt->sw_preproc = atoi(optarg) ? 1 : 0; break;
+        case 22: opt->fpga_a_mask = atoi(optarg) ? 1 : 0; break;
+        case 23: opt->a_proj_ratio = (float)atof(optarg); break;
+        case 24: opt->a_roi_iou_min = (float)atof(optarg); break;
+        case 25: opt->ped_event = atoi(optarg) ? 1 : 0; break;
+        case 26: opt->red_stable_frames = atoi(optarg); break;
+        case 27: opt->red_ratio_thr = (float)atof(optarg); break;
+        case 28: opt->stopline_ratio = (float)atof(optarg); break;
         case 'h':
             print_usage(argv[0]);
             exit(0);
@@ -368,6 +431,16 @@ static int parse_options(int argc, char **argv, struct options *opt)
     if (opt->copy_buffers < MIN_COPY_BUFFERS || opt->copy_buffers > MAX_COPY_BUFFERS)
         return -1;
     if (opt->queue_depth <= 0)
+        return -1;
+    if (opt->a_proj_ratio <= 0.0f || opt->a_proj_ratio >= 1.0f)
+        return -1;
+    if (opt->a_roi_iou_min < 0.0f || opt->a_roi_iou_min > 1.0f)
+        return -1;
+    if (opt->red_stable_frames <= 0 || opt->red_stable_frames > 120)
+        return -1;
+    if (opt->red_ratio_thr < 0.0f || opt->red_ratio_thr > 1.0f)
+        return -1;
+    if (opt->stopline_ratio <= 0.05f || opt->stopline_ratio >= 0.95f)
         return -1;
     if (!opt->veh_model_path || !opt->plate_model_path ||
         !opt->ocr_model_path || !opt->ocr_keys_path || !opt->labels_path)
@@ -425,10 +498,12 @@ static int load_labels(struct app_ctx *ctx, const char *path)
     fclose(fp);
     ctx->label_count = idx;
     ctx->car_class_id = 2;
+    ctx->person_class_id = 0;
     for (idx = 0; idx < ctx->label_count; idx++) {
         if (strcmp(ctx->labels[idx], "car") == 0) {
             ctx->car_class_id = idx;
-            break;
+        } else if (strcmp(ctx->labels[idx], "person") == 0) {
+            ctx->person_class_id = idx;
         }
     }
     return 0;
@@ -1252,6 +1327,280 @@ static void raw565_to_rgb888_full(struct app_ctx *ctx, const uint8_t *raw, uint8
     }
 }
 
+static void bgrx8888_to_rgb888_and_a(const uint8_t *src_bgrx, int w, int h,
+                                     uint8_t *dst_rgb, uint8_t *dst_a)
+{
+    size_t i;
+    size_t pixels = (size_t)w * h;
+    for (i = 0; i < pixels; i++) {
+        const uint8_t *p = src_bgrx + i * 4U;
+        uint8_t *q = dst_rgb + i * 3U;
+        q[0] = p[2];
+        q[1] = p[1];
+        q[2] = p[0];
+        if (dst_a)
+            dst_a[i] = p[3];
+    }
+}
+
+static inline uint8_t clip_u8(int v)
+{
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (uint8_t)v;
+}
+
+static void sw_preprocess_rgb888(uint8_t *rgb, int w, int h)
+{
+    size_t pixels = (size_t)w * h;
+    uint8_t *gray = malloc(pixels);
+    uint8_t *filt = malloc(pixels);
+    uint8_t *edge = malloc(pixels);
+    int x, y;
+    if (!gray || !filt || !edge) {
+        free(gray);
+        free(filt);
+        free(edge);
+        return;
+    }
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            const uint8_t *p = rgb + ((size_t)y * w + x) * 3U;
+            int g = (77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8;
+            gray[(size_t)y * w + x] = (uint8_t)g;
+        }
+    }
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            int s = 0;
+            int c = 0;
+            int ky, kx;
+            for (ky = -1; ky <= 1; ky++) {
+                int yy = y + ky;
+                if (yy < 0 || yy >= h)
+                    continue;
+                for (kx = -1; kx <= 1; kx++) {
+                    int xx = x + kx;
+                    if (xx < 0 || xx >= w)
+                        continue;
+                    s += gray[(size_t)yy * w + xx];
+                    c++;
+                }
+            }
+            filt[(size_t)y * w + x] = (uint8_t)(s / (c > 0 ? c : 1));
+        }
+    }
+    for (y = 1; y < h - 1; y++) {
+        for (x = 1; x < w - 1; x++) {
+            int gx =
+                -filt[(size_t)(y - 1) * w + (x - 1)] + filt[(size_t)(y - 1) * w + (x + 1)] +
+                -2 * filt[(size_t)y * w + (x - 1)]     + 2 * filt[(size_t)y * w + (x + 1)] +
+                -filt[(size_t)(y + 1) * w + (x - 1)] + filt[(size_t)(y + 1) * w + (x + 1)];
+            int gy =
+                -filt[(size_t)(y - 1) * w + (x - 1)] - 2 * filt[(size_t)(y - 1) * w + x] - filt[(size_t)(y - 1) * w + (x + 1)] +
+                 filt[(size_t)(y + 1) * w + (x - 1)] + 2 * filt[(size_t)(y + 1) * w + x] + filt[(size_t)(y + 1) * w + (x + 1)];
+            int mag = (abs(gx) + abs(gy)) >> 2;
+            edge[(size_t)y * w + x] = clip_u8(mag);
+        }
+    }
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            uint8_t g = filt[(size_t)y * w + x];
+            uint8_t e = edge[(size_t)y * w + x];
+            uint8_t enh = clip_u8((int)g + ((int)e >> 1));
+            uint8_t *q = rgb + ((size_t)y * w + x) * 3U;
+            q[0] = enh;
+            q[1] = enh;
+            q[2] = enh;
+        }
+    }
+
+    free(gray);
+    free(filt);
+    free(edge);
+}
+
+static int extract_a_channel_roi(const uint8_t *a_map, int w, int h, float proj_ratio,
+                                 struct det_box *roi, float *red_ratio_out)
+{
+    int *hist_x = calloc((size_t)w, sizeof(int));
+    int *hist_y = calloc((size_t)h, sizeof(int));
+    int x, y;
+    int edge_total = 0;
+    int valid_total = 0;
+    int red_total = 0;
+    int max_x = 0, max_y = 0;
+    int x1 = -1, x2 = -1, y1 = -1, y2 = -1;
+
+    if (!hist_x || !hist_y) {
+        free(hist_x);
+        free(hist_y);
+        return 0;
+    }
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            size_t idx = (size_t)y * w + x;
+            uint8_t a = a_map[idx];
+            uint8_t preproc_valid = (a >> 7) & 0x1;
+            uint8_t edge_flag = (a >> 6) & 0x1;
+            uint8_t color_class = (a >> 2) & 0x3;
+            if (x == 0 && y == 0)
+                continue; /* Pixel[0,0] may be watermark */
+            if (!preproc_valid)
+                continue;
+            valid_total++;
+            if (color_class == 0x3)
+                red_total++;
+            if (edge_flag) {
+                hist_x[x]++;
+                hist_y[y]++;
+                edge_total++;
+            }
+        }
+    }
+    if (red_ratio_out) {
+        *red_ratio_out = (valid_total > 0) ? ((float)red_total / (float)valid_total) : 0.0f;
+    }
+    if (edge_total <= 0) {
+        free(hist_x);
+        free(hist_y);
+        return 0;
+    }
+
+    for (x = 0; x < w; x++)
+        if (hist_x[x] > max_x) max_x = hist_x[x];
+    for (y = 0; y < h; y++)
+        if (hist_y[y] > max_y) max_y = hist_y[y];
+
+    if (max_x <= 0 || max_y <= 0) {
+        free(hist_x);
+        free(hist_y);
+        return 0;
+    }
+
+    {
+        int tx = (int)((float)max_x * proj_ratio);
+        int ty = (int)((float)max_y * proj_ratio);
+        for (x = 0; x < w; x++) {
+            if (hist_x[x] >= tx) {
+                if (x1 < 0) x1 = x;
+                x2 = x;
+            }
+        }
+        for (y = 0; y < h; y++) {
+            if (hist_y[y] >= ty) {
+                if (y1 < 0) y1 = y;
+                y2 = y;
+            }
+        }
+    }
+
+    free(hist_x);
+    free(hist_y);
+
+    if (x1 < 0 || y1 < 0 || x2 <= x1 || y2 <= y1)
+        return 0;
+
+    roi->x1 = x1;
+    roi->y1 = y1;
+    roi->x2 = x2;
+    roi->y2 = y2;
+    roi->conf = 1.0f;
+    roi->cls = 0;
+    return 1;
+}
+
+static int filter_boxes_by_roi(const struct det_box *in, int in_count, const struct det_box *roi,
+                               float iou_thr, struct det_box *out, int out_cap)
+{
+    int i;
+    int n = 0;
+    for (i = 0; i < in_count && n < out_cap; i++) {
+        const struct det_box *b = &in[i];
+        int cx = (b->x1 + b->x2) / 2;
+        int cy = (b->y1 + b->y2) / 2;
+        bool center_inside = (cx >= roi->x1 && cx <= roi->x2 && cy >= roi->y1 && cy <= roi->y2);
+        if (center_inside || box_iou(b, roi) >= iou_thr)
+            out[n++] = *b;
+    }
+    return n;
+}
+
+static int update_ped_tracks_nn(struct app_ctx *ctx,
+                                const struct det_box *persons, int person_count,
+                                bool light_red, uint64_t frame_seq,
+                                struct det_box *out_persons, int *out_person_count)
+{
+    int i;
+    int j;
+    int events = 0;
+    int stopline_y = (int)((float)ctx->frame_height * ctx->opt.stopline_ratio);
+    bool used_det[MAX_DETS] = {0};
+    (void)frame_seq;
+
+    for (i = 0; i < ctx->ped_track_count; i++)
+        ctx->ped_track_ttl[i]--;
+
+    for (i = 0; i < ctx->ped_track_count; i++) {
+        int best = -1;
+        int best_d2 = 0x7fffffff;
+        int tcx = (ctx->ped_track_box[i].x1 + ctx->ped_track_box[i].x2) / 2;
+        int tcy = (ctx->ped_track_box[i].y1 + ctx->ped_track_box[i].y2) / 2;
+        for (j = 0; j < person_count; j++) {
+            int dcx, dcy, d2;
+            if (used_det[j])
+                continue;
+            dcx = (persons[j].x1 + persons[j].x2) / 2 - tcx;
+            dcy = (persons[j].y1 + persons[j].y2) / 2 - tcy;
+            d2 = dcx * dcx + dcy * dcy;
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                best = j;
+            }
+        }
+        if (best >= 0 && best_d2 <= (96 * 96)) {
+            int old_cy = (ctx->ped_track_box[i].y1 + ctx->ped_track_box[i].y2) / 2;
+            int new_cy = (persons[best].y1 + persons[best].y2) / 2;
+            bool crossed = (old_cy < stopline_y) && (new_cy >= stopline_y);
+            ctx->ped_track_box[i] = persons[best];
+            ctx->ped_track_ttl[i] = 8;
+            used_det[best] = true;
+            if (light_red && crossed) {
+                events++;
+            }
+        }
+    }
+
+    for (j = 0; j < person_count && ctx->ped_track_count < MAX_DETS; j++) {
+        if (used_det[j])
+            continue;
+        ctx->ped_track_box[ctx->ped_track_count] = persons[j];
+        ctx->ped_track_id[ctx->ped_track_count] = ctx->ped_next_track_id++;
+        ctx->ped_track_ttl[ctx->ped_track_count] = 8;
+        ctx->ped_track_count++;
+    }
+
+    i = 0;
+    while (i < ctx->ped_track_count) {
+        if (ctx->ped_track_ttl[i] > 0) {
+            i++;
+            continue;
+        }
+        ctx->ped_track_box[i] = ctx->ped_track_box[ctx->ped_track_count - 1];
+        ctx->ped_track_id[i] = ctx->ped_track_id[ctx->ped_track_count - 1];
+        ctx->ped_track_ttl[i] = ctx->ped_track_ttl[ctx->ped_track_count - 1];
+        ctx->ped_track_count--;
+    }
+
+    *out_person_count = 0;
+    for (i = 0; i < person_count && *out_person_count < MAX_DETS; i++)
+        out_persons[(*out_person_count)++] = persons[i];
+
+    return events;
+}
+
 static void clamp_box(struct det_box *b, int w, int h)
 {
     if (b->x1 < 0) b->x1 = 0;
@@ -1888,14 +2237,15 @@ static void build_overlay_ascii_text(const struct plate_det *pd, char *out, size
 static void *infer_thread_main(void *arg)
 {
     struct app_ctx *ctx = (struct app_ctx *)arg;
-    uint8_t *raw_local = malloc(ctx->frame_size);
+    uint8_t *raw_local = malloc(ctx->src_frame_size);
     uint8_t *rgb_full = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
+    uint8_t *a_map = malloc((size_t)ctx->frame_width * ctx->frame_height);
     uint8_t *algo_rgb = malloc((size_t)ALGO_STREAM_SIZE * ALGO_STREAM_SIZE * 3U);
     uint8_t *veh_in = malloc((size_t)ctx->veh_model.in_w * ctx->veh_model.in_h * 3U);
     uint8_t *plate_in = malloc((size_t)ctx->plate_model.in_w * ctx->plate_model.in_h * 3U);
     uint8_t *plate_crop = malloc((size_t)OCR_CROP_WIDTH * OCR_CROP_HEIGHT * 3U);
-    if (!raw_local || !rgb_full || !algo_rgb || !veh_in || !plate_in || !plate_crop) {
-        free(raw_local); free(rgb_full); free(algo_rgb);
+    if (!raw_local || !rgb_full || !a_map || !algo_rgb || !veh_in || !plate_in || !plate_crop) {
+        free(raw_local); free(rgb_full); free(a_map); free(algo_rgb);
         free(veh_in); free(plate_in); free(plate_crop);
         return NULL;
     }
@@ -1904,12 +2254,22 @@ static void *infer_thread_main(void *arg)
         struct det_box cars[MAX_DETS];
         struct det_box raw_plates[MAX_DETS];
         struct det_box filtered_plates[MAX_DETS];
+        struct det_box roi_plates[MAX_DETS];
         struct det_box stable_plates[MAX_DETS];
+        struct det_box persons[MAX_DETS];
+        struct det_box tracked_persons[MAX_DETS];
         struct lpr_results r;
         int car_count = 0;
         int raw_plate_count = 0;
         int filtered_plate_count = 0;
         int stable_plate_count = 0;
+        int person_count = 0;
+        int tracked_person_count = 0;
+        int ped_events = 0;
+        bool light_red = false;
+        float red_ratio = 0.0f;
+        struct det_box a_roi = {0};
+        bool a_roi_valid = false;
         int i;
         int64_t t0, t1;
         uint64_t seq;
@@ -1921,13 +2281,34 @@ static void *infer_thread_main(void *arg)
             pthread_mutex_unlock(&ctx->infer_lock);
             break;
         }
-        memcpy(raw_local, ctx->infer_latest_raw, ctx->frame_size);
+        memcpy(raw_local, ctx->infer_latest_raw, ctx->src_frame_size);
         seq = ctx->infer_frame_seq;
         ctx->infer_has_new = false;
         pthread_mutex_unlock(&ctx->infer_lock);
 
         t0 = mono_us();
-        raw565_to_rgb888_full(ctx, raw_local, rgb_full);
+        if (ctx->src_is_bgrx) {
+            bgrx8888_to_rgb888_and_a(raw_local, (int)ctx->frame_width, (int)ctx->frame_height, rgb_full, a_map);
+        } else {
+            raw565_to_rgb888_full(ctx, raw_local, rgb_full);
+            memset(a_map, 0, (size_t)ctx->frame_width * ctx->frame_height);
+        }
+        if (ctx->opt.sw_preproc)
+            sw_preprocess_rgb888(rgb_full, (int)ctx->frame_width, (int)ctx->frame_height);
+
+        if (ctx->opt.fpga_a_mask && ctx->src_is_bgrx) {
+            a_roi_valid = extract_a_channel_roi(a_map, (int)ctx->frame_width, (int)ctx->frame_height,
+                                                ctx->opt.a_proj_ratio, &a_roi, &red_ratio) ? true : false;
+            if (red_ratio >= ctx->opt.red_ratio_thr)
+                ctx->ped_red_streak++;
+            else
+                ctx->ped_red_streak = 0;
+            light_red = (ctx->ped_red_streak >= ctx->opt.red_stable_frames);
+        } else {
+            ctx->ped_red_streak = 0;
+            light_red = false;
+        }
+
         resize_rgb888_nn(rgb_full, (int)ctx->frame_width, (int)ctx->frame_height,
                          algo_rgb, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE);
 
@@ -1943,35 +2324,75 @@ static void *infer_thread_main(void *arg)
             resize_rgb888_nn(algo_rgb, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
                              plate_in, (int)ctx->plate_model.in_w, (int)ctx->plate_model.in_h);
 
-        if (!ctx->opt.plate_only) {
+        if (!ctx->opt.plate_only || ctx->opt.ped_event) {
             if (run_model_detect(&ctx->veh_model, veh_in, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
                                  ctx->opt.min_car_conf, cars, &car_count) < 0)
                 car_count = 0;
         }
-        if (run_model_detect(&ctx->plate_model, plate_in, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
-                             ctx->opt.min_plate_conf, raw_plates, &raw_plate_count) < 0)
-            raw_plate_count = 0;
+        {
+            float plate_thr = ctx->opt.min_plate_conf;
+            if (ctx->opt.fpga_a_mask && a_roi_valid)
+                plate_thr = fmaxf(0.05f, plate_thr - 0.05f);
+            if (run_model_detect(&ctx->plate_model, plate_in, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
+                                 plate_thr, raw_plates, &raw_plate_count) < 0)
+                raw_plate_count = 0;
+        }
+        if (raw_plate_count > 0) {
+            ctx->gate_plate_raw_positive_frames++;
+            ctx->gate_plate_raw_positive_streak++;
+        } else {
+            ctx->gate_plate_raw_positive_streak = 0;
+        }
 
         for (i = 0; i < car_count; i++)
             map_box_between_spaces(&cars[i], ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
-                                  (int)ctx->frame_width, (int)ctx->frame_height);
+                                   (int)ctx->frame_width, (int)ctx->frame_height);
+        for (i = 0; i < car_count && person_count < MAX_DETS; i++) {
+            if (cars[i].cls == ctx->person_class_id)
+                persons[person_count++] = cars[i];
+        }
+        if (ctx->opt.ped_event)
+            ped_events = update_ped_tracks_nn(ctx, persons, person_count, light_red, seq,
+                                              tracked_persons, &tracked_person_count);
+
         for (i = 0; i < raw_plate_count; i++) {
             map_box_between_spaces(&raw_plates[i], ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
                                    (int)ctx->frame_width, (int)ctx->frame_height);
             if (plate_box_pass_rules(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height))
                 filtered_plates[filtered_plate_count++] = raw_plates[i];
         }
+        if (ctx->opt.fpga_a_mask && a_roi_valid) {
+            int roi_count = filter_boxes_by_roi(filtered_plates, filtered_plate_count, &a_roi,
+                                                ctx->opt.a_roi_iou_min, roi_plates, MAX_DETS);
+            if (roi_count > 0) {
+                memcpy(filtered_plates, roi_plates, (size_t)roi_count * sizeof(roi_plates[0]));
+                filtered_plate_count = roi_count;
+            }
+        }
+
         temporal_confirm_and_update(ctx, filtered_plates, filtered_plate_count,
                                     stable_plates, &stable_plate_count);
         t1 = mono_us();
 
         memset(&r, 0, sizeof(r));
         r.car_raw_count = car_count;
+        r.person_raw_count = person_count;
         r.plate_raw_count = raw_plate_count;
+        r.a_roi_valid = a_roi_valid ? 1 : 0;
+        r.a_roi = a_roi;
+        r.light_red = light_red ? 1 : 0;
         for (i = 0; i < car_count && r.car_count < MAX_DETS; i++) {
             if (cars[i].cls == ctx->car_class_id)
                 r.cars[r.car_count++] = cars[i];
         }
+        if (!ctx->opt.ped_event) {
+            for (i = 0; i < person_count && r.person_count < MAX_DETS; i++)
+                r.persons[r.person_count++] = persons[i];
+        } else {
+            for (i = 0; i < tracked_person_count && r.person_count < MAX_DETS; i++)
+                r.persons[r.person_count++] = tracked_persons[i];
+        }
+
         for (i = 0; i < stable_plate_count && r.plate_count < MAX_DETS; i++) {
             struct plate_det pd;
             int parent = -1;
@@ -2005,6 +2426,7 @@ static void *infer_thread_main(void *arg)
                     plate_type_str(pd.type),
                     plate_color_str(pd.color));
             log_prediction_row(ctx, seq, mono_us(), &pd);
+            ctx->pred_rows_total++;
             r.plates[r.plate_count++] = pd;
         }
         r.frame_seq = seq;
@@ -2012,11 +2434,13 @@ static void *infer_thread_main(void *arg)
         pthread_mutex_lock(&ctx->result_lock);
         r.infer_frames_total = ctx->results.infer_frames_total + 1;
         r.infer_ms_total = ctx->results.infer_ms_total + r.infer_ms_last;
+        r.ped_event_total = ctx->results.ped_event_total + (uint64_t)ped_events;
+        r.ped_event_last_frame = (ped_events > 0) ? seq : ctx->results.ped_event_last_frame;
         ctx->results = r;
         pthread_mutex_unlock(&ctx->result_lock);
     }
 
-    free(raw_local); free(rgb_full); free(algo_rgb);
+    free(raw_local); free(rgb_full); free(a_map); free(algo_rgb);
     free(veh_in); free(plate_in); free(plate_crop);
     return NULL;
 }
@@ -2026,12 +2450,15 @@ static void overlay_results_on_slot(struct app_ctx *ctx, uint8_t *slot_data)
     struct lpr_results r;
     uint16_t *pix = (uint16_t *)slot_data;
     int i;
+    int stopline_y = (int)((float)ctx->frame_height * ctx->opt.stopline_ratio);
     pthread_mutex_lock(&ctx->result_lock);
     r = ctx->results;
     pthread_mutex_unlock(&ctx->result_lock);
 
     for (i = 0; i < r.car_count; i++)
         draw_rect_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, &r.cars[i], COLOR_YELLOW_565);
+    for (i = 0; i < r.person_count; i++)
+        draw_rect_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, &r.persons[i], COLOR_GREEN_565);
 
     for (i = 0; i < r.plate_count; i++) {
         char txt[32];
@@ -2042,6 +2469,14 @@ static void overlay_results_on_slot(struct app_ctx *ctx, uint8_t *slot_data)
         draw_rect_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, &r.plates[i].box, COLOR_CYAN_565);
         draw_text_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, tx, ty, txt, COLOR_CYAN_565);
     }
+
+    if (ctx->opt.fpga_a_mask && r.a_roi_valid)
+        draw_rect_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, &r.a_roi, COLOR_GREEN_565);
+    if (ctx->opt.ped_event) {
+        draw_hline_565(pix, (int)ctx->frame_width, (int)ctx->frame_height,
+                       0, (int)ctx->frame_width - 1, stopline_y,
+                       r.light_red ? COLOR_RED_565 : COLOR_GREEN_565);
+    }
 }
 
 static void push_latest_to_infer(struct app_ctx *ctx, const uint8_t *raw)
@@ -2049,7 +2484,7 @@ static void push_latest_to_infer(struct app_ctx *ctx, const uint8_t *raw)
     pthread_mutex_lock(&ctx->infer_lock);
     if (ctx->infer_has_new)
         ctx->infer_overwrite_count++;
-    memcpy(ctx->infer_latest_raw, raw, ctx->frame_size);
+    memcpy(ctx->infer_latest_raw, raw, ctx->src_frame_size);
     ctx->infer_frame_seq++;
     ctx->infer_has_new = true;
     pthread_cond_signal(&ctx->infer_cond);
@@ -2068,11 +2503,17 @@ static void print_stats(struct app_ctx *ctx)
     pthread_mutex_unlock(&ctx->result_lock);
     fprintf(stderr,
             "[stats] cap=%" PRIu64 " push=%" PRIu64 " rel=%" PRIu64
-            " infer=%" PRIu64 " infer_ms=%.2f cars=%d(raw=%d) plates=%d(raw=%d) drop=%" PRIu64
+            " infer=%" PRIu64 " infer_ms=%.2f cars=%d(raw=%d) persons=%d(raw=%d)"
+            " plates=%d(raw=%d) aroi=%d red=%d ped_evt=%" PRIu64
+            " gate_raw_pos=%" PRIu64 " gate_streak=%" PRIu64 " pred_rows=%" PRIu64 " drop=%" PRIu64
             " cap_fps=%.2f disp_fps=%.2f infer_fps=%.2f\n",
             ctx->captured_frames, ctx->pushed_frames, ctx->released_frames,
             r.infer_frames_total, r.infer_ms_last,
-            r.car_count, r.car_raw_count, r.plate_count, r.plate_raw_count,
+            r.car_count, r.car_raw_count,
+            r.person_count, r.person_raw_count,
+            r.plate_count, r.plate_raw_count,
+            r.a_roi_valid, r.light_red, r.ped_event_total,
+            ctx->gate_plate_raw_positive_frames, ctx->gate_plate_raw_positive_streak, ctx->pred_rows_total,
             ctx->infer_overwrite_count,
             (double)(ctx->captured_frames - ctx->last_stats_cap) * 1000000.0 / (double)dt,
             (double)(ctx->released_frames - ctx->last_stats_rel) * 1000000.0 / (double)dt,
@@ -2186,7 +2627,7 @@ int main(int argc, char **argv)
         fflush(ctx.pred_log_fp);
     }
 
-    ctx.infer_latest_raw = malloc(ctx.frame_size);
+    ctx.infer_latest_raw = malloc(ctx.src_frame_size);
     if (!ctx.infer_latest_raw)
         goto out;
     if (build_pipeline(&ctx) < 0)
@@ -2195,13 +2636,17 @@ int main(int argc, char **argv)
         goto out;
 
     fprintf(stderr,
-            "Start LPR loop: fps=%d src=%s pixel=%s swap16=%s min_car=%.2f min_plate=%.2f plate_only=%d pred_log=%s\n",
+            "Start LPR loop: fps=%d src=%s pixel=%s swap16=%s min_car=%.2f min_plate=%.2f plate_only=%d "
+            "sw_preproc=%d fpga_a_mask=%d ped_event=%d pred_log=%s\n",
             ctx.opt.fps,
             ctx.src_is_bgrx ? "bgrx8888" : "bgr565",
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
             ctx.opt.swap16 ? "on" : "off",
             ctx.opt.min_car_conf, ctx.opt.min_plate_conf,
             ctx.opt.plate_only,
+            ctx.opt.sw_preproc,
+            ctx.opt.fpga_a_mask,
+            ctx.opt.ped_event,
             ctx.opt.pred_log_path ? ctx.opt.pred_log_path : "<off>");
 
     ctx.last_stats_us = mono_us();
@@ -2229,10 +2674,7 @@ int main(int argc, char **argv)
         if (acquire_free_slot(&ctx, &ticket) < 0)
             break;
         copy_frame_to_slot565(&ctx, ctx.slots[ticket.idx].data, ctx.dma_copy);
-        if (ctx.src_is_bgrx)
-            push_latest_to_infer(&ctx, ctx.slots[ticket.idx].data);
-        else
-            push_latest_to_infer(&ctx, ctx.dma_copy);
+        push_latest_to_infer(&ctx, ctx.dma_copy);
         overlay_results_on_slot(&ctx, ctx.slots[ticket.idx].data);
 
         buf = build_frame_buffer(&ctx, &ticket);
