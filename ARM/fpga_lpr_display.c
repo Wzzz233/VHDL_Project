@@ -45,6 +45,8 @@
 #define MAX_LABELS 256
 #define MAX_LABEL_LEN 64
 #define MAX_DETS 128
+#define MAX_OCR_KEYS 128
+#define MAX_OCR_KEY_LEN 16
 #define ALGO_STREAM_SIZE 640
 #define OCR_CROP_WIDTH 150
 #define OCR_CROP_HEIGHT 50
@@ -61,6 +63,17 @@ enum plate_color {
     PLATE_COLOR_UNKNOWN = 0,
     PLATE_COLOR_BLUE,
     PLATE_COLOR_GREEN,
+    PLATE_COLOR_YELLOW,
+};
+
+enum plate_type {
+    PLATE_TYPE_COMMON_BLUE = 0,
+    PLATE_TYPE_COMMON_GREEN,
+    PLATE_TYPE_YELLOW,
+    PLATE_TYPE_POLICE,
+    PLATE_TYPE_TRAILER,
+    PLATE_TYPE_EMBASSY_CONSULATE,
+    PLATE_TYPE_UNKNOWN,
 };
 
 struct options {
@@ -68,7 +81,10 @@ struct options {
     const char *drm_card_path;
     const char *veh_model_path;
     const char *plate_model_path;
+    const char *ocr_model_path;
+    const char *ocr_keys_path;
     const char *labels_path;
+    const char *pred_log_path;
     int connector_id;
     int fps;
     enum pixel_order pixel_order;
@@ -79,6 +95,7 @@ struct options {
     float min_car_conf;
     float min_plate_conf;
     int plate_on_car_only;
+    int plate_only;
     bool swap16;
 };
 
@@ -95,6 +112,7 @@ struct plate_det {
     struct det_box box;
     struct det_box crop_box;
     enum plate_color color;
+    enum plate_type type;
     int parent_car;
     char ocr_text[24];
     float ocr_conf;
@@ -130,6 +148,18 @@ struct yolo_model {
     uint32_t in_h;
     uint32_t in_c;
     int class_count;
+};
+
+struct ocr_model {
+    const char *name;
+    const char *path;
+    rknn_context ctx;
+    rknn_input_output_num io_num;
+    rknn_tensor_attr input_attr;
+    rknn_tensor_attr output_attrs[4];
+    uint32_t in_w;
+    uint32_t in_h;
+    uint32_t in_c;
 };
 
 struct app_ctx {
@@ -182,9 +212,20 @@ struct app_ctx {
 
     struct yolo_model veh_model;
     struct yolo_model plate_model;
+    struct ocr_model ocr_model;
+    char ocr_keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
+    int ocr_key_count;
+    int ocr_blank_index;
+    FILE *pred_log_fp;
+    pthread_mutex_t pred_log_lock;
     char labels[MAX_LABELS][MAX_LABEL_LEN];
     int label_count;
     int car_class_id;
+
+    struct det_box plate_hist1[MAX_DETS];
+    int plate_hist1_count;
+    struct det_box plate_hist2[MAX_DETS];
+    int plate_hist2_count;
 };
 
 struct slot_ticket {
@@ -218,7 +259,10 @@ static void print_usage(const char *prog)
             "  --drm-card <path>       DRM card (default: %s)\n"
             "  --veh-model <path>      Vehicle RKNN model path (required)\n"
             "  --plate-model <path>    Plate RKNN model path (required)\n"
+            "  --ocr-model <path>      OCR RKNN model path (required)\n"
+            "  --ocr-keys <path>       OCR keys file path (required)\n"
             "  --labels <path>         Labels file path (required)\n"
+            "  --pred-log <path>       Prediction CSV output path (optional)\n"
             "  --connector-id <id>     Optional KMS connector id\n"
             "  --fps <num>             Target FPS (default: %d)\n"
             "  --pixel-order <mode>    bgr565|rgb565 (default: bgr565)\n"
@@ -228,8 +272,9 @@ static void print_usage(const char *prog)
             "  --copy-buffers <num>    Copy ring size (default: %d)\n"
             "  --queue-depth <num>     appsrc max frame queue (default: %d)\n"
             "  --min-car-conf <v>      Car confidence threshold (default: 0.35)\n"
-            "  --min-plate-conf <v>    Plate confidence threshold (default: 0.35)\n"
+            "  --min-plate-conf <v>    Plate confidence threshold (default: 0.45)\n"
             "  --plate-on-car-only <0|1>  Reserve switch (default: 0)\n"
+            "  --plate-only <0|1>      Disable vehicle dependency for plate output (default: 1)\n"
             "  --help                  Show this help\n",
             prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD, DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
             DEFAULT_STATS_INTERVAL, DEFAULT_COPY_BUFFERS, DEFAULT_QUEUE_DEPTH);
@@ -242,18 +287,22 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"drm-card", required_argument, NULL, 2},
         {"veh-model", required_argument, NULL, 3},
         {"plate-model", required_argument, NULL, 4},
-        {"labels", required_argument, NULL, 5},
-        {"connector-id", required_argument, NULL, 6},
-        {"fps", required_argument, NULL, 7},
-        {"pixel-order", required_argument, NULL, 8},
-        {"swap16", required_argument, NULL, 9},
-        {"timeout-ms", required_argument, NULL, 10},
-        {"stats-interval", required_argument, NULL, 11},
-        {"copy-buffers", required_argument, NULL, 12},
-        {"queue-depth", required_argument, NULL, 13},
-        {"min-car-conf", required_argument, NULL, 14},
-        {"min-plate-conf", required_argument, NULL, 15},
-        {"plate-on-car-only", required_argument, NULL, 16},
+        {"ocr-model", required_argument, NULL, 5},
+        {"ocr-keys", required_argument, NULL, 6},
+        {"labels", required_argument, NULL, 7},
+        {"pred-log", required_argument, NULL, 8},
+        {"connector-id", required_argument, NULL, 9},
+        {"fps", required_argument, NULL, 10},
+        {"pixel-order", required_argument, NULL, 11},
+        {"swap16", required_argument, NULL, 12},
+        {"timeout-ms", required_argument, NULL, 13},
+        {"stats-interval", required_argument, NULL, 14},
+        {"copy-buffers", required_argument, NULL, 15},
+        {"queue-depth", required_argument, NULL, 16},
+        {"min-car-conf", required_argument, NULL, 17},
+        {"min-plate-conf", required_argument, NULL, 18},
+        {"plate-on-car-only", required_argument, NULL, 19},
+        {"plate-only", required_argument, NULL, 20},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -271,8 +320,9 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->copy_buffers = DEFAULT_COPY_BUFFERS;
     opt->queue_depth = DEFAULT_QUEUE_DEPTH;
     opt->min_car_conf = 0.35f;
-    opt->min_plate_conf = 0.35f;
+    opt->min_plate_conf = 0.45f;
     opt->plate_on_car_only = 0;
+    opt->plate_only = 1;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
         switch (c) {
@@ -280,10 +330,13 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 2: opt->drm_card_path = optarg; break;
         case 3: opt->veh_model_path = optarg; break;
         case 4: opt->plate_model_path = optarg; break;
-        case 5: opt->labels_path = optarg; break;
-        case 6: opt->connector_id = atoi(optarg); break;
-        case 7: opt->fps = atoi(optarg); break;
-        case 8:
+        case 5: opt->ocr_model_path = optarg; break;
+        case 6: opt->ocr_keys_path = optarg; break;
+        case 7: opt->labels_path = optarg; break;
+        case 8: opt->pred_log_path = optarg; break;
+        case 9: opt->connector_id = atoi(optarg); break;
+        case 10: opt->fps = atoi(optarg); break;
+        case 11:
             if (strcmp(optarg, "bgr565") == 0)
                 opt->pixel_order = PIXEL_ORDER_BGR565;
             else if (strcmp(optarg, "rgb565") == 0)
@@ -291,14 +344,15 @@ static int parse_options(int argc, char **argv, struct options *opt)
             else
                 return -1;
             break;
-        case 9: opt->swap16 = atoi(optarg) ? true : false; break;
-        case 10: opt->timeout_ms = atoi(optarg); break;
-        case 11: opt->stats_interval = atoi(optarg); break;
-        case 12: opt->copy_buffers = atoi(optarg); break;
-        case 13: opt->queue_depth = atoi(optarg); break;
-        case 14: opt->min_car_conf = (float)atof(optarg); break;
-        case 15: opt->min_plate_conf = (float)atof(optarg); break;
-        case 16: opt->plate_on_car_only = atoi(optarg) ? 1 : 0; break;
+        case 12: opt->swap16 = atoi(optarg) ? true : false; break;
+        case 13: opt->timeout_ms = atoi(optarg); break;
+        case 14: opt->stats_interval = atoi(optarg); break;
+        case 15: opt->copy_buffers = atoi(optarg); break;
+        case 16: opt->queue_depth = atoi(optarg); break;
+        case 17: opt->min_car_conf = (float)atof(optarg); break;
+        case 18: opt->min_plate_conf = (float)atof(optarg); break;
+        case 19: opt->plate_on_car_only = atoi(optarg) ? 1 : 0; break;
+        case 20: opt->plate_only = atoi(optarg) ? 1 : 0; break;
         case 'h':
             print_usage(argv[0]);
             exit(0);
@@ -313,7 +367,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
         return -1;
     if (opt->queue_depth <= 0)
         return -1;
-    if (!opt->veh_model_path || !opt->plate_model_path || !opt->labels_path)
+    if (!opt->veh_model_path || !opt->plate_model_path ||
+        !opt->ocr_model_path || !opt->ocr_keys_path || !opt->labels_path)
         return -1;
     return 0;
 }
@@ -375,6 +430,262 @@ static int load_labels(struct app_ctx *ctx, const char *path)
         }
     }
     return 0;
+}
+
+static int load_ocr_keys(struct app_ctx *ctx, const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    char line[256];
+    int idx = 0;
+    if (!fp) {
+        fprintf(stderr, "Open OCR keys failed: %s\n", strerror(errno));
+        return -1;
+    }
+    while (fgets(line, sizeof(line), fp) && idx < MAX_OCR_KEYS) {
+        char *nl = strchr(line, '\n');
+        size_t n;
+        if (nl) *nl = '\0';
+        nl = strchr(line, '\r');
+        if (nl) *nl = '\0';
+        if (line[0] == '\0' || line[0] == '#')
+            continue;
+        n = strnlen(line, MAX_OCR_KEY_LEN - 1);
+        memcpy(ctx->ocr_keys[idx], line, n);
+        ctx->ocr_keys[idx][n] = '\0';
+        idx++;
+    }
+    fclose(fp);
+    if (idx <= 0)
+        return -1;
+    ctx->ocr_key_count = idx;
+    ctx->ocr_blank_index = idx;
+    fprintf(stderr, "[ocr] loaded %d keys from %s\n", ctx->ocr_key_count, path);
+    return 0;
+}
+
+static int rknn_ocr_model_load(struct ocr_model *m, const char *name, const char *path)
+{
+    FILE *fp;
+    long sz;
+    void *data;
+    uint32_t i;
+    memset(m, 0, sizeof(*m));
+    m->name = name;
+    m->path = path;
+
+    fp = fopen(path, "rb");
+    if (!fp) return -1;
+    fseek(fp, 0, SEEK_END);
+    sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    data = malloc((size_t)sz);
+    if (!data) { fclose(fp); return -1; }
+    if (fread(data, 1, (size_t)sz, fp) != (size_t)sz) { fclose(fp); free(data); return -1; }
+    fclose(fp);
+
+    if (rknn_init(&m->ctx, data, (uint32_t)sz, 0, NULL) < 0) { free(data); return -1; }
+    free(data);
+    if (rknn_query(m->ctx, RKNN_QUERY_IN_OUT_NUM, &m->io_num, sizeof(m->io_num)) < 0)
+        return -1;
+    if (m->io_num.n_output == 0 || m->io_num.n_output > 4)
+        return -1;
+
+    memset(&m->input_attr, 0, sizeof(m->input_attr));
+    m->input_attr.index = 0;
+    if (rknn_query(m->ctx, RKNN_QUERY_INPUT_ATTR, &m->input_attr, sizeof(m->input_attr)) < 0)
+        return -1;
+    if (m->input_attr.fmt == RKNN_TENSOR_NCHW) {
+        m->in_c = m->input_attr.dims[1];
+        m->in_h = m->input_attr.dims[2];
+        m->in_w = m->input_attr.dims[3];
+    } else {
+        m->in_h = m->input_attr.dims[1];
+        m->in_w = m->input_attr.dims[2];
+        m->in_c = m->input_attr.dims[3];
+    }
+
+    for (i = 0; i < m->io_num.n_output; i++) {
+        memset(&m->output_attrs[i], 0, sizeof(m->output_attrs[i]));
+        m->output_attrs[i].index = i;
+        if (rknn_query(m->ctx, RKNN_QUERY_OUTPUT_ATTR, &m->output_attrs[i], sizeof(m->output_attrs[i])) < 0)
+            return -1;
+    }
+
+    fprintf(stderr, "[%s] loaded input=%ux%ux%u outputs=%u\n",
+            name, m->in_w, m->in_h, m->in_c, m->io_num.n_output);
+    return 0;
+}
+
+static void rknn_ocr_model_release(struct ocr_model *m)
+{
+    if (m->ctx)
+        rknn_destroy(m->ctx);
+    memset(m, 0, sizeof(*m));
+}
+
+static bool build_ocr_layout(const rknn_tensor_attr *a, int *t_size, int *c_size, int *t_stride, int *c_stride)
+{
+    if (a->n_dims == 2) {
+        *t_size = (int)a->dims[0];
+        *c_size = (int)a->dims[1];
+        *t_stride = *c_size;
+        *c_stride = 1;
+        return (*t_size > 0 && *c_size > 1);
+    }
+    if (a->n_dims == 3) {
+        int d1 = (int)a->dims[1];
+        int d2 = (int)a->dims[2];
+        if (d1 <= 0 || d2 <= 1)
+            return false;
+        if (d1 <= d2) {
+            *t_size = d1;
+            *c_size = d2;
+            *t_stride = *c_size;
+            *c_stride = 1;
+        } else {
+            *t_size = d2;
+            *c_size = d1;
+            *t_stride = 1;
+            *c_stride = *t_size;
+        }
+        return true;
+    }
+    if (a->n_dims == 4) {
+        if (a->fmt == RKNN_TENSOR_NCHW) {
+            *c_size = (int)a->dims[1];
+            *t_size = (int)a->dims[2] * (int)a->dims[3];
+            *t_stride = 1;
+            *c_stride = *t_size;
+        } else {
+            *t_size = (int)a->dims[1] * (int)a->dims[2];
+            *c_size = (int)a->dims[3];
+            *t_stride = *c_size;
+            *c_stride = 1;
+        }
+        return (*t_size > 0 && *c_size > 1);
+    }
+    return false;
+}
+
+static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_stride, int c_stride,
+                             struct app_ctx *ctx, char *text, size_t text_len, float *conf_out)
+{
+    int t;
+    int prev = -1;
+    int emitted = 0;
+    float conf_sum = 0.0f;
+    int blank_idx = ctx->ocr_blank_index;
+
+    if (text_len == 0)
+        return -1;
+    text[0] = '\0';
+
+    if (blank_idx < 0 || blank_idx >= c_size) {
+        if (c_size == ctx->ocr_key_count + 1)
+            blank_idx = ctx->ocr_key_count;
+        else
+            blank_idx = c_size - 1;
+    }
+
+    for (t = 0; t < t_size; t++) {
+        int c;
+        int best_c = 0;
+        float best_logit = -1e30f;
+        float max_logit = -1e30f;
+        float exp_sum = 0.0f;
+        const float *row = buf + (size_t)t * (size_t)t_stride;
+
+        for (c = 0; c < c_size; c++) {
+            float v = row[(size_t)c * (size_t)c_stride];
+            if (v > best_logit) {
+                best_logit = v;
+                best_c = c;
+            }
+            if (v > max_logit)
+                max_logit = v;
+        }
+        for (c = 0; c < c_size; c++) {
+            float v = row[(size_t)c * (size_t)c_stride];
+            exp_sum += expf(v - max_logit);
+        }
+        if (best_c == blank_idx || best_c == prev) {
+            prev = best_c;
+            continue;
+        }
+        if (best_c >= 0 && best_c < ctx->ocr_key_count) {
+            float prob = 0.0f;
+            size_t left;
+            exp_sum = (exp_sum > 1e-8f) ? exp_sum : 1e-8f;
+            prob = expf(best_logit - max_logit) / exp_sum;
+            left = text_len - strnlen(text, text_len);
+            if (left > 1) {
+                strncat(text, ctx->ocr_keys[best_c], left - 1);
+                emitted++;
+                conf_sum += prob;
+            }
+        }
+        prev = best_c;
+    }
+    *conf_out = (emitted > 0) ? (conf_sum / (float)emitted) : 0.0f;
+    return 0;
+}
+
+static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_w, int crop_h,
+                         char *text, size_t text_len, float *conf_out)
+{
+    struct ocr_model *m = &ctx->ocr_model;
+    rknn_input in;
+    rknn_output outs[4];
+    uint8_t *ocr_in = NULL;
+    const rknn_tensor_attr *out_attr;
+    int t_size, c_size, t_stride, c_stride;
+    int ret = -1;
+    uint32_t i;
+
+    ocr_in = malloc((size_t)m->in_w * m->in_h * 3U);
+    if (!ocr_in)
+        return -1;
+
+    resize_rgb888_nn(crop_rgb, crop_w, crop_h, ocr_in, (int)m->in_w, (int)m->in_h);
+    memset(&in, 0, sizeof(in));
+    in.index = 0;
+    in.buf = (void *)ocr_in;
+    in.size = m->in_w * m->in_h * 3;
+    in.type = RKNN_TENSOR_UINT8;
+    in.fmt = RKNN_TENSOR_NHWC;
+    ret = rknn_inputs_set(m->ctx, 1, &in);
+    if (ret < 0)
+        goto out;
+    ret = rknn_run(m->ctx, NULL);
+    if (ret < 0)
+        goto out;
+
+    memset(outs, 0, sizeof(outs));
+    for (i = 0; i < m->io_num.n_output; i++)
+        outs[i].want_float = 1;
+    ret = rknn_outputs_get(m->ctx, m->io_num.n_output, outs, NULL);
+    if (ret < 0)
+        goto out;
+
+    out_attr = &m->output_attrs[0];
+    if (!build_ocr_layout(out_attr, &t_size, &c_size, &t_stride, &c_stride)) {
+        ret = -1;
+        goto out_release;
+    }
+    if (ctx->ocr_blank_index < 0 || ctx->ocr_blank_index >= c_size) {
+        if (c_size == ctx->ocr_key_count + 1)
+            ctx->ocr_blank_index = ctx->ocr_key_count;
+        else
+            ctx->ocr_blank_index = c_size - 1;
+    }
+    ret = ctc_decode_logits((const float *)outs[0].buf, t_size, c_size, t_stride, c_stride,
+                            ctx, text, text_len, conf_out);
+
+out_release:
+    rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+out:
+    free(ocr_in);
+    return ret;
 }
 
 static int init_fpga_dma(struct app_ctx *ctx)
@@ -992,23 +1303,6 @@ static void copy_crop_rgb888(const uint8_t *rgb, int img_w, const struct det_box
     }
 }
 
-static void ocr_stub_predict(const uint8_t *crop, int crop_w, int crop_h,
-                             char *text, size_t text_len, float *conf_out)
-{
-    uint32_t hash = 2166136261u;
-    size_t i;
-    size_t n = (size_t)crop_w * (size_t)crop_h * 3U;
-    size_t step = n / 128U;
-    if (step == 0)
-        step = 1;
-    for (i = 0; i < n; i += step) {
-        hash ^= crop[i];
-        hash *= 16777619u;
-    }
-    snprintf(text, text_len, "PLATE_%06X", hash & 0xFFFFFFu);
-    *conf_out = 0.10f;
-}
-
 static void decode_rows_output(const float *rows, int n_rows, int n_cols, int class_count,
                                float conf_thr, int src_w, int src_h, int in_w, int in_h,
                                struct det_box *out, int *out_count)
@@ -1350,7 +1644,7 @@ static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int 
     int y1 = b->y1 + (b->y2 - b->y1) / 6;
     int y2 = b->y2 - (b->y2 - b->y1) / 6;
     int x, y;
-    int total = 0, blue_cnt = 0, green_cnt = 0;
+    int total = 0, blue_cnt = 0, green_cnt = 0, yellow_cnt = 0;
     if (x1 < 0) x1 = 0;
     if (y1 < 0) y1 = 0;
     if (x2 >= w) x2 = w - 1;
@@ -1376,6 +1670,7 @@ static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int 
             total++;
             if (h_deg >= 90.0f && h_deg <= 130.0f && s > 0.23f && v > 0.16f) blue_cnt++;
             else if (h_deg >= 35.0f && h_deg <= 90.0f && s > 0.20f && v > 0.16f) green_cnt++;
+            else if (h_deg >= 15.0f && h_deg <= 55.0f && s > 0.20f && v > 0.16f) yellow_cnt++;
         }
     }
     if (total == 0) return PLATE_COLOR_UNKNOWN;
@@ -1383,6 +1678,8 @@ static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int 
         return PLATE_COLOR_BLUE;
     if ((float)green_cnt / (float)total >= 0.20f && green_cnt > blue_cnt + (int)(0.05f * total))
         return PLATE_COLOR_GREEN;
+    if ((float)yellow_cnt / (float)total >= 0.18f)
+        return PLATE_COLOR_YELLOW;
     return PLATE_COLOR_UNKNOWN;
 }
 
@@ -1420,7 +1717,133 @@ static const char *plate_color_str(enum plate_color c)
 {
     if (c == PLATE_COLOR_BLUE) return "BLUE";
     if (c == PLATE_COLOR_GREEN) return "GREEN";
+    if (c == PLATE_COLOR_YELLOW) return "YELLOW";
     return "UNK";
+}
+
+static enum plate_type classify_plate_type(enum plate_color color, const char *text)
+{
+    const char *utf8_police = "\xE8\xAD\xA6";
+    const char *utf8_trailer = "\xE6\x8C\x82";
+    const char *utf8_embassy = "\xE4\xBD\xBF";
+    const char *utf8_consulate = "\xE9\xA2\x86";
+
+    if (text && strstr(text, utf8_police))
+        return PLATE_TYPE_POLICE;
+    if (text && strstr(text, utf8_trailer))
+        return PLATE_TYPE_TRAILER;
+    if (text && (strstr(text, utf8_embassy) || strstr(text, utf8_consulate)))
+        return PLATE_TYPE_EMBASSY_CONSULATE;
+    if (text && strncmp(text, "WJ", 2) == 0)
+        return PLATE_TYPE_POLICE;
+
+    if (color == PLATE_COLOR_GREEN)
+        return PLATE_TYPE_COMMON_GREEN;
+    if (color == PLATE_COLOR_BLUE)
+        return PLATE_TYPE_COMMON_BLUE;
+    if (color == PLATE_COLOR_YELLOW)
+        return PLATE_TYPE_YELLOW;
+    return PLATE_TYPE_UNKNOWN;
+}
+
+static const char *plate_type_str(enum plate_type t)
+{
+    switch (t) {
+    case PLATE_TYPE_COMMON_BLUE: return "common_blue";
+    case PLATE_TYPE_COMMON_GREEN: return "common_green";
+    case PLATE_TYPE_YELLOW: return "yellow";
+    case PLATE_TYPE_POLICE: return "police";
+    case PLATE_TYPE_TRAILER: return "trailer";
+    case PLATE_TYPE_EMBASSY_CONSULATE: return "embassy_consulate";
+    default: return "unknown";
+    }
+}
+
+static bool plate_box_pass_rules(const struct det_box *b, int frame_w, int frame_h)
+{
+    int bw = b->x2 - b->x1 + 1;
+    int bh = b->y2 - b->y1 + 1;
+    float aspect;
+    float area;
+    float min_area = (float)frame_w * (float)frame_h * 0.0005f;
+
+    if (bw <= 0 || bh <= 0)
+        return false;
+    aspect = (float)bw / (float)bh;
+    if (aspect < 2.0f || aspect > 6.5f)
+        return false;
+    area = (float)bw * (float)bh;
+    if (area < min_area)
+        return false;
+    return true;
+}
+
+static bool has_iou_match(const struct det_box *cur, const struct det_box *hist, int hist_count, float iou_thr)
+{
+    int i;
+    for (i = 0; i < hist_count; i++) {
+        if (box_iou(cur, &hist[i]) >= iou_thr)
+            return true;
+    }
+    return false;
+}
+
+static void temporal_confirm_and_update(struct app_ctx *ctx,
+                                        const struct det_box *filtered, int filtered_count,
+                                        struct det_box *confirmed, int *confirmed_count)
+{
+    int i;
+    *confirmed_count = 0;
+    if (ctx->plate_hist1_count > 0 && ctx->plate_hist2_count > 0) {
+        for (i = 0; i < filtered_count && *confirmed_count < MAX_DETS; i++) {
+            if (has_iou_match(&filtered[i], ctx->plate_hist1, ctx->plate_hist1_count, 0.35f) &&
+                has_iou_match(&filtered[i], ctx->plate_hist2, ctx->plate_hist2_count, 0.30f)) {
+                confirmed[(*confirmed_count)++] = filtered[i];
+            }
+        }
+    }
+    memcpy(ctx->plate_hist2, ctx->plate_hist1, sizeof(ctx->plate_hist1));
+    ctx->plate_hist2_count = ctx->plate_hist1_count;
+    memcpy(ctx->plate_hist1, filtered, (size_t)filtered_count * sizeof(filtered[0]));
+    ctx->plate_hist1_count = filtered_count;
+}
+
+static void csv_safe_text(const char *in, char *out, size_t out_len)
+{
+    size_t i = 0;
+    if (out_len == 0)
+        return;
+    if (!in) {
+        out[0] = '\0';
+        return;
+    }
+    while (*in && i + 1 < out_len) {
+        char ch = *in++;
+        if (ch == ',' || ch == '\n' || ch == '\r')
+            ch = '_';
+        out[i++] = ch;
+    }
+    out[i] = '\0';
+}
+
+static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t ts_us,
+                               const struct plate_det *pd)
+{
+    char safe_text[64];
+    if (!ctx->pred_log_fp)
+        return;
+    csv_safe_text(pd->ocr_text, safe_text, sizeof(safe_text));
+    pthread_mutex_lock(&ctx->pred_log_lock);
+    fprintf(ctx->pred_log_fp,
+            "%" PRIu64 ",%s,%s,%.4f,%d,%d,%d,%d,%" PRId64 "\n",
+            frame_id,
+            safe_text,
+            plate_type_str(pd->type),
+            pd->ocr_conf,
+            pd->box.x1, pd->box.y1, pd->box.x2, pd->box.y2,
+            ts_us);
+    fflush(ctx->pred_log_fp);
+    pthread_mutex_unlock(&ctx->pred_log_lock);
 }
 
 static void *infer_thread_main(void *arg)
@@ -1440,9 +1863,15 @@ static void *infer_thread_main(void *arg)
 
     while (ctx->running) {
         struct det_box cars[MAX_DETS];
-        struct det_box plates[MAX_DETS];
+        struct det_box raw_plates[MAX_DETS];
+        struct det_box filtered_plates[MAX_DETS];
+        struct det_box stable_plates[MAX_DETS];
         struct lpr_results r;
-        int car_count = 0, plate_count = 0, i;
+        int car_count = 0;
+        int raw_plate_count = 0;
+        int filtered_plate_count = 0;
+        int stable_plate_count = 0;
+        int i;
         int64_t t0, t1;
         uint64_t seq;
 
@@ -1475,53 +1904,68 @@ static void *infer_thread_main(void *arg)
             resize_rgb888_nn(algo_rgb, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
                              plate_in, (int)ctx->plate_model.in_w, (int)ctx->plate_model.in_h);
 
-        if (run_model_detect(&ctx->veh_model, veh_in, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
-                             ctx->opt.min_car_conf, cars, &car_count) < 0)
-            car_count = 0;
+        if (!ctx->opt.plate_only) {
+            if (run_model_detect(&ctx->veh_model, veh_in, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
+                                 ctx->opt.min_car_conf, cars, &car_count) < 0)
+                car_count = 0;
+        }
         if (run_model_detect(&ctx->plate_model, plate_in, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
-                             ctx->opt.min_plate_conf, plates, &plate_count) < 0)
-            plate_count = 0;
+                             ctx->opt.min_plate_conf, raw_plates, &raw_plate_count) < 0)
+            raw_plate_count = 0;
 
         for (i = 0; i < car_count; i++)
             map_box_between_spaces(&cars[i], ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
                                   (int)ctx->frame_width, (int)ctx->frame_height);
-        for (i = 0; i < plate_count; i++)
-            map_box_between_spaces(&plates[i], ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
-                                  (int)ctx->frame_width, (int)ctx->frame_height);
+        for (i = 0; i < raw_plate_count; i++) {
+            map_box_between_spaces(&raw_plates[i], ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
+                                   (int)ctx->frame_width, (int)ctx->frame_height);
+            if (plate_box_pass_rules(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height))
+                filtered_plates[filtered_plate_count++] = raw_plates[i];
+        }
+        temporal_confirm_and_update(ctx, filtered_plates, filtered_plate_count,
+                                    stable_plates, &stable_plate_count);
         t1 = mono_us();
 
         memset(&r, 0, sizeof(r));
         r.car_raw_count = car_count;
-        r.plate_raw_count = plate_count;
+        r.plate_raw_count = raw_plate_count;
         for (i = 0; i < car_count && r.car_count < MAX_DETS; i++) {
             if (cars[i].cls == ctx->car_class_id)
                 r.cars[r.car_count++] = cars[i];
         }
-        for (i = 0; i < plate_count && r.plate_count < MAX_DETS; i++) {
+        for (i = 0; i < stable_plate_count && r.plate_count < MAX_DETS; i++) {
             struct plate_det pd;
-            int parent = find_parent_car(&plates[i], r.cars, r.car_count);
+            int parent = -1;
             int crop_w;
             int crop_h;
-            if (parent < 0)
+            pd.box = stable_plates[i];
+            if (!ctx->opt.plate_only)
+                parent = find_parent_car(&pd.box, r.cars, r.car_count);
+            if (!ctx->opt.plate_only && ctx->opt.plate_on_car_only && parent < 0)
                 continue;
-            pd.box = plates[i];
             pd.parent_car = parent;
-            pd.color = classify_plate_color_rgb(rgb_full, (int)ctx->frame_width, (int)ctx->frame_height, &plates[i]);
+            pd.color = classify_plate_color_rgb(rgb_full, (int)ctx->frame_width, (int)ctx->frame_height, &pd.box);
             compute_center_crop_box(&pd.box, (int)ctx->frame_width, (int)ctx->frame_height,
                                     OCR_CROP_WIDTH, OCR_CROP_HEIGHT, &pd.crop_box);
             crop_w = pd.crop_box.x2 - pd.crop_box.x1 + 1;
             crop_h = pd.crop_box.y2 - pd.crop_box.y1 + 1;
             copy_crop_rgb888(rgb_full, (int)ctx->frame_width, &pd.crop_box, plate_crop);
-            ocr_stub_predict(plate_crop, crop_w, crop_h,
-                             pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf);
+            if (run_model_ocr(ctx, plate_crop, crop_w, crop_h,
+                              pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf) < 0) {
+                snprintf(pd.ocr_text, sizeof(pd.ocr_text), "UNK");
+                pd.ocr_conf = 0.0f;
+            }
+            pd.type = classify_plate_type(pd.color, pd.ocr_text);
             fprintf(stderr,
-                    "[ocr] ts_us=%" PRId64 " frame=%" PRIu64 " plate=%d text=%s conf=%.2f crop=[%d,%d,%d,%d]\n",
-                    mono_us(),
+                    "[pred] frame=%" PRIu64 " ts_us=%" PRId64 " bbox=[%d,%d,%d,%d] text=%s conf=%.2f type=%s color=%s\n",
                     seq,
-                    r.plate_count,
+                    mono_us(),
+                    pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2,
                     pd.ocr_text,
                     pd.ocr_conf,
-                    pd.crop_box.x1, pd.crop_box.y1, pd.crop_box.x2, pd.crop_box.y2);
+                    plate_type_str(pd.type),
+                    plate_color_str(pd.color));
+            log_prediction_row(ctx, seq, mono_us(), &pd);
             r.plates[r.plate_count++] = pd;
         }
         r.frame_seq = seq;
@@ -1551,7 +1995,7 @@ static void overlay_results_on_slot(struct app_ctx *ctx, uint8_t *slot_data)
         draw_rect_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, &r.cars[i], COLOR_YELLOW_565);
 
     for (i = 0; i < r.plate_count; i++) {
-        const char *txt = plate_color_str(r.plates[i].color);
+        const char *txt = plate_type_str(r.plates[i].type);
         int tx = r.plates[i].box.x1;
         int ty = r.plates[i].box.y1 - 10;
         if (ty < 0) ty = r.plates[i].box.y1 + 2;
@@ -1611,6 +2055,12 @@ static void cleanup(struct app_ctx *ctx)
 
     rknn_model_release(&ctx->veh_model);
     rknn_model_release(&ctx->plate_model);
+    rknn_ocr_model_release(&ctx->ocr_model);
+
+    if (ctx->pred_log_fp) {
+        fclose(ctx->pred_log_fp);
+        ctx->pred_log_fp = NULL;
+    }
 
     if (ctx->appsrc)
         gst_app_src_end_of_stream(GST_APP_SRC(ctx->appsrc));
@@ -1640,6 +2090,7 @@ static void cleanup(struct app_ctx *ctx)
     pthread_mutex_destroy(&ctx->infer_lock);
     pthread_cond_destroy(&ctx->infer_cond);
     pthread_mutex_destroy(&ctx->result_lock);
+    pthread_mutex_destroy(&ctx->pred_log_lock);
     g_cond_clear(&ctx->slots_cond);
     g_mutex_clear(&ctx->slots_lock);
 }
@@ -1658,6 +2109,7 @@ int main(int argc, char **argv)
     pthread_mutex_init(&ctx.infer_lock, NULL);
     pthread_cond_init(&ctx.infer_cond, NULL);
     pthread_mutex_init(&ctx.result_lock, NULL);
+    pthread_mutex_init(&ctx.pred_log_lock, NULL);
 
     if (parse_options(argc, argv, &ctx.opt) < 0) {
         print_usage(argv[0]);
@@ -1673,6 +2125,8 @@ int main(int argc, char **argv)
         goto out;
     if (load_labels(&ctx, ctx.opt.labels_path) < 0)
         goto out;
+    if (load_ocr_keys(&ctx, ctx.opt.ocr_keys_path) < 0)
+        goto out;
     if (init_fpga_dma(&ctx) < 0)
         goto out;
     if (init_copy_slots(&ctx) < 0)
@@ -1681,6 +2135,16 @@ int main(int argc, char **argv)
         goto out;
     if (rknn_model_load(&ctx.plate_model, "plate", ctx.opt.plate_model_path, 1) < 0)
         goto out;
+    if (rknn_ocr_model_load(&ctx.ocr_model, "ocr", ctx.opt.ocr_model_path) < 0)
+        goto out;
+
+    if (ctx.opt.pred_log_path && ctx.opt.pred_log_path[0] != '\0') {
+        ctx.pred_log_fp = fopen(ctx.opt.pred_log_path, "w");
+        if (!ctx.pred_log_fp)
+            goto out;
+        fprintf(ctx.pred_log_fp, "frame_id,plate_text_pred,plate_type_pred,conf,x1,y1,x2,y2,ts_us\n");
+        fflush(ctx.pred_log_fp);
+    }
 
     ctx.infer_latest_raw = malloc(ctx.frame_size);
     if (!ctx.infer_latest_raw)
@@ -1691,12 +2155,14 @@ int main(int argc, char **argv)
         goto out;
 
     fprintf(stderr,
-            "Start LPR loop: fps=%d src=%s pixel=%s swap16=%s min_car=%.2f min_plate=%.2f\n",
+            "Start LPR loop: fps=%d src=%s pixel=%s swap16=%s min_car=%.2f min_plate=%.2f plate_only=%d pred_log=%s\n",
             ctx.opt.fps,
             ctx.src_is_bgrx ? "bgrx8888" : "bgr565",
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
             ctx.opt.swap16 ? "on" : "off",
-            ctx.opt.min_car_conf, ctx.opt.min_plate_conf);
+            ctx.opt.min_car_conf, ctx.opt.min_plate_conf,
+            ctx.opt.plate_only,
+            ctx.opt.pred_log_path ? ctx.opt.pred_log_path : "<off>");
 
     ctx.last_stats_us = mono_us();
 
