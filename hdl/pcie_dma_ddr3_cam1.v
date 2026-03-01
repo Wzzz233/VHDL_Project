@@ -364,8 +364,8 @@ ips2l_pcie_dma #(
 	.o_axis_slave1_tuser	(axis_slave1_tuser),		
 
 	// AXI4-Stream slave2 interface
-	// Gate slave2 ready with frame stream readiness to avoid underrun tearing.
-	.i_axis_slave2_trdy		(axis_slave2_tready_fc),
+	// Stability hotfix: keep raw ready to avoid frame-mode deadlock on long run.
+	.i_axis_slave2_trdy		(axis_slave2_tready_raw),
 	.o_axis_slave2_tvld		(axis_slave2_tvalid),		
 	.o_axis_slave2_tdata	(axis_slave2_tdata),		
 	.o_axis_slave2_tlast	(axis_slave2_tlast),		
