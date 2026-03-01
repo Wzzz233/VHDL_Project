@@ -1765,17 +1765,22 @@ static bool plate_box_pass_rules(const struct det_box *b, int frame_w, int frame
 {
     int bw = b->x2 - b->x1 + 1;
     int bh = b->y2 - b->y1 + 1;
+    int cy = (b->y1 + b->y2) / 2;
     float aspect;
     float area;
-    float min_area = (float)frame_w * (float)frame_h * 0.0005f;
+    float min_area = (float)frame_w * (float)frame_h * 0.0016f;
 
     if (bw <= 0 || bh <= 0)
         return false;
+    if (bw < 56 || bh < 18)
+        return false;
     aspect = (float)bw / (float)bh;
-    if (aspect < 2.0f || aspect > 6.5f)
+    if (aspect < 2.4f || aspect > 5.8f)
         return false;
     area = (float)bw * (float)bh;
     if (area < min_area)
+        return false;
+    if (cy < (int)(0.12f * (float)frame_h) || cy > (int)(0.95f * (float)frame_h))
         return false;
     return true;
 }
@@ -1846,6 +1851,38 @@ static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t t
             ts_us);
     fflush(ctx->pred_log_fp);
     pthread_mutex_unlock(&ctx->pred_log_lock);
+}
+
+static void build_overlay_ascii_text(const struct plate_det *pd, char *out, size_t out_len)
+{
+    size_t i = 0;
+    const char *s = pd->ocr_text;
+    if (out_len == 0)
+        return;
+    while (s && *s && i + 1 < out_len) {
+        unsigned char ch = (unsigned char)*s++;
+        if ((ch >= '0' && ch <= '9') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= 'a' && ch <= 'z') ||
+            ch == '-') {
+            out[i++] = (char)ch;
+        }
+    }
+    if (i == 0) {
+        const char *fb = plate_type_str(pd->type);
+        while (*fb && i + 1 < out_len) {
+            unsigned char ch = (unsigned char)*fb++;
+            if ((ch >= 'a' && ch <= 'z') || ch == '_')
+                out[i++] = (char)ch;
+        }
+        if (i == 0) {
+            out[0] = 'U';
+            if (out_len > 1) out[1] = 'N';
+            if (out_len > 2) out[2] = 'K';
+            i = (out_len > 2) ? 3 : out_len - 1;
+        }
+    }
+    out[i] = '\0';
 }
 
 static void *infer_thread_main(void *arg)
@@ -1997,10 +2034,11 @@ static void overlay_results_on_slot(struct app_ctx *ctx, uint8_t *slot_data)
         draw_rect_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, &r.cars[i], COLOR_YELLOW_565);
 
     for (i = 0; i < r.plate_count; i++) {
-        const char *txt = plate_type_str(r.plates[i].type);
+        char txt[32];
         int tx = r.plates[i].box.x1;
         int ty = r.plates[i].box.y1 - 10;
         if (ty < 0) ty = r.plates[i].box.y1 + 2;
+        build_overlay_ascii_text(&r.plates[i], txt, sizeof(txt));
         draw_rect_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, &r.plates[i].box, COLOR_CYAN_565);
         draw_text_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, tx, ty, txt, COLOR_CYAN_565);
     }
