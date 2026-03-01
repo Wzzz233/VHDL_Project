@@ -364,7 +364,8 @@ ips2l_pcie_dma #(
 	.o_axis_slave1_tuser	(axis_slave1_tuser),		
 
 	// AXI4-Stream slave2 interface
-	.i_axis_slave2_trdy		(axis_slave2_tready_raw),
+	// Gate slave2 ready with frame stream readiness to avoid underrun tearing.
+	.i_axis_slave2_trdy		(axis_slave2_tready_fc),
 	.o_axis_slave2_tvld		(axis_slave2_tvalid),		
 	.o_axis_slave2_tdata	(axis_slave2_tdata),		
 	.o_axis_slave2_tlast	(axis_slave2_tlast),		
@@ -775,12 +776,15 @@ reg  [9:0]                 post_ddr_line_y;
 reg                        dma_expand_phase;
 reg                        mwr_first_beat_seen;
 reg  [11:0]                mwr_rd_addr_d;
+reg                        mwr_rd_clk_en_d;
 reg  [127:0]               frame_rd_data_hold;
 wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
 wire                       dma_expand_mode = DMA_OUTPUT_BGRX;
 wire [17:0]                frame_words_cfg = dma_expand_mode ? FRAME_WORDS_BGRX : FRAME_WORDS_565;
-wire                       bar2_addr_step = mwr_rd_clk_en && (mwr_rd_addr != mwr_rd_addr_d);
+// Count chunk first beat as a valid step to prevent boundary phase slip.
+wire                       bar2_addr_step = mwr_rd_clk_en &&
+                                            ((mwr_rd_addr != mwr_rd_addr_d) || (~mwr_rd_clk_en_d));
 wire                       frame_rd_fetch_en = bar2_addr_step & (~dma_expand_mode | ~dma_expand_phase);
 wire [11:0]                post_ddr_x_pix = dma_expand_mode ? {1'b0, post_ddr_word_x, 2'b00}
                                                              : {post_ddr_word_x, 3'b000};
@@ -849,6 +853,13 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         mwr_rd_addr_d <= 12'd0;
     else
         mwr_rd_addr_d <= mwr_rd_addr;
+end
+
+always @(posedge pclk_div2 or negedge core_rst_n) begin
+    if (!core_rst_n)
+        mwr_rd_clk_en_d <= 1'b0;
+    else
+        mwr_rd_clk_en_d <= mwr_rd_clk_en;
 end
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
