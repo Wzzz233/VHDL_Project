@@ -166,10 +166,9 @@ assign frame_dwords_to_4kb_raw = (frame_cur_addr[11:0] == 12'd0) ?
                                  11'd1024 :
                                  ((13'd4096 - {1'b0, frame_cur_addr[11:0]}) >> 2);
 assign frame_dwords_to_4kb = (frame_dwords_to_4kb_raw == 11'd0) ? 11'd1 : frame_dwords_to_4kb_raw;
-// Downstream MWR read control uses 10-bit length counters and cannot safely
-// represent 1024DW as "0". Keep frame chunks <= 1023DW for data-path alignment.
-assign frame_dwords_limited = (frame_remaining_dwords >= 24'd1023) ?
-                              11'd1023 :
+// Frame mode request length follows PCIe encoding: 10'd0 means 1024DW.
+assign frame_dwords_limited = (frame_remaining_dwords >= 24'd1024) ?
+                              11'd1024 :
                               {1'b0, frame_remaining_dwords[9:0]};
 assign frame_chunk_dwords_next = (frame_dwords_limited > frame_dwords_to_4kb) ?
                                  frame_dwords_to_4kb :
@@ -568,14 +567,15 @@ begin
     end
 end
 
-//o_req_addr
+// o_req_addr
+// Frame mode owns request address updates while frame_active=1.
 always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
         o_req_addr[31:0] <= 32'd0;
     else if(frame_req_vld)
         o_req_addr[31:0] <= frame_req_addr[31:0];
-    else if(l_addr_cfg_done)
+    else if(l_addr_cfg_done && !frame_active)
         if(device_ep)
             o_req_addr[31:0] <= dma_cmd_l_addr;
         else if(device_rc)
@@ -588,7 +588,7 @@ begin
         o_req_addr[63:32] <= 32'd0;
     else if(frame_req_vld)
         o_req_addr[63:32] <= frame_req_addr[63:32];
-    else if(h_addr_cfg_done)
+    else if(h_addr_cfg_done && !frame_active)
         if(device_ep)
             o_req_addr[63:32] <= dma_cmd_h_addr;
         else if(device_rc)
