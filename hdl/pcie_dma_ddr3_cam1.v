@@ -684,6 +684,8 @@ wire [15:0] cmos1_rgb565_fmt = CAM_SWAP_RB ?
 localparam FORCE_COLOR_BAR_PRE_DDR = 1'b0;
 localparam FORCE_PATTERN_POST_DDR  = 1'b0;
 localparam DMA_OUTPUT_BGRX         = 1'b1;
+// Mainline V3 default: keep bypass unless explicitly enabled.
+localparam PREPROC_ENABLE_DEFAULT  = 1'b0;
 
 reg [11:0] cmos1_bar_x;
 reg        cmos1_href_16bit_d;
@@ -778,9 +780,11 @@ reg                        mwr_first_beat_seen;
 reg  [11:0]                mwr_rd_addr_d;
 reg                        mwr_rd_clk_en_d;
 reg  [127:0]               frame_rd_data_hold;
+reg  [7:0]                 frame_id;
 wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
 wire                       dma_expand_mode = DMA_OUTPUT_BGRX;
+wire                       preproc_en = PREPROC_ENABLE_DEFAULT;
 wire [17:0]                frame_words_cfg = dma_expand_mode ? FRAME_WORDS_BGRX : FRAME_WORDS_565;
 // Count chunk first beat as a valid step to prevent boundary phase slip.
 wire                       bar2_addr_step = mwr_rd_clk_en &&
@@ -806,8 +810,52 @@ begin
 end
 endfunction
 
+function [7:0] preproc_alpha_from_bgr565;
+    input [15:0] pix565;
+    reg [7:0] r8;
+    reg [7:0] g8;
+    reg [7:0] b8;
+    reg [7:0] y8;
+    reg [7:0] drg;
+    reg [7:0] dgb;
+    reg       edge_flag;
+    reg       thresh_flag;
+    reg [1:0] color_class;
+begin
+    r8 = expand5_to_8(pix565[4:0]);
+    g8 = expand6_to_8(pix565[10:5]);
+    b8 = expand5_to_8(pix565[15:11]);
+    y8 = (r8 >> 2) + (g8 >> 1) + (b8 >> 2);
+
+    if (r8 >= g8)
+        drg = r8 - g8;
+    else
+        drg = g8 - r8;
+
+    if (g8 >= b8)
+        dgb = g8 - b8;
+    else
+        dgb = b8 - g8;
+
+    edge_flag = ({1'b0, drg} + {1'b0, dgb}) > 9'd64;
+    thresh_flag = (y8 > 8'd96);
+
+    if ((r8 > 8'd150) && ({1'b0, r8} > ({1'b0, g8} + 9'd24)) && ({1'b0, r8} > ({1'b0, b8} + 9'd24)))
+        color_class = 2'b11;
+    else if ((b8 > 8'd110) && ({1'b0, b8} > ({1'b0, g8} + 9'd16)) && ({1'b0, b8} > ({1'b0, r8} + 9'd16)))
+        color_class = 2'b01;
+    else if ((g8 > 8'd90) && (r8 > 8'd70) && (b8 < 8'd140))
+        color_class = 2'b10;
+    else
+        color_class = 2'b00;
+
+    preproc_alpha_from_bgr565 = {1'b1, edge_flag, thresh_flag, 1'b0, color_class, 2'b00};
+end
+endfunction
+
 function [31:0] bgr565_to_bgrx32;
     input [15:0] pix565;
+    input [7:0] alpha8;
     reg [4:0] r5;
     reg [5:0] g6;
     reg [4:0] b5;
@@ -815,7 +863,7 @@ begin
     r5 = pix565[4:0];
     g6 = pix565[10:5];
     b5 = pix565[15:11];
-    bgr565_to_bgrx32 = {8'hFF, expand5_to_8(r5), expand6_to_8(g6), expand5_to_8(b5)};
+    bgr565_to_bgrx32 = {alpha8, expand5_to_8(r5), expand6_to_8(g6), expand5_to_8(b5)};
 end
 endfunction
 
@@ -824,22 +872,42 @@ function [127:0] pack_4pix_bgrx;
     input [15:0] p1;
     input [15:0] p2;
     input [15:0] p3;
+    input [7:0]  a0;
+    input [7:0]  a1;
+    input [7:0]  a2;
+    input [7:0]  a3;
 begin
     pack_4pix_bgrx = {
-        bgr565_to_bgrx32(p3),
-        bgr565_to_bgrx32(p2),
-        bgr565_to_bgrx32(p1),
-        bgr565_to_bgrx32(p0)
+        bgr565_to_bgrx32(p3, a3),
+        bgr565_to_bgrx32(p2, a2),
+        bgr565_to_bgrx32(p1, a1),
+        bgr565_to_bgrx32(p0, a0)
     };
 end
 endfunction
 
+wire [7:0] alpha_lo_0_base = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[15:0]) : 8'h00;
+wire [7:0] alpha_lo_1 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[31:16]) : 8'h00;
+wire [7:0] alpha_lo_2 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[47:32]) : 8'h00;
+wire [7:0] alpha_lo_3 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[63:48]) : 8'h00;
+
+wire [7:0] alpha_hi_0 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data_hold[79:64]) : 8'h00;
+wire [7:0] alpha_hi_1 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data_hold[95:80]) : 8'h00;
+wire [7:0] alpha_hi_2 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data_hold[111:96]) : 8'h00;
+wire [7:0] alpha_hi_3 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data_hold[127:112]) : 8'h00;
+
+// Reserve Pixel[0,0].A as frame watermark for future sideband lockstep.
+wire first_pixel_word = dma_session_active && (dma_rd_word_count == 18'd0) && (dma_expand_phase == 1'b0);
+wire [7:0] alpha_lo_0 = (preproc_en && first_pixel_word) ? frame_id : alpha_lo_0_base;
+
 wire [127:0] frame_rd_data_bgrx_lo = pack_4pix_bgrx(
-    frame_rd_data[15:0], frame_rd_data[31:16], frame_rd_data[47:32], frame_rd_data[63:48]);
+    frame_rd_data[15:0], frame_rd_data[31:16], frame_rd_data[47:32], frame_rd_data[63:48],
+    alpha_lo_0, alpha_lo_1, alpha_lo_2, alpha_lo_3);
 wire [127:0] frame_rd_hold_bgrx_hi = pack_4pix_bgrx(
-    frame_rd_data_hold[79:64], frame_rd_data_hold[95:80], frame_rd_data_hold[111:96], frame_rd_data_hold[127:112]);
+    frame_rd_data_hold[79:64], frame_rd_data_hold[95:80], frame_rd_data_hold[111:96], frame_rd_data_hold[127:112],
+    alpha_hi_0, alpha_hi_1, alpha_hi_2, alpha_hi_3);
 wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
-wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data)}};
+wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data, preproc_en ? 8'h80 : 8'h00)}};
 wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
 wire [127:0] frame_dma_data = dma_expand_mode
     ? (dma_expand_phase ? frame_rd_hold_bgrx_hi : frame_rd_data_bgrx_lo)
@@ -870,6 +938,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         dma_expand_phase <= 1'b0;
         mwr_first_beat_seen <= 1'b0;
         frame_rd_data_hold <= 128'd0;
+        frame_id <= 8'd0;
     end else if (frame_done_pulse) begin
         dma_session_active <= 1'b0;
         dma_rd_word_count <= 18'd0;
@@ -883,6 +952,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             rd_fsync_stretch_cnt <= 6'd31;
             dma_expand_phase <= 1'b0;
             mwr_first_beat_seen <= 1'b0;
+            frame_id <= frame_id + 8'd1;
         end else begin
             if (dma_session_active && bar2_addr_step)
                 mwr_first_beat_seen <= 1'b1;
