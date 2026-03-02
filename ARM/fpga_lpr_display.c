@@ -23,6 +23,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -139,6 +140,9 @@ struct options {
     int ocr_crop_mode;
     int ocr_resize_mode;
     int ocr_preproc_mode;
+    int ocr_ctc_diag;
+    int ocr_crop_dump_max;
+    const char *ocr_crop_dump_dir;
     bool swap16;
 };
 
@@ -201,6 +205,13 @@ struct detect_decode_diag {
     int rows_keep;
     int heads_keep;
     int mode;
+};
+
+struct ocr_diag {
+    int t_size;
+    int c_size;
+    int blank_idx;
+    float blank_top1_ratio;
 };
 
 struct yolo_model {
@@ -282,7 +293,10 @@ struct app_ctx {
     char ocr_keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
     int ocr_key_count;
     int ocr_blank_index;
+    bool ocr_keysize_warned;
     FILE *pred_log_fp;
+    FILE *ocr_crop_index_fp;
+    int ocr_crop_dumped;
     pthread_mutex_t pred_log_lock;
     char labels[MAX_LABELS][MAX_LABEL_LEN];
     int label_count;
@@ -371,6 +385,9 @@ static void print_usage(const char *prog)
             "  --ocr-crop-mode <m>     OCR crop mode: fixed|box|box-pad (default: fixed)\n"
             "  --ocr-resize-mode <m>   OCR resize: stretch|letterbox (default: stretch)\n"
             "  --ocr-preproc <m>       OCR crop preproc: none|gray|bin (default: none)\n"
+            "  --ocr-ctc-diag <0|1>    Print CTC decode diagnostics (default: 0)\n"
+            "  --ocr-crop-dump-dir <p> Dump OCR crops+inputs to directory (default: off)\n"
+            "  --ocr-crop-dump-max <n> Max dumped OCR samples (default: 20)\n"
             "  --help                  Show this help\n",
             prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD, DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
             DEFAULT_STATS_INTERVAL, DEFAULT_COPY_BUFFERS, DEFAULT_QUEUE_DEPTH);
@@ -411,6 +428,9 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"ocr-crop-mode", required_argument, NULL, 30},
         {"ocr-resize-mode", required_argument, NULL, 31},
         {"ocr-preproc", required_argument, NULL, 32},
+        {"ocr-ctc-diag", required_argument, NULL, 33},
+        {"ocr-crop-dump-dir", required_argument, NULL, 34},
+        {"ocr-crop-dump-max", required_argument, NULL, 35},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -443,6 +463,9 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->ocr_crop_mode = OCR_CROP_FIXED;
     opt->ocr_resize_mode = OCR_RESIZE_STRETCH;
     opt->ocr_preproc_mode = OCR_PREPROC_NONE;
+    opt->ocr_ctc_diag = 0;
+    opt->ocr_crop_dump_max = 20;
+    opt->ocr_crop_dump_dir = NULL;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
         switch (c) {
@@ -517,6 +540,9 @@ static int parse_options(int argc, char **argv, struct options *opt)
             else
                 return -1;
             break;
+        case 33: opt->ocr_ctc_diag = atoi(optarg) ? 1 : 0; break;
+        case 34: opt->ocr_crop_dump_dir = optarg; break;
+        case 35: opt->ocr_crop_dump_max = atoi(optarg); break;
         case 'h':
             print_usage(argv[0]);
             exit(0);
@@ -540,6 +566,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
     if (opt->red_ratio_thr < 0.0f || opt->red_ratio_thr > 1.0f)
         return -1;
     if (opt->stopline_ratio <= 0.05f || opt->stopline_ratio >= 0.95f)
+        return -1;
+    if (opt->ocr_crop_dump_max < 0 || opt->ocr_crop_dump_max > 100000)
         return -1;
     if (!opt->veh_model_path || !opt->plate_model_path ||
         !opt->ocr_model_path || !opt->ocr_keys_path || !opt->labels_path)
@@ -751,13 +779,15 @@ static bool build_ocr_layout(const rknn_tensor_attr *a, int *t_size, int *c_size
 }
 
 static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_stride, int c_stride,
-                             struct app_ctx *ctx, char *text, size_t text_len, float *conf_out)
+                             struct app_ctx *ctx, char *text, size_t text_len, float *conf_out,
+                             struct ocr_diag *diag)
 {
     int t;
     int prev = -1;
     int emitted = 0;
     float conf_sum = 0.0f;
     int blank_idx = ctx->ocr_blank_index;
+    int blank_top1_count = 0;
 
     if (text_len == 0)
         return -1;
@@ -791,6 +821,8 @@ static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_str
             float v = row[(size_t)c * (size_t)c_stride];
             exp_sum += expf(v - max_logit);
         }
+        if (best_c == blank_idx)
+            blank_top1_count++;
         if (best_c == blank_idx || best_c == prev) {
             prev = best_c;
             continue;
@@ -810,11 +842,18 @@ static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_str
         prev = best_c;
     }
     *conf_out = (emitted > 0) ? (conf_sum / (float)emitted) : 0.0f;
+    if (diag) {
+        diag->t_size = t_size;
+        diag->c_size = c_size;
+        diag->blank_idx = blank_idx;
+        diag->blank_top1_ratio = (t_size > 0) ? ((float)blank_top1_count / (float)t_size) : 0.0f;
+    }
     return 0;
 }
 
 static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_w, int crop_h,
-                         char *text, size_t text_len, float *conf_out)
+                         char *text, size_t text_len, float *conf_out,
+                         struct ocr_diag *diag, uint8_t **model_input_out)
 {
     struct ocr_model *m = &ctx->ocr_model;
     rknn_input in;
@@ -825,6 +864,9 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     int ret = -1;
     uint32_t i;
     uint8_t *crop_work = NULL;
+
+    if (diag)
+        memset(diag, 0, sizeof(*diag));
 
     crop_work = malloc((size_t)crop_w * crop_h * 3U);
     ocr_in = malloc((size_t)m->in_w * m->in_h * 3U);
@@ -883,12 +925,25 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
         else
             ctx->ocr_blank_index = c_size - 1;
     }
+    if (!ctx->ocr_keysize_warned) {
+        if (!(c_size == ctx->ocr_key_count || c_size == (ctx->ocr_key_count + 1))) {
+            fprintf(stderr,
+                    "[ocr] WARN key/output mismatch: keys=%d c_size=%d (expected N or N+1)\n",
+                    ctx->ocr_key_count, c_size);
+        }
+        ctx->ocr_keysize_warned = true;
+    }
     ret = ctc_decode_logits((const float *)outs[0].buf, t_size, c_size, t_stride, c_stride,
-                            ctx, text, text_len, conf_out);
+                            ctx, text, text_len, conf_out, diag);
 
 out_release:
     rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
 out:
+    if (model_input_out && ret == 0) {
+        *model_input_out = malloc((size_t)m->in_w * m->in_h * 3U);
+        if (*model_input_out)
+            memcpy(*model_input_out, ocr_in, (size_t)m->in_w * m->in_h * 3U);
+    }
     free(crop_work);
     free(ocr_in);
     return ret;
@@ -2770,6 +2825,95 @@ static void csv_safe_text(const char *in, char *out, size_t out_len)
     out[i] = '\0';
 }
 
+static int mkdir_p_simple(const char *path)
+{
+    char buf[512];
+    size_t n;
+    size_t i;
+
+    if (!path || !path[0])
+        return -1;
+    n = strnlen(path, sizeof(buf) - 1);
+    if (n == 0 || n >= sizeof(buf))
+        return -1;
+    memcpy(buf, path, n);
+    buf[n] = '\0';
+
+    for (i = 1; i < n; i++) {
+        if (buf[i] == '/' || buf[i] == '\\') {
+            char ch = buf[i];
+            buf[i] = '\0';
+            if (buf[0] != '\0') {
+                if (mkdir(buf, 0777) < 0 && errno != EEXIST)
+                    return -1;
+            }
+            buf[i] = ch;
+        }
+    }
+    if (mkdir(buf, 0777) < 0 && errno != EEXIST)
+        return -1;
+    return 0;
+}
+
+static int write_ppm_rgb888(const char *path, const uint8_t *rgb, int w, int h)
+{
+    FILE *fp;
+    size_t need;
+    size_t wr;
+    if (!path || !rgb || w <= 0 || h <= 0)
+        return -1;
+    fp = fopen(path, "wb");
+    if (!fp)
+        return -1;
+    fprintf(fp, "P6\n%d %d\n255\n", w, h);
+    need = (size_t)w * h * 3U;
+    wr = fwrite(rgb, 1, need, fp);
+    fclose(fp);
+    return (wr == need) ? 0 : -1;
+}
+
+static void dump_ocr_pair(struct app_ctx *ctx, uint64_t frame_id, const struct plate_det *pd,
+                          const uint8_t *crop_rgb, int crop_w, int crop_h,
+                          const uint8_t *ocr_in, int ocr_w, int ocr_h)
+{
+    char crop_path[640];
+    char in_path[640];
+    char safe_text[64];
+    int idx;
+    int64_t ts;
+
+    if (!ctx->opt.ocr_crop_dump_dir || ctx->opt.ocr_crop_dump_dir[0] == '\0')
+        return;
+    if (ctx->opt.ocr_crop_dump_max <= 0)
+        return;
+    if (ctx->ocr_crop_dumped >= ctx->opt.ocr_crop_dump_max)
+        return;
+    if (!ctx->ocr_crop_index_fp)
+        return;
+
+    idx = ctx->ocr_crop_dumped;
+    snprintf(crop_path, sizeof(crop_path), "%s/crop_%04d_f%06" PRIu64 ".ppm",
+             ctx->opt.ocr_crop_dump_dir, idx, frame_id);
+    snprintf(in_path, sizeof(in_path), "%s/ocrin_%04d_f%06" PRIu64 ".ppm",
+             ctx->opt.ocr_crop_dump_dir, idx, frame_id);
+
+    if (write_ppm_rgb888(crop_path, crop_rgb, crop_w, crop_h) < 0)
+        return;
+    if (write_ppm_rgb888(in_path, ocr_in, ocr_w, ocr_h) < 0)
+        return;
+
+    ts = mono_us();
+    csv_safe_text(pd->ocr_text, safe_text, sizeof(safe_text));
+    fprintf(ctx->ocr_crop_index_fp,
+            "%d,%" PRIu64 ",%" PRId64 ",%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%s,%s\n",
+            idx, frame_id, ts,
+            pd->box.x1, pd->box.y1, pd->box.x2, pd->box.y2,
+            pd->crop_box.x1, pd->crop_box.y1, pd->crop_box.x2, pd->crop_box.y2,
+            safe_text, pd->ocr_conf, crop_path, in_path);
+    fflush(ctx->ocr_crop_index_fp);
+    ctx->ocr_crop_dumped++;
+}
+
 static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t ts_us,
                                const struct plate_det *pd)
 {
@@ -3000,6 +3144,9 @@ static void *infer_thread_main(void *arg)
 
         for (i = 0; i < stable_plate_count && r.plate_count < MAX_DETS; i++) {
             struct plate_det pd;
+            struct ocr_diag odiag;
+            uint8_t *ocr_input_dump = NULL;
+            uint8_t **ocr_input_out = NULL;
             int parent = -1;
             int crop_w;
             int crop_h;
@@ -3015,10 +3162,23 @@ static void *infer_thread_main(void *arg)
             crop_w = pd.crop_box.x2 - pd.crop_box.x1 + 1;
             crop_h = pd.crop_box.y2 - pd.crop_box.y1 + 1;
             copy_crop_rgb888(rgb_full, (int)ctx->frame_width, &pd.crop_box, plate_crop);
+            if (ctx->ocr_crop_index_fp &&
+                ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max)
+                ocr_input_out = &ocr_input_dump;
             if (run_model_ocr(ctx, plate_crop, crop_w, crop_h,
-                              pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf) < 0) {
+                              pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
+                              &odiag, ocr_input_out) < 0) {
                 snprintf(pd.ocr_text, sizeof(pd.ocr_text), "UNK");
                 pd.ocr_conf = 0.0f;
+                memset(&odiag, 0, sizeof(odiag));
+            }
+            if (ctx->opt.ocr_ctc_diag) {
+                fprintf(stderr,
+                        "[ctc] frame=%" PRIu64 " bbox=[%d,%d,%d,%d] t=%d c=%d blank=%d blank_top1=%.3f text=%s\n",
+                        seq,
+                        pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2,
+                        odiag.t_size, odiag.c_size, odiag.blank_idx, odiag.blank_top1_ratio,
+                        pd.ocr_text);
             }
             if (pd.ocr_text[0] != '\0')
                 ocr_nonempty_count++;
@@ -3026,6 +3186,12 @@ static void *infer_thread_main(void *arg)
             build_overlay_ascii_text(&pd, overlay_txt, sizeof(overlay_txt));
             if (overlay_txt[0] != '\0')
                 overlay_nonempty_count++;
+            if (ocr_input_dump) {
+                dump_ocr_pair(ctx, seq, &pd, plate_crop, crop_w, crop_h,
+                              ocr_input_dump, (int)ctx->ocr_model.in_w, (int)ctx->ocr_model.in_h);
+                free(ocr_input_dump);
+                ocr_input_dump = NULL;
+            }
             fprintf(stderr,
                     "[pred] frame=%" PRIu64 " ts_us=%" PRId64 " bbox=[%d,%d,%d,%d] text=%s conf=%.2f type=%s color=%s\n",
                     seq,
@@ -3159,6 +3325,10 @@ static void cleanup(struct app_ctx *ctx)
         fclose(ctx->pred_log_fp);
         ctx->pred_log_fp = NULL;
     }
+    if (ctx->ocr_crop_index_fp) {
+        fclose(ctx->ocr_crop_index_fp);
+        ctx->ocr_crop_index_fp = NULL;
+    }
 
     if (ctx->appsrc)
         gst_app_src_end_of_stream(GST_APP_SRC(ctx->appsrc));
@@ -3243,6 +3413,19 @@ int main(int argc, char **argv)
         fprintf(ctx.pred_log_fp, "frame_id,plate_text_pred,plate_type_pred,conf,x1,y1,x2,y2,ts_us\n");
         fflush(ctx.pred_log_fp);
     }
+    if (ctx.opt.ocr_crop_dump_dir && ctx.opt.ocr_crop_dump_dir[0] != '\0') {
+        char idx_path[640];
+        if (mkdir_p_simple(ctx.opt.ocr_crop_dump_dir) < 0)
+            goto out;
+        snprintf(idx_path, sizeof(idx_path), "%s/index.csv", ctx.opt.ocr_crop_dump_dir);
+        ctx.ocr_crop_index_fp = fopen(idx_path, "w");
+        if (!ctx.ocr_crop_index_fp)
+            goto out;
+        fprintf(ctx.ocr_crop_index_fp,
+                "sample_id,frame_id,ts_us,box_x1,box_y1,box_x2,box_y2,"
+                "crop_x1,crop_y1,crop_x2,crop_y2,app_text,app_conf,crop_path,ocr_input_path\n");
+        fflush(ctx.ocr_crop_index_fp);
+    }
 
     ctx.infer_latest_raw = malloc(ctx.src_frame_size);
     if (!ctx.infer_latest_raw)
@@ -3254,7 +3437,7 @@ int main(int argc, char **argv)
 
     fprintf(stderr,
             "Start LPR loop: fps=%d src=%s pixel=%s swap16=%s min_car=%.2f min_plate=%.2f plate_only=%d "
-            "sw_preproc=%d fpga_a_mask=%d ped_event=%d ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_pp=%s pred_log=%s\n",
+            "sw_preproc=%d fpga_a_mask=%d ped_event=%d ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_pp=%s ctc_diag=%d ocr_dump=%s max=%d pred_log=%s\n",
             ctx.opt.fps,
             ctx.src_is_bgrx ? "bgrx8888" : "bgr565",
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
@@ -3268,6 +3451,9 @@ int main(int argc, char **argv)
             ocr_crop_mode_str(ctx.opt.ocr_crop_mode),
             ocr_resize_mode_str(ctx.opt.ocr_resize_mode),
             ocr_preproc_mode_str(ctx.opt.ocr_preproc_mode),
+            ctx.opt.ocr_ctc_diag,
+            ctx.opt.ocr_crop_dump_dir ? ctx.opt.ocr_crop_dump_dir : "<off>",
+            ctx.opt.ocr_crop_dump_max,
             ctx.opt.pred_log_path ? ctx.opt.pred_log_path : "<off>");
 
     ctx.last_stats_us = mono_us();

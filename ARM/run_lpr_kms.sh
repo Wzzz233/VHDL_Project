@@ -33,6 +33,9 @@ OCR_CHANNEL_ORDER="rgb"
 OCR_CROP_MODE="fixed"
 OCR_RESIZE_MODE="stretch"
 OCR_PREPROC="none"
+OCR_CTC_DIAG="0"
+OCR_CROP_DUMP_DIR=""
+OCR_CROP_DUMP_MAX="20"
 
 usage() {
   cat <<EOF
@@ -69,6 +72,9 @@ Usage: $0 --veh-model <path> --plate-model <path> --ocr-model <path> --ocr-keys 
   --ocr-crop-mode <m>        OCR crop mode: fixed|box|box-pad (default: ${OCR_CROP_MODE})
   --ocr-resize-mode <m>      OCR resize mode: stretch|letterbox (default: ${OCR_RESIZE_MODE})
   --ocr-preproc <m>          OCR crop preproc: none|gray|bin (default: ${OCR_PREPROC})
+  --ocr-ctc-diag <0|1>       Print CTC decode diagnostics (default: ${OCR_CTC_DIAG})
+  --ocr-crop-dump-dir <p>    Dump OCR crops+inputs to directory (default: off)
+  --ocr-crop-dump-max <n>    Max dumped OCR samples (default: ${OCR_CROP_DUMP_MAX})
 EOF
 }
 
@@ -106,6 +112,9 @@ while [[ $# -gt 0 ]]; do
     --ocr-crop-mode) OCR_CROP_MODE="$2"; shift 2 ;;
     --ocr-resize-mode) OCR_RESIZE_MODE="$2"; shift 2 ;;
     --ocr-preproc) OCR_PREPROC="$2"; shift 2 ;;
+    --ocr-ctc-diag) OCR_CTC_DIAG="$2"; shift 2 ;;
+    --ocr-crop-dump-dir) OCR_CROP_DUMP_DIR="$2"; shift 2 ;;
+    --ocr-crop-dump-max) OCR_CROP_DUMP_MAX="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -176,7 +185,13 @@ CMD=(./fpga_lpr_display
   --ocr-channel-order "$OCR_CHANNEL_ORDER"
   --ocr-crop-mode "$OCR_CROP_MODE"
   --ocr-resize-mode "$OCR_RESIZE_MODE"
-  --ocr-preproc "$OCR_PREPROC")
+  --ocr-preproc "$OCR_PREPROC"
+  --ocr-ctc-diag "$OCR_CTC_DIAG"
+  --ocr-crop-dump-max "$OCR_CROP_DUMP_MAX")
+
+if [[ -n "$OCR_CROP_DUMP_DIR" ]]; then
+  CMD+=(--ocr-crop-dump-dir "$OCR_CROP_DUMP_DIR")
+fi
 
 if [[ -n "$CONNECTOR_ID" ]]; then
   CMD+=(--connector-id "$CONNECTOR_ID")
