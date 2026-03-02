@@ -319,6 +319,9 @@ struct frame_cookie {
 static volatile sig_atomic_t g_stop = 0;
 
 static void resize_rgb888_nn(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh);
+static void resize_rgb888_nn_letterbox(const uint8_t *src, int sw, int sh,
+                                       uint8_t *dst, int dw, int dh, uint8_t pad);
+static void ocr_preprocess_rgb888(uint8_t *rgb, int w, int h, int mode);
 static float box_iou(const struct det_box *a, const struct det_box *b);
 
 static int64_t mono_us(void)
