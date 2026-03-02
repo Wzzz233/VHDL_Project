@@ -29,6 +29,10 @@ PED_EVENT="0"
 RED_STABLE_FRAMES="5"
 RED_RATIO_THR="0.002"
 STOPLINE_RATIO="0.55"
+OCR_CHANNEL_ORDER="rgb"
+OCR_CROP_MODE="fixed"
+OCR_RESIZE_MODE="stretch"
+OCR_PREPROC="none"
 
 usage() {
   cat <<EOF
@@ -61,6 +65,10 @@ Usage: $0 --veh-model <path> --plate-model <path> --ocr-model <path> --ocr-keys 
   --red-stable-frames <n>    Red light debounce frames (default: ${RED_STABLE_FRAMES})
   --red-ratio-thr <v>        A-channel red ratio threshold (default: ${RED_RATIO_THR})
   --stopline-ratio <v>       Stopline Y ratio [0,1] (default: ${STOPLINE_RATIO})
+  --ocr-channel-order <m>    OCR input order: rgb|bgr (default: ${OCR_CHANNEL_ORDER})
+  --ocr-crop-mode <m>        OCR crop mode: fixed|box|box-pad (default: ${OCR_CROP_MODE})
+  --ocr-resize-mode <m>      OCR resize mode: stretch|letterbox (default: ${OCR_RESIZE_MODE})
+  --ocr-preproc <m>          OCR crop preproc: none|gray|bin (default: ${OCR_PREPROC})
 EOF
 }
 
@@ -94,6 +102,10 @@ while [[ $# -gt 0 ]]; do
     --red-stable-frames) RED_STABLE_FRAMES="$2"; shift 2 ;;
     --red-ratio-thr) RED_RATIO_THR="$2"; shift 2 ;;
     --stopline-ratio) STOPLINE_RATIO="$2"; shift 2 ;;
+    --ocr-channel-order) OCR_CHANNEL_ORDER="$2"; shift 2 ;;
+    --ocr-crop-mode) OCR_CROP_MODE="$2"; shift 2 ;;
+    --ocr-resize-mode) OCR_RESIZE_MODE="$2"; shift 2 ;;
+    --ocr-preproc) OCR_PREPROC="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -160,7 +172,11 @@ CMD=(./fpga_lpr_display
   --ped-event "$PED_EVENT"
   --red-stable-frames "$RED_STABLE_FRAMES"
   --red-ratio-thr "$RED_RATIO_THR"
-  --stopline-ratio "$STOPLINE_RATIO")
+  --stopline-ratio "$STOPLINE_RATIO"
+  --ocr-channel-order "$OCR_CHANNEL_ORDER"
+  --ocr-crop-mode "$OCR_CROP_MODE"
+  --ocr-resize-mode "$OCR_RESIZE_MODE"
+  --ocr-preproc "$OCR_PREPROC")
 
 if [[ -n "$CONNECTOR_ID" ]]; then
   CMD+=(--connector-id "$CONNECTOR_ID")
