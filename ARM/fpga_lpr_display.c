@@ -156,6 +156,8 @@ struct lpr_results {
     int plate_rows_keep;
     int plate_heads_keep;
     int plate_decode_mode;
+    int ocr_nonempty_count;
+    int overlay_text_nonempty_count;
     struct det_box a_roi;
     int a_roi_valid;
     int light_red;
@@ -941,15 +943,49 @@ static void draw_rect_565(uint16_t *pix, int w, int h, const struct det_box *b, 
 
 static uint8_t glyph5x7(char ch, int row)
 {
+    if (ch >= 'a' && ch <= 'z')
+        ch = (char)(ch - 'a' + 'A');
     switch (ch) {
-    case 'B': { static const uint8_t g[7]={0x1E,0x11,0x1E,0x11,0x11,0x11,0x1E}; return g[row]; }
-    case 'L': { static const uint8_t g[7]={0x10,0x10,0x10,0x10,0x10,0x10,0x1F}; return g[row]; }
-    case 'U': { static const uint8_t g[7]={0x11,0x11,0x11,0x11,0x11,0x11,0x1F}; return g[row]; }
-    case 'E': { static const uint8_t g[7]={0x1F,0x10,0x1E,0x10,0x10,0x10,0x1F}; return g[row]; }
+    case '0': { static const uint8_t g[7]={0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}; return g[row]; }
+    case '1': { static const uint8_t g[7]={0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}; return g[row]; }
+    case '2': { static const uint8_t g[7]={0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}; return g[row]; }
+    case '3': { static const uint8_t g[7]={0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E}; return g[row]; }
+    case '4': { static const uint8_t g[7]={0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}; return g[row]; }
+    case '5': { static const uint8_t g[7]={0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}; return g[row]; }
+    case '6': { static const uint8_t g[7]={0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}; return g[row]; }
+    case '7': { static const uint8_t g[7]={0x1F,0x01,0x02,0x04,0x08,0x08,0x08}; return g[row]; }
+    case '8': { static const uint8_t g[7]={0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}; return g[row]; }
+    case '9': { static const uint8_t g[7]={0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}; return g[row]; }
+    case 'A': { static const uint8_t g[7]={0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}; return g[row]; }
+    case 'B': { static const uint8_t g[7]={0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}; return g[row]; }
+    case 'C': { static const uint8_t g[7]={0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}; return g[row]; }
+    case 'D': { static const uint8_t g[7]={0x1C,0x12,0x11,0x11,0x11,0x12,0x1C}; return g[row]; }
+    case 'E': { static const uint8_t g[7]={0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}; return g[row]; }
+    case 'F': { static const uint8_t g[7]={0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}; return g[row]; }
     case 'G': { static const uint8_t g[7]={0x0F,0x10,0x10,0x13,0x11,0x11,0x0F}; return g[row]; }
-    case 'R': { static const uint8_t g[7]={0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}; return g[row]; }
-    case 'N': { static const uint8_t g[7]={0x11,0x19,0x15,0x13,0x11,0x11,0x11}; return g[row]; }
+    case 'H': { static const uint8_t g[7]={0x11,0x11,0x11,0x1F,0x11,0x11,0x11}; return g[row]; }
+    case 'I': { static const uint8_t g[7]={0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}; return g[row]; }
+    case 'J': { static const uint8_t g[7]={0x01,0x01,0x01,0x01,0x11,0x11,0x0E}; return g[row]; }
     case 'K': { static const uint8_t g[7]={0x11,0x12,0x14,0x18,0x14,0x12,0x11}; return g[row]; }
+    case 'L': { static const uint8_t g[7]={0x10,0x10,0x10,0x10,0x10,0x10,0x1F}; return g[row]; }
+    case 'M': { static const uint8_t g[7]={0x11,0x1B,0x15,0x15,0x11,0x11,0x11}; return g[row]; }
+    case 'N': { static const uint8_t g[7]={0x11,0x19,0x15,0x13,0x11,0x11,0x11}; return g[row]; }
+    case 'O': { static const uint8_t g[7]={0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}; return g[row]; }
+    case 'P': { static const uint8_t g[7]={0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}; return g[row]; }
+    case 'Q': { static const uint8_t g[7]={0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}; return g[row]; }
+    case 'R': { static const uint8_t g[7]={0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}; return g[row]; }
+    case 'S': { static const uint8_t g[7]={0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}; return g[row]; }
+    case 'T': { static const uint8_t g[7]={0x1F,0x04,0x04,0x04,0x04,0x04,0x04}; return g[row]; }
+    case 'U': { static const uint8_t g[7]={0x11,0x11,0x11,0x11,0x11,0x11,0x0E}; return g[row]; }
+    case 'V': { static const uint8_t g[7]={0x11,0x11,0x11,0x11,0x11,0x0A,0x04}; return g[row]; }
+    case 'W': { static const uint8_t g[7]={0x11,0x11,0x11,0x15,0x15,0x1B,0x11}; return g[row]; }
+    case 'X': { static const uint8_t g[7]={0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}; return g[row]; }
+    case 'Y': { static const uint8_t g[7]={0x11,0x11,0x0A,0x04,0x04,0x04,0x04}; return g[row]; }
+    case 'Z': { static const uint8_t g[7]={0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}; return g[row]; }
+    case '-': { static const uint8_t g[7]={0x00,0x00,0x00,0x1F,0x00,0x00,0x00}; return g[row]; }
+    case '_': { static const uint8_t g[7]={0x00,0x00,0x00,0x00,0x00,0x00,0x1F}; return g[row]; }
+    case ':': { static const uint8_t g[7]={0x00,0x04,0x04,0x00,0x04,0x04,0x00}; return g[row]; }
+    case ' ': { static const uint8_t g[7]={0x00,0x00,0x00,0x00,0x00,0x00,0x00}; return g[row]; }
     default: return 0;
     }
 }
@@ -2472,16 +2508,21 @@ static void build_overlay_ascii_text(const struct plate_det *pd, char *out, size
             (ch >= 'A' && ch <= 'Z') ||
             (ch >= 'a' && ch <= 'z') ||
             ch == '-') {
+            if (ch >= 'a' && ch <= 'z')
+                ch = (unsigned char)(ch - 'a' + 'A');
             out[i++] = (char)ch;
         }
     }
     if (i == 0) {
-        const char *fb = plate_type_str(pd->type);
-        while (*fb && i + 1 < out_len) {
-            unsigned char ch = (unsigned char)*fb++;
-            if ((ch >= 'a' && ch <= 'z') || ch == '_')
-                out[i++] = (char)ch;
-        }
+        const char *fb = "UNK";
+        if (pd->type == PLATE_TYPE_COMMON_BLUE) fb = "BLUE";
+        else if (pd->type == PLATE_TYPE_COMMON_GREEN) fb = "GREEN";
+        else if (pd->type == PLATE_TYPE_YELLOW) fb = "YELLOW";
+        else if (pd->type == PLATE_TYPE_POLICE) fb = "POLICE";
+        else if (pd->type == PLATE_TYPE_TRAILER) fb = "TRAILER";
+        else if (pd->type == PLATE_TYPE_EMBASSY_CONSULATE) fb = "EMB";
+        while (*fb && i + 1 < out_len)
+            out[i++] = *fb++;
         if (i == 0) {
             out[0] = 'U';
             if (out_len > 1) out[1] = 'N';
@@ -2524,6 +2565,8 @@ static void *infer_thread_main(void *arg)
         int person_count = 0;
         int tracked_person_count = 0;
         int ped_events = 0;
+        int ocr_nonempty_count = 0;
+        int overlay_nonempty_count = 0;
         struct detect_decode_diag plate_diag;
         bool light_red = false;
         float red_ratio = 0.0f;
@@ -2644,6 +2687,8 @@ static void *infer_thread_main(void *arg)
         r.plate_rows_keep = plate_diag.rows_keep;
         r.plate_heads_keep = plate_diag.heads_keep;
         r.plate_decode_mode = plate_diag.mode;
+        r.ocr_nonempty_count = 0;
+        r.overlay_text_nonempty_count = 0;
         r.a_roi_valid = a_roi_valid ? 1 : 0;
         r.a_roi = a_roi;
         r.light_red = light_red ? 1 : 0;
@@ -2664,6 +2709,7 @@ static void *infer_thread_main(void *arg)
             int parent = -1;
             int crop_w;
             int crop_h;
+            char overlay_txt[32];
             pd.box = stable_plates[i];
             if (!ctx->opt.plate_only)
                 parent = find_parent_car(&pd.box, r.cars, r.car_count);
@@ -2681,7 +2727,12 @@ static void *infer_thread_main(void *arg)
                 snprintf(pd.ocr_text, sizeof(pd.ocr_text), "UNK");
                 pd.ocr_conf = 0.0f;
             }
+            if (pd.ocr_text[0] != '\0')
+                ocr_nonempty_count++;
             pd.type = classify_plate_type(pd.color, pd.ocr_text);
+            build_overlay_ascii_text(&pd, overlay_txt, sizeof(overlay_txt));
+            if (overlay_txt[0] != '\0')
+                overlay_nonempty_count++;
             fprintf(stderr,
                     "[pred] frame=%" PRIu64 " ts_us=%" PRId64 " bbox=[%d,%d,%d,%d] text=%s conf=%.2f type=%s color=%s\n",
                     seq,
@@ -2695,6 +2746,8 @@ static void *infer_thread_main(void *arg)
             ctx->pred_rows_total++;
             r.plates[r.plate_count++] = pd;
         }
+        r.ocr_nonempty_count = ocr_nonempty_count;
+        r.overlay_text_nonempty_count = overlay_nonempty_count;
         r.frame_seq = seq;
         r.infer_ms_last = (double)(t1 - t0) / 1000.0;
         pthread_mutex_lock(&ctx->result_lock);
@@ -2772,7 +2825,7 @@ static void print_stats(struct app_ctx *ctx)
     fprintf(stderr,
             "[stats] cap=%" PRIu64 " push=%" PRIu64 " rel=%" PRIu64
             " infer=%" PRIu64 " infer_ms=%.2f cars=%d(raw=%d) persons=%d(raw=%d)"
-            " plates=%d(raw=%d) rows=%d/%d heads=%d/%d mode=%s aroi=%d red=%d ped_evt=%" PRIu64
+            " plates=%d(raw=%d) rows=%d/%d heads=%d/%d mode=%s ocr=%d ovtxt=%d aroi=%d red=%d ped_evt=%" PRIu64
             " gate_raw_pos=%" PRIu64 " gate_streak=%" PRIu64 " pred_rows=%" PRIu64 " drop=%" PRIu64
             " cap_fps=%.2f disp_fps=%.2f infer_fps=%.2f\n",
             ctx->captured_frames, ctx->pushed_frames, ctx->released_frames,
@@ -2782,6 +2835,7 @@ static void print_stats(struct app_ctx *ctx)
             r.plate_count, r.plate_raw_count,
             r.plate_rows_raw, r.plate_rows_keep,
             r.plate_heads_raw, r.plate_heads_keep, decode_mode,
+            r.ocr_nonempty_count, r.overlay_text_nonempty_count,
             r.a_roi_valid, r.light_red, r.ped_event_total,
             ctx->gate_plate_raw_positive_frames, ctx->gate_plate_raw_positive_streak, ctx->pred_rows_total,
             ctx->infer_overwrite_count,
