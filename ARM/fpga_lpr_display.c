@@ -78,6 +78,13 @@ enum plate_type {
     PLATE_TYPE_UNKNOWN,
 };
 
+enum plate_decode_mode {
+    PLATE_DECODE_NONE = 0,
+    PLATE_DECODE_ROWS,
+    PLATE_DECODE_HEADS,
+    PLATE_DECODE_MERGED,
+};
+
 struct options {
     const char *device_path;
     const char *drm_card_path;
@@ -144,6 +151,11 @@ struct lpr_results {
     struct plate_det plates[MAX_DETS];
     int plate_count;
     int plate_raw_count;
+    int plate_rows_raw;
+    int plate_heads_raw;
+    int plate_rows_keep;
+    int plate_heads_keep;
+    int plate_decode_mode;
     struct det_box a_roi;
     int a_roi_valid;
     int light_red;
@@ -153,6 +165,14 @@ struct lpr_results {
     double infer_ms_last;
     uint64_t infer_frames_total;
     double infer_ms_total;
+};
+
+struct detect_decode_diag {
+    int rows_raw;
+    int heads_raw;
+    int rows_keep;
+    int heads_keep;
+    int mode;
 };
 
 struct yolo_model {
@@ -1654,77 +1674,100 @@ static void copy_crop_rgb888(const uint8_t *rgb, int img_w, const struct det_box
     }
 }
 
-static void decode_rows_output(const float *rows, int n_rows, int n_cols, int class_count,
-                               float conf_thr, int src_w, int src_h, int in_w, int in_h,
-                               struct det_box *out, int *out_count)
+static float rows_get_value(const float *buf, bool transposed, int n_rows, int n_cols, int r, int c)
+{
+    if (transposed)
+        return buf[(size_t)c * (size_t)n_rows + (size_t)r];
+    return buf[(size_t)r * (size_t)n_cols + (size_t)c];
+}
+
+static bool rows_coords_mostly_normalized(const float *buf, bool transposed, int n_rows, int n_cols)
 {
     int i;
-    int cls_lim = class_count;
+    int sample = (n_rows < 128) ? n_rows : 128;
+    int total = 0;
+    int in01 = 0;
+    for (i = 0; i < sample; i++) {
+        int k;
+        for (k = 0; k < 4; k++) {
+            float v = rows_get_value(buf, transposed, n_rows, n_cols, i, k);
+            if (v >= 0.0f && v <= 1.0f)
+                in01++;
+            total++;
+        }
+    }
+    if (total <= 0)
+        return false;
+    return ((float)in01 / (float)total) >= 0.75f;
+}
+
+static bool rows_classid_like(const float *buf, bool transposed, int n_rows, int n_cols, int class_count)
+{
+    int i;
+    int sample = (n_rows < 128) ? n_rows : 128;
+    int near_int = 0;
+    int in_range = 0;
     if (n_cols < 6)
-        return;
+        return false;
+    if (class_count <= 0)
+        class_count = 1;
+    for (i = 0; i < sample; i++) {
+        float clsf = rows_get_value(buf, transposed, n_rows, n_cols, i, 5);
+        int cls = (int)lroundf(clsf);
+        if (fabsf(clsf - (float)cls) <= 0.15f)
+            near_int++;
+        if (cls >= 0 && cls < class_count)
+            in_range++;
+    }
+    return (near_int >= (sample * 7) / 10) && (in_range >= (sample * 7) / 10);
+}
+
+static int decode_rows_mode_xywh(const float *buf, bool transposed, int n_rows, int n_cols, int class_count,
+                                 float conf_thr, int src_w, int src_h, int in_w, int in_h,
+                                 struct det_box *out, float *avg_conf_out)
+{
+    int i;
+    int count = 0;
+    float conf_sum = 0.0f;
+    int cls_lim = class_count;
+
+    if (n_cols < 6)
+        return 0;
+    if (cls_lim <= 0)
+        cls_lim = 1;
     if (cls_lim > n_cols - 5)
         cls_lim = n_cols - 5;
-    for (i = 0; i < n_rows && *out_count < MAX_DETS; i++) {
-        const float *r = rows + i * n_cols;
-        float obj = r[4];
-        float best = (cls_lim > 0) ? 0.0f : 1.0f;
-        int best_id = 0;
+
+    for (i = 0; i < n_rows && count < MAX_DETS; i++) {
         int c;
-        float cx = r[0], cy = r[1], bw = r[2], bh = r[3];
-        struct det_box b;
-        for (c = 0; c < cls_lim; c++) {
-            float p = r[5 + c];
-            if (p > best) { best = p; best_id = c; }
-        }
-        if (obj <= 1.0f) obj = sigmoidf_local(obj);
-        if (best <= 1.0f) best = sigmoidf_local(best);
-        if (obj * best < conf_thr)
-            continue;
-        if (bw <= 2.0f && bh <= 2.0f) {
-            cx *= (float)in_w; cy *= (float)in_h; bw *= (float)in_w; bh *= (float)in_h;
-        }
-        b.x1 = (int)((cx - bw * 0.5f) * ((float)src_w / (float)in_w));
-        b.y1 = (int)((cy - bh * 0.5f) * ((float)src_h / (float)in_h));
-        b.x2 = (int)((cx + bw * 0.5f) * ((float)src_w / (float)in_w));
-        b.y2 = (int)((cy + bh * 0.5f) * ((float)src_h / (float)in_h));
-        b.conf = obj * best;
-        b.cls = best_id;
-        clamp_box(&b, src_w, src_h);
-        out[(*out_count)++] = b;
-    }
-}
-
-static void decode_rows_output_transposed(const float *rows_t, int n_cols, int n_rows, int class_count,
-                                          float conf_thr, int src_w, int src_h, int in_w, int in_h,
-                                          struct det_box *out, int *out_count)
-{
-    int i;
-    int c;
-    int cls_lim = class_count;
-    if (n_cols < 6)
-        return;
-    if (cls_lim > n_cols - 5)
-        cls_lim = n_cols - 5;
-    for (i = 0; i < n_rows && *out_count < MAX_DETS; i++) {
-        float obj = rows_t[4 * n_rows + i];
+        float obj = rows_get_value(buf, transposed, n_rows, n_cols, i, 4);
         float best = (cls_lim > 0) ? 0.0f : 1.0f;
         int best_id = 0;
-        float cx = rows_t[0 * n_rows + i];
-        float cy = rows_t[1 * n_rows + i];
-        float bw = rows_t[2 * n_rows + i];
-        float bh = rows_t[3 * n_rows + i];
+        float cx = rows_get_value(buf, transposed, n_rows, n_cols, i, 0);
+        float cy = rows_get_value(buf, transposed, n_rows, n_cols, i, 1);
+        float bw = rows_get_value(buf, transposed, n_rows, n_cols, i, 2);
+        float bh = rows_get_value(buf, transposed, n_rows, n_cols, i, 3);
         struct det_box b;
+
         for (c = 0; c < cls_lim; c++) {
-            float p = rows_t[(5 + c) * n_rows + i];
-            if (p > best) { best = p; best_id = c; }
+            float p = rows_get_value(buf, transposed, n_rows, n_cols, i, 5 + c);
+            if (p > best) {
+                best = p;
+                best_id = c;
+            }
         }
         if (obj <= 1.0f) obj = sigmoidf_local(obj);
         if (best <= 1.0f) best = sigmoidf_local(best);
         if (obj * best < conf_thr)
             continue;
+
         if (bw <= 2.0f && bh <= 2.0f) {
-            cx *= (float)in_w; cy *= (float)in_h; bw *= (float)in_w; bh *= (float)in_h;
+            cx *= (float)in_w;
+            cy *= (float)in_h;
+            bw *= (float)in_w;
+            bh *= (float)in_h;
         }
+
         b.x1 = (int)((cx - bw * 0.5f) * ((float)src_w / (float)in_w));
         b.y1 = (int)((cy - bh * 0.5f) * ((float)src_h / (float)in_h));
         b.x2 = (int)((cx + bw * 0.5f) * ((float)src_w / (float)in_w));
@@ -1732,34 +1775,147 @@ static void decode_rows_output_transposed(const float *rows_t, int n_cols, int n
         b.conf = obj * best;
         b.cls = best_id;
         clamp_box(&b, src_w, src_h);
-        out[(*out_count)++] = b;
+        out[count++] = b;
+        conf_sum += b.conf;
     }
+
+    if (avg_conf_out)
+        *avg_conf_out = (count > 0) ? (conf_sum / (float)count) : 0.0f;
+    return count;
 }
 
-static void decode_rows_tensor_output(const rknn_tensor_attr *a, const float *buf, int class_count,
-                                      float conf_thr, int src_w, int src_h, int in_w, int in_h,
-                                      struct det_box *out, int *out_count)
+static int decode_rows_mode_xyxy_clsid(const float *buf, bool transposed, int n_rows, int n_cols, int class_count,
+                                       float conf_thr, int src_w, int src_h, int in_w, int in_h,
+                                       struct det_box *out, float *avg_conf_out)
 {
-    int n1 = (int)a->dims[1];
-    int n2 = (int)a->dims[2];
-    if (a->n_dims != 3)
-        return;
-    if (n2 >= 6 && n2 <= 512) {
-        decode_rows_output(buf, n1, n2, class_count, conf_thr, src_w, src_h, in_w, in_h, out, out_count);
-        return;
+    int i;
+    int count = 0;
+    float conf_sum = 0.0f;
+    bool normalized = rows_coords_mostly_normalized(buf, transposed, n_rows, n_cols);
+    bool clsid_hint = rows_classid_like(buf, transposed, n_rows, n_cols, class_count);
+
+    if (n_cols < 6 || !clsid_hint)
+        return 0;
+    if (class_count <= 0)
+        class_count = 1;
+
+    for (i = 0; i < n_rows && count < MAX_DETS; i++) {
+        float x1 = rows_get_value(buf, transposed, n_rows, n_cols, i, 0);
+        float y1 = rows_get_value(buf, transposed, n_rows, n_cols, i, 1);
+        float x2 = rows_get_value(buf, transposed, n_rows, n_cols, i, 2);
+        float y2 = rows_get_value(buf, transposed, n_rows, n_cols, i, 3);
+        float score = rows_get_value(buf, transposed, n_rows, n_cols, i, 4);
+        int cls = (int)lroundf(rows_get_value(buf, transposed, n_rows, n_cols, i, 5));
+        struct det_box b;
+        float max_x;
+        float max_y;
+
+        if (score < 0.0f || score > 1.0f)
+            score = sigmoidf_local(score);
+        if (score < conf_thr)
+            continue;
+        if (cls < 0 || cls >= class_count)
+            continue;
+
+        if (normalized) {
+            x1 *= (float)in_w;
+            x2 *= (float)in_w;
+            y1 *= (float)in_h;
+            y2 *= (float)in_h;
+        }
+
+        if (x2 < x1) { float t = x1; x1 = x2; x2 = t; }
+        if (y2 < y1) { float t = y1; y1 = y2; y2 = t; }
+        max_x = fmaxf(fabsf(x1), fabsf(x2));
+        max_y = fmaxf(fabsf(y1), fabsf(y2));
+
+        if (max_x <= (float)in_w * 1.5f && max_y <= (float)in_h * 1.5f) {
+            b.x1 = (int)(x1 * ((float)src_w / (float)in_w));
+            b.y1 = (int)(y1 * ((float)src_h / (float)in_h));
+            b.x2 = (int)(x2 * ((float)src_w / (float)in_w));
+            b.y2 = (int)(y2 * ((float)src_h / (float)in_h));
+        } else {
+            b.x1 = (int)x1;
+            b.y1 = (int)y1;
+            b.x2 = (int)x2;
+            b.y2 = (int)y2;
+        }
+        b.conf = score;
+        b.cls = cls;
+        clamp_box(&b, src_w, src_h);
+        out[count++] = b;
+        conf_sum += b.conf;
     }
-    if (n1 >= 6 && n1 <= 512) {
-        decode_rows_output_transposed(buf, n1, n2, class_count, conf_thr, src_w, src_h, in_w, in_h, out, out_count);
-    }
+
+    if (avg_conf_out)
+        *avg_conf_out = (count > 0) ? (conf_sum / (float)count) : 0.0f;
+    return count;
 }
+
+static int decode_rows_tensor_output(const rknn_tensor_attr *a, const float *buf, int class_count,
+                                     float conf_thr, int src_w, int src_h, int in_w, int in_h,
+                                     struct det_box *out, int *out_count)
+{
+    struct det_box xywh_out[MAX_DETS];
+    struct det_box xyxy_out[MAX_DETS];
+    int n_rows;
+    int n_cols;
+    bool transposed = false;
+    int xywh_count = 0;
+    int xyxy_count = 0;
+    float xywh_avg = 0.0f;
+    float xyxy_avg = 0.0f;
+
+    *out_count = 0;
+    if (a->n_dims != 3)
+        return 0;
+
+    n_rows = (int)a->dims[1];
+    n_cols = (int)a->dims[2];
+    if (n_cols < 6 && n_rows >= 6) {
+        int t = n_rows;
+        n_rows = n_cols;
+        n_cols = t;
+        transposed = true;
+    }
+    if (n_cols < 6 || n_rows <= 0)
+        return 0;
+
+    xywh_count = decode_rows_mode_xywh(buf, transposed, n_rows, n_cols, class_count,
+                                       conf_thr, src_w, src_h, in_w, in_h,
+                                       xywh_out, &xywh_avg);
+    xyxy_count = decode_rows_mode_xyxy_clsid(buf, transposed, n_rows, n_cols, class_count,
+                                             conf_thr, src_w, src_h, in_w, in_h,
+                                             xyxy_out, &xyxy_avg);
+
+    if (xywh_count <= 0 && xyxy_count <= 0)
+        return 0;
+    if (xyxy_count <= 0 || (xywh_count > 0 && ((float)xywh_count + xywh_avg * 0.5f >= (float)xyxy_count + xyxy_avg * 0.5f))) {
+        memcpy(out, xywh_out, (size_t)xywh_count * sizeof(out[0]));
+        *out_count = xywh_count;
+        return 1; /* xywh */
+    }
+
+    memcpy(out, xyxy_out, (size_t)xyxy_count * sizeof(out[0]));
+    *out_count = xyxy_count;
+    return 2; /* xyxy+clsid */
+}
+
+enum yolo_head_layout {
+    YOLO_HEAD_4D_NCHW = 0,
+    YOLO_HEAD_4D_NHWC,
+    YOLO_HEAD_5D_AHWA,
+    YOLO_HEAD_5D_HWAA
+};
 
 struct yolo_head_view {
     uint32_t out_idx;
     int h;
     int w;
-    int c;
+    int anchors;
+    int attrs;
     int stride;
-    bool nchw;
+    int layout;
 };
 
 static bool parse_yolo_head_view(const struct yolo_model *m, uint32_t out_idx, struct yolo_head_view *hv)
@@ -1767,45 +1923,76 @@ static bool parse_yolo_head_view(const struct yolo_model *m, uint32_t out_idx, s
     const rknn_tensor_attr *a = &m->output_attrs[out_idx];
     int h = 0;
     int w = 0;
-    int c = 0;
-    bool nchw = false;
+    int anchors = 3;
+    int attrs = 0;
+    int layout = YOLO_HEAD_4D_NCHW;
 
-    if (a->n_dims != 4)
-        return false;
-    if (a->fmt == RKNN_TENSOR_NCHW) {
-        c = (int)a->dims[1];
-        h = (int)a->dims[2];
-        w = (int)a->dims[3];
-        nchw = true;
-    } else if (a->fmt == RKNN_TENSOR_NHWC) {
-        h = (int)a->dims[1];
-        w = (int)a->dims[2];
-        c = (int)a->dims[3];
-        nchw = false;
-    } else {
-        if (a->dims[2] == a->dims[3] && a->dims[1] >= 18) {
+    if (a->n_dims == 4) {
+        int c = 0;
+        if (a->fmt == RKNN_TENSOR_NCHW) {
             c = (int)a->dims[1];
             h = (int)a->dims[2];
             w = (int)a->dims[3];
-            nchw = true;
-        } else if (a->dims[1] == a->dims[2] && a->dims[3] >= 18) {
+            layout = YOLO_HEAD_4D_NCHW;
+        } else if (a->fmt == RKNN_TENSOR_NHWC) {
             h = (int)a->dims[1];
             w = (int)a->dims[2];
             c = (int)a->dims[3];
-            nchw = false;
+            layout = YOLO_HEAD_4D_NHWC;
+        } else {
+            if (a->dims[2] == a->dims[3] && a->dims[1] >= 18) {
+                c = (int)a->dims[1];
+                h = (int)a->dims[2];
+                w = (int)a->dims[3];
+                layout = YOLO_HEAD_4D_NCHW;
+            } else if (a->dims[1] == a->dims[2] && a->dims[3] >= 18) {
+                h = (int)a->dims[1];
+                w = (int)a->dims[2];
+                c = (int)a->dims[3];
+                layout = YOLO_HEAD_4D_NHWC;
+            } else {
+                return false;
+            }
+        }
+        if (c <= 0 || c % 3 != 0)
+            return false;
+        anchors = 3;
+        attrs = c / 3;
+    } else if (a->n_dims == 5) {
+        int d1 = (int)a->dims[1];
+        int d2 = (int)a->dims[2];
+        int d3 = (int)a->dims[3];
+        int d4 = (int)a->dims[4];
+        int attrs_guess = (m->class_count > 0) ? (m->class_count + 5) : 6;
+
+        if (d1 == 3 && d2 > 0 && d3 > 0) {
+            h = d2;
+            w = d3;
+            anchors = 3;
+            attrs = (d4 >= 6) ? d4 : attrs_guess;
+            layout = YOLO_HEAD_5D_AHWA;
+        } else if (d3 == 3 && d1 > 0 && d2 > 0) {
+            h = d1;
+            w = d2;
+            anchors = 3;
+            attrs = (d4 >= 6) ? d4 : attrs_guess;
+            layout = YOLO_HEAD_5D_HWAA;
         } else {
             return false;
         }
+    } else {
+        return false;
     }
 
-    if (h <= 0 || w <= 0 || c <= 0 || c % 3 != 0 || c / 3 < 6)
+    if (h <= 0 || w <= 0 || anchors != 3 || attrs < 6)
         return false;
 
     hv->out_idx = out_idx;
     hv->h = h;
     hv->w = w;
-    hv->c = c;
-    hv->nchw = nchw;
+    hv->anchors = anchors;
+    hv->attrs = attrs;
+    hv->layout = layout;
     hv->stride = (h > 0) ? ((int)m->in_h / h) : 0;
     return hv->stride > 0;
 }
@@ -1827,11 +2014,19 @@ static void sort_heads_by_stride(struct yolo_head_view *heads, int n)
 
 static float head_read(const float *buf, const struct yolo_head_view *hv, int a, int gy, int gx, int k)
 {
-    int attrs = hv->c / 3;
-    int ch = a * attrs + k;
-    if (hv->nchw)
-        return buf[((ch * hv->h + gy) * hv->w) + gx];
-    return buf[((gy * hv->w + gx) * hv->c) + ch];
+    size_t idx = 0;
+    if (hv->layout == YOLO_HEAD_4D_NCHW) {
+        int ch = a * hv->attrs + k;
+        idx = ((size_t)ch * (size_t)hv->h + (size_t)gy) * (size_t)hv->w + (size_t)gx;
+    } else if (hv->layout == YOLO_HEAD_4D_NHWC) {
+        idx = ((size_t)gy * (size_t)hv->w + (size_t)gx) * (size_t)(hv->anchors * hv->attrs) +
+              (size_t)(a * hv->attrs + k);
+    } else if (hv->layout == YOLO_HEAD_5D_AHWA) {
+        idx = ((((size_t)a * (size_t)hv->h + (size_t)gy) * (size_t)hv->w + (size_t)gx) * (size_t)hv->attrs) + (size_t)k;
+    } else {
+        idx = ((((size_t)gy * (size_t)hv->w + (size_t)gx) * (size_t)hv->anchors + (size_t)a) * (size_t)hv->attrs) + (size_t)k;
+    }
+    return buf[idx];
 }
 
 static void decode_yolo_head_output(const float *buf, const struct yolo_head_view *hv,
@@ -1842,11 +2037,12 @@ static void decode_yolo_head_output(const float *buf, const struct yolo_head_vie
     int gy;
     int gx;
     int a;
-    int attrs = hv->c / 3;
-    int classes = attrs - 5;
+    int classes = hv->attrs - 5;
     int cls_lim = class_count;
     if (classes <= 0)
         return;
+    if (cls_lim <= 0)
+        cls_lim = 1;
     if (cls_lim > classes)
         cls_lim = classes;
 
@@ -1921,6 +2117,7 @@ static void decode_yolo_heads_outputs(const struct yolo_model *m, const rknn_out
     int head_count = 0;
     uint32_t i;
 
+    *out_count = 0;
     for (i = 0; i < m->io_num.n_output && head_count < 8; i++) {
         if (parse_yolo_head_view(m, i, &heads[head_count]))
             head_count++;
@@ -1947,13 +2144,21 @@ static void decode_yolo_heads_outputs(const struct yolo_model *m, const rknn_out
 }
 
 static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src_w, int src_h,
-                            float conf_thr, struct det_box *out, int *out_count)
+                            float conf_thr, struct det_box *out, int *out_count,
+                            struct detect_decode_diag *diag)
 {
     rknn_input in;
     rknn_output outs[8];
+    struct det_box rows_out[MAX_DETS];
+    struct det_box heads_out[MAX_DETS];
+    int rows_count = 0;
+    int heads_count = 0;
     uint32_t i;
     int ret;
+
     *out_count = 0;
+    if (diag)
+        memset(diag, 0, sizeof(*diag));
 
     memset(&in, 0, sizeof(in));
     in.index = 0;
@@ -1973,17 +2178,62 @@ static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src
     if (ret < 0) return ret;
 
     for (i = 0; i < m->io_num.n_output; i++) {
-        rknn_tensor_attr *a = &m->output_attrs[i];
-        if (a->n_dims == 3)
+        const rknn_tensor_attr *a = &m->output_attrs[i];
+        if (a->n_dims == 3 && rows_count == 0)
             decode_rows_tensor_output(a, (const float *)outs[i].buf, m->class_count,
                                       conf_thr, src_w, src_h, (int)m->in_w, (int)m->in_h,
-                                      out, out_count);
+                                      rows_out, &rows_count);
     }
-    if (*out_count == 0)
-        decode_yolo_heads_outputs(m, outs, conf_thr, src_w, src_h, out, out_count);
+    decode_yolo_heads_outputs(m, outs, conf_thr, src_w, src_h, heads_out, &heads_count);
 
-    if (*out_count > MAX_DETS) *out_count = MAX_DETS;
-    nms_inplace(out, out_count, 0.45f);
+    if (diag) {
+        diag->rows_raw = rows_count;
+        diag->heads_raw = heads_count;
+        diag->rows_keep = 0;
+        diag->heads_keep = 0;
+        diag->mode = PLATE_DECODE_NONE;
+    }
+
+    if (rows_count > 0 && heads_count > 0) {
+        int i2;
+        int n = 0;
+        for (i2 = 0; i2 < rows_count && n < MAX_DETS; i2++)
+            out[n++] = rows_out[i2];
+        for (i2 = 0; i2 < heads_count && n < MAX_DETS; i2++)
+            out[n++] = heads_out[i2];
+        *out_count = n;
+        nms_inplace(out, out_count, 0.45f);
+        if (diag) {
+            diag->mode = PLATE_DECODE_MERGED;
+            diag->rows_keep = rows_count;
+            diag->heads_keep = heads_count;
+        }
+    } else if (rows_count > 0) {
+        memcpy(out, rows_out, (size_t)rows_count * sizeof(out[0]));
+        *out_count = rows_count;
+        nms_inplace(out, out_count, 0.45f);
+        if (diag) {
+            diag->mode = PLATE_DECODE_ROWS;
+            diag->rows_keep = *out_count;
+        }
+    } else if (heads_count > 0) {
+        memcpy(out, heads_out, (size_t)heads_count * sizeof(out[0]));
+        *out_count = heads_count;
+        nms_inplace(out, out_count, 0.45f);
+        if (diag) {
+            diag->mode = PLATE_DECODE_HEADS;
+            diag->heads_keep = *out_count;
+        }
+    } else {
+        *out_count = 0;
+        if (diag) {
+            diag->mode = PLATE_DECODE_NONE;
+        }
+    }
+
+    if (*out_count > MAX_DETS)
+        *out_count = MAX_DETS;
+
     rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
     return 0;
 }
@@ -2108,6 +2358,14 @@ static const char *plate_type_str(enum plate_type t)
     case PLATE_TYPE_EMBASSY_CONSULATE: return "embassy_consulate";
     default: return "unknown";
     }
+}
+
+static const char *plate_decode_mode_str(int mode)
+{
+    if (mode == PLATE_DECODE_ROWS) return "rows";
+    if (mode == PLATE_DECODE_HEADS) return "heads";
+    if (mode == PLATE_DECODE_MERGED) return "merged";
+    return "none";
 }
 
 static bool plate_box_pass_rules(const struct det_box *b, int frame_w, int frame_h)
@@ -2266,6 +2524,7 @@ static void *infer_thread_main(void *arg)
         int person_count = 0;
         int tracked_person_count = 0;
         int ped_events = 0;
+        struct detect_decode_diag plate_diag;
         bool light_red = false;
         float red_ratio = 0.0f;
         struct det_box a_roi = {0};
@@ -2324,9 +2583,11 @@ static void *infer_thread_main(void *arg)
             resize_rgb888_nn(algo_rgb, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
                              plate_in, (int)ctx->plate_model.in_w, (int)ctx->plate_model.in_h);
 
+        memset(&plate_diag, 0, sizeof(plate_diag));
+
         if (!ctx->opt.plate_only || ctx->opt.ped_event) {
             if (run_model_detect(&ctx->veh_model, veh_in, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
-                                 ctx->opt.min_car_conf, cars, &car_count) < 0)
+                                 ctx->opt.min_car_conf, cars, &car_count, NULL) < 0)
                 car_count = 0;
         }
         {
@@ -2334,7 +2595,7 @@ static void *infer_thread_main(void *arg)
             if (ctx->opt.fpga_a_mask && a_roi_valid)
                 plate_thr = fmaxf(0.05f, plate_thr - 0.05f);
             if (run_model_detect(&ctx->plate_model, plate_in, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
-                                 plate_thr, raw_plates, &raw_plate_count) < 0)
+                                 plate_thr, raw_plates, &raw_plate_count, &plate_diag) < 0)
                 raw_plate_count = 0;
         }
         if (raw_plate_count > 0) {
@@ -2378,6 +2639,11 @@ static void *infer_thread_main(void *arg)
         r.car_raw_count = car_count;
         r.person_raw_count = person_count;
         r.plate_raw_count = raw_plate_count;
+        r.plate_rows_raw = plate_diag.rows_raw;
+        r.plate_heads_raw = plate_diag.heads_raw;
+        r.plate_rows_keep = plate_diag.rows_keep;
+        r.plate_heads_keep = plate_diag.heads_keep;
+        r.plate_decode_mode = plate_diag.mode;
         r.a_roi_valid = a_roi_valid ? 1 : 0;
         r.a_roi = a_roi;
         r.light_red = light_red ? 1 : 0;
@@ -2496,15 +2762,17 @@ static void print_stats(struct app_ctx *ctx)
     int64_t now = mono_us();
     int64_t dt = now - ctx->last_stats_us;
     struct lpr_results r;
+    const char *decode_mode;
     if (dt < (int64_t)ctx->opt.stats_interval * 1000000LL)
         return;
     pthread_mutex_lock(&ctx->result_lock);
     r = ctx->results;
     pthread_mutex_unlock(&ctx->result_lock);
+    decode_mode = plate_decode_mode_str(r.plate_decode_mode);
     fprintf(stderr,
             "[stats] cap=%" PRIu64 " push=%" PRIu64 " rel=%" PRIu64
             " infer=%" PRIu64 " infer_ms=%.2f cars=%d(raw=%d) persons=%d(raw=%d)"
-            " plates=%d(raw=%d) aroi=%d red=%d ped_evt=%" PRIu64
+            " plates=%d(raw=%d) rows=%d/%d heads=%d/%d mode=%s aroi=%d red=%d ped_evt=%" PRIu64
             " gate_raw_pos=%" PRIu64 " gate_streak=%" PRIu64 " pred_rows=%" PRIu64 " drop=%" PRIu64
             " cap_fps=%.2f disp_fps=%.2f infer_fps=%.2f\n",
             ctx->captured_frames, ctx->pushed_frames, ctx->released_frames,
@@ -2512,6 +2780,8 @@ static void print_stats(struct app_ctx *ctx)
             r.car_count, r.car_raw_count,
             r.person_count, r.person_raw_count,
             r.plate_count, r.plate_raw_count,
+            r.plate_rows_raw, r.plate_rows_keep,
+            r.plate_heads_raw, r.plate_heads_keep, decode_mode,
             r.a_roi_valid, r.light_red, r.ped_event_total,
             ctx->gate_plate_raw_positive_frames, ctx->gate_plate_raw_positive_streak, ctx->pred_rows_total,
             ctx->infer_overwrite_count,
