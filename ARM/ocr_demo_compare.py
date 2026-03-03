@@ -15,7 +15,7 @@ import re
 import subprocess
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def norm_text(s: str) -> str:
@@ -35,26 +35,44 @@ def norm_text(s: str) -> str:
 def extract_demo_text(stdout: str, stderr: str) -> str:
     data = (stdout or "") + "\n" + (stderr or "")
     lines = [x.strip() for x in data.splitlines() if x.strip()]
+    stop_tokens = {
+        "FMT", "NHWC", "NCHW", "MODEL", "INPUT", "OUTPUT", "RKNN_RUN",
+        "TENSORS", "SIZE", "IMAGE", "RESULT",
+    }
 
     # Typical:
     #   "车牌识别结果: 湘F6CL03"
     #   "识别结果: 湘F6CL03"
     #   "result: XF6CL03"
     for ln in reversed(lines):
-        m = re.search(r"(?:车牌识别结果|识别结果|result)\s*[:：]\s*(\S+)$", ln, flags=re.IGNORECASE)
+        m = re.search(
+            r"(?:车牌识别结果|识别结果|杞︾墝璇嗗埆缁撴灉|璇嗗埆缁撴灉|result)\s*[:：锛歖]\s*(\S+)$",
+            ln,
+            flags=re.IGNORECASE,
+        )
         if m:
             return norm_text(m.group(1))
 
     # Fallback: choose last plausible OCR token, not path/key-value/log.
     for ln in reversed(lines):
+        low = ln.lower()
+        if ("input tensors" in low or "output tensors" in low or "model input" in low or
+                "model is " in low or "origin size" in low or "input image" in low):
+            continue
         if "=" in ln or "/" in ln or "\\" in ln:
             continue
-        if ":" in ln and not re.search(r"(?:result|识别结果|车牌识别结果)\s*[:：]", ln, flags=re.IGNORECASE):
+        if ":" in ln and not re.search(
+            r"(?:result|识别结果|车牌识别结果|璇嗗埆缁撴灉|杞︾墝璇嗗埆缁撴灉)\s*[:：锛歖]",
+            ln,
+            flags=re.IGNORECASE,
+        ):
             continue
         toks = ln.split()
         if not toks:
             continue
         cand = norm_text(toks[-1])
+        if cand in stop_tokens:
+            continue
         if re.match(r"^[\u4e00-\u9fffA-Z0-9]{1,12}$", cand):
             return cand
     return ""
@@ -73,17 +91,19 @@ def run_demo(demo_bin: str, model: str, image_path: str, timeout_s: float) -> Tu
     return p.stdout, p.stderr
 
 
-def metric_pack(texts: List[str], gt: str) -> Dict[str, object]:
+def metric_pack(texts: List[str], gt: str, blanks: Optional[List[Optional[float]]] = None) -> Dict[str, object]:
     n = len(texts)
     den = n if n > 0 else 1
     nonempty = sum(1 for t in texts if t)
     len7 = sum(1 for t in texts if len(t) >= 7)
     exact = sum(1 for t in texts if gt and t == gt)
+    blank_valid = [b for b in (blanks or []) if b is not None]
     return {
         "count": n,
         "ocr_nonempty_ratio": nonempty / den,
         "len_ge_7_ratio": len7 / den,
         "exact_match_ratio": (exact / den) if gt else None,
+        "blank_top1_mean": (sum(blank_valid) / len(blank_valid)) if blank_valid else None,
         "top_texts": Counter([t for t in texts if t]).most_common(10),
     }
 
@@ -116,16 +136,23 @@ def main() -> int:
 
     app_texts: List[str] = []
     demo_texts: List[str] = []
+    app_blank_top1: List[Optional[float]] = []
     sample_rows: List[Dict[str, str]] = []
 
     for row in rows:
         img = row["ocr_input_path"]
         app_t = norm_text(row.get("app_text", ""))
+        app_blank_raw = (row.get("app_blank_top1", "") or "").strip()
+        try:
+            app_blank = float(app_blank_raw) if app_blank_raw != "" else None
+        except ValueError:
+            app_blank = None
         stdout, stderr = run_demo(args.demo_bin, args.model, img, args.timeout)
         demo_t = extract_demo_text(stdout, stderr)
 
         app_texts.append(app_t)
         demo_texts.append(demo_t)
+        app_blank_top1.append(app_blank)
         sample_rows.append(
             {
                 "sample_id": row.get("sample_id", ""),
@@ -133,6 +160,7 @@ def main() -> int:
                 "image": img,
                 "app_text": app_t,
                 "demo_text": demo_t,
+                "app_blank_top1": "" if app_blank is None else f"{app_blank:.4f}",
                 "same_text": "1" if app_t == demo_t else "0",
             }
         )
@@ -140,7 +168,7 @@ def main() -> int:
     summary = {
         "gt_text": gt if gt else None,
         "samples": len(sample_rows),
-        "app": metric_pack(app_texts, gt),
+        "app": metric_pack(app_texts, gt, app_blank_top1),
         "demo": metric_pack(demo_texts, gt),
         "app_demo_same_ratio": (
             sum(1 for i in range(len(sample_rows)) if app_texts[i] == demo_texts[i]) / len(sample_rows)
@@ -155,7 +183,10 @@ def main() -> int:
         out_csv = Path(args.out_csv)
         out_csv.parent.mkdir(parents=True, exist_ok=True)
         with out_csv.open("w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["sample_id", "frame_id", "image", "app_text", "demo_text", "same_text"])
+            w = csv.DictWriter(
+                f,
+                fieldnames=["sample_id", "frame_id", "image", "app_text", "demo_text", "app_blank_top1", "same_text"],
+            )
             w.writeheader()
             w.writerows(sample_rows)
 
@@ -169,4 +200,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 

@@ -34,10 +34,12 @@ PLATE_REFINE="1"
 OCR_CHANNEL_ORDER="rgb"
 OCR_CROP_MODE="fixed"
 OCR_RESIZE_MODE="stretch"
+OCR_RESIZE_KERNEL="nn"
 OCR_PREPROC="none"
 SHOW_CROP_BOX="0"
 OCR_MIN_PLATE_H="24"
 OCR_MIN_SHARPNESS="20"
+OCR_MIN_OCC_RATIO="0"
 OCR_CTC_DIAG="0"
 OCR_CROP_DUMP_DIR=""
 OCR_CROP_DUMP_MAX="20"
@@ -82,12 +84,14 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --det-resize-mode <m>      Detect resize: stretch|letterbox (default: ${DET_RESIZE_MODE})
   --plate-refine <0|1>       Enable local high-res plate refine (default: ${PLATE_REFINE})
   --ocr-channel-order <m>    OCR input order: rgb|bgr (default: ${OCR_CHANNEL_ORDER})
-  --ocr-crop-mode <m>        OCR crop mode: fixed|box|tight|box-pad (default: ${OCR_CROP_MODE})
+  --ocr-crop-mode <m>        OCR crop mode: fixed|box|tight|box-pad|match (default: ${OCR_CROP_MODE})
   --ocr-resize-mode <m>      OCR resize mode: stretch|letterbox (default: ${OCR_RESIZE_MODE})
+  --ocr-resize-kernel <m>    OCR resize kernel: nn|bilinear (default: ${OCR_RESIZE_KERNEL})
   --ocr-preproc <m>          OCR crop preproc: none|gray|bin (default: ${OCR_PREPROC})
   --show-crop-box <0|1>      Overlay OCR crop box in red (default: ${SHOW_CROP_BOX})
   --ocr-min-plate-h <n>      Skip OCR if plate box h < n (default: ${OCR_MIN_PLATE_H})
   --ocr-min-sharpness <v>    Skip OCR if Laplacian var < v (default: ${OCR_MIN_SHARPNESS})
+  --ocr-min-occ-ratio <v>    Re-crop once if OCR occupancy < v (default: ${OCR_MIN_OCC_RATIO})
   --ocr-ctc-diag <0|1>       Print CTC decode diagnostics (default: ${OCR_CTC_DIAG})
   --ocr-crop-dump-dir <p>    Dump OCR crops+inputs to directory (default: off)
   --ocr-crop-dump-max <n>    Max dumped OCR samples (default: ${OCR_CROP_DUMP_MAX})
@@ -132,10 +136,12 @@ while [[ $# -gt 0 ]]; do
     --ocr-channel-order) OCR_CHANNEL_ORDER="$2"; shift 2 ;;
     --ocr-crop-mode) OCR_CROP_MODE="$2"; shift 2 ;;
     --ocr-resize-mode) OCR_RESIZE_MODE="$2"; shift 2 ;;
+    --ocr-resize-kernel) OCR_RESIZE_KERNEL="$2"; shift 2 ;;
     --ocr-preproc) OCR_PREPROC="$2"; shift 2 ;;
     --show-crop-box) SHOW_CROP_BOX="$2"; shift 2 ;;
     --ocr-min-plate-h) OCR_MIN_PLATE_H="$2"; shift 2 ;;
     --ocr-min-sharpness) OCR_MIN_SHARPNESS="$2"; shift 2 ;;
+    --ocr-min-occ-ratio) OCR_MIN_OCC_RATIO="$2"; shift 2 ;;
     --ocr-ctc-diag) OCR_CTC_DIAG="$2"; shift 2 ;;
     --ocr-crop-dump-dir) OCR_CROP_DUMP_DIR="$2"; shift 2 ;;
     --ocr-crop-dump-max) OCR_CROP_DUMP_MAX="$2"; shift 2 ;;
@@ -220,10 +226,12 @@ CMD=(./fpga_lpr_display
   --ocr-channel-order "$OCR_CHANNEL_ORDER"
   --ocr-crop-mode "$OCR_CROP_MODE"
   --ocr-resize-mode "$OCR_RESIZE_MODE"
+  --ocr-resize-kernel "$OCR_RESIZE_KERNEL"
   --ocr-preproc "$OCR_PREPROC"
   --show-crop-box "$SHOW_CROP_BOX"
   --ocr-min-plate-h "$OCR_MIN_PLATE_H"
   --ocr-min-sharpness "$OCR_MIN_SHARPNESS"
+  --ocr-min-occ-ratio "$OCR_MIN_OCC_RATIO"
   --ocr-ctc-diag "$OCR_CTC_DIAG"
   --ocr-crop-dump-max "$OCR_CROP_DUMP_MAX")
 
