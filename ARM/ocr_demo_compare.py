@@ -36,19 +36,28 @@ def extract_demo_text(stdout: str, stderr: str) -> str:
     data = (stdout or "") + "\n" + (stderr or "")
     lines = [x.strip() for x in data.splitlines() if x.strip()]
 
-    # Typical: "车牌识别结果: 湘F6CL03"
+    # Typical:
+    #   "车牌识别结果: 湘F6CL03"
+    #   "识别结果: 湘F6CL03"
+    #   "result: XF6CL03"
     for ln in reversed(lines):
-        m = re.search(r"(?:结果|result)\s*[:：]\s*(\S+)$", ln, flags=re.IGNORECASE)
+        m = re.search(r"(?:车牌识别结果|识别结果|result)\s*[:：]\s*(\S+)$", ln, flags=re.IGNORECASE)
         if m:
             return norm_text(m.group(1))
 
-    # Fallback: use last token in last non-empty line.
-    if lines:
-        toks = lines[-1].split()
-        if toks:
-            return norm_text(toks[-1])
+    # Fallback: choose last plausible OCR token, not path/key-value/log.
+    for ln in reversed(lines):
+        if "=" in ln or "/" in ln or "\\" in ln:
+            continue
+        if ":" in ln and not re.search(r"(?:result|识别结果|车牌识别结果)\s*[:：]", ln, flags=re.IGNORECASE):
+            continue
+        toks = ln.split()
+        if not toks:
+            continue
+        cand = norm_text(toks[-1])
+        if re.match(r"^[\u4e00-\u9fffA-Z0-9]{1,12}$", cand):
+            return cand
     return ""
-
 
 def run_demo(demo_bin: str, model: str, image_path: str, timeout_s: float) -> Tuple[str, str]:
     p = subprocess.run(

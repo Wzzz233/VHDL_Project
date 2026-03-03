@@ -10,6 +10,7 @@
  */
 
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -117,6 +118,8 @@ struct options {
     const char *ocr_keys_path;
     const char *labels_path;
     const char *pred_log_path;
+    const char *offline_image_path;
+    const char *offline_roi_arg;
     int connector_id;
     int fps;
     enum pixel_order pixel_order;
@@ -143,6 +146,7 @@ struct options {
     int ocr_ctc_diag;
     int ocr_crop_dump_max;
     const char *ocr_crop_dump_dir;
+    int offline_detect_plate;
     bool swap16;
 };
 
@@ -337,6 +341,11 @@ static void resize_rgb888_nn_letterbox(const uint8_t *src, int sw, int sh,
                                        uint8_t *dst, int dw, int dh, uint8_t pad);
 static void ocr_preprocess_rgb888(uint8_t *rgb, int w, int h, int mode);
 static float box_iou(const struct det_box *a, const struct det_box *b);
+static void dump_ocr_pair(struct app_ctx *ctx, uint64_t frame_id, const struct plate_det *pd,
+                          const uint8_t *crop_rgb, int crop_w, int crop_h,
+                          const uint8_t *ocr_in, int ocr_w, int ocr_h);
+static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t ts_us,
+                               const struct plate_det *pd);
 
 static int64_t mono_us(void)
 {
@@ -355,12 +364,15 @@ static void print_usage(const char *prog)
             "Usage: %s [OPTIONS]\n"
             "  --device <path>         FPGA device (default: %s)\n"
             "  --drm-card <path>       DRM card (default: %s)\n"
-            "  --veh-model <path>      Vehicle RKNN model path (required)\n"
+            "  --veh-model <path>      Vehicle RKNN model path (required for live camera mode)\n"
             "  --plate-model <path>    Plate RKNN model path (required)\n"
             "  --ocr-model <path>      OCR RKNN model path (required)\n"
             "  --ocr-keys <path>       OCR keys file path (required)\n"
-            "  --labels <path>         Labels file path (required)\n"
+            "  --labels <path>         Labels file path (required for live camera mode)\n"
             "  --pred-log <path>       Prediction CSV output path (optional)\n"
+            "  --offline-image <path>  One-shot offline infer on PPM(P6) image and exit\n"
+            "  --offline-roi <x1,y1,x2,y2>  Optional plate ROI on offline image\n"
+            "  --offline-detect-plate <0|1> Auto detect plate on offline image (default: 1)\n"
             "  --connector-id <id>     Optional KMS connector id\n"
             "  --fps <num>             Target FPS (default: %d)\n"
             "  --pixel-order <mode>    bgr565|rgb565 (default: bgr565)\n"
@@ -404,6 +416,9 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"ocr-keys", required_argument, NULL, 6},
         {"labels", required_argument, NULL, 7},
         {"pred-log", required_argument, NULL, 8},
+        {"offline-image", required_argument, NULL, 36},
+        {"offline-roi", required_argument, NULL, 37},
+        {"offline-detect-plate", required_argument, NULL, 38},
         {"connector-id", required_argument, NULL, 9},
         {"fps", required_argument, NULL, 10},
         {"pixel-order", required_argument, NULL, 11},
@@ -466,6 +481,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->ocr_ctc_diag = 0;
     opt->ocr_crop_dump_max = 20;
     opt->ocr_crop_dump_dir = NULL;
+    opt->offline_detect_plate = 1;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
         switch (c) {
@@ -477,6 +493,9 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 6: opt->ocr_keys_path = optarg; break;
         case 7: opt->labels_path = optarg; break;
         case 8: opt->pred_log_path = optarg; break;
+        case 36: opt->offline_image_path = optarg; break;
+        case 37: opt->offline_roi_arg = optarg; break;
+        case 38: opt->offline_detect_plate = atoi(optarg) ? 1 : 0; break;
         case 9: opt->connector_id = atoi(optarg); break;
         case 10: opt->fps = atoi(optarg); break;
         case 11:
@@ -569,9 +588,14 @@ static int parse_options(int argc, char **argv, struct options *opt)
         return -1;
     if (opt->ocr_crop_dump_max < 0 || opt->ocr_crop_dump_max > 100000)
         return -1;
-    if (!opt->veh_model_path || !opt->plate_model_path ||
-        !opt->ocr_model_path || !opt->ocr_keys_path || !opt->labels_path)
-        return -1;
+    if (opt->offline_image_path && opt->offline_image_path[0] != '\0') {
+        if (!opt->plate_model_path || !opt->ocr_model_path || !opt->ocr_keys_path)
+            return -1;
+    } else {
+        if (!opt->veh_model_path || !opt->plate_model_path ||
+            !opt->ocr_model_path || !opt->ocr_keys_path || !opt->labels_path)
+            return -1;
+    }
     return 0;
 }
 
@@ -2872,6 +2896,253 @@ static int write_ppm_rgb888(const char *path, const uint8_t *rgb, int w, int h)
     return (wr == need) ? 0 : -1;
 }
 
+static int ppm_next_token(FILE *fp, char *tok, size_t tok_sz)
+{
+    int ch;
+    size_t n = 0;
+
+    if (!fp || !tok || tok_sz == 0)
+        return -1;
+    tok[0] = '\0';
+
+    while (1) {
+        ch = fgetc(fp);
+        if (ch == '#') {
+            while (ch != '\n' && ch != EOF)
+                ch = fgetc(fp);
+            continue;
+        }
+        if (ch == EOF)
+            return -1;
+        if (!isspace((unsigned char)ch))
+            break;
+    }
+
+    while (ch != EOF && !isspace((unsigned char)ch) && ch != '#') {
+        if (n + 1 < tok_sz)
+            tok[n++] = (char)ch;
+        ch = fgetc(fp);
+    }
+    tok[n] = '\0';
+
+    if (ch == '#') {
+        while (ch != '\n' && ch != EOF)
+            ch = fgetc(fp);
+    }
+    return (n > 0) ? 0 : -1;
+}
+
+static int read_ppm_rgb888(const char *path, uint8_t **rgb_out, int *w_out, int *h_out)
+{
+    FILE *fp = NULL;
+    char tok[64];
+    int w, h, maxv;
+    int ch;
+    uint8_t *buf = NULL;
+    size_t need;
+    size_t got;
+
+    if (!path || !rgb_out || !w_out || !h_out)
+        return -1;
+    *rgb_out = NULL;
+    *w_out = 0;
+    *h_out = 0;
+
+    fp = fopen(path, "rb");
+    if (!fp)
+        return -1;
+
+    if (ppm_next_token(fp, tok, sizeof(tok)) < 0 || strcmp(tok, "P6") != 0)
+        goto fail;
+    if (ppm_next_token(fp, tok, sizeof(tok)) < 0)
+        goto fail;
+    w = atoi(tok);
+    if (ppm_next_token(fp, tok, sizeof(tok)) < 0)
+        goto fail;
+    h = atoi(tok);
+    if (ppm_next_token(fp, tok, sizeof(tok)) < 0)
+        goto fail;
+    maxv = atoi(tok);
+    if (w <= 0 || h <= 0 || maxv != 255)
+        goto fail;
+    do {
+        ch = fgetc(fp);
+    } while (ch != EOF && isspace((unsigned char)ch));
+    if (ch == EOF)
+        goto fail;
+    if (ungetc(ch, fp) == EOF)
+        goto fail;
+
+    need = (size_t)w * (size_t)h * 3U;
+    buf = (uint8_t *)malloc(need);
+    if (!buf)
+        goto fail;
+    got = fread(buf, 1, need, fp);
+    if (got != need)
+        goto fail;
+
+    fclose(fp);
+    *rgb_out = buf;
+    *w_out = w;
+    *h_out = h;
+    return 0;
+
+fail:
+    if (fp)
+        fclose(fp);
+    free(buf);
+    return -1;
+}
+
+static int parse_roi_arg(const char *arg, struct det_box *b)
+{
+    int x1, y1, x2, y2;
+    if (!arg || !b)
+        return -1;
+    if (sscanf(arg, "%d,%d,%d,%d", &x1, &y1, &x2, &y2) != 4)
+        return -1;
+    if (x2 < x1 || y2 < y1)
+        return -1;
+    b->x1 = x1;
+    b->y1 = y1;
+    b->x2 = x2;
+    b->y2 = y2;
+    b->conf = 1.0f;
+    b->cls = 0;
+    return 0;
+}
+
+static int run_offline_once(struct app_ctx *ctx)
+{
+    uint8_t *rgb = NULL;
+    uint8_t *algo_rgb = NULL;
+    uint8_t *plate_in = NULL;
+    uint8_t *plate_crop = NULL;
+    uint8_t *ocr_input_dump = NULL;
+    struct det_box dets[MAX_DETS];
+    struct detect_decode_diag plate_diag;
+    struct plate_det pd;
+    struct ocr_diag odiag;
+    struct det_box box;
+    int det_count = 0;
+    int i;
+    int w = 0;
+    int h = 0;
+    int crop_w;
+    int crop_h;
+    int ret = -1;
+    int64_t ts_us;
+
+    if (read_ppm_rgb888(ctx->opt.offline_image_path, &rgb, &w, &h) < 0) {
+        fprintf(stderr, "Offline image load failed (need PPM P6): %s\n",
+                ctx->opt.offline_image_path ? ctx->opt.offline_image_path : "<null>");
+        return -1;
+    }
+    ctx->frame_width = (uint32_t)w;
+    ctx->frame_height = (uint32_t)h;
+
+    memset(&pd, 0, sizeof(pd));
+    memset(&odiag, 0, sizeof(odiag));
+    memset(&plate_diag, 0, sizeof(plate_diag));
+    memset(&box, 0, sizeof(box));
+
+    if (ctx->opt.offline_roi_arg && ctx->opt.offline_roi_arg[0] != '\0') {
+        if (parse_roi_arg(ctx->opt.offline_roi_arg, &box) < 0) {
+            fprintf(stderr, "Invalid --offline-roi, expect x1,y1,x2,y2\n");
+            goto out;
+        }
+        clamp_box(&box, w, h);
+    } else if (ctx->opt.offline_detect_plate) {
+        algo_rgb = malloc((size_t)ALGO_STREAM_SIZE * ALGO_STREAM_SIZE * 3U);
+        plate_in = malloc((size_t)ctx->plate_model.in_w * ctx->plate_model.in_h * 3U);
+        if (!algo_rgb || !plate_in)
+            goto out;
+
+        resize_rgb888_nn(rgb, w, h, algo_rgb, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE);
+        if (ctx->plate_model.in_w == ALGO_STREAM_SIZE && ctx->plate_model.in_h == ALGO_STREAM_SIZE)
+            memcpy(plate_in, algo_rgb, (size_t)ALGO_STREAM_SIZE * ALGO_STREAM_SIZE * 3U);
+        else
+            resize_rgb888_nn(algo_rgb, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
+                             plate_in, (int)ctx->plate_model.in_w, (int)ctx->plate_model.in_h);
+
+        if (run_model_detect(&ctx->plate_model, plate_in, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE,
+                             ctx->opt.min_plate_conf, dets, &det_count, &plate_diag) < 0) {
+            fprintf(stderr, "Offline plate detect failed\n");
+            goto out;
+        }
+        for (i = 0; i < det_count; i++)
+            map_box_between_spaces(&dets[i], ALGO_STREAM_SIZE, ALGO_STREAM_SIZE, w, h);
+        if (det_count <= 0) {
+            fprintf(stderr, "Offline plate detect empty\n");
+            goto out;
+        }
+        box = dets[0];
+        for (i = 1; i < det_count; i++) {
+            if (dets[i].conf > box.conf)
+                box = dets[i];
+        }
+    } else {
+        fprintf(stderr, "Need --offline-roi when --offline-detect-plate=0\n");
+        goto out;
+    }
+
+    pd.box = box;
+    pd.color = classify_plate_color_rgb(rgb, w, h, &pd.box);
+    compute_ocr_crop_box(ctx, &pd.box, &pd.crop_box);
+    crop_w = pd.crop_box.x2 - pd.crop_box.x1 + 1;
+    crop_h = pd.crop_box.y2 - pd.crop_box.y1 + 1;
+    plate_crop = malloc((size_t)crop_w * crop_h * 3U);
+    if (!plate_crop)
+        goto out;
+    copy_crop_rgb888(rgb, w, &pd.crop_box, plate_crop);
+
+    if (ctx->ocr_crop_index_fp && ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max)
+        ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h,
+                            pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
+                            &odiag, &ocr_input_dump);
+    else
+        ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h,
+                            pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
+                            &odiag, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "Offline OCR failed\n");
+        goto out;
+    }
+    pd.type = classify_plate_type(pd.color, pd.ocr_text);
+
+    fprintf(stderr,
+            "[offline] image=%s size=%dx%d box=[%d,%d,%d,%d] crop=[%d,%d,%d,%d]\n",
+            ctx->opt.offline_image_path, w, h,
+            pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2,
+            pd.crop_box.x1, pd.crop_box.y1, pd.crop_box.x2, pd.crop_box.y2);
+    if (ctx->opt.ocr_ctc_diag) {
+        fprintf(stderr,
+                "[offline][ctc] t=%d c=%d blank=%d blank_top1=%.3f\n",
+                odiag.t_size, odiag.c_size, odiag.blank_idx, odiag.blank_top1_ratio);
+    }
+    fprintf(stderr,
+            "[offline][pred] text=%s conf=%.4f type=%s color=%s\n",
+            pd.ocr_text, pd.ocr_conf, plate_type_str(pd.type), plate_color_str(pd.color));
+
+    ts_us = mono_us();
+    log_prediction_row(ctx, 0, ts_us, &pd);
+    if (ocr_input_dump) {
+        dump_ocr_pair(ctx, 0, &pd, plate_crop, crop_w, crop_h,
+                      ocr_input_dump, (int)ctx->ocr_model.in_w, (int)ctx->ocr_model.in_h);
+        free(ocr_input_dump);
+        ocr_input_dump = NULL;
+    }
+    ret = 0;
+
+out:
+    free(ocr_input_dump);
+    free(plate_crop);
+    free(plate_in);
+    free(algo_rgb);
+    free(rgb);
+    return ret;
+}
+
 static void dump_ocr_pair(struct app_ctx *ctx, uint64_t frame_id, const struct plate_det *pd,
                           const uint8_t *crop_rgb, int crop_w, int crop_h,
                           const uint8_t *ocr_in, int ocr_w, int ocr_h)
@@ -3366,6 +3637,7 @@ static void cleanup(struct app_ctx *ctx)
 int main(int argc, char **argv)
 {
     struct app_ctx ctx;
+    bool offline_mode;
     int ret = 1;
     memset(&ctx, 0, sizeof(ctx));
     ctx.dev_fd = -1;
@@ -3383,23 +3655,28 @@ int main(int argc, char **argv)
         print_usage(argv[0]);
         goto out;
     }
+    offline_mode = (ctx.opt.offline_image_path && ctx.opt.offline_image_path[0] != '\0');
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-    gst_init(&argc, &argv);
+    if (!offline_mode)
+        gst_init(&argc, &argv);
 
-    ctx.drm_fd = open(ctx.opt.drm_card_path, O_RDWR | O_CLOEXEC);
-    if (ctx.drm_fd < 0)
-        goto out;
-    if (load_labels(&ctx, ctx.opt.labels_path) < 0)
+    if (!offline_mode) {
+        ctx.drm_fd = open(ctx.opt.drm_card_path, O_RDWR | O_CLOEXEC);
+        if (ctx.drm_fd < 0)
+            goto out;
+    }
+    if (!offline_mode && load_labels(&ctx, ctx.opt.labels_path) < 0)
         goto out;
     if (load_ocr_keys(&ctx, ctx.opt.ocr_keys_path) < 0)
         goto out;
-    if (init_fpga_dma(&ctx) < 0)
+    if (!offline_mode && init_fpga_dma(&ctx) < 0)
         goto out;
-    if (init_copy_slots(&ctx) < 0)
+    if (!offline_mode && init_copy_slots(&ctx) < 0)
         goto out;
-    if (rknn_model_load(&ctx.veh_model, "vehicle", ctx.opt.veh_model_path, ctx.label_count) < 0)
+    if (!offline_mode &&
+        rknn_model_load(&ctx.veh_model, "vehicle", ctx.opt.veh_model_path, ctx.label_count) < 0)
         goto out;
     if (rknn_model_load(&ctx.plate_model, "plate", ctx.opt.plate_model_path, 1) < 0)
         goto out;
@@ -3425,6 +3702,23 @@ int main(int argc, char **argv)
                 "sample_id,frame_id,ts_us,box_x1,box_y1,box_x2,box_y2,"
                 "crop_x1,crop_y1,crop_x2,crop_y2,app_text,app_conf,crop_path,ocr_input_path\n");
         fflush(ctx.ocr_crop_index_fp);
+    }
+
+    if (offline_mode) {
+        fprintf(stderr,
+                "Start OFFLINE OCR: image=%s roi=%s auto_det=%d min_plate=%.2f ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_pp=%s\n",
+                ctx.opt.offline_image_path,
+                (ctx.opt.offline_roi_arg && ctx.opt.offline_roi_arg[0]) ? ctx.opt.offline_roi_arg : "<none>",
+                ctx.opt.offline_detect_plate,
+                ctx.opt.min_plate_conf,
+                ocr_channel_order_str(ctx.opt.ocr_channel_order),
+                ocr_crop_mode_str(ctx.opt.ocr_crop_mode),
+                ocr_resize_mode_str(ctx.opt.ocr_resize_mode),
+                ocr_preproc_mode_str(ctx.opt.ocr_preproc_mode));
+        if (run_offline_once(&ctx) < 0)
+            goto out;
+        ret = 0;
+        goto out;
     }
 
     ctx.infer_latest_raw = malloc(ctx.src_frame_size);

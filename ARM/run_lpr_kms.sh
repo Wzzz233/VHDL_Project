@@ -36,18 +36,24 @@ OCR_PREPROC="none"
 OCR_CTC_DIAG="0"
 OCR_CROP_DUMP_DIR=""
 OCR_CROP_DUMP_MAX="20"
+OFFLINE_IMAGE=""
+OFFLINE_ROI=""
+OFFLINE_DETECT_PLATE="1"
 
 usage() {
   cat <<EOF
-Usage: $0 --veh-model <path> --plate-model <path> --ocr-model <path> --ocr-keys <path> --labels <path> [options]
+Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr-keys <path> [options]
   --device <path>            FPGA device (default: ${DEVICE})
   --drm-card <path>          DRM card (default: ${DRM_CARD})
-  --veh-model <path>         Vehicle RKNN model (required)
+  --veh-model <path>         Vehicle RKNN model (required for live camera mode)
   --plate-model <path>       Plate RKNN model (required)
   --ocr-model <path>         OCR RKNN model (required)
   --ocr-keys <path>          OCR keys txt (required)
-  --labels <path>            Labels file (required)
+  --labels <path>            Labels file (required for live camera mode)
   --pred-log <path>          Prediction CSV output path (optional)
+  --offline-image <path>     Run one-shot offline on image (jpg/png/ppm), no camera path
+  --offline-roi <x1,y1,x2,y2> Optional plate ROI for offline image
+  --offline-detect-plate <0|1> Auto plate detect in offline mode (default: ${OFFLINE_DETECT_PLATE})
   --connector-id <id>        Optional KMS connector id
   --fps <num>                Target FPS (default: ${FPS})
   --pixel-order <mode>       bgr565|rgb565 (default: ${PIXEL_ORDER})
@@ -88,6 +94,9 @@ while [[ $# -gt 0 ]]; do
     --ocr-keys) OCR_KEYS="$2"; shift 2 ;;
     --labels) LABELS="$2"; shift 2 ;;
     --pred-log) PRED_LOG="$2"; shift 2 ;;
+    --offline-image) OFFLINE_IMAGE="$2"; shift 2 ;;
+    --offline-roi) OFFLINE_ROI="$2"; shift 2 ;;
+    --offline-detect-plate) OFFLINE_DETECT_PLATE="$2"; shift 2 ;;
     --connector-id) CONNECTOR_ID="$2"; shift 2 ;;
     --fps) FPS="$2"; shift 2 ;;
     --pixel-order) PIXEL_ORDER="$2"; shift 2 ;;
@@ -120,10 +129,23 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$VEH_MODEL" || -z "$PLATE_MODEL" || -z "$OCR_MODEL" || -z "$OCR_KEYS" || -z "$LABELS" ]]; then
-  echo "Missing required args: --veh-model --plate-model --ocr-model --ocr-keys --labels" >&2
-  usage
-  exit 1
+OFFLINE_MODE=0
+if [[ -n "$OFFLINE_IMAGE" ]]; then
+  OFFLINE_MODE=1
+fi
+
+if [[ "$OFFLINE_MODE" == "1" ]]; then
+  if [[ -z "$PLATE_MODEL" || -z "$OCR_MODEL" || -z "$OCR_KEYS" ]]; then
+    echo "Offline mode requires: --plate-model --ocr-model --ocr-keys" >&2
+    usage
+    exit 1
+  fi
+else
+  if [[ -z "$VEH_MODEL" || -z "$PLATE_MODEL" || -z "$OCR_MODEL" || -z "$OCR_KEYS" || -z "$LABELS" ]]; then
+    echo "Missing required args: --veh-model --plate-model --ocr-model --ocr-keys --labels" >&2
+    usage
+    exit 1
+  fi
 fi
 
 if [[ ! -x ./fpga_lpr_display ]]; then
@@ -131,63 +153,92 @@ if [[ ! -x ./fpga_lpr_display ]]; then
   exit 2
 fi
 
-if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
-  echo "gst-inspect-1.0 not found" >&2
-  exit 2
-fi
-for plugin in appsrc queue kmssink; do
-  if ! gst-inspect-1.0 "$plugin" >/dev/null 2>&1; then
-    echo "Missing plugin: $plugin" >&2
+if [[ "$OFFLINE_MODE" == "0" ]]; then
+  if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
+    echo "gst-inspect-1.0 not found" >&2
     exit 2
   fi
-done
+  for plugin in appsrc queue kmssink; do
+    if ! gst-inspect-1.0 "$plugin" >/dev/null 2>&1; then
+      echo "Missing plugin: $plugin" >&2
+      exit 2
+    fi
+  done
 
-if [[ ! -c "$DEVICE" ]]; then
-  echo "Device not found: $DEVICE" >&2
-  exit 3
+  if [[ ! -c "$DEVICE" ]]; then
+    echo "Device not found: $DEVICE" >&2
+    exit 3
+  fi
+  if [[ ! -e "$DRM_CARD" ]]; then
+    echo "DRM card not found: $DRM_CARD" >&2
+    exit 3
+  fi
 fi
-if [[ ! -e "$DRM_CARD" ]]; then
-  echo "DRM card not found: $DRM_CARD" >&2
-  exit 3
-fi
-if [[ ! -f "$VEH_MODEL" || ! -f "$PLATE_MODEL" || ! -f "$OCR_MODEL" || ! -f "$OCR_KEYS" || ! -f "$LABELS" ]]; then
-  echo "Model/keys/label file not found" >&2
-  exit 3
+
+if [[ "$OFFLINE_MODE" == "1" ]]; then
+  if [[ ! -f "$OFFLINE_IMAGE" || ! -f "$PLATE_MODEL" || ! -f "$OCR_MODEL" || ! -f "$OCR_KEYS" ]]; then
+    echo "Offline image/model/keys file not found" >&2
+    exit 3
+  fi
+  if [[ "$OFFLINE_IMAGE" =~ \.[Pp][Pp][Mm]$ ]]; then
+    OFFLINE_INPUT="$OFFLINE_IMAGE"
+  else
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+      echo "ffmpeg is required to convert offline image to PPM" >&2
+      exit 3
+    fi
+    OFFLINE_INPUT="/tmp/lpr_offline_input_$$.ppm"
+    ffmpeg -loglevel error -y -i "$OFFLINE_IMAGE" -frames:v 1 "$OFFLINE_INPUT"
+  fi
+else
+  if [[ ! -f "$VEH_MODEL" || ! -f "$PLATE_MODEL" || ! -f "$OCR_MODEL" || ! -f "$OCR_KEYS" || ! -f "$LABELS" ]]; then
+    echo "Model/keys/label file not found" >&2
+    exit 3
+  fi
 fi
 
 CMD=(./fpga_lpr_display
-  --device "$DEVICE"
-  --drm-card "$DRM_CARD"
-  --veh-model "$VEH_MODEL"
   --plate-model "$PLATE_MODEL"
   --ocr-model "$OCR_MODEL"
   --ocr-keys "$OCR_KEYS"
-  --labels "$LABELS"
-  --fps "$FPS"
-  --pixel-order "$PIXEL_ORDER"
-  --swap16 "$SWAP16"
-  --timeout-ms "$TIMEOUT_MS"
-  --stats-interval "$STATS_INTERVAL"
-  --copy-buffers "$COPY_BUFFERS"
-  --queue-depth "$QUEUE_DEPTH"
-  --min-car-conf "$MIN_CAR_CONF"
   --min-plate-conf "$MIN_PLATE_CONF"
-  --plate-on-car-only "$PLATE_ON_CAR_ONLY"
-  --plate-only "$PLATE_ONLY"
-  --sw-preproc "$SW_PREPROC"
-  --fpga-a-mask "$FPGA_A_MASK"
-  --a-proj-ratio "$A_PROJ_RATIO"
-  --a-roi-iou-min "$A_ROI_IOU_MIN"
-  --ped-event "$PED_EVENT"
-  --red-stable-frames "$RED_STABLE_FRAMES"
-  --red-ratio-thr "$RED_RATIO_THR"
-  --stopline-ratio "$STOPLINE_RATIO"
   --ocr-channel-order "$OCR_CHANNEL_ORDER"
   --ocr-crop-mode "$OCR_CROP_MODE"
   --ocr-resize-mode "$OCR_RESIZE_MODE"
   --ocr-preproc "$OCR_PREPROC"
   --ocr-ctc-diag "$OCR_CTC_DIAG"
   --ocr-crop-dump-max "$OCR_CROP_DUMP_MAX")
+
+if [[ "$OFFLINE_MODE" == "0" ]]; then
+  CMD+=(
+    --device "$DEVICE"
+    --drm-card "$DRM_CARD"
+    --veh-model "$VEH_MODEL"
+    --labels "$LABELS"
+    --fps "$FPS"
+    --pixel-order "$PIXEL_ORDER"
+    --swap16 "$SWAP16"
+    --timeout-ms "$TIMEOUT_MS"
+    --stats-interval "$STATS_INTERVAL"
+    --copy-buffers "$COPY_BUFFERS"
+    --queue-depth "$QUEUE_DEPTH"
+    --min-car-conf "$MIN_CAR_CONF"
+    --plate-on-car-only "$PLATE_ON_CAR_ONLY"
+    --plate-only "$PLATE_ONLY"
+    --sw-preproc "$SW_PREPROC"
+    --fpga-a-mask "$FPGA_A_MASK"
+    --a-proj-ratio "$A_PROJ_RATIO"
+    --a-roi-iou-min "$A_ROI_IOU_MIN"
+    --ped-event "$PED_EVENT"
+    --red-stable-frames "$RED_STABLE_FRAMES"
+    --red-ratio-thr "$RED_RATIO_THR"
+    --stopline-ratio "$STOPLINE_RATIO")
+else
+  CMD+=(--offline-image "$OFFLINE_INPUT" --offline-detect-plate "$OFFLINE_DETECT_PLATE")
+  if [[ -n "$OFFLINE_ROI" ]]; then
+    CMD+=(--offline-roi "$OFFLINE_ROI")
+  fi
+fi
 
 if [[ -n "$OCR_CROP_DUMP_DIR" ]]; then
   CMD+=(--ocr-crop-dump-dir "$OCR_CROP_DUMP_DIR")
