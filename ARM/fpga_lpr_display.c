@@ -3430,11 +3430,30 @@ static int run_offline_once(struct app_ctx *ctx)
                     valid[relaxed_count++] = dets[i];
             }
             valid_count = relaxed_count;
-            if (valid_count <= 0) {
-                fprintf(stderr, "Offline plate detect empty(valid=0 raw=%d)\n", det_count);
-                goto out;
+            if (valid_count > 0) {
+                fprintf(stderr, "Offline plate detect fallback(relaxed=%d raw=%d)\n", valid_count, det_count);
+            } else if (ctx->opt.det_resize_mode == DET_RESIZE_LETTERBOX) {
+                int saved_mode = ctx->opt.det_resize_mode;
+                fprintf(stderr, "Offline plate detect retry with stretch(raw=%d)\n", det_count);
+                ctx->opt.det_resize_mode = DET_RESIZE_STRETCH;
+                if (run_detect_on_rgb(ctx, &ctx->plate_model, rgb, w, h,
+                                      ctx->opt.min_plate_conf, algo_rgb, plate_in,
+                                      dets, &det_count, &plate_diag) < 0) {
+                    det_count = 0;
+                }
+                ctx->opt.det_resize_mode = saved_mode;
+                for (i = 0; i < det_count && valid_count < MAX_DETS; i++) {
+                    if (plate_box_pass_rules(&dets[i], w, h) ||
+                        plate_box_pass_rules_relaxed(&dets[i], w, h))
+                        valid[valid_count++] = dets[i];
+                }
+                if (valid_count > 0)
+                    fprintf(stderr, "Offline plate detect fallback(stretch valid=%d raw=%d)\n", valid_count, det_count);
             }
-            fprintf(stderr, "Offline plate detect fallback(relaxed=%d raw=%d)\n", valid_count, det_count);
+        }
+        if (valid_count <= 0) {
+            fprintf(stderr, "Offline plate detect empty(valid=0 raw=%d)\n", det_count);
+            goto out;
         }
         box = valid[0];
         for (i = 1; i < valid_count; i++) {
