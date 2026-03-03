@@ -3126,6 +3126,30 @@ static bool plate_box_pass_rules(const struct det_box *b, int frame_w, int frame
     return true;
 }
 
+static bool plate_box_pass_rules_relaxed(const struct det_box *b, int frame_w, int frame_h)
+{
+    int bw = b->x2 - b->x1 + 1;
+    int bh = b->y2 - b->y1 + 1;
+    int cy = (b->y1 + b->y2) / 2;
+    float aspect;
+    float area;
+    float min_area = (float)frame_w * (float)frame_h * 0.00025f;
+
+    if (bw <= 0 || bh <= 0)
+        return false;
+    if (bw < 20 || bh < 8)
+        return false;
+    aspect = (float)bw / (float)bh;
+    if (aspect < 1.8f || aspect > 8.5f)
+        return false;
+    area = (float)bw * (float)bh;
+    if (area < min_area)
+        return false;
+    if (cy < (int)(0.02f * (float)frame_h) || cy > (int)(0.98f * (float)frame_h))
+        return false;
+    return true;
+}
+
 static bool has_iou_match(const struct det_box *cur, const struct det_box *hist, int hist_count, float iou_thr)
 {
     int i;
@@ -3400,8 +3424,17 @@ static int run_offline_once(struct app_ctx *ctx)
                 valid[valid_count++] = dets[i];
         }
         if (valid_count <= 0) {
-            fprintf(stderr, "Offline plate detect empty(valid=0 raw=%d)\n", det_count);
-            goto out;
+            int relaxed_count = 0;
+            for (i = 0; i < det_count && relaxed_count < MAX_DETS; i++) {
+                if (plate_box_pass_rules_relaxed(&dets[i], w, h))
+                    valid[relaxed_count++] = dets[i];
+            }
+            valid_count = relaxed_count;
+            if (valid_count <= 0) {
+                fprintf(stderr, "Offline plate detect empty(valid=0 raw=%d)\n", det_count);
+                goto out;
+            }
+            fprintf(stderr, "Offline plate detect fallback(relaxed=%d raw=%d)\n", valid_count, det_count);
         }
         box = valid[0];
         for (i = 1; i < valid_count; i++) {
