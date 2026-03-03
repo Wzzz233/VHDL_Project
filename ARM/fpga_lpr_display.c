@@ -3349,7 +3349,9 @@ static int run_offline_once(struct app_ctx *ctx)
     struct plate_det pd;
     struct ocr_diag odiag;
     struct det_box box;
+    struct det_box valid[MAX_DETS];
     int det_count = 0;
+    int valid_count = 0;
     int i;
     int w = 0;
     int h = 0;
@@ -3393,14 +3395,23 @@ static int run_offline_once(struct app_ctx *ctx)
             fprintf(stderr, "Offline plate detect empty\n");
             goto out;
         }
-        box = dets[0];
-        for (i = 1; i < det_count; i++) {
-            if (dets[i].conf > box.conf)
-                box = dets[i];
+        for (i = 0; i < det_count && valid_count < MAX_DETS; i++) {
+            if (plate_box_pass_rules(&dets[i], w, h))
+                valid[valid_count++] = dets[i];
+        }
+        if (valid_count <= 0) {
+            fprintf(stderr, "Offline plate detect empty(valid=0 raw=%d)\n", det_count);
+            goto out;
+        }
+        box = valid[0];
+        for (i = 1; i < valid_count; i++) {
+            if (valid[i].conf > box.conf)
+                box = valid[i];
         }
         if (ctx->opt.plate_refine) {
             struct det_box refined = box;
-            if (refine_plate_box_local(ctx, rgb, w, h, &box, algo_rgb, plate_in, &refined))
+            if (refine_plate_box_local(ctx, rgb, w, h, &box, algo_rgb, plate_in, &refined) &&
+                plate_box_pass_rules(&refined, w, h))
                 box = refined;
         }
     } else {
