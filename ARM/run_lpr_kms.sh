@@ -35,6 +35,7 @@ OCR_CHANNEL_ORDER="rgb"
 OCR_CROP_MODE="fixed"
 OCR_RESIZE_MODE="stretch"
 OCR_PREPROC="none"
+SHOW_CROP_BOX="0"
 OCR_MIN_PLATE_H="24"
 OCR_MIN_SHARPNESS="20"
 OCR_CTC_DIAG="0"
@@ -84,6 +85,7 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --ocr-crop-mode <m>        OCR crop mode: fixed|box|tight|box-pad (default: ${OCR_CROP_MODE})
   --ocr-resize-mode <m>      OCR resize mode: stretch|letterbox (default: ${OCR_RESIZE_MODE})
   --ocr-preproc <m>          OCR crop preproc: none|gray|bin (default: ${OCR_PREPROC})
+  --show-crop-box <0|1>      Overlay OCR crop box in red (default: ${SHOW_CROP_BOX})
   --ocr-min-plate-h <n>      Skip OCR if plate box h < n (default: ${OCR_MIN_PLATE_H})
   --ocr-min-sharpness <v>    Skip OCR if Laplacian var < v (default: ${OCR_MIN_SHARPNESS})
   --ocr-ctc-diag <0|1>       Print CTC decode diagnostics (default: ${OCR_CTC_DIAG})
@@ -131,6 +133,7 @@ while [[ $# -gt 0 ]]; do
     --ocr-crop-mode) OCR_CROP_MODE="$2"; shift 2 ;;
     --ocr-resize-mode) OCR_RESIZE_MODE="$2"; shift 2 ;;
     --ocr-preproc) OCR_PREPROC="$2"; shift 2 ;;
+    --show-crop-box) SHOW_CROP_BOX="$2"; shift 2 ;;
     --ocr-min-plate-h) OCR_MIN_PLATE_H="$2"; shift 2 ;;
     --ocr-min-sharpness) OCR_MIN_SHARPNESS="$2"; shift 2 ;;
     --ocr-ctc-diag) OCR_CTC_DIAG="$2"; shift 2 ;;
@@ -218,6 +221,7 @@ CMD=(./fpga_lpr_display
   --ocr-crop-mode "$OCR_CROP_MODE"
   --ocr-resize-mode "$OCR_RESIZE_MODE"
   --ocr-preproc "$OCR_PREPROC"
+  --show-crop-box "$SHOW_CROP_BOX"
   --ocr-min-plate-h "$OCR_MIN_PLATE_H"
   --ocr-min-sharpness "$OCR_MIN_SHARPNESS"
   --ocr-ctc-diag "$OCR_CTC_DIAG"
@@ -253,6 +257,7 @@ else
   CMD+=(
     --offline-image "$OFFLINE_INPUT"
     --offline-detect-plate "$OFFLINE_DETECT_PLATE"
+    --sw-preproc "$SW_PREPROC"
     --det-resize-mode "$DET_RESIZE_MODE"
     --plate-refine "$PLATE_REFINE")
   if [[ -n "$OFFLINE_ROI" ]]; then

@@ -151,6 +151,7 @@ struct options {
     int ocr_crop_mode;
     int ocr_resize_mode;
     int ocr_preproc_mode;
+    int show_crop_box;
     int ocr_min_plate_h;
     float ocr_min_sharpness;
     int ocr_ctc_diag;
@@ -366,6 +367,8 @@ static void resize_rgb888_nn_letterbox(const uint8_t *src, int sw, int sh,
 static void ocr_preprocess_rgb888(uint8_t *rgb, int w, int h, int mode);
 static float box_iou(const struct det_box *a, const struct det_box *b);
 static float laplacian_variance_rgb888(const uint8_t *rgb, int w, int h);
+static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
+                                         const uint8_t *crop_rgb, int crop_w, int crop_h);
 static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src_w, int src_h,
                             float conf_thr, struct det_box *out, int *out_count,
                             struct detect_decode_diag *diag);
@@ -427,6 +430,7 @@ static void print_usage(const char *prog)
             "  --ocr-crop-mode <m>     OCR crop mode: fixed|box|tight|box-pad (default: fixed)\n"
             "  --ocr-resize-mode <m>   OCR resize: stretch|letterbox (default: stretch)\n"
             "  --ocr-preproc <m>       OCR crop preproc: none|gray|bin (default: none)\n"
+            "  --show-crop-box <0|1>   Overlay OCR crop box in red (default: 0)\n"
             "  --ocr-min-plate-h <n>   Skip OCR if plate box h < n (default: 24)\n"
             "  --ocr-min-sharpness <v> Skip OCR if Laplacian var < v (default: 20)\n"
             "  --ocr-ctc-diag <0|1>    Print CTC decode diagnostics (default: 0)\n"
@@ -477,6 +481,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"ocr-crop-mode", required_argument, NULL, 30},
         {"ocr-resize-mode", required_argument, NULL, 31},
         {"ocr-preproc", required_argument, NULL, 32},
+        {"show-crop-box", required_argument, NULL, 43},
         {"ocr-min-plate-h", required_argument, NULL, 41},
         {"ocr-min-sharpness", required_argument, NULL, 42},
         {"ocr-ctc-diag", required_argument, NULL, 33},
@@ -516,6 +521,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->ocr_crop_mode = OCR_CROP_FIXED;
     opt->ocr_resize_mode = OCR_RESIZE_STRETCH;
     opt->ocr_preproc_mode = OCR_PREPROC_NONE;
+    opt->show_crop_box = 0;
     opt->ocr_min_plate_h = 24;
     opt->ocr_min_sharpness = 20.0f;
     opt->ocr_ctc_diag = 0;
@@ -610,6 +616,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
             else
                 return -1;
             break;
+        case 43: opt->show_crop_box = atoi(optarg) ? 1 : 0; break;
         case 41: opt->ocr_min_plate_h = atoi(optarg); break;
         case 42: opt->ocr_min_sharpness = (float)atof(optarg); break;
         case 33: opt->ocr_ctc_diag = atoi(optarg) ? 1 : 0; break;
@@ -932,29 +939,19 @@ static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_str
     return 0;
 }
 
-static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_w, int crop_h,
-                         char *text, size_t text_len, float *conf_out,
-                         struct ocr_diag *diag, uint8_t **model_input_out)
+static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
+                                         const uint8_t *crop_rgb, int crop_w, int crop_h)
 {
-    struct ocr_model *m = &ctx->ocr_model;
-    rknn_input in;
-    rknn_output outs[4];
-    uint8_t *ocr_in = NULL;
-    const rknn_tensor_attr *out_attr;
-    int t_size, c_size, t_stride, c_stride;
-    int ret = -1;
-    uint32_t i;
+    const struct ocr_model *m = &ctx->ocr_model;
     uint8_t *crop_work = NULL;
-
-    if (diag)
-        memset(diag, 0, sizeof(*diag));
+    uint8_t *ocr_in = NULL;
 
     crop_work = malloc((size_t)crop_w * crop_h * 3U);
     ocr_in = malloc((size_t)m->in_w * m->in_h * 3U);
     if (!crop_work || !ocr_in) {
         free(crop_work);
         free(ocr_in);
-        return -1;
+        return NULL;
     }
 
     memcpy(crop_work, crop_rgb, (size_t)crop_w * crop_h * 3U);
@@ -967,12 +964,38 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
 
     if (ctx->opt.ocr_channel_order == OCR_CH_BGR) {
         size_t pix = (size_t)m->in_w * m->in_h;
-        for (size_t p = 0; p < pix; p++) {
+        size_t p;
+        for (p = 0; p < pix; p++) {
             uint8_t *q = ocr_in + p * 3U;
             uint8_t t = q[0];
             q[0] = q[2];
             q[2] = t;
         }
+    }
+
+    free(crop_work);
+    return ocr_in;
+}
+
+static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_w, int crop_h,
+                         char *text, size_t text_len, float *conf_out,
+                         struct ocr_diag *diag, uint8_t **model_input_out)
+{
+    struct ocr_model *m = &ctx->ocr_model;
+    rknn_input in;
+    rknn_output outs[4];
+    uint8_t *ocr_in = NULL;
+    const rknn_tensor_attr *out_attr;
+    int t_size, c_size, t_stride, c_stride;
+    int ret = -1;
+    uint32_t i;
+
+    if (diag)
+        memset(diag, 0, sizeof(*diag));
+
+    ocr_in = prepare_ocr_input_rgb888(ctx, crop_rgb, crop_w, crop_h);
+    if (!ocr_in) {
+        return -1;
     }
 
     memset(&in, 0, sizeof(in));
@@ -1025,7 +1048,6 @@ out:
         if (*model_input_out)
             memcpy(*model_input_out, ocr_in, (size_t)m->in_w * m->in_h * 3U);
     }
-    free(crop_work);
     free(ocr_in);
     return ret;
 }
@@ -3537,6 +3559,10 @@ static int run_offline_once(struct app_ctx *ctx)
 
     ts_us = mono_us();
     log_prediction_row(ctx, 0, ts_us, &pd);
+    if (!ocr_input_dump && ctx->ocr_crop_index_fp &&
+        ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
+        ocr_input_dump = prepare_ocr_input_rgb888(ctx, plate_crop, crop_w, crop_h);
+    }
     if (ocr_input_dump) {
         dump_ocr_pair(ctx, 0, &pd, plate_crop, crop_w, crop_h,
                       ocr_input_dump, (int)ctx->ocr_model.in_w, (int)ctx->ocr_model.in_h);
@@ -3582,8 +3608,12 @@ static void dump_ocr_pair(struct app_ctx *ctx, uint64_t frame_id, const struct p
 
     if (write_ppm_rgb888(crop_path, crop_rgb, crop_w, crop_h) < 0)
         return;
-    if (write_ppm_rgb888(in_path, ocr_in, ocr_w, ocr_h) < 0)
-        return;
+    if (ocr_in && ocr_w > 0 && ocr_h > 0) {
+        if (write_ppm_rgb888(in_path, ocr_in, ocr_w, ocr_h) < 0)
+            return;
+    } else {
+        in_path[0] = '\0';
+    }
 
     ts = mono_us();
     csv_safe_text(pd->ocr_text, safe_text, sizeof(safe_text));
@@ -3894,6 +3924,10 @@ static void *infer_thread_main(void *arg)
             build_overlay_ascii_text(&pd, overlay_txt, sizeof(overlay_txt));
             if (overlay_txt[0] != '\0')
                 overlay_nonempty_count++;
+            if (!ocr_input_dump && ctx->ocr_crop_index_fp &&
+                ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
+                ocr_input_dump = prepare_ocr_input_rgb888(ctx, plate_crop, crop_w, crop_h);
+            }
             if (ocr_input_dump) {
                 dump_ocr_pair(ctx, seq, &pd, plate_crop, crop_w, crop_h,
                               ocr_input_dump, (int)ctx->ocr_model.in_w, (int)ctx->ocr_model.in_h);
@@ -3956,6 +3990,8 @@ static void overlay_results_on_slot(struct app_ctx *ctx, uint8_t *slot_data)
         if (ty < 0) ty = r.plates[i].box.y1 + 2;
         build_overlay_ascii_text(&r.plates[i], txt, sizeof(txt));
         draw_rect_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, &r.plates[i].box, COLOR_CYAN_565);
+        if (ctx->opt.show_crop_box)
+            draw_rect_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, &r.plates[i].crop_box, COLOR_RED_565);
         draw_text_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, tx, ty, txt, COLOR_CYAN_565);
     }
 
@@ -4178,7 +4214,7 @@ int main(int argc, char **argv)
     fprintf(stderr,
             "Start LPR loop: fps=%d src=%s pixel=%s swap16=%s min_car=%.2f min_plate=%.2f plate_only=%d "
             "sw_preproc=%d fpga_a_mask=%d ped_event=%d det_resize=%s plate_refine=%d "
-            "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_pp=%s min_h=%d min_sharp=%.2f "
+            "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_pp=%s min_h=%d min_sharp=%.2f show_crop=%d "
             "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d pred_log=%s\n",
             ctx.opt.fps,
             ctx.src_is_bgrx ? "bgrx8888" : "bgr565",
@@ -4197,6 +4233,7 @@ int main(int argc, char **argv)
             ocr_preproc_mode_str(ctx.opt.ocr_preproc_mode),
             ctx.opt.ocr_min_plate_h,
             ctx.opt.ocr_min_sharpness,
+            ctx.opt.show_crop_box,
             ctx.opt.sw_preproc ? "preproc" : "raw",
             ctx.opt.ocr_ctc_diag,
             ctx.opt.ocr_crop_dump_dir ? ctx.opt.ocr_crop_dump_dir : "<off>",
