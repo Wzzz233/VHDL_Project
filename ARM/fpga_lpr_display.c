@@ -3364,6 +3364,7 @@ static int parse_roi_arg(const char *arg, struct det_box *b)
 static int run_offline_once(struct app_ctx *ctx)
 {
     uint8_t *rgb = NULL;
+    uint8_t *rgb_detect = NULL;
     uint8_t *algo_rgb = NULL;
     uint8_t *plate_in = NULL;
     uint8_t *plate_crop = NULL;
@@ -3383,6 +3384,7 @@ static int run_offline_once(struct app_ctx *ctx)
     int crop_h;
     int ret = -1;
     int64_t ts_us;
+    const uint8_t *det_src_rgb = NULL;
 
     if (read_ppm_rgb888(ctx->opt.offline_image_path, &rgb, &w, &h) < 0) {
         fprintf(stderr, "Offline image load failed (need PPM P6): %s\n",
@@ -3391,6 +3393,15 @@ static int run_offline_once(struct app_ctx *ctx)
     }
     ctx->frame_width = (uint32_t)w;
     ctx->frame_height = (uint32_t)h;
+    det_src_rgb = rgb;
+    if (ctx->opt.sw_preproc) {
+        rgb_detect = malloc((size_t)w * h * 3U);
+        if (!rgb_detect)
+            goto out;
+        memcpy(rgb_detect, rgb, (size_t)w * h * 3U);
+        sw_preprocess_rgb888(rgb_detect, w, h);
+        det_src_rgb = rgb_detect;
+    }
 
     memset(&pd, 0, sizeof(pd));
     memset(&odiag, 0, sizeof(odiag));
@@ -3409,7 +3420,7 @@ static int run_offline_once(struct app_ctx *ctx)
         if (!algo_rgb || !plate_in)
             goto out;
 
-        if (run_detect_on_rgb(ctx, &ctx->plate_model, rgb, w, h,
+        if (run_detect_on_rgb(ctx, &ctx->plate_model, det_src_rgb, w, h,
                               ctx->opt.min_plate_conf, algo_rgb, plate_in,
                               dets, &det_count, &plate_diag) < 0) {
             fprintf(stderr, "Offline plate detect failed\n");
@@ -3436,7 +3447,7 @@ static int run_offline_once(struct app_ctx *ctx)
                 int saved_mode = ctx->opt.det_resize_mode;
                 fprintf(stderr, "Offline plate detect retry with stretch(raw=%d)\n", det_count);
                 ctx->opt.det_resize_mode = DET_RESIZE_STRETCH;
-                if (run_detect_on_rgb(ctx, &ctx->plate_model, rgb, w, h,
+                if (run_detect_on_rgb(ctx, &ctx->plate_model, det_src_rgb, w, h,
                                       ctx->opt.min_plate_conf, algo_rgb, plate_in,
                                       dets, &det_count, &plate_diag) < 0) {
                     det_count = 0;
@@ -3462,7 +3473,7 @@ static int run_offline_once(struct app_ctx *ctx)
         }
         if (ctx->opt.plate_refine) {
             struct det_box refined = box;
-            if (refine_plate_box_local(ctx, rgb, w, h, &box, algo_rgb, plate_in, &refined) &&
+            if (refine_plate_box_local(ctx, det_src_rgb, w, h, &box, algo_rgb, plate_in, &refined) &&
                 plate_box_pass_rules(&refined, w, h))
                 box = refined;
         }
@@ -3539,6 +3550,7 @@ out:
     free(plate_crop);
     free(plate_in);
     free(algo_rgb);
+    free(rgb_detect);
     free(rgb);
     return ret;
 }
@@ -3647,13 +3659,14 @@ static void *infer_thread_main(void *arg)
     struct app_ctx *ctx = (struct app_ctx *)arg;
     uint8_t *raw_local = malloc(ctx->src_frame_size);
     uint8_t *rgb_full = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
+    uint8_t *rgb_detect = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
     uint8_t *a_map = malloc((size_t)ctx->frame_width * ctx->frame_height);
     uint8_t *algo_rgb = malloc((size_t)ALGO_STREAM_SIZE * ALGO_STREAM_SIZE * 3U);
     uint8_t *veh_in = malloc((size_t)ctx->veh_model.in_w * ctx->veh_model.in_h * 3U);
     uint8_t *plate_in = malloc((size_t)ctx->plate_model.in_w * ctx->plate_model.in_h * 3U);
     uint8_t *plate_crop = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
-    if (!raw_local || !rgb_full || !a_map || !algo_rgb || !veh_in || !plate_in || !plate_crop) {
-        free(raw_local); free(rgb_full); free(a_map); free(algo_rgb);
+    if (!raw_local || !rgb_full || !rgb_detect || !a_map || !algo_rgb || !veh_in || !plate_in || !plate_crop) {
+        free(raw_local); free(rgb_full); free(rgb_detect); free(a_map); free(algo_rgb);
         free(veh_in); free(plate_in); free(plate_crop);
         return NULL;
     }
@@ -3687,6 +3700,7 @@ static void *infer_thread_main(void *arg)
         int i;
         int64_t t0, t1;
         uint64_t seq;
+        const uint8_t *det_src_rgb = rgb_full;
 
         pthread_mutex_lock(&ctx->infer_lock);
         while (ctx->running && !ctx->infer_has_new)
@@ -3707,8 +3721,11 @@ static void *infer_thread_main(void *arg)
             raw565_to_rgb888_full(ctx, raw_local, rgb_full);
             memset(a_map, 0, (size_t)ctx->frame_width * ctx->frame_height);
         }
-        if (ctx->opt.sw_preproc)
-            sw_preprocess_rgb888(rgb_full, (int)ctx->frame_width, (int)ctx->frame_height);
+        if (ctx->opt.sw_preproc) {
+            memcpy(rgb_detect, rgb_full, (size_t)ctx->frame_width * ctx->frame_height * 3U);
+            sw_preprocess_rgb888(rgb_detect, (int)ctx->frame_width, (int)ctx->frame_height);
+            det_src_rgb = rgb_detect;
+        }
 
         if (ctx->opt.fpga_a_mask && ctx->src_is_bgrx) {
             a_roi_valid = extract_a_channel_roi(a_map, (int)ctx->frame_width, (int)ctx->frame_height,
@@ -3726,7 +3743,7 @@ static void *infer_thread_main(void *arg)
         memset(&plate_diag, 0, sizeof(plate_diag));
 
         if (!ctx->opt.plate_only || ctx->opt.ped_event) {
-            if (run_detect_on_rgb(ctx, &ctx->veh_model, rgb_full, (int)ctx->frame_width, (int)ctx->frame_height,
+            if (run_detect_on_rgb(ctx, &ctx->veh_model, det_src_rgb, (int)ctx->frame_width, (int)ctx->frame_height,
                                   ctx->opt.min_car_conf, algo_rgb, veh_in, cars, &car_count, NULL) < 0)
                 car_count = 0;
         }
@@ -3734,7 +3751,7 @@ static void *infer_thread_main(void *arg)
             float plate_thr = ctx->opt.min_plate_conf;
             if (ctx->opt.fpga_a_mask && a_roi_valid)
                 plate_thr = fmaxf(0.05f, plate_thr - 0.05f);
-            if (run_detect_on_rgb(ctx, &ctx->plate_model, rgb_full, (int)ctx->frame_width, (int)ctx->frame_height,
+            if (run_detect_on_rgb(ctx, &ctx->plate_model, det_src_rgb, (int)ctx->frame_width, (int)ctx->frame_height,
                                   plate_thr, algo_rgb, plate_in, raw_plates, &raw_plate_count, &plate_diag) < 0)
                 raw_plate_count = 0;
         }
@@ -3813,7 +3830,7 @@ static void *infer_thread_main(void *arg)
             pd.box = stable_plates[i];
             if (ctx->opt.plate_refine) {
                 struct det_box refined = pd.box;
-                if (refine_plate_box_local(ctx, rgb_full, (int)ctx->frame_width, (int)ctx->frame_height,
+                if (refine_plate_box_local(ctx, det_src_rgb, (int)ctx->frame_width, (int)ctx->frame_height,
                                            &pd.box, algo_rgb, plate_in, &refined))
                     pd.box = refined;
             }
@@ -3912,7 +3929,7 @@ static void *infer_thread_main(void *arg)
         pthread_mutex_unlock(&ctx->result_lock);
     }
 
-    free(raw_local); free(rgb_full); free(a_map); free(algo_rgb);
+    free(raw_local); free(rgb_full); free(rgb_detect); free(a_map); free(algo_rgb);
     free(veh_in); free(plate_in); free(plate_crop);
     return NULL;
 }
@@ -4130,7 +4147,7 @@ int main(int argc, char **argv)
     if (offline_mode) {
         fprintf(stderr,
                 "Start OFFLINE OCR: image=%s roi=%s auto_det=%d min_plate=%.2f det_resize=%s plate_refine=%d "
-                "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_pp=%s min_h=%d min_sharp=%.2f\n",
+                "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_pp=%s min_h=%d min_sharp=%.2f crop_src=fullres_raw det_src=%s\n",
                 ctx.opt.offline_image_path,
                 (ctx.opt.offline_roi_arg && ctx.opt.offline_roi_arg[0]) ? ctx.opt.offline_roi_arg : "<none>",
                 ctx.opt.offline_detect_plate,
@@ -4142,7 +4159,8 @@ int main(int argc, char **argv)
                 ocr_resize_mode_str(ctx.opt.ocr_resize_mode),
                 ocr_preproc_mode_str(ctx.opt.ocr_preproc_mode),
                 ctx.opt.ocr_min_plate_h,
-                ctx.opt.ocr_min_sharpness);
+                ctx.opt.ocr_min_sharpness,
+                ctx.opt.sw_preproc ? "preproc" : "raw");
         if (run_offline_once(&ctx) < 0)
             goto out;
         ret = 0;
@@ -4160,7 +4178,8 @@ int main(int argc, char **argv)
     fprintf(stderr,
             "Start LPR loop: fps=%d src=%s pixel=%s swap16=%s min_car=%.2f min_plate=%.2f plate_only=%d "
             "sw_preproc=%d fpga_a_mask=%d ped_event=%d det_resize=%s plate_refine=%d "
-            "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_pp=%s min_h=%d min_sharp=%.2f ctc_diag=%d ocr_dump=%s max=%d pred_log=%s\n",
+            "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_pp=%s min_h=%d min_sharp=%.2f "
+            "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d pred_log=%s\n",
             ctx.opt.fps,
             ctx.src_is_bgrx ? "bgrx8888" : "bgr565",
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
@@ -4178,6 +4197,7 @@ int main(int argc, char **argv)
             ocr_preproc_mode_str(ctx.opt.ocr_preproc_mode),
             ctx.opt.ocr_min_plate_h,
             ctx.opt.ocr_min_sharpness,
+            ctx.opt.sw_preproc ? "preproc" : "raw",
             ctx.opt.ocr_ctc_diag,
             ctx.opt.ocr_crop_dump_dir ? ctx.opt.ocr_crop_dump_dir : "<off>",
             ctx.opt.ocr_crop_dump_max,
