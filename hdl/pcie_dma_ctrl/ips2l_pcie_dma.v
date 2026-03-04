@@ -79,6 +79,10 @@ module ips2l_pcie_dma #(
     output  wire                        o_cross_4kb_boundary    ,
     output  wire                        o_tx_restart_ext        ,
     output  wire                        o_frame_done_pulse_ext  ,
+    output  wire    [31:0]              o_prep_ctrl_ext         ,
+    output  wire    [31:0]              o_prep_clahe_ext        ,
+    output  wire    [31:0]              o_prep_usm_ext          ,
+    output  wire    [31:0]              o_prep_med_ext          ,
     //external BAR2 read data override (for frame data via MWR)
     output  wire                        o_bar2_rd_clk_en_ext    ,
     output  wire    [ADDR_WIDTH-1:0]    o_bar2_rd_addr_ext      ,
@@ -121,6 +125,10 @@ wire                            mrd64_req_ack;
 wire        [9:0]               req_length;
 wire        [63:0]              req_addr;
 wire        [31:0]              req_data;
+wire        [31:0]              prep_ctrl_cfg;
+wire        [31:0]              prep_clahe_cfg;
+wire        [31:0]              prep_usm_cfg;
+wire        [31:0]              prep_med_cfg;
 
 
 //axis_slave0 interface
@@ -164,6 +172,10 @@ assign o_bar2_rd_addr_ext   = bar2_rd_addr;
 assign bar2_rd_data         = i_ext_bar2_rd_sel ? i_ext_bar2_rd_data : bar2_rd_data_int;
 assign o_tx_restart_ext     = tx_restart;
 assign o_frame_done_pulse_ext = frame_done_pulse;
+assign o_prep_ctrl_ext      = prep_ctrl_cfg;
+assign o_prep_clahe_ext     = prep_clahe_cfg;
+assign o_prep_usm_ext       = prep_usm_cfg;
+assign o_prep_med_ext       = prep_med_cfg;
 //**********************************************************************
 //rst tlp cnt
 wire                            tx_restart;
@@ -284,6 +296,10 @@ u_ips2l_pcie_dma_controller
     .o_cross_4kb_boundary       (o_cross_4kb_boundary       ),
     .i_mwr_tx_busy              (mwr_tx_busy                ),
     .o_frame_done_pulse         (frame_done_pulse           ),
+    .o_prep_ctrl                (prep_ctrl_cfg              ),
+    .o_prep_clahe               (prep_clahe_cfg             ),
+    .o_prep_usm                 (prep_usm_cfg               ),
+    .o_prep_med                 (prep_med_cfg               ),
     //rst tlp cnt
     .i_dma_check_result         (dma_check_result           ),
     .o_tx_restart               (tx_restart                 )

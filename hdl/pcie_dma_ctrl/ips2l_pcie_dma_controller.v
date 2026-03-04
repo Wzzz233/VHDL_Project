@@ -14,7 +14,7 @@
 //////////////////////////////////////////////////////////////////////////////
 module ips2l_pcie_dma_controller #(
     parameter                           DEVICE_TYPE = 3'd0      ,   //3'd0:EP,3'd1:Legacy EP,3'd4:RC
-    parameter                           ADDR_WIDTH  = 4'd9
+    parameter                           ADDR_WIDTH  = 4'd12
 )(
     input                               clk                     ,   //gen1:62.5MHz,gen2:125MHz
     input                               rst_n                   ,
@@ -56,7 +56,12 @@ module ips2l_pcie_dma_controller #(
     input           [63:0]              i_dma_check_result      ,
     output  wire                        o_tx_restart            ,
     output  reg                         o_cross_4kb_boundary    ,
-    output  reg                         o_frame_done_pulse
+    output  reg                         o_frame_done_pulse      ,
+    // FPGA AI-ISP control register shadows from BAR1 writes
+    output  reg     [31:0]              o_prep_ctrl             ,
+    output  reg     [31:0]              o_prep_clahe            ,
+    output  reg     [31:0]              o_prep_usm              ,
+    output  reg     [31:0]              o_prep_med
 
 );
 //apb register for rc
@@ -84,12 +89,20 @@ reg                 apb_data_cfg_done;
 reg     [31:0]      dma_cmd_reg;
 reg     [31:0]      dma_cmd_l_addr;
 reg     [31:0]      dma_cmd_h_addr;
+reg     [31:0]      prep_ctrl_reg;
+reg     [31:0]      prep_clahe_reg;
+reg     [31:0]      prep_usm_reg;
+reg     [31:0]      prep_med_reg;
 
 reg     [31:0]      dma_wr_data;
 
 reg                 dma_cmd_reg_vld /*synthesis PAP_MARK_DEBUG="1"*/;
 reg                 dma_cmd_l_addr_vld /*synthesis PAP_MARK_DEBUG="1"*/;
 reg                 dma_cmd_h_addr_vld /*synthesis PAP_MARK_DEBUG="1"*/;
+reg                 prep_ctrl_reg_vld;
+reg                 prep_clahe_reg_vld;
+reg                 prep_usm_reg_vld;
+reg                 prep_med_reg_vld;
 
 reg                 dma_ctrl_cfg_done /*synthesis PAP_MARK_DEBUG="1"*/;
 reg                 dma_l_addr_cfg_done /*synthesis PAP_MARK_DEBUG="1"*/;
@@ -273,6 +286,97 @@ begin
         dma_h_addr_cfg_done <= 1'b0;
     else if(dma_cmd_h_addr_vld)
         dma_h_addr_cfg_done <= 1'b1;
+end
+
+// FPGA AI-ISP preproc registers (BAR1 write-only path)
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        prep_ctrl_reg_vld <= 1'b0;
+    else if(prep_ctrl_reg_vld)
+        prep_ctrl_reg_vld <= 1'b0;
+    else
+        prep_ctrl_reg_vld <= |i_bar1_wr_byte_en && i_bar1_wr_en && (i_bar1_wr_addr[11:0] == 12'h200);
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        prep_clahe_reg_vld <= 1'b0;
+    else if(prep_clahe_reg_vld)
+        prep_clahe_reg_vld <= 1'b0;
+    else
+        prep_clahe_reg_vld <= |i_bar1_wr_byte_en && i_bar1_wr_en && (i_bar1_wr_addr[11:0] == 12'h204);
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        prep_usm_reg_vld <= 1'b0;
+    else if(prep_usm_reg_vld)
+        prep_usm_reg_vld <= 1'b0;
+    else
+        prep_usm_reg_vld <= |i_bar1_wr_byte_en && i_bar1_wr_en && (i_bar1_wr_addr[11:0] == 12'h208);
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        prep_med_reg_vld <= 1'b0;
+    else if(prep_med_reg_vld)
+        prep_med_reg_vld <= 1'b0;
+    else
+        prep_med_reg_vld <= |i_bar1_wr_byte_en && i_bar1_wr_en && (i_bar1_wr_addr[11:0] == 12'h20C);
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        prep_ctrl_reg <= 32'h00000000;
+    else if(prep_ctrl_reg_vld)
+        prep_ctrl_reg <= dma_wr_data;
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        prep_clahe_reg <= 32'hC0300606; // strength=192 clip=48 tile=64x64
+    else if(prep_clahe_reg_vld)
+        prep_clahe_reg <= dma_wr_data;
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        prep_usm_reg <= 32'h00180610; // gain=1.0 thr=6 limit=24
+    else if(prep_usm_reg_vld)
+        prep_usm_reg <= dma_wr_data;
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        prep_med_reg <= 32'h00000000;
+    else if(prep_med_reg_vld)
+        prep_med_reg <= dma_wr_data;
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+    begin
+        o_prep_ctrl <= 32'h00000000;
+        o_prep_clahe <= 32'hC0300606;
+        o_prep_usm <= 32'h00180610;
+        o_prep_med <= 32'h00000000;
+    end
+    else
+    begin
+        o_prep_ctrl <= prep_ctrl_reg;
+        o_prep_clahe <= prep_clahe_reg;
+        o_prep_usm <= prep_usm_reg;
+        o_prep_med <= prep_med_reg;
+    end
 end
 
 always@(posedge clk or negedge rst_n)

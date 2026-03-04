@@ -52,6 +52,26 @@ Current conclusion:
   - `blank_top1_mean`
   - improved demo text parsing robustness.
 
+### 5. FPGA AI-ISP control path (phase-1/2 skeleton)
+- Added FPGA BAR1 preproc register block plumbing:
+  - `PREP_CTRL @0x200`
+  - `PREP_CLAHE @0x204`
+  - `PREP_USM @0x208`
+  - `PREP_MED @0x20C`
+- Added kernel ioctl register bridge:
+  - `FPGA_DMA_SET_BAR1_REG`
+  - `FPGA_DMA_GET_BAR1_REG` (driver shadow readback)
+- Added app/runtime controls:
+  - `--fpga-preproc-profile raw|clahe|clahe_usm|median_clahe_usm`
+  - `--fpga-preproc-target ocr|all`
+  - `--fpga-a-format flags|yenh`
+  - `--fpga-clahe tile=64x64,clip=48,strength=192`
+  - `--fpga-usm gain=1.0,thr=6,limit=24`
+- Added BGR565->BGRX pipeline support for:
+  - Y-channel enhancement proxy in FPGA stream path
+  - OCR-only mode (`target=ocr`) via A-channel `Y_enh`
+  - Full-path mode (`target=all`) via luma remap back to RGB
+
 ## Key Evidence (from latest logs)
 
 ### Geometry converged

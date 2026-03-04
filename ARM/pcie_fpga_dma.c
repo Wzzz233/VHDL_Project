@@ -97,6 +97,13 @@ struct fpga_dma_dev {
     int irq_vector;
     u64 irq_count;
 
+    /* BAR1 write-only FPGA designs need software-side shadows for readback. */
+    u32 prep_ctrl_shadow;
+    u32 prep_clahe_shadow;
+    u32 prep_usm_shadow;
+    u32 prep_med_shadow;
+    u32 prep_stat_shadow;
+
     /* Device info */
     struct fpga_info info;
 
@@ -184,6 +191,38 @@ static inline void fpga_dma_flush_posted_writes(struct fpga_dma_dev *dev)
 {
     /* One non-posted read flushes prior posted BAR1 writes on PCIe. */
     (void)ioread32(dev->bar0);
+}
+
+static bool fpga_dma_prep_offset_supported(u32 offset)
+{
+    switch (offset) {
+    case BAR1_PREP_CTRL:
+    case BAR1_PREP_CLAHE:
+    case BAR1_PREP_USM:
+    case BAR1_PREP_MED:
+    case BAR1_PREP_STAT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static u32 *fpga_dma_prep_shadow_ptr(struct fpga_dma_dev *dev, u32 offset)
+{
+    switch (offset) {
+    case BAR1_PREP_CTRL:
+        return &dev->prep_ctrl_shadow;
+    case BAR1_PREP_CLAHE:
+        return &dev->prep_clahe_shadow;
+    case BAR1_PREP_USM:
+        return &dev->prep_usm_shadow;
+    case BAR1_PREP_MED:
+        return &dev->prep_med_shadow;
+    case BAR1_PREP_STAT:
+        return &dev->prep_stat_shadow;
+    default:
+        return NULL;
+    }
 }
 
 static irqreturn_t fpga_dma_irq_handler(int irq, void *data)
@@ -491,6 +530,57 @@ static long fpga_dma_ioctl(struct file *file, unsigned int cmd, unsigned long ar
         break;
     }
 
+    case FPGA_DMA_SET_BAR1_REG: {
+        struct fpga_bar1_reg reg_io;
+        u32 *shadow;
+
+        if (copy_from_user(&reg_io, argp, sizeof(reg_io))) {
+            ret = -EFAULT;
+            break;
+        }
+        if (!fpga_dma_prep_offset_supported(reg_io.offset)) {
+            ret = -EINVAL;
+            break;
+        }
+
+        shadow = fpga_dma_prep_shadow_ptr(dev, reg_io.offset);
+        if (!shadow) {
+            ret = -EINVAL;
+            break;
+        }
+
+        mutex_lock(&dev->dma_lock);
+        fpga_dma_write_reg(dev, reg_io.offset, reg_io.value);
+        fpga_dma_flush_posted_writes(dev);
+        *shadow = reg_io.value;
+        mutex_unlock(&dev->dma_lock);
+        break;
+    }
+
+    case FPGA_DMA_GET_BAR1_REG: {
+        struct fpga_bar1_reg reg_io;
+        u32 *shadow;
+
+        if (copy_from_user(&reg_io, argp, sizeof(reg_io))) {
+            ret = -EFAULT;
+            break;
+        }
+        if (!fpga_dma_prep_offset_supported(reg_io.offset)) {
+            ret = -EINVAL;
+            break;
+        }
+        shadow = fpga_dma_prep_shadow_ptr(dev, reg_io.offset);
+        if (!shadow) {
+            ret = -EINVAL;
+            break;
+        }
+
+        reg_io.value = *shadow;
+        if (copy_to_user(argp, &reg_io, sizeof(reg_io)))
+            ret = -EFAULT;
+        break;
+    }
+
     default:
         dev_dbg(dev->dev, "Unknown ioctl cmd=0x%x\n", cmd);
         ret = -ENOTTY;
@@ -551,6 +641,11 @@ static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     dev->use_poll_fallback = false;
     dev->irq_vector = -1;
     dev->irq_count = 0;
+    dev->prep_ctrl_shadow = 0x00000000U;
+    dev->prep_clahe_shadow = 0xC0300606U; /* strength=192 clip=48 tile=64x64 */
+    dev->prep_usm_shadow = 0x00180610U;   /* gain=1.0 thr=6 limit=24 */
+    dev->prep_med_shadow = 0x00000000U;
+    dev->prep_stat_shadow = 0x00000000U;
 
     pci_set_drvdata(pdev, dev);
 

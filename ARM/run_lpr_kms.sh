@@ -23,6 +23,11 @@ PLATE_ON_CAR_ONLY="0"
 PLATE_ONLY="1"
 SW_PREPROC="0"
 FPGA_A_MASK="0"
+FPGA_PREPROC_PROFILE="raw"
+FPGA_PREPROC_TARGET="ocr"
+FPGA_A_FORMAT="flags"
+FPGA_CLAHE="tile=64x64,clip=48,strength=192"
+FPGA_USM="gain=1.0,thr=6,limit=24"
 A_PROJ_RATIO="0.35"
 A_ROI_IOU_MIN="0.05"
 PED_EVENT="0"
@@ -75,6 +80,11 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --plate-only <0|1>         Disable vehicle dependency for plate output (default: ${PLATE_ONLY})
   --sw-preproc <0|1>         Enable software preproc A/B path (default: ${SW_PREPROC})
   --fpga-a-mask <0|1>        Enable FPGA A-channel ROI fusion (default: ${FPGA_A_MASK})
+  --fpga-preproc-profile <m> raw|clahe|clahe_usm|median_clahe_usm (default: ${FPGA_PREPROC_PROFILE})
+  --fpga-preproc-target <m>  ocr|all (default: ${FPGA_PREPROC_TARGET})
+  --fpga-a-format <m>        flags|yenh (default: ${FPGA_A_FORMAT})
+  --fpga-clahe <cfg>         tile=64x64,clip=48,strength=192 (default: ${FPGA_CLAHE})
+  --fpga-usm <cfg>           gain=1.0,thr=6,limit=24 (default: ${FPGA_USM})
   --a-proj-ratio <v>         A-channel projection threshold ratio (default: ${A_PROJ_RATIO})
   --a-roi-iou-min <v>        Min IoU for A-ROI filtering (default: ${A_ROI_IOU_MIN})
   --ped-event <0|1>          Enable pedestrian red-light event (default: ${PED_EVENT})
@@ -125,6 +135,11 @@ while [[ $# -gt 0 ]]; do
     --plate-only) PLATE_ONLY="$2"; shift 2 ;;
     --sw-preproc) SW_PREPROC="$2"; shift 2 ;;
     --fpga-a-mask) FPGA_A_MASK="$2"; shift 2 ;;
+    --fpga-preproc-profile) FPGA_PREPROC_PROFILE="$2"; shift 2 ;;
+    --fpga-preproc-target) FPGA_PREPROC_TARGET="$2"; shift 2 ;;
+    --fpga-a-format) FPGA_A_FORMAT="$2"; shift 2 ;;
+    --fpga-clahe) FPGA_CLAHE="$2"; shift 2 ;;
+    --fpga-usm) FPGA_USM="$2"; shift 2 ;;
     --a-proj-ratio) A_PROJ_RATIO="$2"; shift 2 ;;
     --a-roi-iou-min) A_ROI_IOU_MIN="$2"; shift 2 ;;
     --ped-event) PED_EVENT="$2"; shift 2 ;;
@@ -232,6 +247,11 @@ CMD=(./fpga_lpr_display
   --ocr-min-plate-h "$OCR_MIN_PLATE_H"
   --ocr-min-sharpness "$OCR_MIN_SHARPNESS"
   --ocr-min-occ-ratio "$OCR_MIN_OCC_RATIO"
+  --fpga-preproc-profile "$FPGA_PREPROC_PROFILE"
+  --fpga-preproc-target "$FPGA_PREPROC_TARGET"
+  --fpga-a-format "$FPGA_A_FORMAT"
+  --fpga-clahe "$FPGA_CLAHE"
+  --fpga-usm "$FPGA_USM"
   --ocr-ctc-diag "$OCR_CTC_DIAG"
   --ocr-crop-dump-max "$OCR_CROP_DUMP_MAX")
 

@@ -55,17 +55,33 @@ def main() -> int:
     len_ge_7 = 0
     exact = 0
     texts: List[str] = []
+    blank_vals: List[float] = []
+    by_profile: Dict[str, Dict[str, object]] = {}
 
     for row in rows:
         t_raw = row.get("plate_text_pred", "")
         t = norm_text(t_raw)
+        prep_profile = (row.get("prep_profile", "") or "unknown").strip() or "unknown"
+        if prep_profile not in by_profile:
+            by_profile[prep_profile] = {"n": 0, "nonempty": 0, "len7": 0}
+        by_profile[prep_profile]["n"] += 1
+
         if t:
             nonempty += 1
             if len(t) >= 7:
                 len_ge_7 += 1
+            if len(t) >= 7:
+                by_profile[prep_profile]["len7"] += 1
+            by_profile[prep_profile]["nonempty"] += 1
             if gt and t == gt:
                 exact += 1
             texts.append(t)
+        b = (row.get("blank_top1", "") or "").strip()
+        if b:
+            try:
+                blank_vals.append(float(b))
+            except ValueError:
+                pass
 
     denom = pred_rows if pred_rows > 0 else 1
     summary = {
@@ -73,9 +89,21 @@ def main() -> int:
         "ocr_nonempty_ratio": nonempty / denom,
         "len_ge_7_ratio": len_ge_7 / denom,
         "exact_match_ratio": (exact / denom) if gt else None,
+        "blank_top1_mean": (sum(blank_vals) / len(blank_vals)) if blank_vals else None,
         "gt_text": gt if gt else None,
         "top_texts": Counter(texts).most_common(10),
     }
+
+    if by_profile:
+        profile_summary: Dict[str, Dict[str, object]] = {}
+        for k, v in sorted(by_profile.items()):
+            n = int(v["n"]) if int(v["n"]) > 0 else 1
+            profile_summary[k] = {
+                "count": int(v["n"]),
+                "ocr_nonempty_ratio": float(v["nonempty"]) / n,
+                "len_ge_7_ratio": float(v["len7"]) / n,
+            }
+        summary["by_prep_profile"] = profile_summary
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if args.out_json:
@@ -87,4 +115,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
