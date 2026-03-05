@@ -943,7 +943,7 @@ function [7:0] aiisp_enhance_y;
     integer usm_thr;
     integer usm_limit;
     integer usm_gain_q4_4;
-    integer edge;
+    integer edge_mag;
     integer boost;
 begin
     r8 = rgb24[23:16];
@@ -981,9 +981,9 @@ begin
         usm_gain_q4_4 = usm_cfg[7:0];
         usm_thr = usm_cfg[15:8];
         usm_limit = usm_cfg[23:16];
-        edge = (absdiff8(r8, g8) + absdiff8(g8, b8)) >> 1;
-        if (edge >= usm_thr) begin
-            boost = ((edge - usm_thr) * usm_gain_q4_4) >>> 4;
+        edge_mag = (absdiff8(r8, g8) + absdiff8(g8, b8)) >> 1;
+        if (edge_mag >= usm_thr) begin
+            boost = ((edge_mag - usm_thr) * usm_gain_q4_4) >>> 4;
             if (boost > usm_limit)
                 boost = usm_limit;
             y_cur = clamp_u8_int($signed({1'b0, y_cur}) + boost);
