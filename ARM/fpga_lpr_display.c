@@ -527,8 +527,8 @@ static void print_usage(const char *prog)
             "  --fpga-preproc-profile <m>  raw|clahe|clahe_usm|median_clahe_usm (default: raw)\n"
             "  --fpga-preproc-target <m>   ocr|all (default: ocr)\n"
             "  --fpga-a-format <m>         flags|yenh (default: flags)\n"
-            "  --fpga-clahe <cfg>          tile=64x64,clip=48,strength=192\n"
-            "  --fpga-usm <cfg>            gain=1.0,thr=6,limit=24\n"
+            "  --fpga-clahe <cfg>          tile=64x64,clip=24,strength=96\n"
+            "  --fpga-usm <cfg>            gain=0.25,thr=20,limit=8\n"
             "  --a-proj-ratio <v>      A-channel projection threshold ratio (default: 0.35)\n"
             "  --a-roi-iou-min <v>     Min IoU for A-ROI filtering (default: 0.05)\n"
             "  --ped-event <0|1>       Enable pedestrian red-light event (default: 0)\n"
@@ -638,11 +638,11 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->fpga_a_format = FPGA_A_FMT_FLAGS;
     opt->fpga_clahe_tile_w = 64;
     opt->fpga_clahe_tile_h = 64;
-    opt->fpga_clahe_clip = 48;
-    opt->fpga_clahe_strength = 192;
-    opt->fpga_usm_gain = 1.0f;
-    opt->fpga_usm_thr = 6;
-    opt->fpga_usm_limit = 24;
+    opt->fpga_clahe_clip = 24;
+    opt->fpga_clahe_strength = 96;
+    opt->fpga_usm_gain = 0.25f;
+    opt->fpga_usm_thr = 20;
+    opt->fpga_usm_limit = 8;
     opt->fpga_med_noise_gate = 0;
     opt->a_proj_ratio = 0.35f;
     opt->a_roi_iou_min = 0.05f;
@@ -2894,10 +2894,15 @@ static void apply_y_map_to_crop_rgb(const uint8_t *a_map, int img_w, const struc
             int y_old = (77 * r + 150 * g + 29 * b) >> 8;
             int scale_q8;
 
-            if (y_old < 8)
+            if (y_old < 12)
                 scale_q8 = 256;
-            else
+            else {
                 scale_q8 = (y_new << 8) / y_old;
+                if (scale_q8 < 218)
+                    scale_q8 = 218;
+                else if (scale_q8 > 320)
+                    scale_q8 = 320;
+            }
 
             dst_rgb[dst_idx + 0] = clip_u8((r * scale_q8) >> 8);
             dst_rgb[dst_idx + 1] = clip_u8((g * scale_q8) >> 8);
@@ -2924,10 +2929,15 @@ static void apply_y_map_to_full_rgb(const uint8_t *a_map, int img_w, int img_h, 
             int y_old = (77 * r + 150 * g + 29 * b) >> 8;
             int scale_q8;
 
-            if (y_old < 8)
+            if (y_old < 12)
                 scale_q8 = 256;
-            else
+            else {
                 scale_q8 = (y_new << 8) / y_old;
+                if (scale_q8 < 218)
+                    scale_q8 = 218;
+                else if (scale_q8 > 320)
+                    scale_q8 = 320;
+            }
 
             dst_rgb[rgb_idx + 0] = clip_u8((r * scale_q8) >> 8);
             dst_rgb[rgb_idx + 1] = clip_u8((g * scale_q8) >> 8);

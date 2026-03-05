@@ -26,8 +26,8 @@ FPGA_A_MASK="0"
 FPGA_PREPROC_PROFILE="raw"
 FPGA_PREPROC_TARGET="ocr"
 FPGA_A_FORMAT="flags"
-FPGA_CLAHE="tile=64x64,clip=48,strength=192"
-FPGA_USM="gain=1.0,thr=6,limit=24"
+FPGA_CLAHE="tile=64x64,clip=24,strength=96"
+FPGA_USM="gain=0.25,thr=20,limit=8"
 A_PROJ_RATIO="0.35"
 A_ROI_IOU_MIN="0.05"
 PED_EVENT="0"
@@ -85,8 +85,8 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --fpga-preproc-profile <m> raw|clahe|clahe_usm|median_clahe_usm (default: ${FPGA_PREPROC_PROFILE})
   --fpga-preproc-target <m>  ocr|all (default: ${FPGA_PREPROC_TARGET})
   --fpga-a-format <m>        flags|yenh (default: ${FPGA_A_FORMAT})
-  --fpga-clahe <cfg>         tile=64x64,clip=48,strength=192 (default: ${FPGA_CLAHE})
-  --fpga-usm <cfg>           gain=1.0,thr=6,limit=24 (default: ${FPGA_USM})
+  --fpga-clahe <cfg>         tile=64x64,clip=24,strength=96 (default: ${FPGA_CLAHE})
+  --fpga-usm <cfg>           gain=0.25,thr=20,limit=8 (default: ${FPGA_USM})
   --a-proj-ratio <v>         A-channel projection threshold ratio (default: ${A_PROJ_RATIO})
   --a-roi-iou-min <v>        Min IoU for A-ROI filtering (default: ${A_ROI_IOU_MIN})
   --ped-event <0|1>          Enable pedestrian red-light event (default: ${PED_EVENT})

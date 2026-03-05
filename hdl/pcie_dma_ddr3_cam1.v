@@ -950,9 +950,9 @@ begin
     g8 = rgb24[15:8];
     b8 = rgb24[7:0];
     y_cur = luma_from_rgb888(r8, g8, b8);
+    avg_rgb = (r8 + g8 + b8) / 3;
 
     if (en_median) begin
-        avg_rgb = (r8 + g8 + b8) / 3;
         noise_gate = med_cfg[7:0];
         if (noise_gate < 1)
             noise_gate = 12;
@@ -981,7 +981,7 @@ begin
         usm_gain_q4_4 = usm_cfg[7:0];
         usm_thr = usm_cfg[15:8];
         usm_limit = usm_cfg[23:16];
-        edge_mag = (absdiff8(r8, g8) + absdiff8(g8, b8)) >> 1;
+        edge_mag = absdiff8(y_cur, avg_rgb[7:0]);
         if (edge_mag >= usm_thr) begin
             boost = ((edge_mag - usm_thr) * usm_gain_q4_4) >>> 4;
             if (boost > usm_limit)
@@ -1047,6 +1047,25 @@ begin
 end
 endfunction
 
+function [127:0] pack_4pix_bgrx;
+    input [15:0] p0;
+    input [15:0] p1;
+    input [15:0] p2;
+    input [15:0] p3;
+    input [7:0]  a0;
+    input [7:0]  a1;
+    input [7:0]  a2;
+    input [7:0]  a3;
+begin
+    pack_4pix_bgrx = {
+        bgr565_to_bgrx32(p3, a3),
+        bgr565_to_bgrx32(p2, a2),
+        bgr565_to_bgrx32(p1, a1),
+        bgr565_to_bgrx32(p0, a0)
+    };
+end
+endfunction
+
 wire [23:0] rgb_lo_0 = rgb24_from_bgr565(frame_rd_data[15:0]);
 wire [23:0] rgb_lo_1 = rgb24_from_bgr565(frame_rd_data[31:16]);
 wire [23:0] rgb_lo_2 = rgb24_from_bgr565(frame_rd_data[47:32]);
@@ -1056,57 +1075,81 @@ wire [23:0] rgb_hi_1 = rgb24_from_bgr565(frame_rd_data_hold[95:80]);
 wire [23:0] rgb_hi_2 = rgb24_from_bgr565(frame_rd_data_hold[111:96]);
 wire [23:0] rgb_hi_3 = rgb24_from_bgr565(frame_rd_data_hold[127:112]);
 
-wire [7:0] y_lo_0 = aiisp_enhance_y(rgb_lo_0, prep_median_en, prep_clahe_en, prep_usm_en,
-                                    fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
-wire [7:0] y_lo_1 = aiisp_enhance_y(rgb_lo_1, prep_median_en, prep_clahe_en, prep_usm_en,
-                                    fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
-wire [7:0] y_lo_2 = aiisp_enhance_y(rgb_lo_2, prep_median_en, prep_clahe_en, prep_usm_en,
-                                    fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
-wire [7:0] y_lo_3 = aiisp_enhance_y(rgb_lo_3, prep_median_en, prep_clahe_en, prep_usm_en,
-                                    fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
-wire [7:0] y_hi_0 = aiisp_enhance_y(rgb_hi_0, prep_median_en, prep_clahe_en, prep_usm_en,
-                                    fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
-wire [7:0] y_hi_1 = aiisp_enhance_y(rgb_hi_1, prep_median_en, prep_clahe_en, prep_usm_en,
-                                    fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
-wire [7:0] y_hi_2 = aiisp_enhance_y(rgb_hi_2, prep_median_en, prep_clahe_en, prep_usm_en,
-                                    fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
-wire [7:0] y_hi_3 = aiisp_enhance_y(rgb_hi_3, prep_median_en, prep_clahe_en, prep_usm_en,
-                                    fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+// RAW fast path: never depends on enhancement combinational logic.
+wire [127:0] raw_frame_rd_data_bgrx_lo = pack_4pix_bgrx(
+    frame_rd_data[15:0], frame_rd_data[31:16], frame_rd_data[47:32], frame_rd_data[63:48],
+    8'h00, 8'h00, 8'h00, 8'h00);
+wire [127:0] raw_frame_rd_hold_bgrx_hi = pack_4pix_bgrx(
+    frame_rd_data_hold[79:64], frame_rd_data_hold[95:80], frame_rd_data_hold[111:96], frame_rd_data_hold[127:112],
+    8'h00, 8'h00, 8'h00, 8'h00);
 
-wire [23:0] rgb_lo_0_out = prep_target_all ? rgb24_apply_y(rgb_lo_0, y_lo_0) : rgb_lo_0;
-wire [23:0] rgb_lo_1_out = prep_target_all ? rgb24_apply_y(rgb_lo_1, y_lo_1) : rgb_lo_1;
-wire [23:0] rgb_lo_2_out = prep_target_all ? rgb24_apply_y(rgb_lo_2, y_lo_2) : rgb_lo_2;
-wire [23:0] rgb_lo_3_out = prep_target_all ? rgb24_apply_y(rgb_lo_3, y_lo_3) : rgb_lo_3;
-wire [23:0] rgb_hi_0_out = prep_target_all ? rgb24_apply_y(rgb_hi_0, y_hi_0) : rgb_hi_0;
-wire [23:0] rgb_hi_1_out = prep_target_all ? rgb24_apply_y(rgb_hi_1, y_hi_1) : rgb_hi_1;
-wire [23:0] rgb_hi_2_out = prep_target_all ? rgb24_apply_y(rgb_hi_2, y_hi_2) : rgb_hi_2;
-wire [23:0] rgb_hi_3_out = prep_target_all ? rgb24_apply_y(rgb_hi_3, y_hi_3) : rgb_hi_3;
+wire [7:0] prep_y_lo_0 = aiisp_enhance_y(rgb_lo_0, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] prep_y_lo_1 = aiisp_enhance_y(rgb_lo_1, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] prep_y_lo_2 = aiisp_enhance_y(rgb_lo_2, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] prep_y_lo_3 = aiisp_enhance_y(rgb_lo_3, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] prep_y_hi_0 = aiisp_enhance_y(rgb_hi_0, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] prep_y_hi_1 = aiisp_enhance_y(rgb_hi_1, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] prep_y_hi_2 = aiisp_enhance_y(rgb_hi_2, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] prep_y_hi_3 = aiisp_enhance_y(rgb_hi_3, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
 
-wire [7:0] alpha_lo_0_base = prep_active ? (prep_a_fmt_yenh ? y_lo_0 : preproc_alpha_from_bgr565(frame_rd_data[15:0])) : 8'h00;
-wire [7:0] alpha_lo_1 = prep_active ? (prep_a_fmt_yenh ? y_lo_1 : preproc_alpha_from_bgr565(frame_rd_data[31:16])) : 8'h00;
-wire [7:0] alpha_lo_2 = prep_active ? (prep_a_fmt_yenh ? y_lo_2 : preproc_alpha_from_bgr565(frame_rd_data[47:32])) : 8'h00;
-wire [7:0] alpha_lo_3 = prep_active ? (prep_a_fmt_yenh ? y_lo_3 : preproc_alpha_from_bgr565(frame_rd_data[63:48])) : 8'h00;
+wire [23:0] prep_rgb_lo_0 = prep_target_all ? rgb24_apply_y(rgb_lo_0, prep_y_lo_0) : rgb_lo_0;
+wire [23:0] prep_rgb_lo_1 = prep_target_all ? rgb24_apply_y(rgb_lo_1, prep_y_lo_1) : rgb_lo_1;
+wire [23:0] prep_rgb_lo_2 = prep_target_all ? rgb24_apply_y(rgb_lo_2, prep_y_lo_2) : rgb_lo_2;
+wire [23:0] prep_rgb_lo_3 = prep_target_all ? rgb24_apply_y(rgb_lo_3, prep_y_lo_3) : rgb_lo_3;
+wire [23:0] prep_rgb_hi_0 = prep_target_all ? rgb24_apply_y(rgb_hi_0, prep_y_hi_0) : rgb_hi_0;
+wire [23:0] prep_rgb_hi_1 = prep_target_all ? rgb24_apply_y(rgb_hi_1, prep_y_hi_1) : rgb_hi_1;
+wire [23:0] prep_rgb_hi_2 = prep_target_all ? rgb24_apply_y(rgb_hi_2, prep_y_hi_2) : rgb_hi_2;
+wire [23:0] prep_rgb_hi_3 = prep_target_all ? rgb24_apply_y(rgb_hi_3, prep_y_hi_3) : rgb_hi_3;
 
-wire [7:0] alpha_hi_0 = prep_active ? (prep_a_fmt_yenh ? y_hi_0 : preproc_alpha_from_bgr565(frame_rd_data_hold[79:64])) : 8'h00;
-wire [7:0] alpha_hi_1 = prep_active ? (prep_a_fmt_yenh ? y_hi_1 : preproc_alpha_from_bgr565(frame_rd_data_hold[95:80])) : 8'h00;
-wire [7:0] alpha_hi_2 = prep_active ? (prep_a_fmt_yenh ? y_hi_2 : preproc_alpha_from_bgr565(frame_rd_data_hold[111:96])) : 8'h00;
-wire [7:0] alpha_hi_3 = prep_active ? (prep_a_fmt_yenh ? y_hi_3 : preproc_alpha_from_bgr565(frame_rd_data_hold[127:112])) : 8'h00;
+wire [7:0] prep_alpha_lo_0_base = prep_a_fmt_yenh ? prep_y_lo_0 : preproc_alpha_from_bgr565(frame_rd_data[15:0]);
+wire [7:0] prep_alpha_lo_1 = prep_a_fmt_yenh ? prep_y_lo_1 : preproc_alpha_from_bgr565(frame_rd_data[31:16]);
+wire [7:0] prep_alpha_lo_2 = prep_a_fmt_yenh ? prep_y_lo_2 : preproc_alpha_from_bgr565(frame_rd_data[47:32]);
+wire [7:0] prep_alpha_lo_3 = prep_a_fmt_yenh ? prep_y_lo_3 : preproc_alpha_from_bgr565(frame_rd_data[63:48]);
+
+wire [7:0] prep_alpha_hi_0 = prep_a_fmt_yenh ? prep_y_hi_0 : preproc_alpha_from_bgr565(frame_rd_data_hold[79:64]);
+wire [7:0] prep_alpha_hi_1 = prep_a_fmt_yenh ? prep_y_hi_1 : preproc_alpha_from_bgr565(frame_rd_data_hold[95:80]);
+wire [7:0] prep_alpha_hi_2 = prep_a_fmt_yenh ? prep_y_hi_2 : preproc_alpha_from_bgr565(frame_rd_data_hold[111:96]);
+wire [7:0] prep_alpha_hi_3 = prep_a_fmt_yenh ? prep_y_hi_3 : preproc_alpha_from_bgr565(frame_rd_data_hold[127:112]);
 
 // Reserve Pixel[0,0].A as frame watermark only when legacy flag format is active.
 wire first_pixel_word = dma_session_active && (dma_rd_word_count == 18'd0) && (dma_expand_phase == 1'b0);
-wire [7:0] alpha_lo_0 = (prep_active && ~prep_a_fmt_yenh && first_pixel_word) ? frame_id : alpha_lo_0_base;
+wire [7:0] prep_alpha_lo_0 = (~prep_a_fmt_yenh && first_pixel_word) ? frame_id : prep_alpha_lo_0_base;
 
-wire [127:0] frame_rd_data_bgrx_lo = pack_4rgb_bgrx(
-    rgb_lo_0_out, rgb_lo_1_out, rgb_lo_2_out, rgb_lo_3_out,
-    alpha_lo_0, alpha_lo_1, alpha_lo_2, alpha_lo_3);
-wire [127:0] frame_rd_hold_bgrx_hi = pack_4rgb_bgrx(
-    rgb_hi_0_out, rgb_hi_1_out, rgb_hi_2_out, rgb_hi_3_out,
-    alpha_hi_0, alpha_hi_1, alpha_hi_2, alpha_hi_3);
+wire [127:0] prep_frame_rd_data_bgrx_lo_c = pack_4rgb_bgrx(
+    prep_rgb_lo_0, prep_rgb_lo_1, prep_rgb_lo_2, prep_rgb_lo_3,
+    prep_alpha_lo_0, prep_alpha_lo_1, prep_alpha_lo_2, prep_alpha_lo_3);
+wire [127:0] prep_frame_rd_hold_bgrx_hi_c = pack_4rgb_bgrx(
+    prep_rgb_hi_0, prep_rgb_hi_1, prep_rgb_hi_2, prep_rgb_hi_3,
+    prep_alpha_hi_0, prep_alpha_hi_1, prep_alpha_hi_2, prep_alpha_hi_3);
+
+reg  [127:0] prep_frame_rd_data_bgrx_lo_q;
+reg  [127:0] prep_frame_rd_hold_bgrx_hi_q;
+
+always @(posedge pclk_div2 or negedge core_rst_n) begin
+    if (!core_rst_n) begin
+        prep_frame_rd_data_bgrx_lo_q <= 128'd0;
+        prep_frame_rd_hold_bgrx_hi_q <= 128'd0;
+    end else begin
+        prep_frame_rd_data_bgrx_lo_q <= prep_frame_rd_data_bgrx_lo_c;
+        prep_frame_rd_hold_bgrx_hi_q <= prep_frame_rd_hold_bgrx_hi_c;
+    end
+end
+
+wire [127:0] frame_dma_data_raw = dma_expand_phase ? raw_frame_rd_hold_bgrx_hi : raw_frame_rd_data_bgrx_lo;
+wire [127:0] frame_dma_data_prep = dma_expand_phase ? prep_frame_rd_hold_bgrx_hi_q : prep_frame_rd_data_bgrx_lo_q;
 wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
 wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data, prep_active ? 8'h80 : 8'h00)}};
 wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
 wire [127:0] frame_dma_data = dma_expand_mode
-    ? (dma_expand_phase ? frame_rd_hold_bgrx_hi : frame_rd_data_bgrx_lo)
+    ? (prep_active ? frame_dma_data_prep : frame_dma_data_raw)
     : frame_rd_data;
 wire        frame_stream_ready = ~dma_session_active | ~mwr_first_beat_seen | frame_rd_data_ready;
 
