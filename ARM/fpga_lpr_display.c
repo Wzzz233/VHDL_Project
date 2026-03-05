@@ -193,6 +193,8 @@ struct options {
     int ocr_ctc_diag;
     int ocr_crop_dump_max;
     const char *ocr_crop_dump_dir;
+    const char *fpga_preproc_dump_path;
+    int fpga_preproc_dump_max;
     int offline_detect_plate;
     bool swap16;
 };
@@ -369,6 +371,7 @@ struct app_ctx {
     FILE *pred_log_fp;
     FILE *ocr_crop_index_fp;
     int ocr_crop_dumped;
+    int fpga_preproc_dumped;
     pthread_mutex_t pred_log_lock;
     char labels[MAX_LABELS][MAX_LABEL_LEN];
     int label_count;
@@ -420,6 +423,7 @@ static int apply_fpga_preproc_cfg(struct app_ctx *ctx);
 static float box_iou(const struct det_box *a, const struct det_box *b);
 static float laplacian_variance_rgb888(const uint8_t *rgb, int w, int h);
 static void apply_y_map_to_crop_rgb(const uint8_t *a_map, int img_w, const struct det_box *crop, uint8_t *dst_rgb);
+static void apply_y_map_to_full_rgb(const uint8_t *a_map, int img_w, int img_h, uint8_t *dst_rgb);
 static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
                                          const uint8_t *crop_rgb, int crop_w, int crop_h,
                                          float *occ_ratio_out);
@@ -545,6 +549,8 @@ static void print_usage(const char *prog)
             "  --ocr-ctc-diag <0|1>    Print CTC decode diagnostics (default: 0)\n"
             "  --ocr-crop-dump-dir <p> Dump OCR crops+inputs to directory (default: off)\n"
             "  --ocr-crop-dump-max <n> Max dumped OCR samples (default: 20)\n"
+            "  --fpga-preproc-dump-path <p> Dump full preprocessed RGB frame to .ppm path (default: off)\n"
+            "  --fpga-preproc-dump-max <n> Max dumped preprocessed frames (default: 1)\n"
             "  --help                  Show this help\n",
             prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD, DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
             DEFAULT_STATS_INTERVAL, DEFAULT_COPY_BUFFERS, DEFAULT_QUEUE_DEPTH);
@@ -603,6 +609,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"ocr-ctc-diag", required_argument, NULL, 33},
         {"ocr-crop-dump-dir", required_argument, NULL, 34},
         {"ocr-crop-dump-max", required_argument, NULL, 35},
+        {"fpga-preproc-dump-path", required_argument, NULL, 51},
+        {"fpga-preproc-dump-max", required_argument, NULL, 52},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -656,6 +664,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->ocr_ctc_diag = 0;
     opt->ocr_crop_dump_max = 20;
     opt->ocr_crop_dump_dir = NULL;
+    opt->fpga_preproc_dump_path = NULL;
+    opt->fpga_preproc_dump_max = 1;
     opt->offline_detect_plate = 1;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
@@ -798,6 +808,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 33: opt->ocr_ctc_diag = atoi(optarg) ? 1 : 0; break;
         case 34: opt->ocr_crop_dump_dir = optarg; break;
         case 35: opt->ocr_crop_dump_max = atoi(optarg); break;
+        case 51: opt->fpga_preproc_dump_path = optarg; break;
+        case 52: opt->fpga_preproc_dump_max = atoi(optarg); break;
         case 'h':
             print_usage(argv[0]);
             exit(0);
@@ -829,6 +841,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
     if (opt->ocr_min_occ_ratio < 0.0f || opt->ocr_min_occ_ratio > 1.0f)
         return -1;
     if (opt->ocr_crop_dump_max < 0 || opt->ocr_crop_dump_max > 100000)
+        return -1;
+    if (opt->fpga_preproc_dump_max < 0 || opt->fpga_preproc_dump_max > 100000)
         return -1;
     if (opt->fpga_clahe_tile_w < 8 || opt->fpga_clahe_tile_w > 1024 ||
         opt->fpga_clahe_tile_h < 8 || opt->fpga_clahe_tile_h > 1024)
@@ -2892,6 +2906,36 @@ static void apply_y_map_to_crop_rgb(const uint8_t *a_map, int img_w, const struc
     }
 }
 
+static void apply_y_map_to_full_rgb(const uint8_t *a_map, int img_w, int img_h, uint8_t *dst_rgb)
+{
+    int x, y;
+
+    if (!a_map || !dst_rgb || img_w <= 0 || img_h <= 0)
+        return;
+
+    for (y = 0; y < img_h; y++) {
+        for (x = 0; x < img_w; x++) {
+            size_t idx = ((size_t)y * (size_t)img_w + (size_t)x);
+            size_t rgb_idx = idx * 3U;
+            int y_new = a_map[idx];
+            int r = dst_rgb[rgb_idx + 0];
+            int g = dst_rgb[rgb_idx + 1];
+            int b = dst_rgb[rgb_idx + 2];
+            int y_old = (77 * r + 150 * g + 29 * b) >> 8;
+            int scale_q8;
+
+            if (y_old < 8)
+                scale_q8 = 256;
+            else
+                scale_q8 = (y_new << 8) / y_old;
+
+            dst_rgb[rgb_idx + 0] = clip_u8((r * scale_q8) >> 8);
+            dst_rgb[rgb_idx + 1] = clip_u8((g * scale_q8) >> 8);
+            dst_rgb[rgb_idx + 2] = clip_u8((b * scale_q8) >> 8);
+        }
+    }
+}
+
 static bool refine_plate_box_local(struct app_ctx *ctx, const uint8_t *rgb_full, int img_w, int img_h,
                                    const struct det_box *seed_box, uint8_t *det_rgb, uint8_t *plate_in,
                                    struct det_box *out_box)
@@ -4326,17 +4370,28 @@ static void build_overlay_ascii_text(const struct plate_det *pd, char *out, size
 static void *infer_thread_main(void *arg)
 {
     struct app_ctx *ctx = (struct app_ctx *)arg;
+    size_t full_rgb_bytes = (size_t)ctx->frame_width * ctx->frame_height * 3U;
     uint8_t *raw_local = malloc(ctx->src_frame_size);
-    uint8_t *rgb_full = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
-    uint8_t *rgb_detect = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
+    uint8_t *rgb_full = malloc(full_rgb_bytes);
+    uint8_t *rgb_detect = malloc(full_rgb_bytes);
     uint8_t *a_map = malloc((size_t)ctx->frame_width * ctx->frame_height);
     uint8_t *algo_rgb = malloc((size_t)ALGO_STREAM_SIZE * ALGO_STREAM_SIZE * 3U);
     uint8_t *veh_in = malloc((size_t)ctx->veh_model.in_w * ctx->veh_model.in_h * 3U);
     uint8_t *plate_in = malloc((size_t)ctx->plate_model.in_w * ctx->plate_model.in_h * 3U);
     uint8_t *plate_crop = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
-    if (!raw_local || !rgb_full || !rgb_detect || !a_map || !algo_rgb || !veh_in || !plate_in || !plate_crop) {
+    uint8_t *prep_dump_rgb = NULL;
+
+    if (ctx->opt.fpga_preproc_dump_path &&
+        ctx->opt.fpga_preproc_dump_path[0] != '\0' &&
+        ctx->opt.fpga_preproc_dump_max > 0) {
+        prep_dump_rgb = malloc(full_rgb_bytes);
+    }
+
+    if (!raw_local || !rgb_full || !rgb_detect || !a_map || !algo_rgb || !veh_in || !plate_in || !plate_crop ||
+        ((ctx->opt.fpga_preproc_dump_path && ctx->opt.fpga_preproc_dump_path[0] != '\0' &&
+          ctx->opt.fpga_preproc_dump_max > 0) && !prep_dump_rgb)) {
         free(raw_local); free(rgb_full); free(rgb_detect); free(a_map); free(algo_rgb);
-        free(veh_in); free(plate_in); free(plate_crop);
+        free(veh_in); free(plate_in); free(plate_crop); free(prep_dump_rgb);
         return NULL;
     }
 
@@ -4389,6 +4444,55 @@ static void *infer_thread_main(void *arg)
         } else {
             raw565_to_rgb888_full(ctx, raw_local, rgb_full);
             memset(a_map, 0, (size_t)ctx->frame_width * ctx->frame_height);
+        }
+        if (ctx->opt.fpga_preproc_dump_path &&
+            ctx->opt.fpga_preproc_dump_path[0] != '\0' &&
+            ctx->opt.fpga_preproc_dump_max > 0 &&
+            ctx->fpga_preproc_dumped < ctx->opt.fpga_preproc_dump_max) {
+            const uint8_t *dump_rgb = rgb_full;
+            const char *dump_mode = "raw-rgb";
+            char dump_path[768];
+
+            if (ctx->src_is_bgrx &&
+                ctx->opt.fpga_preproc_profile != FPGA_PREP_PROFILE_RAW &&
+                ctx->opt.fpga_preproc_target == FPGA_PREP_TARGET_OCR &&
+                ctx->opt.fpga_a_format == FPGA_A_FMT_YENH) {
+                memcpy(prep_dump_rgb, rgb_full, full_rgb_bytes);
+                apply_y_map_to_full_rgb(a_map, (int)ctx->frame_width, (int)ctx->frame_height, prep_dump_rgb);
+                dump_rgb = prep_dump_rgb;
+                dump_mode = "ocr-yenh";
+            } else if (ctx->src_is_bgrx &&
+                       ctx->opt.fpga_preproc_profile != FPGA_PREP_PROFILE_RAW &&
+                       ctx->opt.fpga_preproc_target == FPGA_PREP_TARGET_ALL) {
+                dump_mode = "all-rgb";
+            } else if (ctx->opt.fpga_preproc_profile != FPGA_PREP_PROFILE_RAW) {
+                dump_mode = "profile-no-y-map";
+            }
+
+            if (ctx->opt.fpga_preproc_dump_max <= 1) {
+                snprintf(dump_path, sizeof(dump_path), "%s", ctx->opt.fpga_preproc_dump_path);
+            } else {
+                const char *base = ctx->opt.fpga_preproc_dump_path;
+                const char *dot = strrchr(base, '.');
+                if (dot && strcmp(dot, ".ppm") == 0) {
+                    size_t stem_len = (size_t)(dot - base);
+                    snprintf(dump_path, sizeof(dump_path), "%.*s_%04d%s",
+                             (int)stem_len, base, ctx->fpga_preproc_dumped, dot);
+                } else {
+                    snprintf(dump_path, sizeof(dump_path), "%s_%04d.ppm",
+                             base, ctx->fpga_preproc_dumped);
+                }
+            }
+
+            if (write_ppm_rgb888(dump_path, dump_rgb, (int)ctx->frame_width, (int)ctx->frame_height) == 0) {
+                ctx->fpga_preproc_dumped++;
+                fprintf(stderr,
+                        "[fpga-prep] dump=%d/%d mode=%s frame=%" PRIu64 " path=%s\n",
+                        ctx->fpga_preproc_dumped, ctx->opt.fpga_preproc_dump_max,
+                        dump_mode, seq, dump_path);
+            } else {
+                fprintf(stderr, "[fpga-prep] WARN: failed to dump preproc frame: %s\n", dump_path);
+            }
         }
         if (ctx->opt.sw_preproc) {
             memcpy(rgb_detect, rgb_full, (size_t)ctx->frame_width * ctx->frame_height * 3U);
@@ -4663,7 +4767,7 @@ static void *infer_thread_main(void *arg)
     }
 
     free(raw_local); free(rgb_full); free(rgb_detect); free(a_map); free(algo_rgb);
-    free(veh_in); free(plate_in); free(plate_crop);
+    free(veh_in); free(plate_in); free(plate_crop); free(prep_dump_rgb);
     return NULL;
 }
 
@@ -4881,6 +4985,19 @@ int main(int argc, char **argv)
                 "crop_path,ocr_input_path\n");
         fflush(ctx.ocr_crop_index_fp);
     }
+    if (ctx.opt.fpga_preproc_dump_path && ctx.opt.fpga_preproc_dump_path[0] != '\0') {
+        const char *p = strrchr(ctx.opt.fpga_preproc_dump_path, '/');
+        if (p && p != ctx.opt.fpga_preproc_dump_path) {
+            char dir_path[640];
+            size_t n = (size_t)(p - ctx.opt.fpga_preproc_dump_path);
+            if (n >= sizeof(dir_path))
+                goto out;
+            memcpy(dir_path, ctx.opt.fpga_preproc_dump_path, n);
+            dir_path[n] = '\0';
+            if (mkdir_p_simple(dir_path) < 0)
+                goto out;
+        }
+    }
 
     if (offline_mode) {
         fprintf(stderr,
@@ -4925,7 +5042,7 @@ int main(int argc, char **argv)
             "sw_preproc=%d fpga_a_mask=%d ped_event=%d det_resize=%s plate_refine=%d "
             "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_kernel=%s ocr_pp=%s min_h=%d min_sharp=%.2f min_occ=%.2f show_crop=%d "
             "prep_profile=%s prep_target=%s prep_params=%s prep_ctrl=0x%08x prep_clahe=0x%08x prep_usm=0x%08x prep_med=0x%08x "
-            "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d pred_log=%s\n",
+            "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d prep_dump=%s max=%d pred_log=%s\n",
             ctx.opt.fps,
             ctx.src_is_bgrx ? "bgrx8888" : "bgr565",
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
@@ -4957,6 +5074,8 @@ int main(int argc, char **argv)
             ctx.opt.ocr_ctc_diag,
             ctx.opt.ocr_crop_dump_dir ? ctx.opt.ocr_crop_dump_dir : "<off>",
             ctx.opt.ocr_crop_dump_max,
+            ctx.opt.fpga_preproc_dump_path ? ctx.opt.fpga_preproc_dump_path : "<off>",
+            ctx.opt.fpga_preproc_dump_max,
             ctx.opt.pred_log_path ? ctx.opt.pred_log_path : "<off>");
 
     ctx.last_stats_us = mono_us();

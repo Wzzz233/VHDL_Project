@@ -48,6 +48,8 @@ OCR_MIN_OCC_RATIO="0"
 OCR_CTC_DIAG="0"
 OCR_CROP_DUMP_DIR=""
 OCR_CROP_DUMP_MAX="20"
+FPGA_PREPROC_DUMP_PATH=""
+FPGA_PREPROC_DUMP_MAX="1"
 OFFLINE_IMAGE=""
 OFFLINE_ROI=""
 OFFLINE_DETECT_PLATE="1"
@@ -105,6 +107,8 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --ocr-ctc-diag <0|1>       Print CTC decode diagnostics (default: ${OCR_CTC_DIAG})
   --ocr-crop-dump-dir <p>    Dump OCR crops+inputs to directory (default: off)
   --ocr-crop-dump-max <n>    Max dumped OCR samples (default: ${OCR_CROP_DUMP_MAX})
+  --fpga-preproc-dump-path <p> Dump preprocessed full frame to PPM path (default: off)
+  --fpga-preproc-dump-max <n>  Max dumped preprocessed full frames (default: ${FPGA_PREPROC_DUMP_MAX})
 EOF
 }
 
@@ -160,6 +164,8 @@ while [[ $# -gt 0 ]]; do
     --ocr-ctc-diag) OCR_CTC_DIAG="$2"; shift 2 ;;
     --ocr-crop-dump-dir) OCR_CROP_DUMP_DIR="$2"; shift 2 ;;
     --ocr-crop-dump-max) OCR_CROP_DUMP_MAX="$2"; shift 2 ;;
+    --fpga-preproc-dump-path) FPGA_PREPROC_DUMP_PATH="$2"; shift 2 ;;
+    --fpga-preproc-dump-max) FPGA_PREPROC_DUMP_MAX="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -253,7 +259,8 @@ CMD=(./fpga_lpr_display
   --fpga-clahe "$FPGA_CLAHE"
   --fpga-usm "$FPGA_USM"
   --ocr-ctc-diag "$OCR_CTC_DIAG"
-  --ocr-crop-dump-max "$OCR_CROP_DUMP_MAX")
+  --ocr-crop-dump-max "$OCR_CROP_DUMP_MAX"
+  --fpga-preproc-dump-max "$FPGA_PREPROC_DUMP_MAX")
 
 if [[ "$OFFLINE_MODE" == "0" ]]; then
   CMD+=(
@@ -295,6 +302,9 @@ fi
 
 if [[ -n "$OCR_CROP_DUMP_DIR" ]]; then
   CMD+=(--ocr-crop-dump-dir "$OCR_CROP_DUMP_DIR")
+fi
+if [[ -n "$FPGA_PREPROC_DUMP_PATH" ]]; then
+  CMD+=(--fpga-preproc-dump-path "$FPGA_PREPROC_DUMP_PATH")
 fi
 
 if [[ -n "$CONNECTOR_ID" ]]; then
