@@ -784,11 +784,15 @@ reg  [5:0]                 rd_fsync_stretch_cnt;
 reg  [8:0]                 post_ddr_word_x;
 reg  [9:0]                 post_ddr_line_y;
 reg                        dma_expand_phase;
+reg                        dma_expand_phase_q_for_prep;
 reg                        mwr_first_beat_seen;
 reg  [11:0]                mwr_rd_addr_d;
 reg                        mwr_rd_clk_en_d;
 reg  [127:0]               frame_rd_data_hold;
 reg  [7:0]                 frame_id;
+reg                        prep_session_en;
+reg                        prep_session_target_all;
+reg                        prep_session_a_fmt_yenh;
 wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
 wire                       dma_expand_mode = DMA_OUTPUT_BGRX;
@@ -801,6 +805,9 @@ wire                       prep_target_ocr_only = fpga_prep_ctrl[5];
 wire                       prep_a_fmt_yenh = fpga_prep_ctrl[6];
 wire                       prep_active = preproc_en & ~prep_bypass;
 wire                       prep_target_all = prep_active & ~prep_target_ocr_only;
+wire                       prep_active_latched = prep_session_en;
+wire                       prep_target_all_latched = prep_session_target_all;
+wire                       prep_a_fmt_yenh_latched = prep_session_a_fmt_yenh;
 wire [17:0]                frame_words_cfg = dma_expand_mode ? FRAME_WORDS_BGRX : FRAME_WORDS_565;
 // Count chunk first beat as a valid step to prevent boundary phase slip.
 wire                       bar2_addr_step = mwr_rd_clk_en &&
@@ -1100,28 +1107,28 @@ wire [7:0] prep_y_hi_2 = aiisp_enhance_y(rgb_hi_2, prep_median_en, prep_clahe_en
 wire [7:0] prep_y_hi_3 = aiisp_enhance_y(rgb_hi_3, prep_median_en, prep_clahe_en, prep_usm_en,
                                          fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
 
-wire [23:0] prep_rgb_lo_0 = prep_target_all ? rgb24_apply_y(rgb_lo_0, prep_y_lo_0) : rgb_lo_0;
-wire [23:0] prep_rgb_lo_1 = prep_target_all ? rgb24_apply_y(rgb_lo_1, prep_y_lo_1) : rgb_lo_1;
-wire [23:0] prep_rgb_lo_2 = prep_target_all ? rgb24_apply_y(rgb_lo_2, prep_y_lo_2) : rgb_lo_2;
-wire [23:0] prep_rgb_lo_3 = prep_target_all ? rgb24_apply_y(rgb_lo_3, prep_y_lo_3) : rgb_lo_3;
-wire [23:0] prep_rgb_hi_0 = prep_target_all ? rgb24_apply_y(rgb_hi_0, prep_y_hi_0) : rgb_hi_0;
-wire [23:0] prep_rgb_hi_1 = prep_target_all ? rgb24_apply_y(rgb_hi_1, prep_y_hi_1) : rgb_hi_1;
-wire [23:0] prep_rgb_hi_2 = prep_target_all ? rgb24_apply_y(rgb_hi_2, prep_y_hi_2) : rgb_hi_2;
-wire [23:0] prep_rgb_hi_3 = prep_target_all ? rgb24_apply_y(rgb_hi_3, prep_y_hi_3) : rgb_hi_3;
+wire [23:0] prep_rgb_lo_0 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_0, prep_y_lo_0) : rgb_lo_0;
+wire [23:0] prep_rgb_lo_1 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_1, prep_y_lo_1) : rgb_lo_1;
+wire [23:0] prep_rgb_lo_2 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_2, prep_y_lo_2) : rgb_lo_2;
+wire [23:0] prep_rgb_lo_3 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_3, prep_y_lo_3) : rgb_lo_3;
+wire [23:0] prep_rgb_hi_0 = prep_target_all_latched ? rgb24_apply_y(rgb_hi_0, prep_y_hi_0) : rgb_hi_0;
+wire [23:0] prep_rgb_hi_1 = prep_target_all_latched ? rgb24_apply_y(rgb_hi_1, prep_y_hi_1) : rgb_hi_1;
+wire [23:0] prep_rgb_hi_2 = prep_target_all_latched ? rgb24_apply_y(rgb_hi_2, prep_y_hi_2) : rgb_hi_2;
+wire [23:0] prep_rgb_hi_3 = prep_target_all_latched ? rgb24_apply_y(rgb_hi_3, prep_y_hi_3) : rgb_hi_3;
 
-wire [7:0] prep_alpha_lo_0_base = prep_a_fmt_yenh ? prep_y_lo_0 : preproc_alpha_from_bgr565(frame_rd_data[15:0]);
-wire [7:0] prep_alpha_lo_1 = prep_a_fmt_yenh ? prep_y_lo_1 : preproc_alpha_from_bgr565(frame_rd_data[31:16]);
-wire [7:0] prep_alpha_lo_2 = prep_a_fmt_yenh ? prep_y_lo_2 : preproc_alpha_from_bgr565(frame_rd_data[47:32]);
-wire [7:0] prep_alpha_lo_3 = prep_a_fmt_yenh ? prep_y_lo_3 : preproc_alpha_from_bgr565(frame_rd_data[63:48]);
+wire [7:0] prep_alpha_lo_0_base = prep_a_fmt_yenh_latched ? prep_y_lo_0 : preproc_alpha_from_bgr565(frame_rd_data[15:0]);
+wire [7:0] prep_alpha_lo_1 = prep_a_fmt_yenh_latched ? prep_y_lo_1 : preproc_alpha_from_bgr565(frame_rd_data[31:16]);
+wire [7:0] prep_alpha_lo_2 = prep_a_fmt_yenh_latched ? prep_y_lo_2 : preproc_alpha_from_bgr565(frame_rd_data[47:32]);
+wire [7:0] prep_alpha_lo_3 = prep_a_fmt_yenh_latched ? prep_y_lo_3 : preproc_alpha_from_bgr565(frame_rd_data[63:48]);
 
-wire [7:0] prep_alpha_hi_0 = prep_a_fmt_yenh ? prep_y_hi_0 : preproc_alpha_from_bgr565(frame_rd_data_hold[79:64]);
-wire [7:0] prep_alpha_hi_1 = prep_a_fmt_yenh ? prep_y_hi_1 : preproc_alpha_from_bgr565(frame_rd_data_hold[95:80]);
-wire [7:0] prep_alpha_hi_2 = prep_a_fmt_yenh ? prep_y_hi_2 : preproc_alpha_from_bgr565(frame_rd_data_hold[111:96]);
-wire [7:0] prep_alpha_hi_3 = prep_a_fmt_yenh ? prep_y_hi_3 : preproc_alpha_from_bgr565(frame_rd_data_hold[127:112]);
+wire [7:0] prep_alpha_hi_0 = prep_a_fmt_yenh_latched ? prep_y_hi_0 : preproc_alpha_from_bgr565(frame_rd_data_hold[79:64]);
+wire [7:0] prep_alpha_hi_1 = prep_a_fmt_yenh_latched ? prep_y_hi_1 : preproc_alpha_from_bgr565(frame_rd_data_hold[95:80]);
+wire [7:0] prep_alpha_hi_2 = prep_a_fmt_yenh_latched ? prep_y_hi_2 : preproc_alpha_from_bgr565(frame_rd_data_hold[111:96]);
+wire [7:0] prep_alpha_hi_3 = prep_a_fmt_yenh_latched ? prep_y_hi_3 : preproc_alpha_from_bgr565(frame_rd_data_hold[127:112]);
 
 // Reserve Pixel[0,0].A as frame watermark only when legacy flag format is active.
 wire first_pixel_word = dma_session_active && (dma_rd_word_count == 18'd0) && (dma_expand_phase == 1'b0);
-wire [7:0] prep_alpha_lo_0 = (~prep_a_fmt_yenh && first_pixel_word) ? frame_id : prep_alpha_lo_0_base;
+wire [7:0] prep_alpha_lo_0 = (~prep_a_fmt_yenh_latched && first_pixel_word) ? frame_id : prep_alpha_lo_0_base;
 
 wire [127:0] prep_frame_rd_data_bgrx_lo_c = pack_4rgb_bgrx(
     prep_rgb_lo_0, prep_rgb_lo_1, prep_rgb_lo_2, prep_rgb_lo_3,
@@ -1144,12 +1151,12 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
 end
 
 wire [127:0] frame_dma_data_raw = dma_expand_phase ? raw_frame_rd_hold_bgrx_hi : raw_frame_rd_data_bgrx_lo;
-wire [127:0] frame_dma_data_prep = dma_expand_phase ? prep_frame_rd_hold_bgrx_hi_q : prep_frame_rd_data_bgrx_lo_q;
+wire [127:0] frame_dma_data_prep = dma_expand_phase_q_for_prep ? prep_frame_rd_hold_bgrx_hi_q : prep_frame_rd_data_bgrx_lo_q;
 wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
-wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data, prep_active ? 8'h80 : 8'h00)}};
+wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data, prep_active_latched ? 8'h80 : 8'h00)}};
 wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
 wire [127:0] frame_dma_data = dma_expand_mode
-    ? (prep_active ? frame_dma_data_prep : frame_dma_data_raw)
+    ? (prep_active_latched ? frame_dma_data_prep : frame_dma_data_raw)
     : frame_rd_data;
 wire        frame_stream_ready = ~dma_session_active | ~mwr_first_beat_seen | frame_rd_data_ready;
 
@@ -1175,23 +1182,36 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         dma_rd_word_count <= 18'd0;
         rd_fsync_stretch_cnt <= 6'd0;
         dma_expand_phase <= 1'b0;
+        dma_expand_phase_q_for_prep <= 1'b0;
         mwr_first_beat_seen <= 1'b0;
         frame_rd_data_hold <= 128'd0;
         frame_id <= 8'd0;
+        prep_session_en <= 1'b0;
+        prep_session_target_all <= 1'b0;
+        prep_session_a_fmt_yenh <= 1'b0;
     end else if (frame_done_pulse) begin
         dma_session_active <= 1'b0;
         dma_rd_word_count <= 18'd0;
         rd_fsync_stretch_cnt <= 6'd0;
         dma_expand_phase <= 1'b0;
+        dma_expand_phase_q_for_prep <= 1'b0;
         mwr_first_beat_seen <= 1'b0;
+        prep_session_en <= 1'b0;
+        prep_session_target_all <= 1'b0;
+        prep_session_a_fmt_yenh <= 1'b0;
     end else begin
+        dma_expand_phase_q_for_prep <= dma_expand_phase;
         if (dma_session_start) begin
             dma_session_active <= 1'b1;
             dma_rd_word_count <= 18'd0;
             rd_fsync_stretch_cnt <= 6'd31;
             dma_expand_phase <= 1'b0;
+            dma_expand_phase_q_for_prep <= 1'b0;
             mwr_first_beat_seen <= 1'b0;
             frame_id <= frame_id + 8'd1;
+            prep_session_en <= prep_active;
+            prep_session_target_all <= prep_target_all;
+            prep_session_a_fmt_yenh <= prep_a_fmt_yenh;
         end else begin
             if (dma_session_active && bar2_addr_step)
                 mwr_first_beat_seen <= 1'b1;
@@ -1200,6 +1220,9 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 if (dma_rd_word_count == frame_words_cfg - 1'b1) begin
                     dma_rd_word_count <= 18'd0;
                     dma_session_active <= 1'b0;
+                    prep_session_en <= 1'b0;
+                    prep_session_target_all <= 1'b0;
+                    prep_session_a_fmt_yenh <= 1'b0;
                 end else begin
                     dma_rd_word_count <= dma_rd_word_count + 18'd1;
                 end

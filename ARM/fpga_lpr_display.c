@@ -5051,6 +5051,7 @@ int main(int argc, char **argv)
             "Start LPR loop: fps=%d src=%s pixel=%s swap16=%s min_car=%.2f min_plate=%.2f plate_only=%d "
             "sw_preproc=%d fpga_a_mask=%d ped_event=%d det_resize=%s plate_refine=%d "
             "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_kernel=%s ocr_pp=%s min_h=%d min_sharp=%.2f min_occ=%.2f show_crop=%d "
+            "prep_session_latched=1 prep_phase_align=1 "
             "prep_profile=%s prep_target=%s prep_params=%s prep_ctrl=0x%08x prep_clahe=0x%08x prep_usm=0x%08x prep_med=0x%08x "
             "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d prep_dump=%s max=%d pred_log=%s\n",
             ctx.opt.fps,
