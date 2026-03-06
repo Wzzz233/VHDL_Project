@@ -49,6 +49,9 @@
 #define BAR1_PREP_USM        0x208
 #define BAR1_PREP_MED        0x20C
 #define BAR1_PREP_STAT       0x210
+#define BAR1_ROI_X1Y1        0x214
+#define BAR1_ROI_X2Y2        0x218
+#define BAR1_ROI_CTRL        0x21C
 
 /* DMA Command Register Bit Fields */
 #define DMA_CMD_LEN_MASK     0x3FF  /* Bits [9:0] - Transfer length in DWORDs minus 1 */

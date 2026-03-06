@@ -103,6 +103,9 @@ struct fpga_dma_dev {
     u32 prep_usm_shadow;
     u32 prep_med_shadow;
     u32 prep_stat_shadow;
+    u32 roi_x1y1_shadow;
+    u32 roi_x2y2_shadow;
+    u32 roi_ctrl_shadow;
 
     /* Device info */
     struct fpga_info info;
@@ -201,6 +204,9 @@ static bool fpga_dma_prep_offset_supported(u32 offset)
     case BAR1_PREP_USM:
     case BAR1_PREP_MED:
     case BAR1_PREP_STAT:
+    case BAR1_ROI_X1Y1:
+    case BAR1_ROI_X2Y2:
+    case BAR1_ROI_CTRL:
         return true;
     default:
         return false;
@@ -220,6 +226,12 @@ static u32 *fpga_dma_prep_shadow_ptr(struct fpga_dma_dev *dev, u32 offset)
         return &dev->prep_med_shadow;
     case BAR1_PREP_STAT:
         return &dev->prep_stat_shadow;
+    case BAR1_ROI_X1Y1:
+        return &dev->roi_x1y1_shadow;
+    case BAR1_ROI_X2Y2:
+        return &dev->roi_x2y2_shadow;
+    case BAR1_ROI_CTRL:
+        return &dev->roi_ctrl_shadow;
     default:
         return NULL;
     }
@@ -646,6 +658,9 @@ static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     dev->prep_usm_shadow = 0x00180610U;   /* gain=1.0 thr=6 limit=24 */
     dev->prep_med_shadow = 0x00000000U;
     dev->prep_stat_shadow = 0x00000000U;
+    dev->roi_x1y1_shadow = 0x00000000U;
+    dev->roi_x2y2_shadow = 0x00000000U;
+    dev->roi_ctrl_shadow = 0x00000000U;
 
     pci_set_drvdata(pdev, dev);
 

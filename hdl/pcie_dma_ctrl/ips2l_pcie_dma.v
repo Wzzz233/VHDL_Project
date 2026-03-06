@@ -83,6 +83,9 @@ module ips2l_pcie_dma #(
     output  wire    [31:0]              o_prep_clahe_ext        ,
     output  wire    [31:0]              o_prep_usm_ext          ,
     output  wire    [31:0]              o_prep_med_ext          ,
+    output  wire    [31:0]              o_roi_x1y1_ext          ,
+    output  wire    [31:0]              o_roi_x2y2_ext          ,
+    output  wire    [31:0]              o_roi_ctrl_ext          ,
     //external BAR2 read data override (for frame data via MWR)
     output  wire                        o_bar2_rd_clk_en_ext    ,
     output  wire    [ADDR_WIDTH-1:0]    o_bar2_rd_addr_ext      ,
@@ -129,6 +132,9 @@ wire        [31:0]              prep_ctrl_cfg;
 wire        [31:0]              prep_clahe_cfg;
 wire        [31:0]              prep_usm_cfg;
 wire        [31:0]              prep_med_cfg;
+wire        [31:0]              roi_x1y1_cfg;
+wire        [31:0]              roi_x2y2_cfg;
+wire        [31:0]              roi_ctrl_cfg;
 
 
 //axis_slave0 interface
@@ -176,6 +182,9 @@ assign o_prep_ctrl_ext      = prep_ctrl_cfg;
 assign o_prep_clahe_ext     = prep_clahe_cfg;
 assign o_prep_usm_ext       = prep_usm_cfg;
 assign o_prep_med_ext       = prep_med_cfg;
+assign o_roi_x1y1_ext       = roi_x1y1_cfg;
+assign o_roi_x2y2_ext       = roi_x2y2_cfg;
+assign o_roi_ctrl_ext       = roi_ctrl_cfg;
 //**********************************************************************
 //rst tlp cnt
 wire                            tx_restart;
@@ -300,6 +309,9 @@ u_ips2l_pcie_dma_controller
     .o_prep_clahe               (prep_clahe_cfg             ),
     .o_prep_usm                 (prep_usm_cfg               ),
     .o_prep_med                 (prep_med_cfg               ),
+    .o_roi_x1y1                 (roi_x1y1_cfg               ),
+    .o_roi_x2y2                 (roi_x2y2_cfg               ),
+    .o_roi_ctrl                 (roi_ctrl_cfg               ),
     //rst tlp cnt
     .i_dma_check_result         (dma_check_result           ),
     .o_tx_restart               (tx_restart                 )

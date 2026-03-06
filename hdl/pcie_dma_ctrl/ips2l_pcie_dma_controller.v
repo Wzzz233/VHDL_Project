@@ -61,7 +61,10 @@ module ips2l_pcie_dma_controller #(
     output  reg     [31:0]              o_prep_ctrl             ,
     output  reg     [31:0]              o_prep_clahe            ,
     output  reg     [31:0]              o_prep_usm              ,
-    output  reg     [31:0]              o_prep_med
+    output  reg     [31:0]              o_prep_med              ,
+    output  reg     [31:0]              o_roi_x1y1              ,
+    output  reg     [31:0]              o_roi_x2y2              ,
+    output  reg     [31:0]              o_roi_ctrl
 
 );
 //apb register for rc
@@ -93,6 +96,9 @@ reg     [31:0]      prep_ctrl_reg;
 reg     [31:0]      prep_clahe_reg;
 reg     [31:0]      prep_usm_reg;
 reg     [31:0]      prep_med_reg;
+reg     [31:0]      roi_x1y1_reg;
+reg     [31:0]      roi_x2y2_reg;
+reg     [31:0]      roi_ctrl_reg;
 
 reg     [31:0]      dma_wr_data;
 
@@ -103,6 +109,9 @@ reg                 prep_ctrl_reg_vld;
 reg                 prep_clahe_reg_vld;
 reg                 prep_usm_reg_vld;
 reg                 prep_med_reg_vld;
+reg                 roi_x1y1_reg_vld;
+reg                 roi_x2y2_reg_vld;
+reg                 roi_ctrl_reg_vld;
 
 reg                 dma_ctrl_cfg_done /*synthesis PAP_MARK_DEBUG="1"*/;
 reg                 dma_l_addr_cfg_done /*synthesis PAP_MARK_DEBUG="1"*/;
@@ -332,6 +341,36 @@ end
 always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
+        roi_x1y1_reg_vld <= 1'b0;
+    else if(roi_x1y1_reg_vld)
+        roi_x1y1_reg_vld <= 1'b0;
+    else
+        roi_x1y1_reg_vld <= |i_bar1_wr_byte_en && i_bar1_wr_en && (i_bar1_wr_addr[11:0] == 12'h214);
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        roi_x2y2_reg_vld <= 1'b0;
+    else if(roi_x2y2_reg_vld)
+        roi_x2y2_reg_vld <= 1'b0;
+    else
+        roi_x2y2_reg_vld <= |i_bar1_wr_byte_en && i_bar1_wr_en && (i_bar1_wr_addr[11:0] == 12'h218);
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        roi_ctrl_reg_vld <= 1'b0;
+    else if(roi_ctrl_reg_vld)
+        roi_ctrl_reg_vld <= 1'b0;
+    else
+        roi_ctrl_reg_vld <= |i_bar1_wr_byte_en && i_bar1_wr_en && (i_bar1_wr_addr[11:0] == 12'h21C);
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
         prep_ctrl_reg <= 32'h00000000;
     else if(prep_ctrl_reg_vld)
         prep_ctrl_reg <= dma_wr_data;
@@ -364,11 +403,38 @@ end
 always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
+        roi_x1y1_reg <= 32'h00000000;
+    else if(roi_x1y1_reg_vld)
+        roi_x1y1_reg <= dma_wr_data;
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        roi_x2y2_reg <= 32'h00000000;
+    else if(roi_x2y2_reg_vld)
+        roi_x2y2_reg <= dma_wr_data;
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        roi_ctrl_reg <= 32'h00000000;
+    else if(roi_ctrl_reg_vld)
+        roi_ctrl_reg <= dma_wr_data;
+end
+
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
     begin
         o_prep_ctrl <= 32'h00000000;
         o_prep_clahe <= 32'hC0300606;
         o_prep_usm <= 32'h00180610;
         o_prep_med <= 32'h00000000;
+        o_roi_x1y1 <= 32'h00000000;
+        o_roi_x2y2 <= 32'h00000000;
+        o_roi_ctrl <= 32'h00000000;
     end
     else
     begin
@@ -376,6 +442,9 @@ begin
         o_prep_clahe <= prep_clahe_reg;
         o_prep_usm <= prep_usm_reg;
         o_prep_med <= prep_med_reg;
+        o_roi_x1y1 <= roi_x1y1_reg;
+        o_roi_x2y2 <= roi_x2y2_reg;
+        o_roi_ctrl <= roi_ctrl_reg;
     end
 end
 

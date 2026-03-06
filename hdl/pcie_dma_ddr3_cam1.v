@@ -186,6 +186,9 @@ wire    [31:0]  fpga_prep_ctrl;
 wire    [31:0]  fpga_prep_clahe;
 wire    [31:0]  fpga_prep_usm;
 wire    [31:0]  fpga_prep_med;
+wire    [31:0]  fpga_roi_x1y1;
+wire    [31:0]  fpga_roi_x2y2;
+wire    [31:0]  fpga_roi_ctrl;
 
 wire			cfg_msi_en;
 wire			ven_msi_grant;
@@ -401,6 +404,9 @@ ips2l_pcie_dma #(
 	.o_prep_clahe_ext		(fpga_prep_clahe),
 	.o_prep_usm_ext			(fpga_prep_usm),
 	.o_prep_med_ext			(fpga_prep_med),
+	.o_roi_x1y1_ext			(fpga_roi_x1y1),
+	.o_roi_x2y2_ext			(fpga_roi_x2y2),
+	.o_roi_ctrl_ext			(fpga_roi_ctrl),
 	// External BAR2 read override for MWR frame data
 	.o_bar2_rd_clk_en_ext	(mwr_rd_clk_en),
 	.o_bar2_rd_addr_ext		(mwr_rd_addr),
@@ -793,6 +799,17 @@ reg  [7:0]                 frame_id;
 reg                        prep_session_en;
 reg                        prep_session_target_all;
 reg                        prep_session_a_fmt_yenh;
+reg                        prep_session_ocr_stroke;
+reg                        roi_session_active;
+reg                        roi_session_left_bias;
+reg  [11:0]                roi_session_x1;
+reg  [11:0]                roi_session_x2;
+reg  [10:0]                roi_session_y1;
+reg  [10:0]                roi_session_y2;
+reg  [7:0]                 roi_timeout_count;
+reg  [31:0]                roi_cfg_seen_x1y1;
+reg  [31:0]                roi_cfg_seen_x2y2;
+reg  [31:0]                roi_cfg_seen_ctrl;
 wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
 wire                       dma_expand_mode = DMA_OUTPUT_BGRX;
@@ -803,11 +820,24 @@ wire                       prep_clahe_en = fpga_prep_ctrl[3];
 wire                       prep_usm_en = fpga_prep_ctrl[4];
 wire                       prep_target_ocr_only = fpga_prep_ctrl[5];
 wire                       prep_a_fmt_yenh = fpga_prep_ctrl[6];
+wire                       prep_ocr_stroke_mode = fpga_prep_ctrl[7];
 wire                       prep_active = preproc_en & ~prep_bypass;
 wire                       prep_target_all = prep_active & ~prep_target_ocr_only;
 wire                       prep_active_latched = prep_session_en;
 wire                       prep_target_all_latched = prep_session_target_all;
 wire                       prep_a_fmt_yenh_latched = prep_session_a_fmt_yenh;
+wire                       prep_ocr_stroke_latched = prep_session_ocr_stroke;
+wire                       roi_cfg_enable = fpga_roi_ctrl[0];
+wire                       roi_cfg_left_bias = fpga_roi_ctrl[1];
+wire [7:0]                 roi_cfg_timeout_frames = (fpga_roi_ctrl[15:8] != 8'd0) ? fpga_roi_ctrl[15:8] : 8'd3;
+wire [11:0]                roi_cfg_x1 = fpga_roi_x1y1[11:0];
+wire [11:0]                roi_cfg_x2 = fpga_roi_x2y2[11:0];
+wire [10:0]                roi_cfg_y1 = fpga_roi_x1y1[26:16];
+wire [10:0]                roi_cfg_y2 = fpga_roi_x2y2[26:16];
+wire                       roi_cfg_bbox_valid = (roi_cfg_x2 >= roi_cfg_x1) && (roi_cfg_y2 >= roi_cfg_y1);
+wire                       roi_cfg_changed = (fpga_roi_x1y1 != roi_cfg_seen_x1y1) ||
+                                            (fpga_roi_x2y2 != roi_cfg_seen_x2y2) ||
+                                            (fpga_roi_ctrl != roi_cfg_seen_ctrl);
 wire [17:0]                frame_words_cfg = dma_expand_mode ? FRAME_WORDS_BGRX : FRAME_WORDS_565;
 // Count chunk first beat as a valid step to prevent boundary phase slip.
 wire                       bar2_addr_step = mwr_rd_clk_en &&
@@ -905,6 +935,71 @@ begin
 end
 endfunction
 
+function [7:0] max3_u8;
+    input [7:0] a;
+    input [7:0] b;
+    input [7:0] c;
+    reg [7:0] t;
+begin
+    t = (a >= b) ? a : b;
+    max3_u8 = (t >= c) ? t : c;
+end
+endfunction
+
+function [7:0] min3_u8;
+    input [7:0] a;
+    input [7:0] b;
+    input [7:0] c;
+    reg [7:0] t;
+begin
+    t = (a <= b) ? a : b;
+    min3_u8 = (t <= c) ? t : c;
+end
+endfunction
+
+function [7:0] median3_u8;
+    input [7:0] a;
+    input [7:0] b;
+    input [7:0] c;
+begin
+    if ((a >= b && a <= c) || (a <= b && a >= c))
+        median3_u8 = a;
+    else if ((b >= a && b <= c) || (b <= a && b >= c))
+        median3_u8 = b;
+    else
+        median3_u8 = c;
+end
+endfunction
+
+function [1:0] roi_boost_mode_xy;
+    input [11:0] x;
+    input [10:0] y;
+    input        active;
+    input        left_bias;
+    input [11:0] x1;
+    input [10:0] y1;
+    input [11:0] x2;
+    input [10:0] y2;
+    integer roi_w;
+    integer left_w;
+    integer left_x2;
+begin
+    roi_boost_mode_xy = 2'd0;
+    if (active && (x >= x1) && (x <= x2) && (y >= y1) && (y <= y2)) begin
+        roi_boost_mode_xy = 2'd1;
+        if (left_bias) begin
+            roi_w = ({20'd0, x2} - {20'd0, x1}) + 1;
+            left_w = (roi_w * 28 + 99) / 100;
+            if (left_w < 1)
+                left_w = 1;
+            left_x2 = x1 + left_w - 1;
+            if (x <= left_x2[11:0])
+                roi_boost_mode_xy = 2'd2;
+        end
+    end
+end
+endfunction
+
 function [23:0] rgb24_from_bgr565;
     input [15:0] pix565;
     reg [7:0] r8;
@@ -931,6 +1026,8 @@ function [7:0] aiisp_enhance_y;
     input        en_median;
     input        en_clahe;
     input        en_usm;
+    input        ocr_stroke_mode;
+    input [1:0]  roi_boost_mode;
     input [31:0] clahe_cfg;
     input [31:0] usm_cfg;
     input [31:0] med_cfg;
@@ -939,7 +1036,10 @@ function [7:0] aiisp_enhance_y;
     reg [7:0] b8;
     reg [7:0] y_cur;
     integer avg_rgb;
+    integer median_rgb;
+    integer local_grad;
     integer noise_gate;
+    integer grad_gate;
     integer strength;
     integer clip_span;
     integer delta;
@@ -958,42 +1058,116 @@ begin
     b8 = rgb24[7:0];
     y_cur = luma_from_rgb888(r8, g8, b8);
     avg_rgb = (r8 + g8 + b8) / 3;
+    median_rgb = median3_u8(r8, g8, b8);
+    local_grad = max3_u8(r8, g8, b8) - min3_u8(r8, g8, b8);
 
-    if (en_median) begin
-        noise_gate = med_cfg[7:0];
-        if (noise_gate < 1)
-            noise_gate = 12;
-        if (absdiff8(y_cur, avg_rgb[7:0]) > noise_gate[7:0])
-            y_cur = (y_cur + avg_rgb[7:0]) >> 1;
-    end
+    if (ocr_stroke_mode) begin
+        if (en_median) begin
+            noise_gate = med_cfg[7:0];
+            grad_gate = med_cfg[15:8];
+            if (noise_gate < 1)
+                noise_gate = 12;
+            if (grad_gate < 1)
+                grad_gate = 18;
+            if ((absdiff8(y_cur, median_rgb[7:0]) >= noise_gate[7:0]) &&
+                (local_grad <= grad_gate))
+                y_cur = median_rgb[7:0];
+        end
 
-    if (en_clahe) begin
-        strength = clahe_cfg[31:24];
-        clip_span = clahe_cfg[23:16];
-        if (clip_span < 1)
-            clip_span = 24;
-        delta = $signed({1'b0, y_cur}) - 128;
-        gain_q8 = 256 + strength;
-        y_tmp = 128 + ((delta * gain_q8) >>> 8);
-        clip_min = $signed({1'b0, y_cur}) - clip_span;
-        clip_max = $signed({1'b0, y_cur}) + clip_span;
-        if (y_tmp < clip_min)
-            y_tmp = clip_min;
-        if (y_tmp > clip_max)
-            y_tmp = clip_max;
-        y_cur = clamp_u8_int(y_tmp);
-    end
+        if (en_clahe) begin
+            strength = clahe_cfg[31:24];
+            clip_span = clahe_cfg[23:16];
+            if (clip_span < 1)
+                clip_span = 16;
+            if (roi_boost_mode == 2'd1) begin
+                strength = strength + 24;
+                clip_span = clip_span + 2;
+            end else if (roi_boost_mode == 2'd2) begin
+                strength = strength + 40;
+                clip_span = clip_span + 4;
+            end
+            if (strength > 255)
+                strength = 255;
+            if (clip_span > 255)
+                clip_span = 255;
+            delta = $signed({1'b0, y_cur}) - 128;
+            gain_q8 = 256 + strength;
+            y_tmp = 128 + ((delta * gain_q8) >>> 8);
+            clip_min = $signed({1'b0, y_cur}) - clip_span;
+            clip_max = $signed({1'b0, y_cur}) + clip_span;
+            if (y_tmp < clip_min)
+                y_tmp = clip_min;
+            if (y_tmp > clip_max)
+                y_tmp = clip_max;
+            y_cur = clamp_u8_int(y_tmp);
+        end
 
-    if (en_usm) begin
-        usm_gain_q4_4 = usm_cfg[7:0];
-        usm_thr = usm_cfg[15:8];
-        usm_limit = usm_cfg[23:16];
-        edge_mag = absdiff8(y_cur, avg_rgb[7:0]);
-        if (edge_mag >= usm_thr) begin
-            boost = ((edge_mag - usm_thr) * usm_gain_q4_4) >>> 4;
-            if (boost > usm_limit)
-                boost = usm_limit;
-            y_cur = clamp_u8_int($signed({1'b0, y_cur}) + boost);
+        if (en_usm) begin
+            usm_gain_q4_4 = usm_cfg[7:0];
+            usm_thr = usm_cfg[15:8];
+            usm_limit = usm_cfg[23:16];
+            if (usm_thr < 1)
+                usm_thr = 3;
+            if (roi_boost_mode == 2'd1) begin
+                usm_gain_q4_4 = usm_gain_q4_4 + (usm_gain_q4_4 >>> 2);
+                usm_limit = usm_limit + 2;
+                if (usm_thr > 1)
+                    usm_thr = usm_thr - 1;
+            end else if (roi_boost_mode == 2'd2) begin
+                usm_gain_q4_4 = usm_gain_q4_4 + (usm_gain_q4_4 >>> 1);
+                usm_limit = usm_limit + 4;
+                if (usm_thr > 2)
+                    usm_thr = usm_thr - 2;
+                else
+                    usm_thr = 1;
+            end
+            if (usm_limit > 255)
+                usm_limit = 255;
+            edge_mag = absdiff8(y_cur, median_rgb[7:0]) + (local_grad >>> 1);
+            if (edge_mag >= usm_thr) begin
+                boost = ((edge_mag - usm_thr) * usm_gain_q4_4) >>> 4;
+                if (boost > usm_limit)
+                    boost = usm_limit;
+                y_cur = clamp_u8_int($signed({1'b0, y_cur}) + boost);
+            end
+        end
+    end else begin
+        if (en_median) begin
+            noise_gate = med_cfg[7:0];
+            if (noise_gate < 1)
+                noise_gate = 12;
+            if (absdiff8(y_cur, avg_rgb[7:0]) > noise_gate[7:0])
+                y_cur = (y_cur + avg_rgb[7:0]) >> 1;
+        end
+
+        if (en_clahe) begin
+            strength = clahe_cfg[31:24];
+            clip_span = clahe_cfg[23:16];
+            if (clip_span < 1)
+                clip_span = 24;
+            delta = $signed({1'b0, y_cur}) - 128;
+            gain_q8 = 256 + strength;
+            y_tmp = 128 + ((delta * gain_q8) >>> 8);
+            clip_min = $signed({1'b0, y_cur}) - clip_span;
+            clip_max = $signed({1'b0, y_cur}) + clip_span;
+            if (y_tmp < clip_min)
+                y_tmp = clip_min;
+            if (y_tmp > clip_max)
+                y_tmp = clip_max;
+            y_cur = clamp_u8_int(y_tmp);
+        end
+
+        if (en_usm) begin
+            usm_gain_q4_4 = usm_cfg[7:0];
+            usm_thr = usm_cfg[15:8];
+            usm_limit = usm_cfg[23:16];
+            edge_mag = absdiff8(y_cur, avg_rgb[7:0]);
+            if (edge_mag >= usm_thr) begin
+                boost = ((edge_mag - usm_thr) * usm_gain_q4_4) >>> 4;
+                if (boost > usm_limit)
+                    boost = usm_limit;
+                y_cur = clamp_u8_int($signed({1'b0, y_cur}) + boost);
+            end
         end
     end
     aiisp_enhance_y = y_cur;
@@ -1090,21 +1264,42 @@ wire [127:0] raw_frame_rd_hold_bgrx_hi = pack_4pix_bgrx(
     frame_rd_data_hold[79:64], frame_rd_data_hold[95:80], frame_rd_data_hold[111:96], frame_rd_data_hold[127:112],
     8'h00, 8'h00, 8'h00, 8'h00);
 
+wire [1:0] prep_roi_mode_0 = roi_boost_mode_xy(post_ddr_x_pix + 12'd0, {1'b0, post_ddr_line_y},
+                                               roi_session_active, roi_session_left_bias,
+                                               roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
+wire [1:0] prep_roi_mode_1 = roi_boost_mode_xy(post_ddr_x_pix + 12'd1, {1'b0, post_ddr_line_y},
+                                               roi_session_active, roi_session_left_bias,
+                                               roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
+wire [1:0] prep_roi_mode_2 = roi_boost_mode_xy(post_ddr_x_pix + 12'd2, {1'b0, post_ddr_line_y},
+                                               roi_session_active, roi_session_left_bias,
+                                               roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
+wire [1:0] prep_roi_mode_3 = roi_boost_mode_xy(post_ddr_x_pix + 12'd3, {1'b0, post_ddr_line_y},
+                                               roi_session_active, roi_session_left_bias,
+                                               roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
+
 wire [7:0] prep_y_lo_0 = aiisp_enhance_y(rgb_lo_0, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         prep_ocr_stroke_latched, prep_roi_mode_0,
                                          fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
 wire [7:0] prep_y_lo_1 = aiisp_enhance_y(rgb_lo_1, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         prep_ocr_stroke_latched, prep_roi_mode_1,
                                          fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
 wire [7:0] prep_y_lo_2 = aiisp_enhance_y(rgb_lo_2, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         prep_ocr_stroke_latched, prep_roi_mode_2,
                                          fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
 wire [7:0] prep_y_lo_3 = aiisp_enhance_y(rgb_lo_3, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         prep_ocr_stroke_latched, prep_roi_mode_3,
                                          fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
 wire [7:0] prep_y_hi_0 = aiisp_enhance_y(rgb_hi_0, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         prep_ocr_stroke_latched, prep_roi_mode_0,
                                          fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
 wire [7:0] prep_y_hi_1 = aiisp_enhance_y(rgb_hi_1, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         prep_ocr_stroke_latched, prep_roi_mode_1,
                                          fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
 wire [7:0] prep_y_hi_2 = aiisp_enhance_y(rgb_hi_2, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         prep_ocr_stroke_latched, prep_roi_mode_2,
                                          fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
 wire [7:0] prep_y_hi_3 = aiisp_enhance_y(rgb_hi_3, prep_median_en, prep_clahe_en, prep_usm_en,
+                                         prep_ocr_stroke_latched, prep_roi_mode_3,
                                          fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
 
 wire [23:0] prep_rgb_lo_0 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_0, prep_y_lo_0) : rgb_lo_0;
@@ -1200,6 +1395,17 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_session_en <= 1'b0;
         prep_session_target_all <= 1'b0;
         prep_session_a_fmt_yenh <= 1'b0;
+        prep_session_ocr_stroke <= 1'b0;
+        roi_session_active <= 1'b0;
+        roi_session_left_bias <= 1'b0;
+        roi_session_x1 <= 12'd0;
+        roi_session_x2 <= 12'd0;
+        roi_session_y1 <= 11'd0;
+        roi_session_y2 <= 11'd0;
+        roi_timeout_count <= 8'd0;
+        roi_cfg_seen_x1y1 <= 32'd0;
+        roi_cfg_seen_x2y2 <= 32'd0;
+        roi_cfg_seen_ctrl <= 32'd0;
     end else if (frame_done_pulse) begin
         dma_session_active <= 1'b0;
         dma_rd_word_count <= 18'd0;
@@ -1210,6 +1416,9 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_session_en <= 1'b0;
         prep_session_target_all <= 1'b0;
         prep_session_a_fmt_yenh <= 1'b0;
+        prep_session_ocr_stroke <= 1'b0;
+        roi_session_active <= 1'b0;
+        roi_session_left_bias <= 1'b0;
     end else begin
         dma_expand_phase_q_for_prep <= dma_expand_phase;
         if (dma_session_start) begin
@@ -1223,6 +1432,40 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             prep_session_en <= prep_active;
             prep_session_target_all <= prep_target_all;
             prep_session_a_fmt_yenh <= prep_a_fmt_yenh;
+            prep_session_ocr_stroke <= prep_ocr_stroke_mode;
+            roi_cfg_seen_x1y1 <= fpga_roi_x1y1;
+            roi_cfg_seen_x2y2 <= fpga_roi_x2y2;
+            roi_cfg_seen_ctrl <= fpga_roi_ctrl;
+            if (prep_active && prep_ocr_stroke_mode && prep_target_ocr_only) begin
+                if (roi_cfg_changed) begin
+                    if (roi_cfg_enable && roi_cfg_bbox_valid) begin
+                        roi_session_active <= 1'b1;
+                        roi_session_left_bias <= roi_cfg_left_bias;
+                        roi_session_x1 <= roi_cfg_x1;
+                        roi_session_x2 <= roi_cfg_x2;
+                        roi_session_y1 <= roi_cfg_y1;
+                        roi_session_y2 <= roi_cfg_y2;
+                        roi_timeout_count <= roi_cfg_timeout_frames;
+                    end else begin
+                        roi_session_active <= 1'b0;
+                        roi_session_left_bias <= 1'b0;
+                        roi_timeout_count <= 8'd0;
+                    end
+                end else if (roi_session_active) begin
+                    if (roi_timeout_count != 8'd0)
+                        roi_timeout_count <= roi_timeout_count - 8'd1;
+                    else begin
+                        roi_session_active <= 1'b0;
+                        roi_session_left_bias <= 1'b0;
+                    end
+                end else begin
+                    roi_timeout_count <= 8'd0;
+                end
+            end else begin
+                roi_session_active <= 1'b0;
+                roi_session_left_bias <= 1'b0;
+                roi_timeout_count <= 8'd0;
+            end
         end else begin
             if (dma_session_active && bar2_addr_step)
                 mwr_first_beat_seen <= 1'b1;
@@ -1234,6 +1477,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                     prep_session_en <= 1'b0;
                     prep_session_target_all <= 1'b0;
                     prep_session_a_fmt_yenh <= 1'b0;
+                    prep_session_ocr_stroke <= 1'b0;
                 end else begin
                     dma_rd_word_count <= dma_rd_word_count + 18'd1;
                 end
