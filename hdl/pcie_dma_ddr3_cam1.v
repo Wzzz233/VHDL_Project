@@ -1139,26 +1139,39 @@ wire [127:0] prep_frame_rd_hold_bgrx_hi_c = pack_4rgb_bgrx(
 
 reg  [127:0] prep_frame_rd_data_bgrx_lo_q;
 reg  [127:0] prep_frame_rd_hold_bgrx_hi_q;
+reg          prep_pipe_valid;
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
         prep_frame_rd_data_bgrx_lo_q <= 128'd0;
         prep_frame_rd_hold_bgrx_hi_q <= 128'd0;
+        prep_pipe_valid <= 1'b0;
+    end else if (frame_done_pulse || dma_session_start) begin
+        prep_frame_rd_data_bgrx_lo_q <= 128'd0;
+        prep_frame_rd_hold_bgrx_hi_q <= 128'd0;
+        prep_pipe_valid <= 1'b0;
     end else begin
-        prep_frame_rd_data_bgrx_lo_q <= prep_frame_rd_data_bgrx_lo_c;
-        prep_frame_rd_hold_bgrx_hi_q <= prep_frame_rd_hold_bgrx_hi_c;
+        if (frame_rd_fetch_en) begin
+            prep_frame_rd_data_bgrx_lo_q <= prep_frame_rd_data_bgrx_lo_c;
+            prep_pipe_valid <= 1'b1;
+        end
+        if (dma_expand_mode && dma_session_active && bar2_addr_step && dma_expand_phase)
+            prep_frame_rd_hold_bgrx_hi_q <= prep_frame_rd_hold_bgrx_hi_c;
     end
 end
 
 wire [127:0] frame_dma_data_raw = dma_expand_phase ? raw_frame_rd_hold_bgrx_hi : raw_frame_rd_data_bgrx_lo;
 wire [127:0] frame_dma_data_prep = dma_expand_phase_q_for_prep ? prep_frame_rd_hold_bgrx_hi_q : prep_frame_rd_data_bgrx_lo_q;
+wire        prep_output_active = prep_active_latched & prep_pipe_valid;
 wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
 wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data, prep_active_latched ? 8'h80 : 8'h00)}};
 wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
 wire [127:0] frame_dma_data = dma_expand_mode
-    ? (prep_active_latched ? frame_dma_data_prep : frame_dma_data_raw)
+    ? (prep_output_active ? frame_dma_data_prep : frame_dma_data_raw)
     : frame_rd_data;
-wire        frame_stream_ready = ~dma_session_active | ~mwr_first_beat_seen | frame_rd_data_ready;
+wire        frame_stream_ready = ~dma_session_active |
+                                 ~mwr_first_beat_seen |
+                                 (frame_rd_data_ready & (~prep_active_latched | prep_pipe_valid));
 
 assign axis_slave2_tready_fc = axis_slave2_tready_raw & frame_stream_ready;
 
