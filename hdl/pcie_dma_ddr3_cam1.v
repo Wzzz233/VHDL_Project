@@ -981,19 +981,19 @@ function [1:0] roi_boost_mode_xy;
     input [11:0] x2;
     input [10:0] y2;
     integer roi_w;
-    integer left_w;
-    integer left_x2;
+    integer x_rel;
+    integer roi_w_mul28;
+    integer x_rel_mul100;
 begin
     roi_boost_mode_xy = 2'd0;
     if (active && (x >= x1) && (x <= x2) && (y >= y1) && (y <= y2)) begin
         roi_boost_mode_xy = 2'd1;
         if (left_bias) begin
             roi_w = ({20'd0, x2} - {20'd0, x1}) + 1;
-            left_w = (roi_w * 28 + 99) / 100;
-            if (left_w < 1)
-                left_w = 1;
-            left_x2 = x1 + left_w - 1;
-            if (x <= left_x2[11:0])
+            x_rel = ({20'd0, x} - {20'd0, x1}) + 1;
+            roi_w_mul28 = (roi_w << 4) + (roi_w << 3) + (roi_w << 2);
+            x_rel_mul100 = (x_rel << 6) + (x_rel << 5) + (x_rel << 2);
+            if (x_rel_mul100 <= roi_w_mul28)
                 roi_boost_mode_xy = 2'd2;
         end
     end
