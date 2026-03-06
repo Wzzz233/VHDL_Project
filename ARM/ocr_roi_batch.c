@@ -138,7 +138,14 @@ static int find_col(char **fields, int n, const char *name)
 {
     int i;
     for (i = 0; i < n; i++) {
-        if (fields[i] && strcmp(fields[i], name) == 0)
+        char *s;
+        if (!fields[i])
+            continue;
+        s = fields[i];
+        s[strcspn(s, "\r\n")] = '\0';
+        while (*s == ' ' || *s == '\t')
+            s++;
+        if (strcmp(s, name) == 0)
             return i;
     }
     return -1;
