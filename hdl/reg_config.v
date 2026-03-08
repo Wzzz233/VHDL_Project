@@ -364,7 +364,7 @@ always@(reg_index)
      352  :reg_data <=24'h460c20 ;//          
 	 353  :reg_data <=24'h483716 ;//         
 	 354  :reg_data <=24'h382404 ;//         
-	 355  :reg_data <=24'h500183 ;//         
+	 355  :reg_data <=24'h500187 ;//         
 	 356  :reg_data <=24'h350300 ;//         
      357  :reg_data <= SENSOR_TEST_PATTERN_EN ? 24'h503D80 : 24'h503D00 ;// OV5640 test pattern on/off
 	 default:reg_data<=24'hffffff;//        
