@@ -50,6 +50,10 @@
 	 localparam [8:0] REG_INDEX_RESUME       = 9'd102;
 	 localparam [8:0] REG_INDEX_LAST         = 9'd357;
 	 localparam [15:0] POST_RESET_WAIT_CYCLES = 16'd4200;
+	 localparam [1:0] OV5640_NOISE_PRESET_REF                = 2'd0;
+	 localparam [1:0] OV5640_NOISE_PRESET_LOW_NOISE_BALANCED = 2'd1;
+	 localparam [1:0] OV5640_NOISE_PRESET_LOW_NOISE_DISPLAY  = 2'd2;
+	 localparam [1:0] OV5640_NOISE_PRESET                    = OV5640_NOISE_PRESET_LOW_NOISE_BALANCED;
 
 	 function [8:0] next_reg_index;
 		input [8:0] curr_index;
@@ -190,7 +194,8 @@ always@(reg_index)
 	 129  :reg_data  <=24'h471c50 ;//       
 	 130  :reg_data  <=24'h3a1343 ;//       
 	 131  :reg_data  <=24'h3a1800 ;//       
-	 132  :reg_data  <=24'h3a19f8 ;//       
+	 132  :reg_data  <= (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_DISPLAY)  ? 24'h3a1960 :
+	                    (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_BALANCED) ? 24'h3a1980 : 24'h3a19f8 ;//
 	 133  :reg_data  <=24'h363513 ;//       
 	 134  :reg_data  <=24'h363603 ;//       
 	 135  :reg_data  <=24'h363440 ;//       
@@ -352,18 +357,27 @@ always@(reg_index)
 	 291  :reg_data <=24'h558a00 ;//        
 	 292  :reg_data <=24'h558bf8 ;//        
 	 293  :reg_data <=24'h501d40 ;//        
-	 294  :reg_data <=24'h530008 ;//        
-	 295  :reg_data <=24'h530130 ;//        
-	 296  :reg_data <=24'h530210 ;//        
+	 294  :reg_data <= (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_DISPLAY)  ? 24'h530018 :
+	                    (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_BALANCED) ? 24'h530010 : 24'h530008 ;//
+	 295  :reg_data <= (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_DISPLAY)  ? 24'h530118 :
+	                    (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_BALANCED) ? 24'h530120 : 24'h530130 ;//
+	 296  :reg_data <= (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_DISPLAY)  ? 24'h530204 :
+	                    (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_BALANCED) ? 24'h530208 : 24'h530210 ;//
 	 297  :reg_data <=24'h530300 ;//        
-	 298  :reg_data <=24'h530408 ;//        
-	 299  :reg_data <=24'h530530 ;//        
-	 300  :reg_data <=24'h530608 ;//        
-	 301  :reg_data <=24'h530716 ;//        
-	 302  :reg_data <=24'h530908 ;//        
-	 303  :reg_data <=24'h530a30 ;//        
-	 304  :reg_data <=24'h530b04 ;//        
-	 305  :reg_data <=24'h530c06 ;//        
+	 298  :reg_data <=24'h530410 ;//
+	 299  :reg_data <= (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_DISPLAY)  ? 24'h530550 :
+	                    (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_BALANCED) ? 24'h530540 : 24'h530530 ;//
+	 300  :reg_data <=24'h530610 ;//
+	 301  :reg_data <= (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_DISPLAY)  ? 24'h530724 :
+	                    (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_BALANCED) ? 24'h530720 : 24'h530716 ;//
+	 302  :reg_data <= (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_DISPLAY)  ? 24'h530918 :
+	                    (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_BALANCED) ? 24'h530910 : 24'h530908 ;//
+	 303  :reg_data <= (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_DISPLAY)  ? 24'h530a18 :
+	                    (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_BALANCED) ? 24'h530a20 : 24'h530a30 ;//
+	 304  :reg_data <= (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_DISPLAY)  ? 24'h530b01 :
+	                    (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_BALANCED) ? 24'h530b02 : 24'h530b04 ;//
+	 305  :reg_data <= (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_DISPLAY)  ? 24'h530c02 :
+	                    (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_BALANCED) ? 24'h530c04 : 24'h530c06 ;//
 	 306  :reg_data <=24'h502500 ;//        
 	 307  :reg_data <=24'h300802 ;//       
   //720 30帧/秒, night mode 5fps ;//

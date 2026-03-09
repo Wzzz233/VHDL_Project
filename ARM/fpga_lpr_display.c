@@ -125,6 +125,7 @@ enum fpga_preproc_profile {
     FPGA_PREP_PROFILE_RAW = 0,
     FPGA_PREP_PROFILE_CLAHE,
     FPGA_PREP_PROFILE_CLAHE_USM,
+    FPGA_PREP_PROFILE_MEDIAN,
     FPGA_PREP_PROFILE_MEDIAN_CLAHE_USM,
     FPGA_PREP_PROFILE_OCR_STROKE,
 };
@@ -545,7 +546,7 @@ static void print_usage(const char *prog)
             "  --plate-only <0|1>      Disable vehicle dependency for plate output (default: 1)\n"
             "  --sw-preproc <0|1>      Enable software preproc A/B path (default: 0)\n"
             "  --fpga-a-mask <0|1>     Enable FPGA A-channel ROI fusion (default: 0)\n"
-            "  --fpga-preproc-profile <m>  raw|clahe|clahe_usm|median_clahe_usm|ocr_stroke (default: ocr_stroke)\n"
+            "  --fpga-preproc-profile <m>  raw|clahe|clahe_usm|median|median_clahe_usm|ocr_stroke (default: ocr_stroke)\n"
             "  --fpga-preproc-target <m>   ocr|all (default: ocr)\n"
             "  --fpga-a-format <m>         flags|yenh (default: yenh)\n"
             "  --fpga-clahe <cfg>          tile=32x32,clip=16,strength=128\n"
@@ -730,6 +731,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
                 opt->fpga_preproc_profile = FPGA_PREP_PROFILE_CLAHE;
             else if (strcmp(optarg, "clahe_usm") == 0)
                 opt->fpga_preproc_profile = FPGA_PREP_PROFILE_CLAHE_USM;
+            else if (strcmp(optarg, "median") == 0)
+                opt->fpga_preproc_profile = FPGA_PREP_PROFILE_MEDIAN;
             else if (strcmp(optarg, "median_clahe_usm") == 0)
                 opt->fpga_preproc_profile = FPGA_PREP_PROFILE_MEDIAN_CLAHE_USM;
             else if (strcmp(optarg, "ocr_stroke") == 0)
@@ -1495,7 +1498,8 @@ static int apply_fpga_preproc_cfg(struct app_ctx *ctx)
         ctrl |= FPGA_PREP_CTRL_BYPASS;
     } else {
         ctrl |= FPGA_PREP_CTRL_ENABLE;
-        if (profile == FPGA_PREP_PROFILE_MEDIAN_CLAHE_USM ||
+        if (profile == FPGA_PREP_PROFILE_MEDIAN ||
+            profile == FPGA_PREP_PROFILE_MEDIAN_CLAHE_USM ||
             profile == FPGA_PREP_PROFILE_OCR_STROKE)
             ctrl |= FPGA_PREP_CTRL_MEDIAN;
         if (profile == FPGA_PREP_PROFILE_CLAHE ||
@@ -3924,6 +3928,7 @@ static const char *fpga_preproc_profile_str(int mode)
 {
     if (mode == FPGA_PREP_PROFILE_CLAHE) return "clahe";
     if (mode == FPGA_PREP_PROFILE_CLAHE_USM) return "clahe_usm";
+    if (mode == FPGA_PREP_PROFILE_MEDIAN) return "median";
     if (mode == FPGA_PREP_PROFILE_MEDIAN_CLAHE_USM) return "median_clahe_usm";
     if (mode == FPGA_PREP_PROFILE_OCR_STROKE) return "ocr_stroke";
     return "raw";

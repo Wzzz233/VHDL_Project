@@ -82,7 +82,7 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --plate-only <0|1>         Disable vehicle dependency for plate output (default: ${PLATE_ONLY})
   --sw-preproc <0|1>         Enable software preproc A/B path (default: ${SW_PREPROC})
   --fpga-a-mask <0|1>        Enable FPGA A-channel ROI fusion (default: ${FPGA_A_MASK})
-  --fpga-preproc-profile <m> raw|clahe|clahe_usm|median_clahe_usm|ocr_stroke (default: ${FPGA_PREPROC_PROFILE})
+  --fpga-preproc-profile <m> raw|clahe|clahe_usm|median|median_clahe_usm|ocr_stroke (default: ${FPGA_PREPROC_PROFILE})
   --fpga-preproc-target <m>  ocr|all (default: ${FPGA_PREPROC_TARGET})
   --fpga-a-format <m>        flags|yenh (default: ${FPGA_A_FORMAT})
   --fpga-clahe <cfg>         tile=32x32,clip=16,strength=128 (default: ${FPGA_CLAHE})
