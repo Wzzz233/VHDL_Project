@@ -33,7 +33,7 @@
 	  );
 
      reg [15:0]clock_20k_cnt;
-     reg [7:0]post_reset_wait_cnt;
+     reg [15:0]post_reset_wait_cnt;
      reg [1:0]config_step;	  
      reg [31:0]i2c_data;
      reg [23:0]reg_data;
@@ -46,7 +46,7 @@
 	 localparam [8:0] REG_INDEX_SOFT_RESET   = 9'd1;
 	 localparam [8:0] REG_INDEX_RESUME       = 9'd102;
 	 localparam [8:0] REG_INDEX_LAST         = 9'd357;
-	 localparam [7:0] POST_RESET_WAIT_CYCLES = 8'd100;
+	 localparam [15:0] POST_RESET_WAIT_CYCLES = 16'd4200;
 
 	 function [8:0] next_reg_index;
 		input [8:0] curr_index;
