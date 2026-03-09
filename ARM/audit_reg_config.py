@@ -5,7 +5,7 @@ Phase S blocker audit for OV5640 register init table.
 Checks:
 1) Register-index continuity vs state-machine traversal.
 2) Duplicate writes and key-register final values.
-3) Risk markers: default 0xFFFFFF write path and unused initial_en gate.
+3) Risk markers: unsafe default write path, unused initial_en gate, and ignored ACK.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from typing import Dict, List, Tuple
 
 ENTRY_RE = re.compile(r"(\d+)\s*:\s*reg_data\s*<=\s*24'h([0-9a-fA-F]{6})")
 LIMIT_RE = re.compile(r"if\s*\(\s*reg_index\s*<\s*(\d+)\s*\)")
+LAST_INDEX_RE = re.compile(r"REG_INDEX_LAST\s*=\s*9'd(\d+)")
 
 
 @dataclass
@@ -55,8 +56,23 @@ def parse_entries(text: str) -> List[Entry]:
 def detect_reg_limit(text: str) -> int:
     m = LIMIT_RE.search(text)
     if not m:
-        return -1
+        m = LAST_INDEX_RE.search(text)
+        if not m:
+            return -1
+        return int(m.group(1)) + 1
     return int(m.group(1))
+
+
+def detect_sparse_table_safety(text: str) -> bool:
+    normalized = text.replace(" ", "").replace("\t", "")
+    required_tokens = [
+        "function[8:0]next_reg_index",
+        "REG_INDEX_SOFT_RESET:next_reg_index=REG_INDEX_RESUME",
+        "if((initial_en==1'b1)&&(reg_conf_done_reg==1'b0))",
+        "if(!ack)",
+        "default:reg_data<=24'h000000",
+    ]
+    return all(token in normalized for token in required_tokens)
 
 
 def summarize(entries: List[Entry], reg_limit: int, text: str) -> Tuple[bool, List[str]]:
@@ -76,12 +92,19 @@ def summarize(entries: List[Entry], reg_limit: int, text: str) -> Tuple[bool, Li
         expected = list(range(idx_min, idx_max + 1))
 
     missing = [i for i in expected if i not in present]
+    sparse_table_safe = detect_sparse_table_safety(text)
     if missing:
-        trusted = False
-        findings.append(
-            f"Missing table indices: {len(missing)} (first 20: {missing[:20]}). "
-            "State machine still traverses full range."
-        )
+        if sparse_table_safe:
+            findings.append(
+                f"Sparse table indices: {len(missing)} (first 20: {missing[:20]}). "
+                "Sequencer explicitly skips the hole and avoids default writes."
+            )
+        else:
+            trusted = False
+            findings.append(
+                f"Missing table indices: {len(missing)} (first 20: {missing[:20]}). "
+                "State machine still traverses full range."
+            )
 
     default_ffff = "default:reg_data<=24'hffffff" in text.replace(" ", "").lower()
     if default_ffff and missing:
@@ -170,4 +193,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
