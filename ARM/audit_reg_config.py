@@ -69,6 +69,7 @@ def detect_sparse_table_safety(text: str) -> bool:
         "function[8:0]next_reg_index",
         "REG_INDEX_SOFT_RESET:next_reg_index=REG_INDEX_RESUME",
         "if((initial_en==1'b1)&&(reg_conf_done_reg==1'b0))",
+        "if(!ack)",
         "default:reg_data<=24'h000000",
     ]
     return all(token in normalized for token in required_tokens)

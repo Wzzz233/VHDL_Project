@@ -101,7 +101,6 @@ begin
 		 reg_conf_done_reg<=0;
    end
    else begin
-	  start<=0;
       if((initial_en==1'b1) && (reg_conf_done_reg==1'b0)) begin          //婵″倹鐏塩amera閸掓繂顫愰崠鏍ㄦ弓鐎瑰本鍨?
 			  if(reg_index<=REG_INDEX_LAST) begin               //闁板秶鐤嗙€靛嫬鐡ㄩ崳?
 				 case(config_step)
@@ -123,6 +122,7 @@ begin
 							ack_fail_first_index<=reg_index;
 						ack_fail_count<=ack_fail_count+1'b1;
 					end
+					if(!ack) begin
 					if(reg_index==REG_INDEX_LAST) begin
 						reg_conf_done_reg<=1'b1;
 						config_step<=0;
@@ -134,6 +134,7 @@ begin
 					else begin
 						reg_index<=next_reg_index(reg_index);
 						config_step<=0;
+					end
 					end
 				 end
 				 3:begin
