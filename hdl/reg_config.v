@@ -18,7 +18,7 @@
 // Additional Comments:
 // 
 //////////////////////////////////////////////////////////////////////////////////
-//camera中寄存器的配置程序
+//camera涓瘎瀛樺櫒鐨勯厤缃▼搴?
  module reg_config #(
           parameter SENSOR_TEST_PATTERN_EN = 1'b0
       )(     
@@ -29,7 +29,10 @@
 		  output i2c_sclk,
 		  inout i2c_sdat,
 		  output reg clock_20k,
-		  output reg [8:0]reg_index
+		  output reg [8:0]reg_index,
+		  output reg ack_fail_sticky,
+		  output reg [8:0]ack_fail_first_index,
+		  output reg [8:0]ack_fail_count
 	  );
 
      reg [15:0]clock_20k_cnt;
@@ -84,7 +87,7 @@ begin
 end
 
 
-////iic寄存器配置过程控制
+////iic瀵勫瓨鍣ㄩ厤缃繃绋嬫帶鍒?
 always@(posedge clock_20k)
 begin
    if(!camera_rstn) begin
@@ -92,57 +95,64 @@ begin
        start<=0;
 	   post_reset_wait_cnt<=0;
        reg_index<=REG_INDEX_START;
+	   ack_fail_sticky<=1'b0;
+	   ack_fail_first_index<=9'd0;
+	   ack_fail_count<=9'd0;
 		 reg_conf_done_reg<=0;
    end
    else begin
 	  start<=0;
-      if((initial_en==1'b1) && (reg_conf_done_reg==1'b0)) begin          //如果camera初始化未完成
-			  if(reg_index<=REG_INDEX_LAST) begin               //配置寄存器
-					 case(config_step)
-					 0:begin
-						i2c_data<={8'h78,reg_data};       //OV5640 IIC Device address is 0x78   
-						start<=1;                         //i2c写开始
-						config_step<=1;                  
-					 end
-					 1:begin
-						if(tr_end) begin                  //i2c写结束
-							 start<=0;
-							 config_step<=2;
-						end
-					 end
-					 2:begin
-						  if(!ack) begin
-							  if(reg_index==REG_INDEX_LAST) begin
-								  reg_conf_done_reg<=1'b1;
-								  config_step<=0;
-							  end
-							  else if(reg_index==REG_INDEX_SOFT_RESET) begin
-								  post_reset_wait_cnt<=POST_RESET_WAIT_CYCLES;
-								  config_step<=3;
-							  end
-							  else begin
-								  reg_index<=next_reg_index(reg_index);       //配置下一个寄存器
-								  config_step<=0;
-							  end
-						  end
-					 end
-					 3:begin
-						  if(post_reset_wait_cnt!=0)
-							  post_reset_wait_cnt<=post_reset_wait_cnt-1'b1;
-						  else begin
-							  reg_index<=next_reg_index(reg_index);
-							  config_step<=0;
-						  end
-					 end
-					 endcase
+      if((initial_en==1'b1) && (reg_conf_done_reg==1'b0)) begin          //婵″倹鐏塩amera閸掓繂顫愰崠鏍ㄦ弓鐎瑰本鍨?
+			  if(reg_index<=REG_INDEX_LAST) begin               //闁板秶鐤嗙€靛嫬鐡ㄩ崳?
+				 case(config_step)
+				 0:begin
+					i2c_data<={8'h78,reg_data};       //OV5640 IIC Device address is 0x78
+					start<=1;
+					config_step<=1;
+				 end
+				 1:begin
+					if(tr_end) begin
+						start<=0;
+						config_step<=2;
+					end
+				 end
+				 2:begin
+					if(ack) begin
+						ack_fail_sticky<=1'b1;
+						if(!ack_fail_sticky)
+							ack_fail_first_index<=reg_index;
+						ack_fail_count<=ack_fail_count+1'b1;
+					end
+					if(reg_index==REG_INDEX_LAST) begin
+						reg_conf_done_reg<=1'b1;
+						config_step<=0;
+					end
+					else if(reg_index==REG_INDEX_SOFT_RESET) begin
+						post_reset_wait_cnt<=POST_RESET_WAIT_CYCLES;
+						config_step<=3;
+					end
+					else begin
+						reg_index<=next_reg_index(reg_index);
+						config_step<=0;
+					end
+				 end
+				 3:begin
+					if(post_reset_wait_cnt!=0)
+						post_reset_wait_cnt<=post_reset_wait_cnt-1'b1;
+					else begin
+						reg_index<=next_reg_index(reg_index);
+						config_step<=0;
+					end
+				 end
+				 endcase
 				end
 			 else 
-				reg_conf_done_reg<=1'b1;                //OV5640寄存器初始化完成
+				reg_conf_done_reg<=1'b1;                //OV5640鐎靛嫬鐡ㄩ崳銊ュ灥婵瀵茬€瑰本鍨?
       end
    end
  end
 
-////iic需要配置的寄存器值
+////iic闇€瑕侀厤缃殑瀵勫瓨鍣ㄥ€?
 always@(reg_index)
  begin
     case(reg_index)
@@ -413,4 +423,3 @@ always@(reg_index)
 end
 
 endmodule
-

@@ -648,6 +648,10 @@ assign cmos_reset = camera_rstn;
 // Camera 1 I2C Configuration (OV5640)
 //=============================================================================
 wire cmos1_init_done /*synthesis PAP_MARK_DEBUG="1"*/;
+wire [8:0] cmos1_init_reg_index /*synthesis PAP_MARK_DEBUG="1"*/;
+wire cmos1_init_ack_fail_sticky /*synthesis PAP_MARK_DEBUG="1"*/;
+wire [8:0] cmos1_init_ack_fail_first_index /*synthesis PAP_MARK_DEBUG="1"*/;
+wire [8:0] cmos1_init_ack_fail_count /*synthesis PAP_MARK_DEBUG="1"*/;
 localparam SENSOR_TEST_PATTERN_EN = 1'b0;
 
 reg_config #(
@@ -659,7 +663,10 @@ reg_config #(
     .i2c_sclk       (cmos1_scl),        // I2C clock output
     .i2c_sdat       (cmos1_sda),        // I2C data bidirectional
     .reg_conf_done  (cmos1_init_done),  // Configuration done flag
-    .reg_index      (),                 // Debug: current register index
+    .reg_index      (cmos1_init_reg_index),
+    .ack_fail_sticky(cmos1_init_ack_fail_sticky),
+    .ack_fail_first_index(cmos1_init_ack_fail_first_index),
+    .ack_fail_count (cmos1_init_ack_fail_count),
     .clock_20k      ()                  // Debug: I2C clock
 );
 
