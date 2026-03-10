@@ -1332,46 +1332,79 @@ wire [7:0] prep_alpha_hi_3 = prep_a_fmt_yenh_latched ? prep_y_hi_3 : preproc_alp
 wire first_pixel_word = dma_session_active && (dma_rd_word_count == 18'd0) && (dma_expand_phase == 1'b0);
 wire [7:0] prep_alpha_lo_0 = (~prep_a_fmt_yenh_latched && first_pixel_word) ? frame_id : prep_alpha_lo_0_base;
 
-wire [127:0] prep_frame_rd_data_bgrx_lo_c = pack_4rgb_bgrx(
+wire [127:0] prep_frame_rd_data_bgrx_lo_c = pack_4pix_bgrx(
+    frame_rd_data[15:0], frame_rd_data[31:16], frame_rd_data[47:32], frame_rd_data[63:48],
+    prep_alpha_lo_0, prep_alpha_lo_1, prep_alpha_lo_2, prep_alpha_lo_3);
+wire [127:0] prep_frame_rd_hold_bgrx_hi_c = pack_4pix_bgrx(
+    frame_rd_data_hold[79:64], frame_rd_data_hold[95:80], frame_rd_data_hold[111:96], frame_rd_data_hold[127:112],
+    prep_alpha_hi_0, prep_alpha_hi_1, prep_alpha_hi_2, prep_alpha_hi_3);
+wire [127:0] prep_disp_frame_rd_data_bgrx_lo_c = pack_4rgb_bgrx(
     prep_rgb_lo_0, prep_rgb_lo_1, prep_rgb_lo_2, prep_rgb_lo_3,
     prep_alpha_lo_0, prep_alpha_lo_1, prep_alpha_lo_2, prep_alpha_lo_3);
-wire [127:0] prep_frame_rd_hold_bgrx_hi_c = pack_4rgb_bgrx(
+wire [127:0] prep_disp_frame_rd_hold_bgrx_hi_c = pack_4rgb_bgrx(
     prep_rgb_hi_0, prep_rgb_hi_1, prep_rgb_hi_2, prep_rgb_hi_3,
     prep_alpha_hi_0, prep_alpha_hi_1, prep_alpha_hi_2, prep_alpha_hi_3);
 
 reg  [127:0] prep_frame_rd_data_bgrx_lo_q;
 reg  [127:0] prep_frame_rd_hold_bgrx_hi_q;
+reg  [127:0] prep_disp_frame_rd_data_bgrx_lo_q;
+reg  [127:0] prep_disp_frame_rd_hold_bgrx_hi_q;
 reg          prep_pipe_valid;
+reg          prep_disp_lo_valid;
+reg          prep_disp_hi_valid;
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
         prep_frame_rd_data_bgrx_lo_q <= 128'd0;
         prep_frame_rd_hold_bgrx_hi_q <= 128'd0;
+        prep_disp_frame_rd_data_bgrx_lo_q <= 128'd0;
+        prep_disp_frame_rd_hold_bgrx_hi_q <= 128'd0;
         prep_pipe_valid <= 1'b0;
+        prep_disp_lo_valid <= 1'b0;
+        prep_disp_hi_valid <= 1'b0;
     end else if (frame_done_pulse || dma_session_start) begin
         prep_frame_rd_data_bgrx_lo_q <= 128'd0;
         prep_frame_rd_hold_bgrx_hi_q <= 128'd0;
+        prep_disp_frame_rd_data_bgrx_lo_q <= 128'd0;
+        prep_disp_frame_rd_hold_bgrx_hi_q <= 128'd0;
         prep_pipe_valid <= 1'b0;
+        prep_disp_lo_valid <= 1'b0;
+        prep_disp_hi_valid <= 1'b0;
     end else begin
         if (frame_rd_fetch_en) begin
             prep_frame_rd_data_bgrx_lo_q <= prep_frame_rd_data_bgrx_lo_c;
             prep_pipe_valid <= 1'b1;
+            if (prep_active_latched && prep_target_all_latched) begin
+                prep_disp_frame_rd_data_bgrx_lo_q <= prep_disp_frame_rd_data_bgrx_lo_c;
+                prep_disp_lo_valid <= 1'b1;
+                prep_disp_hi_valid <= 1'b0;
+            end
         end
-        if (dma_expand_mode && dma_session_active && bar2_addr_step && dma_expand_phase)
+        if (dma_expand_mode && dma_session_active && bar2_addr_step && dma_expand_phase) begin
             prep_frame_rd_hold_bgrx_hi_q <= prep_frame_rd_hold_bgrx_hi_c;
+            if (prep_active_latched && prep_target_all_latched) begin
+                prep_disp_frame_rd_hold_bgrx_hi_q <= prep_disp_frame_rd_hold_bgrx_hi_c;
+                prep_disp_hi_valid <= 1'b1;
+            end
+        end
     end
 end
 
 wire [127:0] frame_dma_data_raw = dma_expand_phase ? raw_frame_rd_hold_bgrx_hi : raw_frame_rd_data_bgrx_lo;
-wire [127:0] frame_dma_data_prep = dma_expand_phase_q_for_prep ? prep_frame_rd_hold_bgrx_hi_q : prep_frame_rd_data_bgrx_lo_q;
-wire        prep_output_active = prep_active_latched & prep_pipe_valid;
+wire [127:0] frame_dma_data_prep_sideband = dma_expand_phase_q_for_prep ? prep_frame_rd_hold_bgrx_hi_q : prep_frame_rd_data_bgrx_lo_q;
+wire [127:0] frame_dma_data_prep_rgb = dma_expand_phase_q_for_prep ? prep_disp_frame_rd_hold_bgrx_hi_q : prep_disp_frame_rd_data_bgrx_lo_q;
+wire        prep_disp_phase_valid = dma_expand_phase_q_for_prep ? prep_disp_hi_valid : prep_disp_lo_valid;
+wire [127:0] frame_dma_data_prep = prep_target_all_latched ? frame_dma_data_prep_rgb : frame_dma_data_prep_sideband;
+wire        prep_output_active = prep_active_latched & (prep_target_all_latched ? prep_disp_phase_valid : prep_pipe_valid);
 wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
 wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data, 8'h00)}};
 wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
 wire [127:0] frame_dma_data = dma_expand_mode
     ? (prep_output_active ? frame_dma_data_prep : frame_dma_data_raw)
     : frame_rd_data;
-wire        frame_stream_ready = ~dma_session_active | ~mwr_first_beat_seen | frame_rd_data_ready;
+wire        frame_stream_ready = ~dma_session_active |
+                                 ~mwr_first_beat_seen |
+                                 (frame_rd_data_ready & (~(prep_active_latched & prep_target_all_latched) | prep_disp_phase_valid));
 
 assign axis_slave2_tready_fc = axis_slave2_tready_raw & frame_stream_ready;
 
