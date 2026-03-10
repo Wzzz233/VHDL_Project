@@ -1489,6 +1489,22 @@ static int apply_fpga_preproc_cfg(struct app_ctx *ctx)
         grad_gate = 18;
     }
 
+    if (target == FPGA_PREP_TARGET_ALL && profile != FPGA_PREP_PROFILE_RAW) {
+        /* Display path needs conservative defaults to avoid noise amplification artifacts. */
+        if (med_noise_gate < 20)
+            med_noise_gate = 20;
+        if (clip > 12)
+            clip = 12;
+        if (strength > 48)
+            strength = 48;
+        if (usm_gain > 0.125f)
+            usm_gain = 0.125f;
+        if (usm_thr < 8)
+            usm_thr = 8;
+        if (usm_limit > 6)
+            usm_limit = 6;
+    }
+
     tw_log2 = ilog2_pow2_u32((uint32_t)tile_w);
     th_log2 = ilog2_pow2_u32((uint32_t)tile_h);
     if (tw_log2 < 0 || th_log2 < 0)

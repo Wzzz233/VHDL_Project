@@ -1197,8 +1197,13 @@ begin
     g8 = rgb24[15:8];
     b8 = rgb24[7:0];
     y_old = luma_from_rgb888(r8, g8, b8);
-    // Divider-free luminance remap to avoid unstable long combinational paths.
+    // Divider-free luminance remap with limited delta for display stability.
     delta_y = $signed({1'b0, y_new}) - $signed(y_old);
+    if (delta_y > 48)
+        delta_y = 48;
+    else if (delta_y < -48)
+        delta_y = -48;
+    delta_y = delta_y >>> 1;
     rr = $signed({1'b0, r8}) + delta_y;
     gg = $signed({1'b0, g8}) + delta_y;
     bb = $signed({1'b0, b8}) + delta_y;
