@@ -1332,11 +1332,11 @@ wire [7:0] prep_alpha_hi_3 = prep_a_fmt_yenh_latched ? prep_y_hi_3 : preproc_alp
 wire first_pixel_word = dma_session_active && (dma_rd_word_count == 18'd0) && (dma_expand_phase == 1'b0);
 wire [7:0] prep_alpha_lo_0 = (~prep_a_fmt_yenh_latched && first_pixel_word) ? frame_id : prep_alpha_lo_0_base;
 
-wire [127:0] prep_frame_rd_data_bgrx_lo_c = pack_4pix_bgrx(
-    frame_rd_data[15:0], frame_rd_data[31:16], frame_rd_data[47:32], frame_rd_data[63:48],
+wire [127:0] prep_frame_rd_data_bgrx_lo_c = pack_4rgb_bgrx(
+    prep_rgb_lo_0, prep_rgb_lo_1, prep_rgb_lo_2, prep_rgb_lo_3,
     prep_alpha_lo_0, prep_alpha_lo_1, prep_alpha_lo_2, prep_alpha_lo_3);
-wire [127:0] prep_frame_rd_hold_bgrx_hi_c = pack_4pix_bgrx(
-    frame_rd_data_hold[79:64], frame_rd_data_hold[95:80], frame_rd_data_hold[111:96], frame_rd_data_hold[127:112],
+wire [127:0] prep_frame_rd_hold_bgrx_hi_c = pack_4rgb_bgrx(
+    prep_rgb_hi_0, prep_rgb_hi_1, prep_rgb_hi_2, prep_rgb_hi_3,
     prep_alpha_hi_0, prep_alpha_hi_1, prep_alpha_hi_2, prep_alpha_hi_3);
 
 reg  [127:0] prep_frame_rd_data_bgrx_lo_q;
