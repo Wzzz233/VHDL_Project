@@ -1,5 +1,5 @@
-﻿//pango鍙傝€冧緥绋?
-//鍩轰簬瀹樻柟demo淇敼 - 娣诲姞 DDR3 + power_on_delay 娴嬭瘯
+// pango reference design
+// Based on vendor demo, extended with DDR3 and power_on_delay test path
 module pcie_dma_ddr3_cam1 #(
     parameter MEM_ROW_ADDR_WIDTH   = 15,
     parameter MEM_COL_ADDR_WIDTH   = 10,
