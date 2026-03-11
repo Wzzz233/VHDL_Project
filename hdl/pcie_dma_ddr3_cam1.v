@@ -859,8 +859,10 @@ localparam [7:0]          PREP_FETCH_WORDS_PER_LINE = 8'd160;
 wire [7:0]                 post_ddr_fetch_word_x = dma_expand_mode ? {1'b0, post_ddr_word_x[8:1]}
                                                                         : post_ddr_word_x[7:0];
 wire [11:0]                prep_x_pix_base = {post_ddr_fetch_word_x, 3'b000};
-(* ram_style = "block" *) reg [63:0] prep_linebuf_prev1 [0:PREP_FETCH_WORDS_PER_LINE-1];
-(* ram_style = "block" *) reg [63:0] prep_linebuf_prev2 [0:PREP_FETCH_WORDS_PER_LINE-1];
+// Keep the line taps as plain register arrays so same-address read-before-write
+// behavior stays deterministic for the 3x3 prep window.
+reg  [63:0]                prep_linebuf_prev1 [0:PREP_FETCH_WORDS_PER_LINE-1];
+reg  [63:0]                prep_linebuf_prev2 [0:PREP_FETCH_WORDS_PER_LINE-1];
 reg  [7:0]                 prep_top_hist_0_q;
 reg  [7:0]                 prep_top_hist_1_q;
 reg  [7:0]                 prep_mid_hist_0_q;
