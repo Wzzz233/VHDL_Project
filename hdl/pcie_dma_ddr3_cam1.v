@@ -805,7 +805,6 @@ reg  [7:0]                 prep_word_x;
 reg  [9:0]                 prep_line_y;
 reg  [2:0]                 frame_src_bootstrap_count;
 reg                        dma_expand_phase;
-reg                        mwr_first_beat_seen;
 reg  [11:0]                mwr_rd_addr_d;
 reg                        mwr_rd_clk_en_d;
 reg  [7:0]                 frame_id;
@@ -844,19 +843,13 @@ reg  [9:0]                 prep_pending_line_y;
 reg  [11:0]                prep_pending_x_pix_base;
 reg  [1:0]                 prep_flush_words_pending;
 reg                        out_pair_active_valid;
-reg  [127:0]               out_pair_active_raw_lo;
-reg  [127:0]               out_pair_active_raw_hi;
-reg  [127:0]               out_pair_active_prep_lo;
-reg  [127:0]               out_pair_active_prep_hi;
-reg  [127:0]               out_pair_active_disp_lo;
-reg  [127:0]               out_pair_active_disp_hi;
+reg  [127:0]               out_pair_active_src_word;
+reg  [63:0]                out_pair_active_y_word;
+reg                        out_pair_active_first_word;
 reg                        out_pair_next_valid;
-reg  [127:0]               out_pair_next_raw_lo;
-reg  [127:0]               out_pair_next_raw_hi;
-reg  [127:0]               out_pair_next_prep_lo;
-reg  [127:0]               out_pair_next_prep_hi;
-reg  [127:0]               out_pair_next_disp_lo;
-reg  [127:0]               out_pair_next_disp_hi;
+reg  [127:0]               out_pair_next_src_word;
+reg  [63:0]                out_pair_next_y_word;
+reg                        out_pair_next_first_word;
 wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
 wire                       dma_expand_mode = DMA_OUTPUT_BGRX;
@@ -1346,6 +1339,50 @@ begin
 end
 endfunction
 
+function [31:0] prep_pixel_bgrx32;
+    input [15:0] pix565;
+    input [7:0]  y_new;
+    input        target_all;
+    input        a_fmt_yenh;
+    input        mark_frame_id;
+    input [7:0]  frame_id_in;
+    reg   [7:0]  alpha8;
+    reg   [23:0] rgb24;
+begin
+    rgb24 = rgb24_from_bgr565(pix565);
+    alpha8 = a_fmt_yenh ? y_new : preproc_alpha_from_bgr565(pix565);
+    if (mark_frame_id && ~a_fmt_yenh)
+        alpha8 = frame_id_in;
+    if (target_all)
+        prep_pixel_bgrx32 = rgb24_to_bgrx32(rgb24_apply_y(rgb24, y_new), alpha8);
+    else
+        prep_pixel_bgrx32 = bgr565_to_bgrx32(pix565, alpha8);
+end
+endfunction
+
+function [127:0] pack_4prep_bgrx;
+    input [15:0] p0;
+    input [15:0] p1;
+    input [15:0] p2;
+    input [15:0] p3;
+    input [7:0]  y0;
+    input [7:0]  y1;
+    input [7:0]  y2;
+    input [7:0]  y3;
+    input        target_all;
+    input        a_fmt_yenh;
+    input        mark_first;
+    input [7:0]  frame_id_in;
+begin
+    pack_4prep_bgrx = {
+        prep_pixel_bgrx32(p3, y3, target_all, a_fmt_yenh, 1'b0,       frame_id_in),
+        prep_pixel_bgrx32(p2, y2, target_all, a_fmt_yenh, 1'b0,       frame_id_in),
+        prep_pixel_bgrx32(p1, y1, target_all, a_fmt_yenh, 1'b0,       frame_id_in),
+        prep_pixel_bgrx32(p0, y0, target_all, a_fmt_yenh, mark_first, frame_id_in)
+    };
+end
+endfunction
+
 reg          emit_push_valid_c;
 reg  [127:0] emit_src_word_c;
 reg  [63:0]  emit_top_word_c;
@@ -1500,69 +1537,47 @@ always @* begin
     end
 end
 
-wire [23:0] emit_rgb_0 = rgb24_from_bgr565(emit_src_word_c[15:0]);
-wire [23:0] emit_rgb_1 = rgb24_from_bgr565(emit_src_word_c[31:16]);
-wire [23:0] emit_rgb_2 = rgb24_from_bgr565(emit_src_word_c[47:32]);
-wire [23:0] emit_rgb_3 = rgb24_from_bgr565(emit_src_word_c[63:48]);
-wire [23:0] emit_rgb_4 = rgb24_from_bgr565(emit_src_word_c[79:64]);
-wire [23:0] emit_rgb_5 = rgb24_from_bgr565(emit_src_word_c[95:80]);
-wire [23:0] emit_rgb_6 = rgb24_from_bgr565(emit_src_word_c[111:96]);
-wire [23:0] emit_rgb_7 = rgb24_from_bgr565(emit_src_word_c[127:112]);
-wire [7:0]  emit_y_0 = emit_y_word_c[7:0];
-wire [7:0]  emit_y_1 = emit_y_word_c[15:8];
-wire [7:0]  emit_y_2 = emit_y_word_c[23:16];
-wire [7:0]  emit_y_3 = emit_y_word_c[31:24];
-wire [7:0]  emit_y_4 = emit_y_word_c[39:32];
-wire [7:0]  emit_y_5 = emit_y_word_c[47:40];
-wire [7:0]  emit_y_6 = emit_y_word_c[55:48];
-wire [7:0]  emit_y_7 = emit_y_word_c[63:56];
-wire [23:0] emit_prep_rgb_0 = rgb24_apply_y(emit_rgb_0, emit_y_0);
-wire [23:0] emit_prep_rgb_1 = rgb24_apply_y(emit_rgb_1, emit_y_1);
-wire [23:0] emit_prep_rgb_2 = rgb24_apply_y(emit_rgb_2, emit_y_2);
-wire [23:0] emit_prep_rgb_3 = rgb24_apply_y(emit_rgb_3, emit_y_3);
-wire [23:0] emit_prep_rgb_4 = rgb24_apply_y(emit_rgb_4, emit_y_4);
-wire [23:0] emit_prep_rgb_5 = rgb24_apply_y(emit_rgb_5, emit_y_5);
-wire [23:0] emit_prep_rgb_6 = rgb24_apply_y(emit_rgb_6, emit_y_6);
-wire [23:0] emit_prep_rgb_7 = rgb24_apply_y(emit_rgb_7, emit_y_7);
-wire [7:0]  emit_alpha_0_base = prep_a_fmt_yenh_latched ? emit_y_0 : preproc_alpha_from_bgr565(emit_src_word_c[15:0]);
-wire [7:0]  emit_alpha_1 = prep_a_fmt_yenh_latched ? emit_y_1 : preproc_alpha_from_bgr565(emit_src_word_c[31:16]);
-wire [7:0]  emit_alpha_2 = prep_a_fmt_yenh_latched ? emit_y_2 : preproc_alpha_from_bgr565(emit_src_word_c[47:32]);
-wire [7:0]  emit_alpha_3 = prep_a_fmt_yenh_latched ? emit_y_3 : preproc_alpha_from_bgr565(emit_src_word_c[63:48]);
-wire [7:0]  emit_alpha_4 = prep_a_fmt_yenh_latched ? emit_y_4 : preproc_alpha_from_bgr565(emit_src_word_c[79:64]);
-wire [7:0]  emit_alpha_5 = prep_a_fmt_yenh_latched ? emit_y_5 : preproc_alpha_from_bgr565(emit_src_word_c[95:80]);
-wire [7:0]  emit_alpha_6 = prep_a_fmt_yenh_latched ? emit_y_6 : preproc_alpha_from_bgr565(emit_src_word_c[111:96]);
-wire [7:0]  emit_alpha_7 = prep_a_fmt_yenh_latched ? emit_y_7 : preproc_alpha_from_bgr565(emit_src_word_c[127:112]);
-wire [7:0]  emit_alpha_0 = (~prep_a_fmt_yenh_latched && emit_first_word_c) ? frame_id : emit_alpha_0_base;
-wire [127:0] emit_raw_lo_pack = pack_4pix_bgrx(
-    emit_src_word_c[15:0], emit_src_word_c[31:16], emit_src_word_c[47:32], emit_src_word_c[63:48],
+wire [7:0]  out_pair_active_y_0 = out_pair_active_y_word[7:0];
+wire [7:0]  out_pair_active_y_1 = out_pair_active_y_word[15:8];
+wire [7:0]  out_pair_active_y_2 = out_pair_active_y_word[23:16];
+wire [7:0]  out_pair_active_y_3 = out_pair_active_y_word[31:24];
+wire [7:0]  out_pair_active_y_4 = out_pair_active_y_word[39:32];
+wire [7:0]  out_pair_active_y_5 = out_pair_active_y_word[47:40];
+wire [7:0]  out_pair_active_y_6 = out_pair_active_y_word[55:48];
+wire [7:0]  out_pair_active_y_7 = out_pair_active_y_word[63:56];
+wire [127:0] out_pair_active_raw_lo_pack = pack_4pix_bgrx(
+    out_pair_active_src_word[15:0], out_pair_active_src_word[31:16],
+    out_pair_active_src_word[47:32], out_pair_active_src_word[63:48],
     8'h00, 8'h00, 8'h00, 8'h00);
-wire [127:0] emit_raw_hi_pack = pack_4pix_bgrx(
-    emit_src_word_c[79:64], emit_src_word_c[95:80], emit_src_word_c[111:96], emit_src_word_c[127:112],
+wire [127:0] out_pair_active_raw_hi_pack = pack_4pix_bgrx(
+    out_pair_active_src_word[79:64], out_pair_active_src_word[95:80],
+    out_pair_active_src_word[111:96], out_pair_active_src_word[127:112],
     8'h00, 8'h00, 8'h00, 8'h00);
-wire [127:0] emit_prep_lo_pack = pack_4pix_bgrx(
-    emit_src_word_c[15:0], emit_src_word_c[31:16], emit_src_word_c[47:32], emit_src_word_c[63:48],
-    emit_alpha_0, emit_alpha_1, emit_alpha_2, emit_alpha_3);
-wire [127:0] emit_prep_hi_pack = pack_4pix_bgrx(
-    emit_src_word_c[79:64], emit_src_word_c[95:80], emit_src_word_c[111:96], emit_src_word_c[127:112],
-    emit_alpha_4, emit_alpha_5, emit_alpha_6, emit_alpha_7);
-wire [127:0] emit_disp_lo_pack = pack_4rgb_bgrx(
-    emit_prep_rgb_0, emit_prep_rgb_1, emit_prep_rgb_2, emit_prep_rgb_3,
-    emit_alpha_0, emit_alpha_1, emit_alpha_2, emit_alpha_3);
-wire [127:0] emit_disp_hi_pack = pack_4rgb_bgrx(
-    emit_prep_rgb_4, emit_prep_rgb_5, emit_prep_rgb_6, emit_prep_rgb_7,
-    emit_alpha_4, emit_alpha_5, emit_alpha_6, emit_alpha_7);
-
-wire [127:0] frame_dma_data_raw = dma_expand_phase ? out_pair_active_raw_hi : out_pair_active_raw_lo;
-wire [127:0] frame_dma_data_prep_sideband = dma_expand_phase ? out_pair_active_prep_hi : out_pair_active_prep_lo;
-wire [127:0] frame_dma_data_prep_rgb = dma_expand_phase ? out_pair_active_disp_hi : out_pair_active_disp_lo;
-wire [127:0] frame_dma_data_prep = prep_target_all_latched ? frame_dma_data_prep_rgb : frame_dma_data_prep_sideband;
+wire [127:0] out_pair_active_prep_lo_pack = pack_4prep_bgrx(
+    out_pair_active_src_word[15:0], out_pair_active_src_word[31:16],
+    out_pair_active_src_word[47:32], out_pair_active_src_word[63:48],
+    out_pair_active_y_0, out_pair_active_y_1, out_pair_active_y_2, out_pair_active_y_3,
+    prep_target_all_latched,
+    prep_a_fmt_yenh_latched,
+    out_pair_active_first_word,
+    frame_id);
+wire [127:0] out_pair_active_prep_hi_pack = pack_4prep_bgrx(
+    out_pair_active_src_word[79:64], out_pair_active_src_word[95:80],
+    out_pair_active_src_word[111:96], out_pair_active_src_word[127:112],
+    out_pair_active_y_4, out_pair_active_y_5, out_pair_active_y_6, out_pair_active_y_7,
+    prep_target_all_latched,
+    prep_a_fmt_yenh_latched,
+    1'b0,
+    frame_id);
+wire [127:0] frame_dma_data_raw = dma_expand_phase ? out_pair_active_raw_hi_pack : out_pair_active_raw_lo_pack;
+wire [127:0] frame_dma_data_prep = dma_expand_phase ? out_pair_active_prep_hi_pack : out_pair_active_prep_lo_pack;
 wire        prep_output_active = prep_active_latched & out_pair_active_valid;
 wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
 wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data, 8'h00)}};
 wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
 wire [127:0] frame_dma_data = dma_expand_mode
     ? (prep_output_active ? frame_dma_data_prep : frame_dma_data_raw)
-    : out_pair_active_raw_lo;
+    : out_pair_active_src_word;
 wire        frame_stream_ready = ~dma_session_active | out_pair_active_valid;
 
 assign axis_slave2_tready_fc = axis_slave2_tready_raw & frame_stream_ready;
@@ -1590,7 +1605,6 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_line_y <= 10'd0;
         frame_src_bootstrap_count <= 3'd0;
         dma_expand_phase <= 1'b0;
-        mwr_first_beat_seen <= 1'b0;
         frame_id <= 8'd0;
         prep_session_en <= 1'b0;
         prep_session_target_all <= 1'b0;
@@ -1627,19 +1641,13 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_pending_x_pix_base <= 12'd0;
         prep_flush_words_pending <= 2'd0;
         out_pair_active_valid <= 1'b0;
-        out_pair_active_raw_lo <= 128'd0;
-        out_pair_active_raw_hi <= 128'd0;
-        out_pair_active_prep_lo <= 128'd0;
-        out_pair_active_prep_hi <= 128'd0;
-        out_pair_active_disp_lo <= 128'd0;
-        out_pair_active_disp_hi <= 128'd0;
+        out_pair_active_src_word <= 128'd0;
+        out_pair_active_y_word <= 64'd0;
+        out_pair_active_first_word <= 1'b0;
         out_pair_next_valid <= 1'b0;
-        out_pair_next_raw_lo <= 128'd0;
-        out_pair_next_raw_hi <= 128'd0;
-        out_pair_next_prep_lo <= 128'd0;
-        out_pair_next_prep_hi <= 128'd0;
-        out_pair_next_disp_lo <= 128'd0;
-        out_pair_next_disp_hi <= 128'd0;
+        out_pair_next_src_word <= 128'd0;
+        out_pair_next_y_word <= 64'd0;
+        out_pair_next_first_word <= 1'b0;
     end else if (frame_done_pulse) begin
         dma_session_active <= 1'b0;
         dma_rd_word_count <= 18'd0;
@@ -1649,7 +1657,6 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_line_y <= 10'd0;
         frame_src_bootstrap_count <= 3'd0;
         dma_expand_phase <= 1'b0;
-        mwr_first_beat_seen <= 1'b0;
         prep_session_en <= 1'b0;
         prep_session_target_all <= 1'b0;
         prep_session_a_fmt_yenh <= 1'b0;
@@ -1671,7 +1678,6 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             prep_line_y <= 10'd0;
             frame_src_bootstrap_count <= 3'd0;
             dma_expand_phase <= 1'b0;
-            mwr_first_beat_seen <= 1'b0;
             frame_id <= frame_id + 8'd1;
             prep_session_en <= prep_active;
             prep_session_target_all <= prep_target_all;
@@ -1733,9 +1739,6 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 roi_timeout_count <= 8'd0;
             end
         end else begin
-            if (dma_session_active && bar2_addr_step)
-                mwr_first_beat_seen <= 1'b1;
-
             if (dma_session_active && bar2_addr_step) begin
                 if (dma_rd_word_count == frame_words_cfg - 1'b1) begin
                     dma_rd_word_count <= 18'd0;
@@ -1764,12 +1767,9 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             if (out_pair_pop) begin
                 if (out_pair_next_valid) begin
                     out_pair_active_valid <= 1'b1;
-                    out_pair_active_raw_lo <= out_pair_next_raw_lo;
-                    out_pair_active_raw_hi <= out_pair_next_raw_hi;
-                    out_pair_active_prep_lo <= out_pair_next_prep_lo;
-                    out_pair_active_prep_hi <= out_pair_next_prep_hi;
-                    out_pair_active_disp_lo <= out_pair_next_disp_lo;
-                    out_pair_active_disp_hi <= out_pair_next_disp_hi;
+                    out_pair_active_src_word <= out_pair_next_src_word;
+                    out_pair_active_y_word <= out_pair_next_y_word;
+                    out_pair_active_first_word <= out_pair_next_first_word;
                     out_pair_next_valid <= 1'b0;
                 end else begin
                     out_pair_active_valid <= 1'b0;
@@ -1779,20 +1779,14 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             if (emit_push_valid_c) begin
                 if (!out_pair_active_valid || (out_pair_pop && !out_pair_next_valid)) begin
                     out_pair_active_valid <= 1'b1;
-                    out_pair_active_raw_lo <= emit_raw_lo_pack;
-                    out_pair_active_raw_hi <= emit_raw_hi_pack;
-                    out_pair_active_prep_lo <= emit_prep_lo_pack;
-                    out_pair_active_prep_hi <= emit_prep_hi_pack;
-                    out_pair_active_disp_lo <= emit_disp_lo_pack;
-                    out_pair_active_disp_hi <= emit_disp_hi_pack;
+                    out_pair_active_src_word <= emit_src_word_c;
+                    out_pair_active_y_word <= emit_y_word_c;
+                    out_pair_active_first_word <= emit_first_word_c;
                 end else if (!out_pair_next_valid || out_pair_pop) begin
                     out_pair_next_valid <= 1'b1;
-                    out_pair_next_raw_lo <= emit_raw_lo_pack;
-                    out_pair_next_raw_hi <= emit_raw_hi_pack;
-                    out_pair_next_prep_lo <= emit_prep_lo_pack;
-                    out_pair_next_prep_hi <= emit_prep_hi_pack;
-                    out_pair_next_disp_lo <= emit_disp_lo_pack;
-                    out_pair_next_disp_hi <= emit_disp_hi_pack;
+                    out_pair_next_src_word <= emit_src_word_c;
+                    out_pair_next_y_word <= emit_y_word_c;
+                    out_pair_next_first_word <= emit_first_word_c;
                 end
             end
 
