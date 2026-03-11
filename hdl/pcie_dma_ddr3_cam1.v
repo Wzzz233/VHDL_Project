@@ -1181,6 +1181,92 @@ begin
 end
 endfunction
 
+function [7:0] display_enhance_y;
+    input [23:0] rgb24;
+    input        en_median;
+    input        en_clahe;
+    input        en_usm;
+    input [31:0] clahe_cfg;
+    input [31:0] usm_cfg;
+    input [31:0] med_cfg;
+    reg [7:0] r8;
+    reg [7:0] g8;
+    reg [7:0] b8;
+    reg [7:0] y_base;
+    reg [7:0] y_cur;
+    integer strength;
+    integer clip_span;
+    integer usm_gain_q4_4;
+    integer usm_limit;
+    integer noise_gate;
+    integer delta;
+    integer gain_q8;
+    integer y_tmp;
+    integer clip_min;
+    integer clip_max;
+begin
+    r8 = rgb24[23:16];
+    g8 = rgb24[15:8];
+    b8 = rgb24[7:0];
+    y_base = luma_from_rgb888(r8, g8, b8);
+    y_cur = y_base;
+    gain_q8 = 256;
+    clip_span = 0;
+
+    // The OCR enhancer uses per-pixel RGB channel heuristics that are not
+    // display-safe. Visible RGB only gets a bounded luma remap here.
+    if (en_clahe) begin
+        strength = clahe_cfg[31:24];
+        clip_span = clahe_cfg[23:16];
+        if (strength < 1)
+            strength = 16;
+        if (clip_span < 1)
+            clip_span = 24;
+        gain_q8 = gain_q8 + strength;
+    end
+
+    if (en_usm) begin
+        usm_gain_q4_4 = usm_cfg[7:0];
+        usm_limit = usm_cfg[23:16];
+        if (usm_gain_q4_4 < 1)
+            usm_gain_q4_4 = 16;
+        if (usm_limit < 1)
+            usm_limit = 8;
+        gain_q8 = gain_q8 + (usm_gain_q4_4 >>> 2);
+        clip_span = clip_span + (usm_limit >>> 1);
+    end
+
+    if (en_median) begin
+        noise_gate = med_cfg[7:0];
+        if (noise_gate < 1)
+            noise_gate = 12;
+        if (clip_span < (noise_gate + 4))
+            clip_span = noise_gate + 4;
+    end
+
+    if (clip_span < 12)
+        clip_span = 12;
+    if (clip_span > 32)
+        clip_span = 32;
+    if (gain_q8 > 352)
+        gain_q8 = 352;
+
+    if (gain_q8 != 256) begin
+        delta = $signed({1'b0, y_base}) - 128;
+        y_tmp = 128 + ((delta * gain_q8) >>> 8);
+        clip_min = $signed({1'b0, y_base}) - clip_span;
+        clip_max = $signed({1'b0, y_base}) + clip_span;
+        if (y_tmp < clip_min)
+            y_tmp = clip_min;
+        if (y_tmp > clip_max)
+            y_tmp = clip_max;
+        y_cur = clamp_u8_int(y_tmp);
+    end
+
+    display_enhance_y = y_cur;
+end
+endfunction
+
 function [23:0] rgb24_apply_y;
     input [23:0] rgb24;
     input [7:0] y_new;
@@ -1324,14 +1410,31 @@ wire [7:0] prep_y_hi_3 = aiisp_enhance_y(rgb_hi_3, prep_median_en, prep_clahe_en
                                          prep_ocr_stroke_latched, prep_roi_mode_7,
                                          fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
 
-wire [23:0] prep_rgb_lo_0 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_0, prep_y_lo_0) : rgb_lo_0;
-wire [23:0] prep_rgb_lo_1 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_1, prep_y_lo_1) : rgb_lo_1;
-wire [23:0] prep_rgb_lo_2 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_2, prep_y_lo_2) : rgb_lo_2;
-wire [23:0] prep_rgb_lo_3 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_3, prep_y_lo_3) : rgb_lo_3;
-wire [23:0] prep_rgb_hi_0 = prep_target_all_latched ? rgb24_apply_y(rgb_hi_0, prep_y_hi_0) : rgb_hi_0;
-wire [23:0] prep_rgb_hi_1 = prep_target_all_latched ? rgb24_apply_y(rgb_hi_1, prep_y_hi_1) : rgb_hi_1;
-wire [23:0] prep_rgb_hi_2 = prep_target_all_latched ? rgb24_apply_y(rgb_hi_2, prep_y_hi_2) : rgb_hi_2;
-wire [23:0] prep_rgb_hi_3 = prep_target_all_latched ? rgb24_apply_y(rgb_hi_3, prep_y_hi_3) : rgb_hi_3;
+wire [7:0] disp_y_lo_0 = display_enhance_y(rgb_lo_0, prep_median_en, prep_clahe_en, prep_usm_en,
+                                           fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] disp_y_lo_1 = display_enhance_y(rgb_lo_1, prep_median_en, prep_clahe_en, prep_usm_en,
+                                           fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] disp_y_lo_2 = display_enhance_y(rgb_lo_2, prep_median_en, prep_clahe_en, prep_usm_en,
+                                           fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] disp_y_lo_3 = display_enhance_y(rgb_lo_3, prep_median_en, prep_clahe_en, prep_usm_en,
+                                           fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] disp_y_hi_0 = display_enhance_y(rgb_hi_0, prep_median_en, prep_clahe_en, prep_usm_en,
+                                           fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] disp_y_hi_1 = display_enhance_y(rgb_hi_1, prep_median_en, prep_clahe_en, prep_usm_en,
+                                           fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] disp_y_hi_2 = display_enhance_y(rgb_hi_2, prep_median_en, prep_clahe_en, prep_usm_en,
+                                           fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+wire [7:0] disp_y_hi_3 = display_enhance_y(rgb_hi_3, prep_median_en, prep_clahe_en, prep_usm_en,
+                                           fpga_prep_clahe, fpga_prep_usm, fpga_prep_med);
+
+wire [23:0] prep_rgb_lo_0 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_0, disp_y_lo_0) : rgb_lo_0;
+wire [23:0] prep_rgb_lo_1 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_1, disp_y_lo_1) : rgb_lo_1;
+wire [23:0] prep_rgb_lo_2 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_2, disp_y_lo_2) : rgb_lo_2;
+wire [23:0] prep_rgb_lo_3 = prep_target_all_latched ? rgb24_apply_y(rgb_lo_3, disp_y_lo_3) : rgb_lo_3;
+wire [23:0] prep_rgb_hi_0 = prep_target_all_latched ? rgb24_apply_y(rgb_hi_0, disp_y_hi_0) : rgb_hi_0;
+wire [23:0] prep_rgb_hi_1 = prep_target_all_latched ? rgb24_apply_y(rgb_hi_1, disp_y_hi_1) : rgb_hi_1;
+wire [23:0] prep_rgb_hi_2 = prep_target_all_latched ? rgb24_apply_y(rgb_hi_2, disp_y_hi_2) : rgb_hi_2;
+wire [23:0] prep_rgb_hi_3 = prep_target_all_latched ? rgb24_apply_y(rgb_hi_3, disp_y_hi_3) : rgb_hi_3;
 
 wire [7:0] prep_alpha_lo_0_base = prep_a_fmt_yenh_latched ? prep_y_lo_0 : preproc_alpha_from_bgr565(frame_rd_data[15:0]);
 wire [7:0] prep_alpha_lo_1 = prep_a_fmt_yenh_latched ? prep_y_lo_1 : preproc_alpha_from_bgr565(frame_rd_data[31:16]);
