@@ -803,6 +803,16 @@ reg  [8:0]                 post_ddr_word_x;
 reg  [9:0]                 post_ddr_line_y;
 reg  [7:0]                 prep_word_x;
 reg  [9:0]                 prep_line_y;
+reg                        prep_linebuf_req_valid_d0;
+reg                        prep_linebuf_req_valid_d1;
+reg  [7:0]                 prep_linebuf_req_word_x_d0;
+reg  [7:0]                 prep_linebuf_req_word_x_d1;
+reg  [9:0]                 prep_linebuf_req_line_y_d0;
+reg  [9:0]                 prep_linebuf_req_line_y_d1;
+reg  [63:0]                prep_linebuf_prev1_rd_d0;
+reg  [63:0]                prep_linebuf_prev1_rd_d1;
+reg  [63:0]                prep_linebuf_prev2_rd_d0;
+reg  [63:0]                prep_linebuf_prev2_rd_d1;
 reg  [2:0]                 frame_src_bootstrap_count;
 reg                        dma_expand_phase;
 reg  [11:0]                mwr_rd_addr_d;
@@ -822,26 +832,12 @@ reg  [7:0]                 roi_timeout_count;
 reg  [31:0]                roi_cfg_seen_x1y1;
 reg  [31:0]                roi_cfg_seen_x2y2;
 reg  [31:0]                roi_cfg_seen_ctrl;
-reg                        frame_stage_valid;
-reg  [127:0]               frame_stage_src_word;
-reg  [63:0]                frame_stage_luma_word;
-reg  [63:0]                frame_stage_top_word;
-reg  [63:0]                frame_stage_mid_word;
-reg  [7:0]                 prep_stage_word_x;
-reg  [9:0]                 prep_stage_line_y;
-reg  [11:0]                prep_stage_x_pix_base;
-reg                        frame_pending_valid;
-reg  [127:0]               frame_pending_src_word;
-reg  [63:0]                frame_pending_luma_word;
-reg  [63:0]                frame_pending_top_word;
-reg  [63:0]                frame_pending_mid_word;
-reg  [7:0]                 frame_pending_top_left_pix;
-reg  [7:0]                 frame_pending_mid_left_pix;
-reg  [7:0]                 frame_pending_bot_left_pix;
-reg  [7:0]                 prep_pending_word_x;
-reg  [9:0]                 prep_pending_line_y;
-reg  [11:0]                prep_pending_x_pix_base;
-reg  [1:0]                 prep_flush_words_pending;
+reg  [7:0]                 prep_top_hist_0_q;
+reg  [7:0]                 prep_top_hist_1_q;
+reg  [7:0]                 prep_mid_hist_0_q;
+reg  [7:0]                 prep_mid_hist_1_q;
+reg  [7:0]                 prep_bot_hist_0_q;
+reg  [7:0]                 prep_bot_hist_1_q;
 reg                        out_pair_active_valid;
 reg  [127:0]               out_pair_active_src_word;
 reg  [63:0]                out_pair_active_y_word;
@@ -892,8 +888,13 @@ wire [11:0]                post_ddr_x_pix = dma_expand_mode ? {1'b0, post_ddr_wo
 wire [15:0]                post_ddr_color_base = color_bar_bgr565(post_ddr_x_pix);
 wire [15:0]                post_ddr_color_data = post_ddr_color_base;
 wire [8:0]                 post_ddr_words_per_line = dma_expand_mode ? 9'd320 : 9'd160;
+// Read the prep line buffers through registered request/data phases so the
+// synthesizer can map them as RAM instead of a wide async mux tree.
 reg  [63:0]                prep_linebuf_prev1 [0:PREP_FETCH_WORDS_PER_LINE-1];
 reg  [63:0]                prep_linebuf_prev2 [0:PREP_FETCH_WORDS_PER_LINE-1];
+wire [7:0]                 prep_data_word_x = prep_linebuf_req_word_x_d1;
+wire [9:0]                 prep_data_line_y = prep_linebuf_req_line_y_d1;
+wire [11:0]                prep_x_pix_base = {prep_data_word_x, 3'b000};
 function [7:0] expand5_to_8;
     input [4:0] value5;
 begin
@@ -1383,157 +1384,120 @@ begin
 end
 endfunction
 
-reg          emit_push_valid_c;
-reg  [127:0] emit_src_word_c;
-reg  [63:0]  emit_top_word_c;
-reg  [63:0]  emit_mid_word_c;
-reg  [63:0]  emit_bot_word_c;
-reg  [63:0]  emit_right_top_word_c;
-reg  [63:0]  emit_right_mid_word_c;
-reg  [63:0]  emit_right_bot_word_c;
-reg  [7:0]   emit_left_top_pix_c;
-reg  [7:0]   emit_left_mid_pix_c;
-reg  [7:0]   emit_left_bot_pix_c;
-reg  [11:0]  emit_x_pix_base_c;
-reg  [9:0]   emit_line_y_c;
-reg          emit_first_word_c;
-reg  [63:0]  emit_y_word_c;
-reg  [1:0]   emit_roi_mode_c;
-reg  [7:0]   emit_top_l_c;
-reg  [7:0]   emit_top_m_c;
-reg  [7:0]   emit_top_r_c;
-reg  [7:0]   emit_mid_l_c;
-reg  [7:0]   emit_mid_m_c;
-reg  [7:0]   emit_mid_r_c;
-reg  [7:0]   emit_bot_l_c;
-reg  [7:0]   emit_bot_m_c;
-reg  [7:0]   emit_bot_r_c;
-reg  [7:0]   emit_min_top_c;
-reg  [7:0]   emit_min_mid_c;
-reg  [7:0]   emit_min_bot_c;
-reg  [7:0]   emit_max_top_c;
-reg  [7:0]   emit_max_mid_c;
-reg  [7:0]   emit_max_bot_c;
-reg  [7:0]   emit_y_med_c;
-reg  [7:0]   emit_y_min_c;
-reg  [7:0]   emit_y_max_c;
-integer      emit_k;
+reg  [63:0] prep_luma_word_enh_c;
+reg  [7:0]  prep_top_hist_0_d;
+reg  [7:0]  prep_top_hist_1_d;
+reg  [7:0]  prep_mid_hist_0_d;
+reg  [7:0]  prep_mid_hist_1_d;
+reg  [7:0]  prep_bot_hist_0_d;
+reg  [7:0]  prep_bot_hist_1_d;
+reg  [7:0]  prep_top_cur_r;
+reg  [7:0]  prep_mid_cur_r;
+reg  [7:0]  prep_bot_cur_r;
+reg  [7:0]  prep_top_min_r;
+reg  [7:0]  prep_mid_min_r;
+reg  [7:0]  prep_bot_min_r;
+reg  [7:0]  prep_top_max_r;
+reg  [7:0]  prep_mid_max_r;
+reg  [7:0]  prep_bot_max_r;
+reg  [7:0]  prep_y_med_r;
+reg  [7:0]  prep_y_min_r;
+reg  [7:0]  prep_y_max_r;
+reg  [1:0]  prep_roi_mode_r;
+integer     prep_k;
 
 wire [63:0] frame_rd_luma_word = luma_word_from_src128(frame_rd_data);
+wire [63:0] prep_luma_word_cur = frame_rd_luma_word;
+wire [63:0] prep_luma_word_top = (prep_data_line_y == 10'd0) ? prep_luma_word_cur :
+                                 (prep_data_line_y == 10'd1) ? prep_linebuf_prev1_rd_d1 : prep_linebuf_prev2_rd_d1;
+wire [63:0] prep_luma_word_mid = (prep_data_line_y == 10'd0) ? prep_luma_word_cur : prep_linebuf_prev1_rd_d1;
 wire        out_pair_pop = bar2_addr_step & (~dma_expand_mode | dma_expand_phase);
 
-always @* begin
-    emit_push_valid_c = 1'b0;
-    emit_src_word_c = 128'd0;
-    emit_top_word_c = 64'd0;
-    emit_mid_word_c = 64'd0;
-    emit_bot_word_c = 64'd0;
-    emit_right_top_word_c = 64'd0;
-    emit_right_mid_word_c = 64'd0;
-    emit_right_bot_word_c = 64'd0;
-    emit_left_top_pix_c = 8'd0;
-    emit_left_mid_pix_c = 8'd0;
-    emit_left_bot_pix_c = 8'd0;
-    emit_x_pix_base_c = 12'd0;
-    emit_line_y_c = 10'd0;
-    emit_first_word_c = 1'b0;
-    emit_y_word_c = 64'd0;
+wire [1:0] prep_roi_mode_0 = roi_boost_mode_xy(prep_x_pix_base + 12'd0, {1'b0, prep_data_line_y},
+                                               roi_session_active, roi_session_left_bias,
+                                               roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
+wire [1:0] prep_roi_mode_1 = roi_boost_mode_xy(prep_x_pix_base + 12'd1, {1'b0, prep_data_line_y},
+                                               roi_session_active, roi_session_left_bias,
+                                               roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
+wire [1:0] prep_roi_mode_2 = roi_boost_mode_xy(prep_x_pix_base + 12'd2, {1'b0, prep_data_line_y},
+                                               roi_session_active, roi_session_left_bias,
+                                               roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
+wire [1:0] prep_roi_mode_3 = roi_boost_mode_xy(prep_x_pix_base + 12'd3, {1'b0, prep_data_line_y},
+                                               roi_session_active, roi_session_left_bias,
+                                               roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
+wire [1:0] prep_roi_mode_4 = roi_boost_mode_xy(prep_x_pix_base + 12'd4, {1'b0, prep_data_line_y},
+                                               roi_session_active, roi_session_left_bias,
+                                               roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
+wire [1:0] prep_roi_mode_5 = roi_boost_mode_xy(prep_x_pix_base + 12'd5, {1'b0, prep_data_line_y},
+                                               roi_session_active, roi_session_left_bias,
+                                               roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
+wire [1:0] prep_roi_mode_6 = roi_boost_mode_xy(prep_x_pix_base + 12'd6, {1'b0, prep_data_line_y},
+                                               roi_session_active, roi_session_left_bias,
+                                               roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
+wire [1:0] prep_roi_mode_7 = roi_boost_mode_xy(prep_x_pix_base + 12'd7, {1'b0, prep_data_line_y},
+                                               roi_session_active, roi_session_left_bias,
+                                               roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
 
-    if (dma_session_active && frame_rd_data_valid && frame_pending_valid) begin
-        emit_push_valid_c = 1'b1;
-        emit_src_word_c = frame_pending_src_word;
-        emit_top_word_c = frame_pending_top_word;
-        emit_mid_word_c = frame_pending_mid_word;
-        emit_bot_word_c = frame_pending_luma_word;
-        emit_left_top_pix_c = frame_pending_top_left_pix;
-        emit_left_mid_pix_c = frame_pending_mid_left_pix;
-        emit_left_bot_pix_c = frame_pending_bot_left_pix;
-        emit_x_pix_base_c = prep_pending_x_pix_base;
-        emit_line_y_c = prep_pending_line_y;
-        emit_first_word_c = (prep_pending_word_x == 8'd0) && (prep_pending_line_y == 10'd0);
-        if (frame_stage_valid &&
-            (prep_pending_line_y == prep_stage_line_y) &&
-            (prep_pending_word_x != (PREP_FETCH_WORDS_PER_LINE - 1'b1))) begin
-            emit_right_top_word_c = frame_stage_top_word;
-            emit_right_mid_word_c = frame_stage_mid_word;
-            emit_right_bot_word_c = frame_stage_luma_word;
-        end else begin
-            emit_right_top_word_c = frame_pending_top_word;
-            emit_right_mid_word_c = frame_pending_mid_word;
-            emit_right_bot_word_c = frame_pending_luma_word;
-        end
-    end else if ((prep_flush_words_pending != 2'd0) && frame_pending_valid) begin
-        emit_push_valid_c = 1'b1;
-        emit_src_word_c = frame_pending_src_word;
-        emit_top_word_c = frame_pending_top_word;
-        emit_mid_word_c = frame_pending_mid_word;
-        emit_bot_word_c = frame_pending_luma_word;
-        emit_left_top_pix_c = frame_pending_top_left_pix;
-        emit_left_mid_pix_c = frame_pending_mid_left_pix;
-        emit_left_bot_pix_c = frame_pending_bot_left_pix;
-        emit_x_pix_base_c = prep_pending_x_pix_base;
-        emit_line_y_c = prep_pending_line_y;
-        emit_first_word_c = (prep_pending_word_x == 8'd0) && (prep_pending_line_y == 10'd0);
-        if ((prep_flush_words_pending == 2'd2) &&
-            frame_stage_valid &&
-            (prep_pending_line_y == prep_stage_line_y) &&
-            (prep_pending_word_x != (PREP_FETCH_WORDS_PER_LINE - 1'b1))) begin
-            emit_right_top_word_c = frame_stage_top_word;
-            emit_right_mid_word_c = frame_stage_mid_word;
-            emit_right_bot_word_c = frame_stage_luma_word;
-        end else begin
-            emit_right_top_word_c = frame_pending_top_word;
-            emit_right_mid_word_c = frame_pending_mid_word;
-            emit_right_bot_word_c = frame_pending_luma_word;
-        end
+always @* begin
+    prep_luma_word_enh_c = 64'd0;
+
+    if (prep_data_word_x == 8'd0) begin
+        prep_top_hist_0_d = prep_luma_word_top[7:0];
+        prep_top_hist_1_d = prep_luma_word_top[7:0];
+        prep_mid_hist_0_d = prep_luma_word_mid[7:0];
+        prep_mid_hist_1_d = prep_luma_word_mid[7:0];
+        prep_bot_hist_0_d = prep_luma_word_cur[7:0];
+        prep_bot_hist_1_d = prep_luma_word_cur[7:0];
+    end else begin
+        prep_top_hist_0_d = prep_top_hist_0_q;
+        prep_top_hist_1_d = prep_top_hist_1_q;
+        prep_mid_hist_0_d = prep_mid_hist_0_q;
+        prep_mid_hist_1_d = prep_mid_hist_1_q;
+        prep_bot_hist_0_d = prep_bot_hist_0_q;
+        prep_bot_hist_1_d = prep_bot_hist_1_q;
     end
 
-    for (emit_k = 0; emit_k < 8; emit_k = emit_k + 1) begin
-        emit_top_m_c = emit_top_word_c[(emit_k * 8) +: 8];
-        emit_mid_m_c = emit_mid_word_c[(emit_k * 8) +: 8];
-        emit_bot_m_c = emit_bot_word_c[(emit_k * 8) +: 8];
+    for (prep_k = 0; prep_k < 8; prep_k = prep_k + 1) begin
+        prep_top_cur_r = prep_luma_word_top[(prep_k * 8) +: 8];
+        prep_mid_cur_r = prep_luma_word_mid[(prep_k * 8) +: 8];
+        prep_bot_cur_r = prep_luma_word_cur[(prep_k * 8) +: 8];
+        prep_top_min_r = min3_u8(prep_top_hist_0_d, prep_top_hist_1_d, prep_top_cur_r);
+        prep_mid_min_r = min3_u8(prep_mid_hist_0_d, prep_mid_hist_1_d, prep_mid_cur_r);
+        prep_bot_min_r = min3_u8(prep_bot_hist_0_d, prep_bot_hist_1_d, prep_bot_cur_r);
+        prep_top_max_r = max3_u8(prep_top_hist_0_d, prep_top_hist_1_d, prep_top_cur_r);
+        prep_mid_max_r = max3_u8(prep_mid_hist_0_d, prep_mid_hist_1_d, prep_mid_cur_r);
+        prep_bot_max_r = max3_u8(prep_bot_hist_0_d, prep_bot_hist_1_d, prep_bot_cur_r);
+        prep_y_med_r = median9_u8(prep_top_hist_0_d, prep_top_hist_1_d, prep_top_cur_r,
+                                  prep_mid_hist_0_d, prep_mid_hist_1_d, prep_mid_cur_r,
+                                  prep_bot_hist_0_d, prep_bot_hist_1_d, prep_bot_cur_r);
+        prep_y_min_r = min3_u8(prep_top_min_r, prep_mid_min_r, prep_bot_min_r);
+        prep_y_max_r = max3_u8(prep_top_max_r, prep_mid_max_r, prep_bot_max_r);
 
-        if (emit_k == 0) begin
-            emit_top_l_c = emit_left_top_pix_c;
-            emit_mid_l_c = emit_left_mid_pix_c;
-            emit_bot_l_c = emit_left_bot_pix_c;
-        end else begin
-            emit_top_l_c = emit_top_word_c[((emit_k - 1) * 8) +: 8];
-            emit_mid_l_c = emit_mid_word_c[((emit_k - 1) * 8) +: 8];
-            emit_bot_l_c = emit_bot_word_c[((emit_k - 1) * 8) +: 8];
-        end
+        case (prep_k)
+            0: prep_roi_mode_r = prep_roi_mode_0;
+            1: prep_roi_mode_r = prep_roi_mode_1;
+            2: prep_roi_mode_r = prep_roi_mode_2;
+            3: prep_roi_mode_r = prep_roi_mode_3;
+            4: prep_roi_mode_r = prep_roi_mode_4;
+            5: prep_roi_mode_r = prep_roi_mode_5;
+            6: prep_roi_mode_r = prep_roi_mode_6;
+            default: prep_roi_mode_r = prep_roi_mode_7;
+        endcase
 
-        if (emit_k == 7) begin
-            emit_top_r_c = emit_right_top_word_c[7:0];
-            emit_mid_r_c = emit_right_mid_word_c[7:0];
-            emit_bot_r_c = emit_right_bot_word_c[7:0];
-        end else begin
-            emit_top_r_c = emit_top_word_c[((emit_k + 1) * 8) +: 8];
-            emit_mid_r_c = emit_mid_word_c[((emit_k + 1) * 8) +: 8];
-            emit_bot_r_c = emit_bot_word_c[((emit_k + 1) * 8) +: 8];
-        end
+        prep_luma_word_enh_c[(prep_k * 8) +: 8] = spatial_enhance_y(prep_bot_cur_r, prep_y_med_r,
+                                                                    prep_y_min_r, prep_y_max_r,
+                                                                    prep_median_en, prep_clahe_en,
+                                                                    prep_usm_en, prep_ocr_stroke_latched,
+                                                                    prep_roi_mode_r,
+                                                                    fpga_prep_clahe, fpga_prep_usm,
+                                                                    fpga_prep_med);
 
-        emit_min_top_c = min3_u8(emit_top_l_c, emit_top_m_c, emit_top_r_c);
-        emit_min_mid_c = min3_u8(emit_mid_l_c, emit_mid_m_c, emit_mid_r_c);
-        emit_min_bot_c = min3_u8(emit_bot_l_c, emit_bot_m_c, emit_bot_r_c);
-        emit_max_top_c = max3_u8(emit_top_l_c, emit_top_m_c, emit_top_r_c);
-        emit_max_mid_c = max3_u8(emit_mid_l_c, emit_mid_m_c, emit_mid_r_c);
-        emit_max_bot_c = max3_u8(emit_bot_l_c, emit_bot_m_c, emit_bot_r_c);
-        emit_y_med_c = median9_u8(emit_top_l_c, emit_top_m_c, emit_top_r_c,
-                                  emit_mid_l_c, emit_mid_m_c, emit_mid_r_c,
-                                  emit_bot_l_c, emit_bot_m_c, emit_bot_r_c);
-        emit_y_min_c = min3_u8(emit_min_top_c, emit_min_mid_c, emit_min_bot_c);
-        emit_y_max_c = max3_u8(emit_max_top_c, emit_max_mid_c, emit_max_bot_c);
-        emit_roi_mode_c = roi_boost_mode_xy(emit_x_pix_base_c + emit_k, {1'b0, emit_line_y_c},
-                                            roi_session_active, roi_session_left_bias,
-                                            roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
-        emit_y_word_c[(emit_k * 8) +: 8] = spatial_enhance_y(emit_bot_m_c, emit_y_med_c,
-                                                             emit_y_min_c, emit_y_max_c,
-                                                             prep_median_en, prep_clahe_en,
-                                                             prep_usm_en, prep_ocr_stroke_latched,
-                                                             emit_roi_mode_c,
-                                                             fpga_prep_clahe, fpga_prep_usm,
-                                                             fpga_prep_med);
+        prep_top_hist_0_d = prep_top_hist_1_d;
+        prep_top_hist_1_d = prep_top_cur_r;
+        prep_mid_hist_0_d = prep_mid_hist_1_d;
+        prep_mid_hist_1_d = prep_mid_cur_r;
+        prep_bot_hist_0_d = prep_bot_hist_1_d;
+        prep_bot_hist_1_d = prep_bot_cur_r;
     end
 end
 
@@ -1603,6 +1567,16 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         rd_fsync_stretch_cnt <= 6'd0;
         prep_word_x <= 8'd0;
         prep_line_y <= 10'd0;
+        prep_linebuf_req_valid_d0 <= 1'b0;
+        prep_linebuf_req_valid_d1 <= 1'b0;
+        prep_linebuf_req_word_x_d0 <= 8'd0;
+        prep_linebuf_req_word_x_d1 <= 8'd0;
+        prep_linebuf_req_line_y_d0 <= 10'd0;
+        prep_linebuf_req_line_y_d1 <= 10'd0;
+        prep_linebuf_prev1_rd_d0 <= 64'd0;
+        prep_linebuf_prev1_rd_d1 <= 64'd0;
+        prep_linebuf_prev2_rd_d0 <= 64'd0;
+        prep_linebuf_prev2_rd_d1 <= 64'd0;
         frame_src_bootstrap_count <= 3'd0;
         dma_expand_phase <= 1'b0;
         frame_id <= 8'd0;
@@ -1620,26 +1594,12 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         roi_cfg_seen_x1y1 <= 32'd0;
         roi_cfg_seen_x2y2 <= 32'd0;
         roi_cfg_seen_ctrl <= 32'd0;
-        frame_stage_valid <= 1'b0;
-        frame_stage_src_word <= 128'd0;
-        frame_stage_luma_word <= 64'd0;
-        frame_stage_top_word <= 64'd0;
-        frame_stage_mid_word <= 64'd0;
-        prep_stage_word_x <= 8'd0;
-        prep_stage_line_y <= 10'd0;
-        prep_stage_x_pix_base <= 12'd0;
-        frame_pending_valid <= 1'b0;
-        frame_pending_src_word <= 128'd0;
-        frame_pending_luma_word <= 64'd0;
-        frame_pending_top_word <= 64'd0;
-        frame_pending_mid_word <= 64'd0;
-        frame_pending_top_left_pix <= 8'd0;
-        frame_pending_mid_left_pix <= 8'd0;
-        frame_pending_bot_left_pix <= 8'd0;
-        prep_pending_word_x <= 8'd0;
-        prep_pending_line_y <= 10'd0;
-        prep_pending_x_pix_base <= 12'd0;
-        prep_flush_words_pending <= 2'd0;
+        prep_top_hist_0_q <= 8'd0;
+        prep_top_hist_1_q <= 8'd0;
+        prep_mid_hist_0_q <= 8'd0;
+        prep_mid_hist_1_q <= 8'd0;
+        prep_bot_hist_0_q <= 8'd0;
+        prep_bot_hist_1_q <= 8'd0;
         out_pair_active_valid <= 1'b0;
         out_pair_active_src_word <= 128'd0;
         out_pair_active_y_word <= 64'd0;
@@ -1655,6 +1615,16 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         rd_fsync_stretch_cnt <= 6'd0;
         prep_word_x <= 8'd0;
         prep_line_y <= 10'd0;
+        prep_linebuf_req_valid_d0 <= 1'b0;
+        prep_linebuf_req_valid_d1 <= 1'b0;
+        prep_linebuf_req_word_x_d0 <= 8'd0;
+        prep_linebuf_req_word_x_d1 <= 8'd0;
+        prep_linebuf_req_line_y_d0 <= 10'd0;
+        prep_linebuf_req_line_y_d1 <= 10'd0;
+        prep_linebuf_prev1_rd_d0 <= 64'd0;
+        prep_linebuf_prev1_rd_d1 <= 64'd0;
+        prep_linebuf_prev2_rd_d0 <= 64'd0;
+        prep_linebuf_prev2_rd_d1 <= 64'd0;
         frame_src_bootstrap_count <= 3'd0;
         dma_expand_phase <= 1'b0;
         prep_session_en <= 1'b0;
@@ -1663,11 +1633,20 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_session_ocr_stroke <= 1'b0;
         roi_session_active <= 1'b0;
         roi_session_left_bias <= 1'b0;
-        frame_stage_valid <= 1'b0;
-        frame_pending_valid <= 1'b0;
-        prep_flush_words_pending <= 2'd0;
+        prep_top_hist_0_q <= 8'd0;
+        prep_top_hist_1_q <= 8'd0;
+        prep_mid_hist_0_q <= 8'd0;
+        prep_mid_hist_1_q <= 8'd0;
+        prep_bot_hist_0_q <= 8'd0;
+        prep_bot_hist_1_q <= 8'd0;
         out_pair_active_valid <= 1'b0;
+        out_pair_active_src_word <= 128'd0;
+        out_pair_active_y_word <= 64'd0;
+        out_pair_active_first_word <= 1'b0;
         out_pair_next_valid <= 1'b0;
+        out_pair_next_src_word <= 128'd0;
+        out_pair_next_y_word <= 64'd0;
+        out_pair_next_first_word <= 1'b0;
     end else begin
         if (dma_session_start) begin
             dma_session_active <= 1'b1;
@@ -1676,6 +1655,16 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             rd_fsync_stretch_cnt <= 6'd31;
             prep_word_x <= 8'd0;
             prep_line_y <= 10'd0;
+            prep_linebuf_req_valid_d0 <= 1'b0;
+            prep_linebuf_req_valid_d1 <= 1'b0;
+            prep_linebuf_req_word_x_d0 <= 8'd0;
+            prep_linebuf_req_word_x_d1 <= 8'd0;
+            prep_linebuf_req_line_y_d0 <= 10'd0;
+            prep_linebuf_req_line_y_d1 <= 10'd0;
+            prep_linebuf_prev1_rd_d0 <= 64'd0;
+            prep_linebuf_prev1_rd_d1 <= 64'd0;
+            prep_linebuf_prev2_rd_d0 <= 64'd0;
+            prep_linebuf_prev2_rd_d1 <= 64'd0;
             frame_src_bootstrap_count <= 3'd0;
             dma_expand_phase <= 1'b0;
             frame_id <= frame_id + 8'd1;
@@ -1686,28 +1675,20 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             roi_cfg_seen_x1y1 <= fpga_roi_x1y1;
             roi_cfg_seen_x2y2 <= fpga_roi_x2y2;
             roi_cfg_seen_ctrl <= fpga_roi_ctrl;
-            frame_stage_valid <= 1'b0;
-            frame_stage_src_word <= 128'd0;
-            frame_stage_luma_word <= 64'd0;
-            frame_stage_top_word <= 64'd0;
-            frame_stage_mid_word <= 64'd0;
-            prep_stage_word_x <= 8'd0;
-            prep_stage_line_y <= 10'd0;
-            prep_stage_x_pix_base <= 12'd0;
-            frame_pending_valid <= 1'b0;
-            frame_pending_src_word <= 128'd0;
-            frame_pending_luma_word <= 64'd0;
-            frame_pending_top_word <= 64'd0;
-            frame_pending_mid_word <= 64'd0;
-            frame_pending_top_left_pix <= 8'd0;
-            frame_pending_mid_left_pix <= 8'd0;
-            frame_pending_bot_left_pix <= 8'd0;
-            prep_pending_word_x <= 8'd0;
-            prep_pending_line_y <= 10'd0;
-            prep_pending_x_pix_base <= 12'd0;
-            prep_flush_words_pending <= 2'd0;
+            prep_top_hist_0_q <= 8'd0;
+            prep_top_hist_1_q <= 8'd0;
+            prep_mid_hist_0_q <= 8'd0;
+            prep_mid_hist_1_q <= 8'd0;
+            prep_bot_hist_0_q <= 8'd0;
+            prep_bot_hist_1_q <= 8'd0;
             out_pair_active_valid <= 1'b0;
+            out_pair_active_src_word <= 128'd0;
+            out_pair_active_y_word <= 64'd0;
+            out_pair_active_first_word <= 1'b0;
             out_pair_next_valid <= 1'b0;
+            out_pair_next_src_word <= 128'd0;
+            out_pair_next_y_word <= 64'd0;
+            out_pair_next_first_word <= 1'b0;
             if (prep_active && prep_ocr_stroke_mode && prep_target_ocr_only) begin
                 if (roi_cfg_changed) begin
                     if (roi_cfg_enable && roi_cfg_bbox_valid) begin
@@ -1739,6 +1720,13 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 roi_timeout_count <= 8'd0;
             end
         end else begin
+            prep_linebuf_req_valid_d1 <= prep_linebuf_req_valid_d0;
+            prep_linebuf_req_word_x_d1 <= prep_linebuf_req_word_x_d0;
+            prep_linebuf_req_line_y_d1 <= prep_linebuf_req_line_y_d0;
+            prep_linebuf_prev1_rd_d1 <= prep_linebuf_prev1_rd_d0;
+            prep_linebuf_prev2_rd_d1 <= prep_linebuf_prev2_rd_d0;
+            prep_linebuf_req_valid_d0 <= 1'b0;
+
             if (dma_session_active && bar2_addr_step) begin
                 if (dma_rd_word_count == frame_words_cfg - 1'b1) begin
                     dma_rd_word_count <= 18'd0;
@@ -1762,6 +1750,20 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 frame_src_req_count <= frame_src_req_count + 18'd1;
                 if (frame_src_bootstrap_count != PREP_BOOTSTRAP_WORDS)
                     frame_src_bootstrap_count <= frame_src_bootstrap_count + 3'd1;
+                prep_linebuf_req_valid_d0 <= 1'b1;
+                prep_linebuf_req_word_x_d0 <= prep_word_x;
+                prep_linebuf_req_line_y_d0 <= prep_line_y;
+                prep_linebuf_prev1_rd_d0 <= prep_linebuf_prev1[prep_word_x];
+                prep_linebuf_prev2_rd_d0 <= prep_linebuf_prev2[prep_word_x];
+                if (prep_word_x == (PREP_FETCH_WORDS_PER_LINE - 1'b1)) begin
+                    prep_word_x <= 8'd0;
+                    if (prep_line_y == 10'd719)
+                        prep_line_y <= 10'd0;
+                    else
+                        prep_line_y <= prep_line_y + 10'd1;
+                end else begin
+                    prep_word_x <= prep_word_x + 8'd1;
+                end
             end
 
             if (out_pair_pop) begin
@@ -1776,100 +1778,25 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 end
             end
 
-            if (emit_push_valid_c) begin
+            if (dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1) begin
+                prep_top_hist_0_q <= prep_top_hist_0_d;
+                prep_top_hist_1_q <= prep_top_hist_1_d;
+                prep_mid_hist_0_q <= prep_mid_hist_0_d;
+                prep_mid_hist_1_q <= prep_mid_hist_1_d;
+                prep_bot_hist_0_q <= prep_bot_hist_0_d;
+                prep_bot_hist_1_q <= prep_bot_hist_1_d;
+                prep_linebuf_prev2[prep_data_word_x] <= prep_linebuf_prev1_rd_d1;
+                prep_linebuf_prev1[prep_data_word_x] <= frame_rd_luma_word;
                 if (!out_pair_active_valid || (out_pair_pop && !out_pair_next_valid)) begin
                     out_pair_active_valid <= 1'b1;
-                    out_pair_active_src_word <= emit_src_word_c;
-                    out_pair_active_y_word <= emit_y_word_c;
-                    out_pair_active_first_word <= emit_first_word_c;
+                    out_pair_active_src_word <= frame_rd_data;
+                    out_pair_active_y_word <= prep_luma_word_enh_c;
+                    out_pair_active_first_word <= (prep_data_word_x == 8'd0) && (prep_data_line_y == 10'd0);
                 end else if (!out_pair_next_valid || out_pair_pop) begin
                     out_pair_next_valid <= 1'b1;
-                    out_pair_next_src_word <= emit_src_word_c;
-                    out_pair_next_y_word <= emit_y_word_c;
-                    out_pair_next_first_word <= emit_first_word_c;
-                end
-            end
-
-            if (dma_session_active && frame_rd_data_valid) begin
-                if (frame_stage_valid) begin
-                    frame_pending_valid <= 1'b1;
-                    frame_pending_src_word <= frame_stage_src_word;
-                    frame_pending_luma_word <= frame_stage_luma_word;
-                    frame_pending_top_word <= frame_stage_top_word;
-                    frame_pending_mid_word <= frame_stage_mid_word;
-                    prep_pending_word_x <= prep_stage_word_x;
-                    prep_pending_line_y <= prep_stage_line_y;
-                    prep_pending_x_pix_base <= prep_stage_x_pix_base;
-                    if (frame_pending_valid &&
-                        (prep_pending_line_y == prep_stage_line_y) &&
-                        ((prep_pending_word_x + 8'd1) == prep_stage_word_x)) begin
-                        frame_pending_top_left_pix <= frame_pending_top_word[63:56];
-                        frame_pending_mid_left_pix <= frame_pending_mid_word[63:56];
-                        frame_pending_bot_left_pix <= frame_pending_luma_word[63:56];
-                    end else begin
-                        frame_pending_top_left_pix <= frame_stage_top_word[7:0];
-                        frame_pending_mid_left_pix <= frame_stage_mid_word[7:0];
-                        frame_pending_bot_left_pix <= frame_stage_luma_word[7:0];
-                    end
-                end
-
-                frame_stage_valid <= 1'b1;
-                frame_stage_src_word <= frame_rd_data;
-                frame_stage_luma_word <= frame_rd_luma_word;
-                if (prep_line_y == 10'd0) begin
-                    frame_stage_top_word <= frame_rd_luma_word;
-                    frame_stage_mid_word <= frame_rd_luma_word;
-                end else if (prep_line_y == 10'd1) begin
-                    frame_stage_top_word <= prep_linebuf_prev1[prep_word_x];
-                    frame_stage_mid_word <= prep_linebuf_prev1[prep_word_x];
-                end else begin
-                    frame_stage_top_word <= prep_linebuf_prev2[prep_word_x];
-                    frame_stage_mid_word <= prep_linebuf_prev1[prep_word_x];
-                end
-                prep_stage_word_x <= prep_word_x;
-                prep_stage_line_y <= prep_line_y;
-                prep_stage_x_pix_base <= {prep_word_x, 3'b000};
-
-                prep_linebuf_prev2[prep_word_x] <= prep_linebuf_prev1[prep_word_x];
-                prep_linebuf_prev1[prep_word_x] <= frame_rd_luma_word;
-
-                if ((prep_word_x == (PREP_FETCH_WORDS_PER_LINE - 1'b1)) && (prep_line_y == 10'd719))
-                    prep_flush_words_pending <= 2'd2;
-
-                if (prep_word_x == (PREP_FETCH_WORDS_PER_LINE - 1'b1)) begin
-                    prep_word_x <= 8'd0;
-                    if (prep_line_y == 10'd719)
-                        prep_line_y <= 10'd0;
-                    else
-                        prep_line_y <= prep_line_y + 10'd1;
-                end else begin
-                    prep_word_x <= prep_word_x + 8'd1;
-                end
-            end else if (prep_flush_words_pending != 2'd0) begin
-                prep_flush_words_pending <= prep_flush_words_pending - 2'd1;
-                if (frame_stage_valid) begin
-                    frame_pending_valid <= 1'b1;
-                    frame_pending_src_word <= frame_stage_src_word;
-                    frame_pending_luma_word <= frame_stage_luma_word;
-                    frame_pending_top_word <= frame_stage_top_word;
-                    frame_pending_mid_word <= frame_stage_mid_word;
-                    prep_pending_word_x <= prep_stage_word_x;
-                    prep_pending_line_y <= prep_stage_line_y;
-                    prep_pending_x_pix_base <= prep_stage_x_pix_base;
-                    if (frame_pending_valid &&
-                        (prep_pending_line_y == prep_stage_line_y) &&
-                        ((prep_pending_word_x + 8'd1) == prep_stage_word_x)) begin
-                        frame_pending_top_left_pix <= frame_pending_top_word[63:56];
-                        frame_pending_mid_left_pix <= frame_pending_mid_word[63:56];
-                        frame_pending_bot_left_pix <= frame_pending_luma_word[63:56];
-                    end else begin
-                        frame_pending_top_left_pix <= frame_stage_top_word[7:0];
-                        frame_pending_mid_left_pix <= frame_stage_mid_word[7:0];
-                        frame_pending_bot_left_pix <= frame_stage_luma_word[7:0];
-                    end
-                    frame_stage_valid <= 1'b0;
-                end else begin
-                    frame_pending_valid <= 1'b0;
+                    out_pair_next_src_word <= frame_rd_data;
+                    out_pair_next_y_word <= prep_luma_word_enh_c;
+                    out_pair_next_first_word <= (prep_data_word_x == 8'd0) && (prep_data_line_y == 10'd0);
                 end
             end
         end
