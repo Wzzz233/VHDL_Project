@@ -794,6 +794,7 @@ localparam [17:0]          FRAME_WORDS_565  = (1280 * 720 * 16) / 128;
 localparam [17:0]          FRAME_WORDS_BGRX = (1280 * 720 * 32) / 128;
 localparam [17:0]          FRAME_SRC_WORDS  = FRAME_WORDS_565;
 localparam [2:0]           PREP_BOOTSTRAP_WORDS = 3'd4;
+localparam [2:0]           RAW_BOOTSTRAP_WORDS = 3'd2;
 localparam [7:0]           PREP_FETCH_WORDS_PER_LINE = 8'd160;
 reg                        dma_session_active;
 reg  [17:0]                dma_rd_word_count;
@@ -902,13 +903,15 @@ wire                       roi_cfg_changed = (fpga_roi_x1y1 != roi_cfg_seen_x1y1
                                             (fpga_roi_x2y2 != roi_cfg_seen_x2y2) ||
                                             (fpga_roi_ctrl != roi_cfg_seen_ctrl);
 wire [17:0]                frame_words_cfg = dma_expand_mode ? FRAME_WORDS_BGRX : FRAME_WORDS_565;
+wire [2:0]                 frame_bootstrap_words = prep_active_latched ? PREP_BOOTSTRAP_WORDS
+                                                                        : RAW_BOOTSTRAP_WORDS;
 // Count chunk first beat as a valid step to prevent boundary phase slip.
 wire                       bar2_addr_step = mwr_rd_clk_en &&
                                             ((mwr_rd_addr != mwr_rd_addr_d) || (~mwr_rd_clk_en_d));
 wire                       frame_rd_req_en = dma_session_active &&
                                             frame_rd_data_ready &&
                                             (frame_src_req_count < FRAME_SRC_WORDS) &&
-                                            ((frame_src_bootstrap_count < PREP_BOOTSTRAP_WORDS) ||
+                                            ((frame_src_bootstrap_count < frame_bootstrap_words) ||
                                              (bar2_addr_step & (~dma_expand_mode | ~dma_expand_phase)));
 wire [11:0]                post_ddr_x_pix = dma_expand_mode ? {1'b0, post_ddr_word_x, 2'b00}
                                                              : {post_ddr_word_x, 3'b000};
@@ -1883,7 +1886,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
 
             if (frame_rd_req_en) begin
                 frame_src_req_count <= frame_src_req_count + 18'd1;
-                if (frame_src_bootstrap_count != PREP_BOOTSTRAP_WORDS)
+                if (frame_src_bootstrap_count != frame_bootstrap_words)
                     frame_src_bootstrap_count <= frame_src_bootstrap_count + 3'd1;
                 prep_linebuf_req_valid_d0 <= 1'b1;
                 prep_linebuf_req_word_x_d0 <= prep_word_x;
