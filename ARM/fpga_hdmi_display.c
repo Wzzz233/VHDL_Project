@@ -161,7 +161,7 @@ static void print_usage(const char *prog)
             "  --stats-interval <sec>  Stats print interval (default: %d)\n"
             "  --copy-buffers <num>    Copy ring size (default: %d, range: %d..%d)\n"
             "  --queue-depth <num>     appsrc max frame queue (default: %d)\n"
-            "  --io-mode <mode>        mmap|copy (default: mmap)\n"
+            "  --io-mode <mode>        mmap|copy (default: mmap, display remains buffered)\n"
             "  --swap16 <0|1>          Swap bytes in each 16-bit pixel (default: 1)\n"
             "  --help                  Show this message\n",
             prog,
@@ -595,7 +595,16 @@ static int init_fpga_dma(struct app_ctx *ctx)
     ctx->display_frame_size = ctx->source_is_bgrx
         ? ctx->frame_size
         : ((size_t)ctx->frame_width * ctx->frame_height * 4U);
-    ctx->zero_copy_mode = ctx->source_is_bgrx && (ctx->opt.io_mode == IO_MODE_MMAP);
+    /*
+     * The FPGA DMA mmap exposes a single live capture buffer. Handing that
+     * buffer directly to kmssink lets the next DMA overwrite scanout memory
+     * mid-refresh, which shows up as vertical tearing. Keep mmap for source
+     * access, but always present through app-managed slots.
+     */
+    ctx->zero_copy_mode = false;
+    if (ctx->source_is_bgrx && (ctx->opt.io_mode == IO_MODE_MMAP))
+        fprintf(stderr,
+                "[fpga-init] mmap source enabled; display stays buffered to avoid live scanout tearing\n");
 
     if (ctx->opt.io_mode == IO_MODE_MMAP) {
         struct buffer_map map;
