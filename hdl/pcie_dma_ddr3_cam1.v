@@ -821,7 +821,6 @@ reg                        dma_expand_phase;
 reg  [11:0]                mwr_rd_addr_d;
 reg                        mwr_rd_clk_en_d;
 reg  [127:0]               frame_rd_data_hold;
-reg                        raw_frame_hold_valid;
 reg  [7:0]                 frame_id;
 reg                        prep_session_en;
 reg                        prep_session_target_all;
@@ -1623,10 +1622,8 @@ wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgr
 wire [127:0] frame_dma_data = dma_expand_mode
     ? (prep_output_active ? frame_dma_data_prep : frame_dma_data_raw)
     : frame_rd_data;
-wire        raw_pipe_valid = dma_expand_mode ? (raw_capture_fire | raw_frame_hold_valid)
-                                             : frame_rd_data_ready;
 wire        prep_pipe_valid = prep_active_latched ? (out_pair_active_valid & prep_pair_active_valid)
-                                                  : raw_pipe_valid;
+                                                  : frame_rd_data_ready;
 wire        frame_stream_ready = ~dma_session_active | prep_pipe_valid;
 
 assign axis_slave2_tready_fc = axis_slave2_tready_raw & frame_stream_ready;
@@ -1665,7 +1662,6 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         frame_src_bootstrap_count <= 3'd0;
         dma_expand_phase <= 1'b0;
         frame_rd_data_hold <= 128'd0;
-        raw_frame_hold_valid <= 1'b0;
         frame_id <= 8'd0;
         prep_session_en <= 1'b0;
         prep_session_target_all <= 1'b0;
@@ -1751,7 +1747,6 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_linebuf_prev2_rd_d1 <= 64'd0;
         frame_src_bootstrap_count <= 3'd0;
         dma_expand_phase <= 1'b0;
-        raw_frame_hold_valid <= 1'b0;
         prep_session_en <= 1'b0;
         prep_session_target_all <= 1'b0;
         prep_session_a_fmt_yenh <= 1'b0;
@@ -1830,7 +1825,6 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             frame_src_bootstrap_count <= 3'd0;
             dma_expand_phase <= 1'b0;
             frame_rd_data_hold <= 128'd0;
-            raw_frame_hold_valid <= 1'b0;
             frame_id <= frame_id + 8'd1;
             prep_session_en <= prep_active;
             prep_session_target_all <= prep_target_all;
@@ -1949,9 +1943,6 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
 
             if (raw_frame_hold_en)
                 frame_rd_data_hold <= frame_rd_data;
-
-            if (!prep_active_latched && raw_capture_fire)
-                raw_frame_hold_valid <= 1'b1;
 
             if (rd_fsync_stretch_cnt != 6'd0)
                 rd_fsync_stretch_cnt <= rd_fsync_stretch_cnt - 6'd1;
