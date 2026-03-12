@@ -931,8 +931,7 @@ wire [2:0]                 frame_bootstrap_words = prep_active_latched ? PREP_BO
 wire                       bar2_addr_step = mwr_rd_clk_en &&
                                             ((mwr_rd_addr != mwr_rd_addr_d) || (~mwr_rd_clk_en_d));
 wire                       raw_start_bootstrap_req = raw_startup_active &&
-                                                    ~raw_start_word_valid &&
-                                                    (frame_src_req_count == 18'd0);
+                                                    (frame_src_bootstrap_count < RAW_BOOTSTRAP_WORDS);
 wire                       frame_rd_req_en_raw = dma_session_active &&
                                                 frame_rd_data_ready &&
                                                 (frame_src_req_count < FRAME_SRC_WORDS) &&
