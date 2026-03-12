@@ -820,6 +820,7 @@ reg  [2:0]                 frame_src_bootstrap_count;
 reg                        dma_expand_phase;
 reg  [11:0]                mwr_rd_addr_d;
 reg                        mwr_rd_clk_en_d;
+reg  [127:0]               frame_rd_data_hold;
 reg  [7:0]                 frame_id;
 reg                        prep_session_en;
 reg                        prep_session_target_all;
@@ -926,6 +927,7 @@ wire [2:0]                 frame_bootstrap_words = prep_active_latched ? PREP_BO
 // Count chunk first beat as a valid step to prevent boundary phase slip.
 wire                       bar2_addr_step = mwr_rd_clk_en &&
                                             ((mwr_rd_addr != mwr_rd_addr_d) || (~mwr_rd_clk_en_d));
+wire                       raw_frame_hold_en = bar2_addr_step & (~dma_expand_mode | ~dma_expand_phase);
 wire                       frame_rd_req_en = dma_session_active &&
                                             frame_rd_data_ready &&
                                             (frame_src_req_count < FRAME_SRC_WORDS) &&
@@ -1583,12 +1585,12 @@ wire [7:0]  prep_pair_active_y_5 = prep_pair_active_y_word[47:40];
 wire [7:0]  prep_pair_active_y_6 = prep_pair_active_y_word[55:48];
 wire [7:0]  prep_pair_active_y_7 = prep_pair_active_y_word[63:56];
 wire [127:0] out_pair_active_raw_lo_pack = pack_4pix_bgrx(
-    out_pair_active_src_word[15:0], out_pair_active_src_word[31:16],
-    out_pair_active_src_word[47:32], out_pair_active_src_word[63:48],
+    frame_rd_data[15:0], frame_rd_data[31:16],
+    frame_rd_data[47:32], frame_rd_data[63:48],
     8'h00, 8'h00, 8'h00, 8'h00);
 wire [127:0] out_pair_active_raw_hi_pack = pack_4pix_bgrx(
-    out_pair_active_src_word[79:64], out_pair_active_src_word[95:80],
-    out_pair_active_src_word[111:96], out_pair_active_src_word[127:112],
+    frame_rd_data_hold[79:64], frame_rd_data_hold[95:80],
+    frame_rd_data_hold[111:96], frame_rd_data_hold[127:112],
     8'h00, 8'h00, 8'h00, 8'h00);
 wire [127:0] prep_pair_active_prep_lo_pack = pack_4prep_bgrx(
     prep_pair_active_src_word[15:0], prep_pair_active_src_word[31:16],
@@ -1614,9 +1616,9 @@ wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_dat
 wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
 wire [127:0] frame_dma_data = dma_expand_mode
     ? (prep_output_active ? frame_dma_data_prep : frame_dma_data_raw)
-    : out_pair_active_src_word;
+    : frame_rd_data;
 wire        prep_pipe_valid = prep_active_latched ? (out_pair_active_valid & prep_pair_active_valid)
-                                                  : out_pair_active_valid;
+                                                  : frame_rd_data_ready;
 wire        frame_stream_ready = ~dma_session_active | prep_pipe_valid;
 
 assign axis_slave2_tready_fc = axis_slave2_tready_raw & frame_stream_ready;
@@ -1654,6 +1656,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_linebuf_prev2_rd_d1 <= 64'd0;
         frame_src_bootstrap_count <= 3'd0;
         dma_expand_phase <= 1'b0;
+        frame_rd_data_hold <= 128'd0;
         frame_id <= 8'd0;
         prep_session_en <= 1'b0;
         prep_session_target_all <= 1'b0;
@@ -1739,6 +1742,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_linebuf_prev2_rd_d1 <= 64'd0;
         frame_src_bootstrap_count <= 3'd0;
         dma_expand_phase <= 1'b0;
+        frame_rd_data_hold <= 128'd0;
         prep_session_en <= 1'b0;
         prep_session_target_all <= 1'b0;
         prep_session_a_fmt_yenh <= 1'b0;
@@ -1816,6 +1820,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             prep_linebuf_prev2_rd_d1 <= 64'd0;
             frame_src_bootstrap_count <= 3'd0;
             dma_expand_phase <= 1'b0;
+            frame_rd_data_hold <= 128'd0;
             frame_id <= frame_id + 8'd1;
             prep_session_en <= prep_active;
             prep_session_target_all <= prep_target_all;
@@ -1931,6 +1936,9 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
 
             if (dma_expand_mode && dma_session_active && bar2_addr_step)
                 dma_expand_phase <= ~dma_expand_phase;
+
+            if (raw_frame_hold_en)
+                frame_rd_data_hold <= frame_rd_data;
 
             if (rd_fsync_stretch_cnt != 6'd0)
                 rd_fsync_stretch_cnt <= rd_fsync_stretch_cnt - 6'd1;
