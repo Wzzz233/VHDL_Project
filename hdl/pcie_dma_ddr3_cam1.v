@@ -1468,9 +1468,8 @@ wire [63:0] prep_luma_word_top = (prep_data_line_y == 10'd0) ? prep_luma_word_cu
                                  (prep_data_line_y == 10'd1) ? prep_linebuf_prev1_rd_d1 : prep_linebuf_prev2_rd_d1;
 wire [63:0] prep_luma_word_mid = (prep_data_line_y == 10'd0) ? prep_luma_word_cur : prep_linebuf_prev1_rd_d1;
 wire        out_pair_pop = bar2_addr_step & (~dma_expand_mode | dma_expand_phase);
-wire        frame_capture_fire = dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1;
-wire        raw_capture_fire = frame_capture_fire;
-wire        prep_capture_fire = frame_capture_fire;
+wire        raw_capture_fire = dma_session_active && frame_rd_data_valid;
+wire        prep_capture_fire = dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1;
 wire        prep_capture_first_word = (prep_data_word_x == 8'd0) && (prep_data_line_y == 10'd0);
 wire        pair_capture_fire = prep_active_latched ? prep_capture_fire : raw_capture_fire;
 wire        pair_capture_first_word = prep_active_latched ? prep_capture_first_word : 1'b0;
