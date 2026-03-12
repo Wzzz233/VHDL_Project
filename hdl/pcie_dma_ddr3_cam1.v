@@ -838,14 +838,41 @@ reg  [7:0]                 prep_mid_hist_0_q;
 reg  [7:0]                 prep_mid_hist_1_q;
 reg  [7:0]                 prep_bot_hist_0_q;
 reg  [7:0]                 prep_bot_hist_1_q;
+reg                        prep_stage_a_valid;
+reg  [127:0]               prep_stage_a_src_word;
+reg  [63:0]                prep_stage_a_luma_top_word;
+reg  [63:0]                prep_stage_a_luma_mid_word;
+reg  [63:0]                prep_stage_a_luma_bot_word;
+reg  [15:0]                prep_stage_a_roi_mode_word;
+reg                        prep_stage_a_first_word;
+reg  [7:0]                 prep_stage_a_top_hist_0;
+reg  [7:0]                 prep_stage_a_top_hist_1;
+reg  [7:0]                 prep_stage_a_mid_hist_0;
+reg  [7:0]                 prep_stage_a_mid_hist_1;
+reg  [7:0]                 prep_stage_a_bot_hist_0;
+reg  [7:0]                 prep_stage_a_bot_hist_1;
+reg                        prep_stage_b_valid;
+reg  [127:0]               prep_stage_b_src_word;
+reg  [63:0]                prep_stage_b_luma_bot_word;
+reg  [15:0]                prep_stage_b_roi_mode_word;
+reg                        prep_stage_b_first_word;
+reg  [63:0]                prep_stage_b_median_word;
+reg  [63:0]                prep_stage_b_min_word;
+reg  [63:0]                prep_stage_b_max_word;
 reg                        out_pair_active_valid;
 reg  [127:0]               out_pair_active_src_word;
-reg  [63:0]                out_pair_active_y_word;
 reg                        out_pair_active_first_word;
 reg                        out_pair_next_valid;
 reg  [127:0]               out_pair_next_src_word;
-reg  [63:0]                out_pair_next_y_word;
 reg                        out_pair_next_first_word;
+reg                        prep_pair_active_valid;
+reg  [127:0]               prep_pair_active_src_word;
+reg  [63:0]                prep_pair_active_y_word;
+reg                        prep_pair_active_first_word;
+reg                        prep_pair_next_valid;
+reg  [127:0]               prep_pair_next_src_word;
+reg  [63:0]                prep_pair_next_y_word;
+reg                        prep_pair_next_first_word;
 wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
 wire                       dma_expand_mode = DMA_OUTPUT_BGRX;
@@ -1384,7 +1411,10 @@ begin
 end
 endfunction
 
-reg  [63:0] prep_luma_word_enh_c;
+reg  [63:0] prep_stage_b_median_word_c;
+reg  [63:0] prep_stage_b_min_word_c;
+reg  [63:0] prep_stage_b_max_word_c;
+reg  [63:0] prep_stage_c_y_word_c;
 reg  [7:0]  prep_top_hist_0_d;
 reg  [7:0]  prep_top_hist_1_d;
 reg  [7:0]  prep_mid_hist_0_d;
@@ -1403,8 +1433,13 @@ reg  [7:0]  prep_bot_max_r;
 reg  [7:0]  prep_y_med_r;
 reg  [7:0]  prep_y_min_r;
 reg  [7:0]  prep_y_max_r;
-reg  [1:0]  prep_roi_mode_r;
+reg  [7:0]  prep_stage_c_bot_cur_r;
+reg  [7:0]  prep_stage_c_y_med_r;
+reg  [7:0]  prep_stage_c_y_min_r;
+reg  [7:0]  prep_stage_c_y_max_r;
+reg  [1:0]  prep_stage_c_roi_mode_r;
 integer     prep_k;
+integer     prep_stage_c_k;
 
 wire [63:0] frame_rd_luma_word = luma_word_from_src128(frame_rd_data);
 wire [63:0] prep_luma_word_cur = frame_rd_luma_word;
@@ -1412,6 +1447,8 @@ wire [63:0] prep_luma_word_top = (prep_data_line_y == 10'd0) ? prep_luma_word_cu
                                  (prep_data_line_y == 10'd1) ? prep_linebuf_prev1_rd_d1 : prep_linebuf_prev2_rd_d1;
 wire [63:0] prep_luma_word_mid = (prep_data_line_y == 10'd0) ? prep_luma_word_cur : prep_linebuf_prev1_rd_d1;
 wire        out_pair_pop = bar2_addr_step & (~dma_expand_mode | dma_expand_phase);
+wire        prep_capture_fire = dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1;
+wire        prep_capture_first_word = (prep_data_word_x == 8'd0) && (prep_data_line_y == 10'd0);
 
 wire [1:0] prep_roi_mode_0 = roi_boost_mode_xy(prep_x_pix_base + 12'd0, {1'b0, prep_data_line_y},
                                                roi_session_active, roi_session_left_bias,
@@ -1437,30 +1474,36 @@ wire [1:0] prep_roi_mode_6 = roi_boost_mode_xy(prep_x_pix_base + 12'd6, {1'b0, p
 wire [1:0] prep_roi_mode_7 = roi_boost_mode_xy(prep_x_pix_base + 12'd7, {1'b0, prep_data_line_y},
                                                roi_session_active, roi_session_left_bias,
                                                roi_session_x1, roi_session_y1, roi_session_x2, roi_session_y2);
+wire [15:0] prep_roi_mode_word = {prep_roi_mode_7, prep_roi_mode_6, prep_roi_mode_5, prep_roi_mode_4,
+                                  prep_roi_mode_3, prep_roi_mode_2, prep_roi_mode_1, prep_roi_mode_0};
+wire [7:0] prep_stage_a_top_hist_0_seed = (prep_data_word_x == 8'd0) ? prep_luma_word_top[7:0] :
+                                          (prep_stage_a_valid ? prep_stage_a_luma_top_word[55:48] : prep_top_hist_0_q);
+wire [7:0] prep_stage_a_top_hist_1_seed = (prep_data_word_x == 8'd0) ? prep_luma_word_top[7:0] :
+                                          (prep_stage_a_valid ? prep_stage_a_luma_top_word[63:56] : prep_top_hist_1_q);
+wire [7:0] prep_stage_a_mid_hist_0_seed = (prep_data_word_x == 8'd0) ? prep_luma_word_mid[7:0] :
+                                          (prep_stage_a_valid ? prep_stage_a_luma_mid_word[55:48] : prep_mid_hist_0_q);
+wire [7:0] prep_stage_a_mid_hist_1_seed = (prep_data_word_x == 8'd0) ? prep_luma_word_mid[7:0] :
+                                          (prep_stage_a_valid ? prep_stage_a_luma_mid_word[63:56] : prep_mid_hist_1_q);
+wire [7:0] prep_stage_a_bot_hist_0_seed = (prep_data_word_x == 8'd0) ? prep_luma_word_cur[7:0] :
+                                          (prep_stage_a_valid ? prep_stage_a_luma_bot_word[55:48] : prep_bot_hist_0_q);
+wire [7:0] prep_stage_a_bot_hist_1_seed = (prep_data_word_x == 8'd0) ? prep_luma_word_cur[7:0] :
+                                          (prep_stage_a_valid ? prep_stage_a_luma_bot_word[63:56] : prep_bot_hist_1_q);
 
 always @* begin
-    prep_luma_word_enh_c = 64'd0;
-
-    if (prep_data_word_x == 8'd0) begin
-        prep_top_hist_0_d = prep_luma_word_top[7:0];
-        prep_top_hist_1_d = prep_luma_word_top[7:0];
-        prep_mid_hist_0_d = prep_luma_word_mid[7:0];
-        prep_mid_hist_1_d = prep_luma_word_mid[7:0];
-        prep_bot_hist_0_d = prep_luma_word_cur[7:0];
-        prep_bot_hist_1_d = prep_luma_word_cur[7:0];
-    end else begin
-        prep_top_hist_0_d = prep_top_hist_0_q;
-        prep_top_hist_1_d = prep_top_hist_1_q;
-        prep_mid_hist_0_d = prep_mid_hist_0_q;
-        prep_mid_hist_1_d = prep_mid_hist_1_q;
-        prep_bot_hist_0_d = prep_bot_hist_0_q;
-        prep_bot_hist_1_d = prep_bot_hist_1_q;
-    end
+    prep_stage_b_median_word_c = 64'd0;
+    prep_stage_b_min_word_c = 64'd0;
+    prep_stage_b_max_word_c = 64'd0;
+    prep_top_hist_0_d = prep_stage_a_top_hist_0;
+    prep_top_hist_1_d = prep_stage_a_top_hist_1;
+    prep_mid_hist_0_d = prep_stage_a_mid_hist_0;
+    prep_mid_hist_1_d = prep_stage_a_mid_hist_1;
+    prep_bot_hist_0_d = prep_stage_a_bot_hist_0;
+    prep_bot_hist_1_d = prep_stage_a_bot_hist_1;
 
     for (prep_k = 0; prep_k < 8; prep_k = prep_k + 1) begin
-        prep_top_cur_r = prep_luma_word_top[(prep_k * 8) +: 8];
-        prep_mid_cur_r = prep_luma_word_mid[(prep_k * 8) +: 8];
-        prep_bot_cur_r = prep_luma_word_cur[(prep_k * 8) +: 8];
+        prep_top_cur_r = prep_stage_a_luma_top_word[(prep_k * 8) +: 8];
+        prep_mid_cur_r = prep_stage_a_luma_mid_word[(prep_k * 8) +: 8];
+        prep_bot_cur_r = prep_stage_a_luma_bot_word[(prep_k * 8) +: 8];
         prep_top_min_r = min3_u8(prep_top_hist_0_d, prep_top_hist_1_d, prep_top_cur_r);
         prep_mid_min_r = min3_u8(prep_mid_hist_0_d, prep_mid_hist_1_d, prep_mid_cur_r);
         prep_bot_min_r = min3_u8(prep_bot_hist_0_d, prep_bot_hist_1_d, prep_bot_cur_r);
@@ -1472,26 +1515,9 @@ always @* begin
                                   prep_bot_hist_0_d, prep_bot_hist_1_d, prep_bot_cur_r);
         prep_y_min_r = min3_u8(prep_top_min_r, prep_mid_min_r, prep_bot_min_r);
         prep_y_max_r = max3_u8(prep_top_max_r, prep_mid_max_r, prep_bot_max_r);
-
-        case (prep_k)
-            0: prep_roi_mode_r = prep_roi_mode_0;
-            1: prep_roi_mode_r = prep_roi_mode_1;
-            2: prep_roi_mode_r = prep_roi_mode_2;
-            3: prep_roi_mode_r = prep_roi_mode_3;
-            4: prep_roi_mode_r = prep_roi_mode_4;
-            5: prep_roi_mode_r = prep_roi_mode_5;
-            6: prep_roi_mode_r = prep_roi_mode_6;
-            default: prep_roi_mode_r = prep_roi_mode_7;
-        endcase
-
-        prep_luma_word_enh_c[(prep_k * 8) +: 8] = spatial_enhance_y(prep_bot_cur_r, prep_y_med_r,
-                                                                    prep_y_min_r, prep_y_max_r,
-                                                                    prep_median_en, prep_clahe_en,
-                                                                    prep_usm_en, prep_ocr_stroke_latched,
-                                                                    prep_roi_mode_r,
-                                                                    fpga_prep_clahe, fpga_prep_usm,
-                                                                    fpga_prep_med);
-
+        prep_stage_b_median_word_c[(prep_k * 8) +: 8] = prep_y_med_r;
+        prep_stage_b_min_word_c[(prep_k * 8) +: 8] = prep_y_min_r;
+        prep_stage_b_max_word_c[(prep_k * 8) +: 8] = prep_y_max_r;
         prep_top_hist_0_d = prep_top_hist_1_d;
         prep_top_hist_1_d = prep_top_cur_r;
         prep_mid_hist_0_d = prep_mid_hist_1_d;
@@ -1501,14 +1527,37 @@ always @* begin
     end
 end
 
-wire [7:0]  out_pair_active_y_0 = out_pair_active_y_word[7:0];
-wire [7:0]  out_pair_active_y_1 = out_pair_active_y_word[15:8];
-wire [7:0]  out_pair_active_y_2 = out_pair_active_y_word[23:16];
-wire [7:0]  out_pair_active_y_3 = out_pair_active_y_word[31:24];
-wire [7:0]  out_pair_active_y_4 = out_pair_active_y_word[39:32];
-wire [7:0]  out_pair_active_y_5 = out_pair_active_y_word[47:40];
-wire [7:0]  out_pair_active_y_6 = out_pair_active_y_word[55:48];
-wire [7:0]  out_pair_active_y_7 = out_pair_active_y_word[63:56];
+always @* begin
+    prep_stage_c_y_word_c = 64'd0;
+    for (prep_stage_c_k = 0; prep_stage_c_k < 8; prep_stage_c_k = prep_stage_c_k + 1) begin
+        prep_stage_c_bot_cur_r = prep_stage_b_luma_bot_word[(prep_stage_c_k * 8) +: 8];
+        prep_stage_c_y_med_r = prep_stage_b_median_word[(prep_stage_c_k * 8) +: 8];
+        prep_stage_c_y_min_r = prep_stage_b_min_word[(prep_stage_c_k * 8) +: 8];
+        prep_stage_c_y_max_r = prep_stage_b_max_word[(prep_stage_c_k * 8) +: 8];
+        prep_stage_c_roi_mode_r = prep_stage_b_roi_mode_word[(prep_stage_c_k * 2) +: 2];
+        prep_stage_c_y_word_c[(prep_stage_c_k * 8) +: 8] = spatial_enhance_y(prep_stage_c_bot_cur_r,
+                                                                              prep_stage_c_y_med_r,
+                                                                              prep_stage_c_y_min_r,
+                                                                              prep_stage_c_y_max_r,
+                                                                              prep_median_en,
+                                                                              prep_clahe_en,
+                                                                              prep_usm_en,
+                                                                              prep_ocr_stroke_latched,
+                                                                              prep_stage_c_roi_mode_r,
+                                                                              fpga_prep_clahe,
+                                                                              fpga_prep_usm,
+                                                                              fpga_prep_med);
+    end
+end
+
+wire [7:0]  prep_pair_active_y_0 = prep_pair_active_y_word[7:0];
+wire [7:0]  prep_pair_active_y_1 = prep_pair_active_y_word[15:8];
+wire [7:0]  prep_pair_active_y_2 = prep_pair_active_y_word[23:16];
+wire [7:0]  prep_pair_active_y_3 = prep_pair_active_y_word[31:24];
+wire [7:0]  prep_pair_active_y_4 = prep_pair_active_y_word[39:32];
+wire [7:0]  prep_pair_active_y_5 = prep_pair_active_y_word[47:40];
+wire [7:0]  prep_pair_active_y_6 = prep_pair_active_y_word[55:48];
+wire [7:0]  prep_pair_active_y_7 = prep_pair_active_y_word[63:56];
 wire [127:0] out_pair_active_raw_lo_pack = pack_4pix_bgrx(
     out_pair_active_src_word[15:0], out_pair_active_src_word[31:16],
     out_pair_active_src_word[47:32], out_pair_active_src_word[63:48],
@@ -1517,32 +1566,34 @@ wire [127:0] out_pair_active_raw_hi_pack = pack_4pix_bgrx(
     out_pair_active_src_word[79:64], out_pair_active_src_word[95:80],
     out_pair_active_src_word[111:96], out_pair_active_src_word[127:112],
     8'h00, 8'h00, 8'h00, 8'h00);
-wire [127:0] out_pair_active_prep_lo_pack = pack_4prep_bgrx(
-    out_pair_active_src_word[15:0], out_pair_active_src_word[31:16],
-    out_pair_active_src_word[47:32], out_pair_active_src_word[63:48],
-    out_pair_active_y_0, out_pair_active_y_1, out_pair_active_y_2, out_pair_active_y_3,
+wire [127:0] prep_pair_active_prep_lo_pack = pack_4prep_bgrx(
+    prep_pair_active_src_word[15:0], prep_pair_active_src_word[31:16],
+    prep_pair_active_src_word[47:32], prep_pair_active_src_word[63:48],
+    prep_pair_active_y_0, prep_pair_active_y_1, prep_pair_active_y_2, prep_pair_active_y_3,
     prep_target_all_latched,
     prep_a_fmt_yenh_latched,
-    out_pair_active_first_word,
+    prep_pair_active_first_word,
     frame_id);
-wire [127:0] out_pair_active_prep_hi_pack = pack_4prep_bgrx(
-    out_pair_active_src_word[79:64], out_pair_active_src_word[95:80],
-    out_pair_active_src_word[111:96], out_pair_active_src_word[127:112],
-    out_pair_active_y_4, out_pair_active_y_5, out_pair_active_y_6, out_pair_active_y_7,
+wire [127:0] prep_pair_active_prep_hi_pack = pack_4prep_bgrx(
+    prep_pair_active_src_word[79:64], prep_pair_active_src_word[95:80],
+    prep_pair_active_src_word[111:96], prep_pair_active_src_word[127:112],
+    prep_pair_active_y_4, prep_pair_active_y_5, prep_pair_active_y_6, prep_pair_active_y_7,
     prep_target_all_latched,
     prep_a_fmt_yenh_latched,
     1'b0,
     frame_id);
 wire [127:0] frame_dma_data_raw = dma_expand_phase ? out_pair_active_raw_hi_pack : out_pair_active_raw_lo_pack;
-wire [127:0] frame_dma_data_prep = dma_expand_phase ? out_pair_active_prep_hi_pack : out_pair_active_prep_lo_pack;
-wire        prep_output_active = prep_active_latched & out_pair_active_valid;
+wire [127:0] frame_dma_data_prep = dma_expand_phase ? prep_pair_active_prep_hi_pack : prep_pair_active_prep_lo_pack;
+wire        prep_output_active = prep_active_latched & out_pair_active_valid & prep_pair_active_valid;
 wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
 wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data, 8'h00)}};
 wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
 wire [127:0] frame_dma_data = dma_expand_mode
     ? (prep_output_active ? frame_dma_data_prep : frame_dma_data_raw)
     : out_pair_active_src_word;
-wire        frame_stream_ready = ~dma_session_active | out_pair_active_valid;
+wire        prep_pipe_valid = prep_active_latched ? (out_pair_active_valid & prep_pair_active_valid)
+                                                  : out_pair_active_valid;
+wire        frame_stream_ready = ~dma_session_active | prep_pipe_valid;
 
 assign axis_slave2_tready_fc = axis_slave2_tready_raw & frame_stream_ready;
 always @(posedge pclk_div2 or negedge core_rst_n) begin
@@ -1600,14 +1651,41 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_mid_hist_1_q <= 8'd0;
         prep_bot_hist_0_q <= 8'd0;
         prep_bot_hist_1_q <= 8'd0;
+        prep_stage_a_valid <= 1'b0;
+        prep_stage_a_src_word <= 128'd0;
+        prep_stage_a_luma_top_word <= 64'd0;
+        prep_stage_a_luma_mid_word <= 64'd0;
+        prep_stage_a_luma_bot_word <= 64'd0;
+        prep_stage_a_roi_mode_word <= 16'd0;
+        prep_stage_a_first_word <= 1'b0;
+        prep_stage_a_top_hist_0 <= 8'd0;
+        prep_stage_a_top_hist_1 <= 8'd0;
+        prep_stage_a_mid_hist_0 <= 8'd0;
+        prep_stage_a_mid_hist_1 <= 8'd0;
+        prep_stage_a_bot_hist_0 <= 8'd0;
+        prep_stage_a_bot_hist_1 <= 8'd0;
+        prep_stage_b_valid <= 1'b0;
+        prep_stage_b_src_word <= 128'd0;
+        prep_stage_b_luma_bot_word <= 64'd0;
+        prep_stage_b_roi_mode_word <= 16'd0;
+        prep_stage_b_first_word <= 1'b0;
+        prep_stage_b_median_word <= 64'd0;
+        prep_stage_b_min_word <= 64'd0;
+        prep_stage_b_max_word <= 64'd0;
         out_pair_active_valid <= 1'b0;
         out_pair_active_src_word <= 128'd0;
-        out_pair_active_y_word <= 64'd0;
         out_pair_active_first_word <= 1'b0;
         out_pair_next_valid <= 1'b0;
         out_pair_next_src_word <= 128'd0;
-        out_pair_next_y_word <= 64'd0;
         out_pair_next_first_word <= 1'b0;
+        prep_pair_active_valid <= 1'b0;
+        prep_pair_active_src_word <= 128'd0;
+        prep_pair_active_y_word <= 64'd0;
+        prep_pair_active_first_word <= 1'b0;
+        prep_pair_next_valid <= 1'b0;
+        prep_pair_next_src_word <= 128'd0;
+        prep_pair_next_y_word <= 64'd0;
+        prep_pair_next_first_word <= 1'b0;
     end else if (frame_done_pulse) begin
         dma_session_active <= 1'b0;
         dma_rd_word_count <= 18'd0;
@@ -1639,14 +1717,41 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_mid_hist_1_q <= 8'd0;
         prep_bot_hist_0_q <= 8'd0;
         prep_bot_hist_1_q <= 8'd0;
+        prep_stage_a_valid <= 1'b0;
+        prep_stage_a_src_word <= 128'd0;
+        prep_stage_a_luma_top_word <= 64'd0;
+        prep_stage_a_luma_mid_word <= 64'd0;
+        prep_stage_a_luma_bot_word <= 64'd0;
+        prep_stage_a_roi_mode_word <= 16'd0;
+        prep_stage_a_first_word <= 1'b0;
+        prep_stage_a_top_hist_0 <= 8'd0;
+        prep_stage_a_top_hist_1 <= 8'd0;
+        prep_stage_a_mid_hist_0 <= 8'd0;
+        prep_stage_a_mid_hist_1 <= 8'd0;
+        prep_stage_a_bot_hist_0 <= 8'd0;
+        prep_stage_a_bot_hist_1 <= 8'd0;
+        prep_stage_b_valid <= 1'b0;
+        prep_stage_b_src_word <= 128'd0;
+        prep_stage_b_luma_bot_word <= 64'd0;
+        prep_stage_b_roi_mode_word <= 16'd0;
+        prep_stage_b_first_word <= 1'b0;
+        prep_stage_b_median_word <= 64'd0;
+        prep_stage_b_min_word <= 64'd0;
+        prep_stage_b_max_word <= 64'd0;
         out_pair_active_valid <= 1'b0;
         out_pair_active_src_word <= 128'd0;
-        out_pair_active_y_word <= 64'd0;
         out_pair_active_first_word <= 1'b0;
         out_pair_next_valid <= 1'b0;
         out_pair_next_src_word <= 128'd0;
-        out_pair_next_y_word <= 64'd0;
         out_pair_next_first_word <= 1'b0;
+        prep_pair_active_valid <= 1'b0;
+        prep_pair_active_src_word <= 128'd0;
+        prep_pair_active_y_word <= 64'd0;
+        prep_pair_active_first_word <= 1'b0;
+        prep_pair_next_valid <= 1'b0;
+        prep_pair_next_src_word <= 128'd0;
+        prep_pair_next_y_word <= 64'd0;
+        prep_pair_next_first_word <= 1'b0;
     end else begin
         if (dma_session_start) begin
             dma_session_active <= 1'b1;
@@ -1681,14 +1786,41 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             prep_mid_hist_1_q <= 8'd0;
             prep_bot_hist_0_q <= 8'd0;
             prep_bot_hist_1_q <= 8'd0;
+            prep_stage_a_valid <= 1'b0;
+            prep_stage_a_src_word <= 128'd0;
+            prep_stage_a_luma_top_word <= 64'd0;
+            prep_stage_a_luma_mid_word <= 64'd0;
+            prep_stage_a_luma_bot_word <= 64'd0;
+            prep_stage_a_roi_mode_word <= 16'd0;
+            prep_stage_a_first_word <= 1'b0;
+            prep_stage_a_top_hist_0 <= 8'd0;
+            prep_stage_a_top_hist_1 <= 8'd0;
+            prep_stage_a_mid_hist_0 <= 8'd0;
+            prep_stage_a_mid_hist_1 <= 8'd0;
+            prep_stage_a_bot_hist_0 <= 8'd0;
+            prep_stage_a_bot_hist_1 <= 8'd0;
+            prep_stage_b_valid <= 1'b0;
+            prep_stage_b_src_word <= 128'd0;
+            prep_stage_b_luma_bot_word <= 64'd0;
+            prep_stage_b_roi_mode_word <= 16'd0;
+            prep_stage_b_first_word <= 1'b0;
+            prep_stage_b_median_word <= 64'd0;
+            prep_stage_b_min_word <= 64'd0;
+            prep_stage_b_max_word <= 64'd0;
             out_pair_active_valid <= 1'b0;
             out_pair_active_src_word <= 128'd0;
-            out_pair_active_y_word <= 64'd0;
             out_pair_active_first_word <= 1'b0;
             out_pair_next_valid <= 1'b0;
             out_pair_next_src_word <= 128'd0;
-            out_pair_next_y_word <= 64'd0;
             out_pair_next_first_word <= 1'b0;
+            prep_pair_active_valid <= 1'b0;
+            prep_pair_active_src_word <= 128'd0;
+            prep_pair_active_y_word <= 64'd0;
+            prep_pair_active_first_word <= 1'b0;
+            prep_pair_next_valid <= 1'b0;
+            prep_pair_next_src_word <= 128'd0;
+            prep_pair_next_y_word <= 64'd0;
+            prep_pair_next_first_word <= 1'b0;
             if (prep_active && prep_ocr_stroke_mode && prep_target_ocr_only) begin
                 if (roi_cfg_changed) begin
                     if (roi_cfg_enable && roi_cfg_bbox_valid) begin
@@ -1770,33 +1902,82 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 if (out_pair_next_valid) begin
                     out_pair_active_valid <= 1'b1;
                     out_pair_active_src_word <= out_pair_next_src_word;
-                    out_pair_active_y_word <= out_pair_next_y_word;
                     out_pair_active_first_word <= out_pair_next_first_word;
                     out_pair_next_valid <= 1'b0;
                 end else begin
                     out_pair_active_valid <= 1'b0;
                 end
+
+                if (prep_pair_next_valid) begin
+                    prep_pair_active_valid <= 1'b1;
+                    prep_pair_active_src_word <= prep_pair_next_src_word;
+                    prep_pair_active_y_word <= prep_pair_next_y_word;
+                    prep_pair_active_first_word <= prep_pair_next_first_word;
+                    prep_pair_next_valid <= 1'b0;
+                end else begin
+                    prep_pair_active_valid <= 1'b0;
+                end
             end
 
-            if (dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1) begin
-                prep_top_hist_0_q <= prep_top_hist_0_d;
-                prep_top_hist_1_q <= prep_top_hist_1_d;
-                prep_mid_hist_0_q <= prep_mid_hist_0_d;
-                prep_mid_hist_1_q <= prep_mid_hist_1_d;
-                prep_bot_hist_0_q <= prep_bot_hist_0_d;
-                prep_bot_hist_1_q <= prep_bot_hist_1_d;
+            prep_stage_b_valid <= prep_stage_a_valid;
+            if (prep_stage_a_valid) begin
+                prep_top_hist_0_q <= prep_stage_a_luma_top_word[55:48];
+                prep_top_hist_1_q <= prep_stage_a_luma_top_word[63:56];
+                prep_mid_hist_0_q <= prep_stage_a_luma_mid_word[55:48];
+                prep_mid_hist_1_q <= prep_stage_a_luma_mid_word[63:56];
+                prep_bot_hist_0_q <= prep_stage_a_luma_bot_word[55:48];
+                prep_bot_hist_1_q <= prep_stage_a_luma_bot_word[63:56];
+                prep_stage_b_src_word <= prep_stage_a_src_word;
+                prep_stage_b_luma_bot_word <= prep_stage_a_luma_bot_word;
+                prep_stage_b_roi_mode_word <= prep_stage_a_roi_mode_word;
+                prep_stage_b_first_word <= prep_stage_a_first_word;
+                prep_stage_b_median_word <= prep_stage_b_median_word_c;
+                prep_stage_b_min_word <= prep_stage_b_min_word_c;
+                prep_stage_b_max_word <= prep_stage_b_max_word_c;
+            end
+
+            prep_stage_a_valid <= 1'b0;
+            if (prep_capture_fire) begin
                 prep_linebuf_prev2[prep_data_word_x] <= prep_linebuf_prev1_rd_d1;
                 prep_linebuf_prev1[prep_data_word_x] <= frame_rd_luma_word;
                 if (!out_pair_active_valid || (out_pair_pop && !out_pair_next_valid)) begin
                     out_pair_active_valid <= 1'b1;
                     out_pair_active_src_word <= frame_rd_data;
-                    out_pair_active_y_word <= prep_luma_word_enh_c;
-                    out_pair_active_first_word <= (prep_data_word_x == 8'd0) && (prep_data_line_y == 10'd0);
+                    out_pair_active_first_word <= prep_capture_first_word;
                 end else if (!out_pair_next_valid || out_pair_pop) begin
                     out_pair_next_valid <= 1'b1;
                     out_pair_next_src_word <= frame_rd_data;
-                    out_pair_next_y_word <= prep_luma_word_enh_c;
-                    out_pair_next_first_word <= (prep_data_word_x == 8'd0) && (prep_data_line_y == 10'd0);
+                    out_pair_next_first_word <= prep_capture_first_word;
+                end
+
+                if (prep_active_latched) begin
+                    prep_stage_a_valid <= 1'b1;
+                    prep_stage_a_src_word <= frame_rd_data;
+                    prep_stage_a_luma_top_word <= prep_luma_word_top;
+                    prep_stage_a_luma_mid_word <= prep_luma_word_mid;
+                    prep_stage_a_luma_bot_word <= prep_luma_word_cur;
+                    prep_stage_a_roi_mode_word <= prep_roi_mode_word;
+                    prep_stage_a_first_word <= prep_capture_first_word;
+                    prep_stage_a_top_hist_0 <= prep_stage_a_top_hist_0_seed;
+                    prep_stage_a_top_hist_1 <= prep_stage_a_top_hist_1_seed;
+                    prep_stage_a_mid_hist_0 <= prep_stage_a_mid_hist_0_seed;
+                    prep_stage_a_mid_hist_1 <= prep_stage_a_mid_hist_1_seed;
+                    prep_stage_a_bot_hist_0 <= prep_stage_a_bot_hist_0_seed;
+                    prep_stage_a_bot_hist_1 <= prep_stage_a_bot_hist_1_seed;
+                end
+            end
+
+            if (prep_stage_b_valid) begin
+                if (!prep_pair_active_valid || (out_pair_pop && !prep_pair_next_valid)) begin
+                    prep_pair_active_valid <= 1'b1;
+                    prep_pair_active_src_word <= prep_stage_b_src_word;
+                    prep_pair_active_y_word <= prep_stage_c_y_word_c;
+                    prep_pair_active_first_word <= prep_stage_b_first_word;
+                end else if (!prep_pair_next_valid || out_pair_pop) begin
+                    prep_pair_next_valid <= 1'b1;
+                    prep_pair_next_src_word <= prep_stage_b_src_word;
+                    prep_pair_next_y_word <= prep_stage_c_y_word_c;
+                    prep_pair_next_first_word <= prep_stage_b_first_word;
                 end
             end
         end
