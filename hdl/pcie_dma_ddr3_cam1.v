@@ -927,12 +927,17 @@ wire [2:0]                 frame_bootstrap_words = prep_active_latched ? PREP_BO
 // Count chunk first beat as a valid step to prevent boundary phase slip.
 wire                       bar2_addr_step = mwr_rd_clk_en &&
                                             ((mwr_rd_addr != mwr_rd_addr_d) || (~mwr_rd_clk_en_d));
-wire                       raw_frame_hold_en = bar2_addr_step & (~dma_expand_mode | ~dma_expand_phase);
-wire                       frame_rd_req_en = dma_session_active &&
-                                            frame_rd_data_ready &&
-                                            (frame_src_req_count < FRAME_SRC_WORDS) &&
-                                            ((frame_src_bootstrap_count < frame_bootstrap_words) ||
-                                             (bar2_addr_step & (~dma_expand_mode | ~dma_expand_phase)));
+wire                       frame_rd_req_en_raw = dma_session_active &&
+                                                frame_rd_data_ready &&
+                                                (frame_src_req_count < FRAME_SRC_WORDS) &&
+                                                (bar2_addr_step & (~dma_expand_mode | ~dma_expand_phase));
+wire                       frame_rd_req_en_prep = dma_session_active &&
+                                                 frame_rd_data_ready &&
+                                                 (frame_src_req_count < FRAME_SRC_WORDS) &&
+                                                 ((frame_src_bootstrap_count < frame_bootstrap_words) ||
+                                                  (bar2_addr_step & (~dma_expand_mode | ~dma_expand_phase)));
+wire                       frame_rd_req_en = prep_active_latched ? frame_rd_req_en_prep : frame_rd_req_en_raw;
+wire                       raw_frame_hold_en = frame_rd_req_en_raw;
 wire [11:0]                post_ddr_x_pix = dma_expand_mode ? {1'b0, post_ddr_word_x, 2'b00}
                                                              : {post_ddr_word_x, 3'b000};
 wire [15:0]                post_ddr_color_base = color_bar_bgr565(post_ddr_x_pix);
