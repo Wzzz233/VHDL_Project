@@ -795,6 +795,8 @@ localparam [17:0]          FRAME_WORDS_BGRX = (1280 * 720 * 32) / 128;
 localparam [17:0]          FRAME_SRC_WORDS  = FRAME_WORDS_565;
 localparam [2:0]           PREP_BOOTSTRAP_WORDS = 3'd4;
 localparam [2:0]           RAW_BOOTSTRAP_WORDS = 3'd2;
+localparam                  PREP_TIMING_CLAHE_ENABLE = 1'b0;
+localparam                  PREP_TIMING_USM_ENABLE = 1'b0;
 localparam [7:0]           PREP_FETCH_WORDS_PER_LINE = 8'd160;
 reg                        dma_session_active;
 reg  [17:0]                dma_rd_word_count;
@@ -823,6 +825,12 @@ reg                        prep_session_en;
 reg                        prep_session_target_all;
 reg                        prep_session_a_fmt_yenh;
 reg                        prep_session_ocr_stroke;
+reg                        prep_session_median_en;
+reg                        prep_session_clahe_en;
+reg                        prep_session_usm_en;
+reg  [31:0]                prep_session_clahe_cfg;
+reg  [31:0]                prep_session_usm_cfg;
+reg  [31:0]                prep_session_med_cfg;
 reg                        roi_session_active;
 reg                        roi_session_left_bias;
 reg  [11:0]                roi_session_x1;
@@ -860,6 +868,10 @@ reg                        prep_stage_b_first_word;
 reg  [63:0]                prep_stage_b_median_word;
 reg  [63:0]                prep_stage_b_min_word;
 reg  [63:0]                prep_stage_b_max_word;
+reg                        prep_stage_c_valid;
+reg  [127:0]               prep_stage_c_src_word;
+reg  [63:0]                prep_stage_c_y_word;
+reg                        prep_stage_c_first_word;
 reg                        out_pair_active_valid;
 reg  [127:0]               out_pair_active_src_word;
 reg                        out_pair_active_first_word;
@@ -891,6 +903,12 @@ wire                       prep_active_latched = prep_session_en;
 wire                       prep_target_all_latched = prep_session_target_all;
 wire                       prep_a_fmt_yenh_latched = prep_session_a_fmt_yenh;
 wire                       prep_ocr_stroke_latched = prep_session_ocr_stroke;
+wire                       prep_median_en_latched = prep_session_median_en;
+wire                       prep_clahe_en_latched = PREP_TIMING_CLAHE_ENABLE ? prep_session_clahe_en : 1'b0;
+wire                       prep_usm_en_latched = PREP_TIMING_USM_ENABLE ? prep_session_usm_en : 1'b0;
+wire [31:0]                prep_clahe_cfg_latched = PREP_TIMING_CLAHE_ENABLE ? prep_session_clahe_cfg : 32'd0;
+wire [31:0]                prep_usm_cfg_latched = PREP_TIMING_USM_ENABLE ? prep_session_usm_cfg : 32'd0;
+wire [31:0]                prep_med_cfg_latched = prep_session_med_cfg;
 wire                       roi_cfg_enable = fpga_roi_ctrl[0];
 wire                       roi_cfg_left_bias = fpga_roi_ctrl[1];
 wire [7:0]                 roi_cfg_timeout_frames = (fpga_roi_ctrl[15:8] != 8'd0) ? fpga_roi_ctrl[15:8] : 8'd3;
@@ -1450,8 +1468,9 @@ wire [63:0] prep_luma_word_top = (prep_data_line_y == 10'd0) ? prep_luma_word_cu
                                  (prep_data_line_y == 10'd1) ? prep_linebuf_prev1_rd_d1 : prep_linebuf_prev2_rd_d1;
 wire [63:0] prep_luma_word_mid = (prep_data_line_y == 10'd0) ? prep_luma_word_cur : prep_linebuf_prev1_rd_d1;
 wire        out_pair_pop = bar2_addr_step & (~dma_expand_mode | dma_expand_phase);
-wire        raw_capture_fire = dma_session_active && frame_rd_data_valid;
-wire        prep_capture_fire = dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1;
+wire        frame_capture_fire = dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1;
+wire        raw_capture_fire = frame_capture_fire;
+wire        prep_capture_fire = frame_capture_fire;
 wire        prep_capture_first_word = (prep_data_word_x == 8'd0) && (prep_data_line_y == 10'd0);
 wire        pair_capture_fire = prep_active_latched ? prep_capture_fire : raw_capture_fire;
 wire        pair_capture_first_word = prep_active_latched ? prep_capture_first_word : 1'b0;
@@ -1545,14 +1564,14 @@ always @* begin
                                                                               prep_stage_c_y_med_r,
                                                                               prep_stage_c_y_min_r,
                                                                               prep_stage_c_y_max_r,
-                                                                              prep_median_en,
-                                                                              prep_clahe_en,
-                                                                              prep_usm_en,
+                                                                              prep_median_en_latched,
+                                                                              prep_clahe_en_latched,
+                                                                              prep_usm_en_latched,
                                                                               prep_ocr_stroke_latched,
                                                                               prep_stage_c_roi_mode_r,
-                                                                              fpga_prep_clahe,
-                                                                              fpga_prep_usm,
-                                                                              fpga_prep_med);
+                                                                              prep_clahe_cfg_latched,
+                                                                              prep_usm_cfg_latched,
+                                                                              prep_med_cfg_latched);
     end
 end
 
@@ -1641,6 +1660,12 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_session_target_all <= 1'b0;
         prep_session_a_fmt_yenh <= 1'b0;
         prep_session_ocr_stroke <= 1'b0;
+        prep_session_median_en <= 1'b0;
+        prep_session_clahe_en <= 1'b0;
+        prep_session_usm_en <= 1'b0;
+        prep_session_clahe_cfg <= 32'd0;
+        prep_session_usm_cfg <= 32'd0;
+        prep_session_med_cfg <= 32'd0;
         roi_session_active <= 1'b0;
         roi_session_left_bias <= 1'b0;
         roi_session_x1 <= 12'd0;
@@ -1678,6 +1703,10 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_stage_b_median_word <= 64'd0;
         prep_stage_b_min_word <= 64'd0;
         prep_stage_b_max_word <= 64'd0;
+        prep_stage_c_valid <= 1'b0;
+        prep_stage_c_src_word <= 128'd0;
+        prep_stage_c_y_word <= 64'd0;
+        prep_stage_c_first_word <= 1'b0;
         out_pair_active_valid <= 1'b0;
         out_pair_active_src_word <= 128'd0;
         out_pair_active_first_word <= 1'b0;
@@ -1715,6 +1744,12 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_session_target_all <= 1'b0;
         prep_session_a_fmt_yenh <= 1'b0;
         prep_session_ocr_stroke <= 1'b0;
+        prep_session_median_en <= 1'b0;
+        prep_session_clahe_en <= 1'b0;
+        prep_session_usm_en <= 1'b0;
+        prep_session_clahe_cfg <= 32'd0;
+        prep_session_usm_cfg <= 32'd0;
+        prep_session_med_cfg <= 32'd0;
         roi_session_active <= 1'b0;
         roi_session_left_bias <= 1'b0;
         prep_top_hist_0_q <= 8'd0;
@@ -1744,6 +1779,10 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_stage_b_median_word <= 64'd0;
         prep_stage_b_min_word <= 64'd0;
         prep_stage_b_max_word <= 64'd0;
+        prep_stage_c_valid <= 1'b0;
+        prep_stage_c_src_word <= 128'd0;
+        prep_stage_c_y_word <= 64'd0;
+        prep_stage_c_first_word <= 1'b0;
         out_pair_active_valid <= 1'b0;
         out_pair_active_src_word <= 128'd0;
         out_pair_active_first_word <= 1'b0;
@@ -1783,6 +1822,12 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             prep_session_target_all <= prep_target_all;
             prep_session_a_fmt_yenh <= prep_a_fmt_yenh;
             prep_session_ocr_stroke <= prep_ocr_stroke_mode;
+            prep_session_median_en <= prep_median_en;
+            prep_session_clahe_en <= prep_clahe_en;
+            prep_session_usm_en <= prep_usm_en;
+            prep_session_clahe_cfg <= fpga_prep_clahe;
+            prep_session_usm_cfg <= fpga_prep_usm;
+            prep_session_med_cfg <= fpga_prep_med;
             roi_cfg_seen_x1y1 <= fpga_roi_x1y1;
             roi_cfg_seen_x2y2 <= fpga_roi_x2y2;
             roi_cfg_seen_ctrl <= fpga_roi_ctrl;
@@ -1813,6 +1858,10 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             prep_stage_b_median_word <= 64'd0;
             prep_stage_b_min_word <= 64'd0;
             prep_stage_b_max_word <= 64'd0;
+            prep_stage_c_valid <= 1'b0;
+            prep_stage_c_src_word <= 128'd0;
+            prep_stage_c_y_word <= 64'd0;
+            prep_stage_c_first_word <= 1'b0;
             out_pair_active_valid <= 1'b0;
             out_pair_active_src_word <= 128'd0;
             out_pair_active_first_word <= 1'b0;
@@ -1873,6 +1922,9 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                     prep_session_target_all <= 1'b0;
                     prep_session_a_fmt_yenh <= 1'b0;
                     prep_session_ocr_stroke <= 1'b0;
+                    prep_session_median_en <= 1'b0;
+                    prep_session_clahe_en <= 1'b0;
+                    prep_session_usm_en <= 1'b0;
                 end else begin
                     dma_rd_word_count <= dma_rd_word_count + 18'd1;
                 end
@@ -1942,6 +1994,13 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 prep_stage_b_max_word <= prep_stage_b_max_word_c;
             end
 
+            prep_stage_c_valid <= prep_stage_b_valid;
+            if (prep_stage_b_valid) begin
+                prep_stage_c_src_word <= prep_stage_b_src_word;
+                prep_stage_c_y_word <= prep_stage_c_y_word_c;
+                prep_stage_c_first_word <= prep_stage_b_first_word;
+            end
+
             prep_stage_a_valid <= 1'b0;
             if (pair_capture_fire) begin
                 if (!out_pair_active_valid || (out_pair_pop && !out_pair_next_valid)) begin
@@ -1976,17 +2035,17 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 end
             end
 
-            if (prep_stage_b_valid) begin
+            if (prep_stage_c_valid) begin
                 if (!prep_pair_active_valid || (out_pair_pop && !prep_pair_next_valid)) begin
                     prep_pair_active_valid <= 1'b1;
-                    prep_pair_active_src_word <= prep_stage_b_src_word;
-                    prep_pair_active_y_word <= prep_stage_c_y_word_c;
-                    prep_pair_active_first_word <= prep_stage_b_first_word;
+                    prep_pair_active_src_word <= prep_stage_c_src_word;
+                    prep_pair_active_y_word <= prep_stage_c_y_word;
+                    prep_pair_active_first_word <= prep_stage_c_first_word;
                 end else if (!prep_pair_next_valid || out_pair_pop) begin
                     prep_pair_next_valid <= 1'b1;
-                    prep_pair_next_src_word <= prep_stage_b_src_word;
-                    prep_pair_next_y_word <= prep_stage_c_y_word_c;
-                    prep_pair_next_first_word <= prep_stage_b_first_word;
+                    prep_pair_next_src_word <= prep_stage_c_src_word;
+                    prep_pair_next_y_word <= prep_stage_c_y_word;
+                    prep_pair_next_first_word <= prep_stage_c_first_word;
                 end
             end
         end
