@@ -3,14 +3,28 @@ create_clock -name {pclk} [get_pins u_ips2l_pcie_wrap.U_IPS2L_PCIE_TOP.U_IPS2L_H
 create_clock -name {pclk_div2} [get_pins u_ips2l_pcie_wrap.U_IPS2L_PCIE_TOP.U_IPS2L_HSSTLP_PCIE_SOFT_PHY.pclk_div2] -period {8} -waveform {0.000 4.000} -add
 create_clock -name {ref_clk} [get_pins u_ips2l_pcie_wrap.U_IPS2L_PCIE_TOP.U_IPS2L_HSSTLP_PCIE_SOFT_PHY/P_REFCK2CORE_0] -period {10} -waveform {0.000 5.000} -add
 create_clock -name {cmos1_pclk} [get_ports {cmos1_pclk}] -period {11.900} -waveform {0.000 5.950}
+create_clock -name {sys_clk} [get_ports {sys_clk}] -period {40} -waveform {0.000 5.000} -add
 ###==== END "create_clock"
+###==== BEGIN "create_generated_clock"
+create_generated_clock -name {cfg_clk} -source [get_ports {sys_clk}] [get_nets {u_pll.clkout0}] -master_clock [get_clocks {sys_clk}] -multiply_by {2} -divide_by {5}
+create_generated_clock -name {ddr_rst_clk} -source [get_ports {sys_clk}] [get_pins {u_DDR3/u_ddrphy_top/rst_clk_gpll/clkout0}] -master_clock [get_clocks {sys_clk}] -multiply_by {84} -divide_by {84}
+create_generated_clock -name {ddrphy_sysclk} -source [get_ports {sys_clk}] [get_pins {u_DDR3/u_ddrphy_top/ddrphy_gpll/clkout0}] -master_clock [get_clocks {sys_clk}] -multiply_by {84} -divide_by {16}
+create_generated_clock -name {phy_dq_clk_0} -source [get_ports {sys_clk}] [get_pins {u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[0].ddrphy_ppll/clkoutphy}] -master_clock [get_clocks {sys_clk}] -multiply_by {84} -divide_by {2}
+create_generated_clock -name {phy_dq_sysclk_0} -source [get_pins {u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[0].ddrphy_ppll/clkoutphy}] [get_pins {u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[0].u_ddrphy_ioclkdiv/CLKDIVOUT}] -master_clock [get_clocks {phy_dq_clk_0}] -edges {5 13 21} -edge_shift {0 0 0}
+create_generated_clock -name {phy_dq_clk_1} -source [get_ports {sys_clk}] [get_pins {u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[1].ddrphy_ppll/clkoutphy}] -master_clock [get_clocks {sys_clk}] -multiply_by {84} -divide_by {2}
+create_generated_clock -name {phy_dq_sysclk_1} -source [get_pins {u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[1].ddrphy_ppll/clkoutphy}] [get_pins {u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[1].u_ddrphy_ioclkdiv/CLKDIVOUT}] -master_clock [get_clocks {phy_dq_clk_1}] -edges {5 13 21} -edge_shift {0 0 0}
+###==== END "create_generated_clock"
 ###==== BEGIN "set_clock_latency"
 ###==== END "set_clock_latency"
 ###==== BEGIN "set_clock_uncertainty"
 set_clock_uncertainty {0.200} [get_clocks {cmos1_pclk}] -setup -hold
+set_clock_uncertainty {0.400} -from [get_clocks {ddrphy_sysclk}] -to [get_clocks {phy_dq_sysclk_0}] -setup -hold
+set_clock_uncertainty {0.400} -from [get_clocks {phy_dq_sysclk_0}] -to [get_clocks {ddrphy_sysclk}] -setup -hold
+set_clock_uncertainty {0.400} -from [get_clocks {ddrphy_sysclk}] -to [get_clocks {phy_dq_sysclk_1}] -setup -hold
+set_clock_uncertainty {0.400} -from [get_clocks {phy_dq_sysclk_1}] -to [get_clocks {ddrphy_sysclk}] -setup -hold
 ###==== END "set_clock_uncertainty"
 ###==== BEGIN "set_clock_groups"
-set_clock_groups -name {async_domains} -asynchronous -group [get_clocks {pclk pclk_div2 ref_clk}] -group [get_clocks {sys_clk cfg_clk sys_clk|u_DDR3/u_ddrphy_top/rst_clk_gpll/u_gpll/CLKOUT0_Inferred sys_clk|u_DDR3/u_ddrphy_top/ddrphy_gpll/u_gpll/CLKOUT0_Inferred sys_clk|u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[0].ddrphy_ppll/u_ppll/CLKOUTPHY_Inferred sys_clk|u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[0].ddrphy_ppll/u_ppll/CLKOUTPHY_Inferred|u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[0].u_ddrphy_ioclkdiv/CLKDIVOUT_Inferred sys_clk|u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[1].ddrphy_ppll/u_ppll/CLKOUTPHY_Inferred sys_clk|u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[1].ddrphy_ppll/u_ppll/CLKOUTPHY_Inferred|u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[1].u_ddrphy_ioclkdiv/CLKDIVOUT_Inferred}] -group [get_clocks {cmos1_pclk}]
+set_clock_groups -name {async_domains} -asynchronous -group [get_clocks {pclk pclk_div2 ref_clk}] -group [get_clocks {sys_clk cfg_clk ddr_rst_clk ddrphy_sysclk phy_dq_clk_0 phy_dq_sysclk_0 phy_dq_clk_1 phy_dq_sysclk_1}] -group [get_clocks {cmos1_pclk}]
 ###==== END "set_clock_groups"
 ###==== BEGIN "set_input_delay"
 set_input_delay -clock [get_clocks {cmos1_pclk}] -max 2.5 [get_ports {cmos1_data[0] cmos1_data[1] cmos1_data[2] cmos1_data[3] cmos1_data[4] cmos1_data[5] cmos1_data[6] cmos1_data[7] cmos1_href cmos1_vsync}]
@@ -27,11 +41,11 @@ set_input_delay -clock [get_clocks {cmos1_pclk}] -min 0.5 [get_ports {cmos1_data
 ###==== END "set_min_delay"
 
 ###==== BEGIN "set_multicycle_path"
+set_multicycle_path 2 -from [get_clocks {ddrphy_sysclk}] -to [get_clocks {phy_dq_sysclk_0}]
+set_multicycle_path 2 -from [get_clocks {ddrphy_sysclk}] -to [get_clocks {phy_dq_sysclk_1}]
 ###==== END "set_multicycle_path"
 
 ###==== BEGIN "set_false_path"
-set_false_path -to [get_pins {u_fram_buf/rd_buf/ddr_rstn_1d/opit_0_srl/D u_fram_buf/rd_buf/data_ready_sync1/opit_0_srl/D u_fram_buf/wr_buf/ddr_rstn_1d/opit_0_srl/D u_ips2l_pcie_expd_apb_mux/u_pcie_expd_apb_cross/src_dly[0]/opit_0_inv_srl/D u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/u_pcie_apb_mux/u_pcie_apb_cross/src_dly[0]/opit_0_inv_srl/D u_DDR3/u_ddrphy_top/u_dll_freeze_sync/sig_async_r1[0]/opit_0_inv_srl/D u_DDR3/u_ddrphy_top/u_dll_update_n_sync/sig_async_r1[0]/opit_0_inv_srl/D}]
-set_false_path -to [get_pins {u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/u_ddrphy_rstn_sync/sig_async_r1[0]/opit_0_inv_srl/RS u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/u_dll_rst_sync/sig_async_r1[0]/opit_0_inv_srl/RS u_DDR3/u_ddrphy_top/u_ddrphy_cpd_rstn_sync/sig_async_r1[0]/opit_0_inv_srl/RS u_DDR3/u_ddrphy_top/u_ddrphy_rst_seq_rstn_sync/sig_async_r1[0]/opit_0_srl/RS}]
 ###==== END "set_false_path"
 
 ###==== BEGIN Attributes - (Populated from tab in SCOPE, do not edit)
@@ -423,8 +437,6 @@ define_attribute {p:sys_clk} {PAP_IO_LOC} {V4}
 define_attribute {p:sys_clk} {PAP_IO_VCCIO} {1.5}
 define_attribute {p:sys_clk} {PAP_IO_STANDARD} {HSTL15_I}
 define_attribute {p:sys_clk} {PAP_IO_UNUSED} {TRUE}
-create_clock -name {sys_clk} [get_ports sys_clk] -period {40} -waveform {0.000 5.000} -add
-create_generated_clock -name {cfg_clk} -source [get_ports {sys_clk}] [get_nets {u_pll.clkout0}] -master_clock [get_clocks {sys_clk}] -multiply_by {2} -divide_by {5}
 define_attribute {n:cmos1_pclk} {PAP_CLOCK_DEDICATED_ROUTE} {FALSE}
 define_attribute {p:mem_dqs[1]} {PAP_IO_DIRECTION} {INOUT}
 define_attribute {p:mem_dqs[1]} {PAP_IO_LOC} {M1}
