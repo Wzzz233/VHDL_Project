@@ -521,6 +521,25 @@ static const char *pixel_format_name(uint32_t pixel_format)
     }
 }
 
+static int write_bar1_reg_best_effort(int fd, uint32_t offset, uint32_t value, const char *name)
+{
+    struct fpga_bar1_reg reg_io;
+
+    memset(&reg_io, 0, sizeof(reg_io));
+    reg_io.offset = offset;
+    reg_io.value = value;
+    if (ioctl(fd, FPGA_DMA_SET_BAR1_REG, &reg_io) < 0) {
+        fprintf(stderr,
+                "[fpga-init] WARN: failed to write %s (0x%03x)=0x%08x: %s\n",
+                name ? name : "BAR1",
+                offset,
+                value,
+                strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 static int init_fpga_dma(struct app_ctx *ctx)
 {
     struct fpga_info info;
@@ -531,6 +550,10 @@ static int init_fpga_dma(struct app_ctx *ctx)
         fprintf(stderr, "Failed to open %s: %s\n", ctx->opt.device_path, strerror(errno));
         return -1;
     }
+
+    /* Keep HDMI raw display path deterministic across sessions. */
+    (void)write_bar1_reg_best_effort(ctx->dev_fd, BAR1_PREP_CTRL, 0U, "PREP_CTRL");
+    (void)write_bar1_reg_best_effort(ctx->dev_fd, BAR1_ROI_CTRL, 0U, "ROI_CTRL");
 
     if (ioctl(ctx->dev_fd, FPGA_DMA_GET_INFO, &info) < 0) {
         fprintf(stderr, "FPGA_DMA_GET_INFO failed: %s\n", strerror(errno));

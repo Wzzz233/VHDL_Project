@@ -1450,6 +1450,8 @@ wire        out_pair_pop = bar2_addr_step & (~dma_expand_mode | dma_expand_phase
 wire        raw_capture_fire = dma_session_active && frame_rd_data_valid;
 wire        prep_capture_fire = dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1;
 wire        prep_capture_first_word = (prep_data_word_x == 8'd0) && (prep_data_line_y == 10'd0);
+wire        pair_capture_fire = prep_active_latched ? prep_capture_fire : raw_capture_fire;
+wire        pair_capture_first_word = prep_active_latched ? prep_capture_first_word : 1'b0;
 
 wire [1:0] prep_roi_mode_0 = roi_boost_mode_xy(prep_x_pix_base + 12'd0, {1'b0, prep_data_line_y},
                                                roi_session_active, roi_session_left_bias,
@@ -1938,15 +1940,15 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             end
 
             prep_stage_a_valid <= 1'b0;
-            if (raw_capture_fire) begin
+            if (pair_capture_fire) begin
                 if (!out_pair_active_valid || (out_pair_pop && !out_pair_next_valid)) begin
                     out_pair_active_valid <= 1'b1;
                     out_pair_active_src_word <= frame_rd_data;
-                    out_pair_active_first_word <= prep_capture_fire ? prep_capture_first_word : 1'b0;
+                    out_pair_active_first_word <= pair_capture_first_word;
                 end else if (!out_pair_next_valid || out_pair_pop) begin
                     out_pair_next_valid <= 1'b1;
                     out_pair_next_src_word <= frame_rd_data;
-                    out_pair_next_first_word <= prep_capture_fire ? prep_capture_first_word : 1'b0;
+                    out_pair_next_first_word <= pair_capture_first_word;
                 end
             end
 
