@@ -78,6 +78,7 @@ module ips2l_pcie_dma #(
     //cross_4kb_boundary
     output  wire                        o_cross_4kb_boundary    ,
     output  wire                        o_tx_restart_ext        ,
+    output  wire                        o_frame_req_ack_pulse_ext,
     output  wire                        o_frame_done_pulse_ext  ,
     output  wire                        o_mwr_tx_busy_ext       ,
     output  wire    [31:0]              o_prep_ctrl_ext         ,
@@ -178,6 +179,7 @@ wire        [127:0]             bar2_rd_data_int;  // from internal BAR2 RAM
 wire        [127:0]             bar2_rd_data;      // muxed: internal or external
 //rst tlp cnt
 wire                            tx_restart;
+wire                            frame_req_ack_pulse;
 wire        [63:0]              dma_check_result;
 wire                            mwr_tx_busy;
 wire                            frame_done_pulse;
@@ -187,6 +189,7 @@ assign o_bar2_rd_clk_en_ext = bar2_rd_clk_en;
 assign o_bar2_rd_addr_ext   = bar2_rd_addr;
 assign bar2_rd_data         = i_ext_bar2_rd_sel ? i_ext_bar2_rd_data : bar2_rd_data_int;
 assign o_tx_restart_ext     = tx_restart;
+assign o_frame_req_ack_pulse_ext = frame_req_ack_pulse;
 assign o_frame_done_pulse_ext = frame_done_pulse;
 assign o_mwr_tx_busy_ext    = mwr_tx_busy;
 assign o_prep_ctrl_ext      = prep_ctrl_cfg;
@@ -312,6 +315,7 @@ u_ips2l_pcie_dma_controller
     .o_req_data                 (req_data                   ),
     .o_cross_4kb_boundary       (o_cross_4kb_boundary       ),
     .i_mwr_tx_busy              (mwr_tx_busy                ),
+    .o_frame_req_ack_pulse      (frame_req_ack_pulse        ),
     .o_frame_done_pulse         (frame_done_pulse           ),
     .o_prep_ctrl                (prep_ctrl_cfg              ),
     .o_prep_clahe               (prep_clahe_cfg             ),
