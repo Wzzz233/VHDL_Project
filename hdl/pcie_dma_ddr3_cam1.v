@@ -182,6 +182,8 @@ wire	[11:0]	mwr_rd_addr;
 wire	[127:0]	mwr_rd_data;
 wire			mwr_cmd_start;
 wire			frame_done_pulse;
+wire			mwr_tx_busy;
+reg				mwr_tx_busy_d;
 wire			mwr_payload_fire;
 wire			mwr_payload_active;
 wire    [31:0]  fpga_prep_ctrl;
@@ -214,14 +216,21 @@ assign cfg_msi_pending	=	32'd0;
 assign ven_msi_req		=	msi_pending & cfg_msi_en;
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
-	if (!core_rst_n) begin
-		msi_pending <= 1'b0;
-	end else begin
+    if (!core_rst_n) begin
+        msi_pending <= 1'b0;
+    end else begin
 		if (ven_msi_grant)
 			msi_pending <= 1'b0;
 		if (frame_done_pulse)
 			msi_pending <= 1'b1;
-	end
+    end
+end
+
+always @(posedge pclk_div2 or negedge core_rst_n) begin
+	if (!core_rst_n)
+		mwr_tx_busy_d <= 1'b0;
+	else
+		mwr_tx_busy_d <= mwr_tx_busy;
 end
 
 // Rst debounce
@@ -402,6 +411,7 @@ ips2l_pcie_dma #(
 	.o_cross_4kb_boundary	(cross_4kb_boundary),	//4k杈圭晫
 	.o_tx_restart_ext		(mwr_cmd_start),
 	.o_frame_done_pulse_ext	(frame_done_pulse),
+	.o_mwr_tx_busy_ext		(mwr_tx_busy),
 	.o_prep_ctrl_ext		(fpga_prep_ctrl),
 	.o_prep_clahe_ext		(fpga_prep_clahe),
 	.o_prep_usm_ext			(fpga_prep_usm),
@@ -2079,7 +2089,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
     end
 end
 
-assign dma_session_start = mwr_cmd_start & ~dma_session_active;
+assign dma_session_start = mwr_tx_busy & ~mwr_tx_busy_d & ~dma_session_active;
 assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
 assign mwr_rd_data = FORCE_PATTERN_POST_DDR ? post_ddr_pattern_data : frame_dma_data;
 

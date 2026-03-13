@@ -79,6 +79,7 @@ module ips2l_pcie_dma #(
     output  wire                        o_cross_4kb_boundary    ,
     output  wire                        o_tx_restart_ext        ,
     output  wire                        o_frame_done_pulse_ext  ,
+    output  wire                        o_mwr_tx_busy_ext       ,
     output  wire    [31:0]              o_prep_ctrl_ext         ,
     output  wire    [31:0]              o_prep_clahe_ext        ,
     output  wire    [31:0]              o_prep_usm_ext          ,
@@ -187,6 +188,7 @@ assign o_bar2_rd_addr_ext   = bar2_rd_addr;
 assign bar2_rd_data         = i_ext_bar2_rd_sel ? i_ext_bar2_rd_data : bar2_rd_data_int;
 assign o_tx_restart_ext     = tx_restart;
 assign o_frame_done_pulse_ext = frame_done_pulse;
+assign o_mwr_tx_busy_ext    = mwr_tx_busy;
 assign o_prep_ctrl_ext      = prep_ctrl_cfg;
 assign o_prep_clahe_ext     = prep_clahe_cfg;
 assign o_prep_usm_ext       = prep_usm_cfg;
