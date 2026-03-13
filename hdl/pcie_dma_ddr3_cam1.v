@@ -183,6 +183,7 @@ wire	[127:0]	mwr_rd_data;
 wire			mwr_cmd_start;
 wire			frame_done_pulse;
 wire			mwr_payload_fire;
+wire			mwr_payload_active;
 wire    [31:0]  fpga_prep_ctrl;
 wire    [31:0]  fpga_prep_clahe;
 wire    [31:0]  fpga_prep_usm;
@@ -409,6 +410,7 @@ ips2l_pcie_dma #(
 	.o_roi_x2y2_ext			(fpga_roi_x2y2),
 	.o_roi_ctrl_ext			(fpga_roi_ctrl),
 	.o_mwr_payload_fire_ext	(mwr_payload_fire),
+	.o_mwr_payload_active_ext	(mwr_payload_active),
 	// External BAR2 read override for MWR frame data
 	.o_bar2_rd_clk_en_ext	(mwr_rd_clk_en),
 	.o_bar2_rd_addr_ext		(mwr_rd_addr),
@@ -1636,7 +1638,7 @@ wire        prep_pipe_valid = prep_active_latched ? (out_pair_active_valid & pre
                                                   : raw_stream_ready;
 wire        frame_stream_ready = ~dma_session_active | prep_pipe_valid;
 
-assign axis_slave2_tready_fc = axis_slave2_tready_raw & frame_stream_ready;
+assign axis_slave2_tready_fc = axis_slave2_tready_raw & (~mwr_payload_active | frame_stream_ready);
 
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n) begin
