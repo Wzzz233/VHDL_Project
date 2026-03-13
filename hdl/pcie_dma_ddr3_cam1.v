@@ -1486,8 +1486,7 @@ wire        raw_start_capture_now = raw_startup_active && raw_capture_fire && !r
 wire        raw_startup_use_word = raw_startup_active && (raw_start_word_valid || raw_start_capture_now);
 wire        raw_startup_done = raw_startup_use_word && out_pair_pop;
 wire [127:0] raw_start_src_word = raw_start_word_valid ? raw_start_word : frame_rd_data;
-wire [127:0] raw_lo_src_word = raw_startup_use_word ? raw_start_src_word : frame_rd_data;
-wire [127:0] raw_hi_src_word = raw_startup_use_word ? raw_start_src_word : frame_rd_data_hold;
+wire [127:0] raw_pair_src_word = raw_startup_use_word ? raw_start_src_word : out_pair_active_src_word;
 wire        prep_capture_fire = dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1;
 wire        prep_capture_first_word = (prep_data_word_x == 8'd0) && (prep_data_line_y == 10'd0);
 wire        pair_capture_fire = prep_active_latched ? prep_capture_fire : raw_capture_fire;
@@ -1602,12 +1601,12 @@ wire [7:0]  prep_pair_active_y_5 = prep_pair_active_y_word[47:40];
 wire [7:0]  prep_pair_active_y_6 = prep_pair_active_y_word[55:48];
 wire [7:0]  prep_pair_active_y_7 = prep_pair_active_y_word[63:56];
 wire [127:0] out_pair_active_raw_lo_pack = pack_4pix_bgrx(
-    raw_lo_src_word[15:0], raw_lo_src_word[31:16],
-    raw_lo_src_word[47:32], raw_lo_src_word[63:48],
+    raw_pair_src_word[15:0], raw_pair_src_word[31:16],
+    raw_pair_src_word[47:32], raw_pair_src_word[63:48],
     8'h00, 8'h00, 8'h00, 8'h00);
 wire [127:0] out_pair_active_raw_hi_pack = pack_4pix_bgrx(
-    raw_hi_src_word[79:64], raw_hi_src_word[95:80],
-    raw_hi_src_word[111:96], raw_hi_src_word[127:112],
+    raw_pair_src_word[79:64], raw_pair_src_word[95:80],
+    raw_pair_src_word[111:96], raw_pair_src_word[127:112],
     8'h00, 8'h00, 8'h00, 8'h00);
 wire [127:0] prep_pair_active_prep_lo_pack = pack_4prep_bgrx(
     prep_pair_active_src_word[15:0], prep_pair_active_src_word[31:16],
