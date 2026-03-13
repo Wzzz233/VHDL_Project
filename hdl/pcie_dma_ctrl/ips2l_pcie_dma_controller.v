@@ -55,7 +55,6 @@ module ips2l_pcie_dma_controller #(
     input                               i_mwr_tx_busy           ,
     input           [63:0]              i_dma_check_result      ,
     output  wire                        o_tx_restart            ,
-    output  wire                        o_frame_req_ack_pulse   ,
     output  reg                         o_cross_4kb_boundary    ,
     output  reg                         o_frame_done_pulse      ,
     // FPGA AI-ISP control register shadows from BAR1 writes
@@ -901,7 +900,6 @@ begin
 end
 
 assign o_tx_restart = i_bar1_wr_en && (i_bar1_wr_addr[8:0] == 9'h110);
-assign o_frame_req_ack_pulse = frame_active && (frame_state == FRAME_WAIT_ACK) && i_mwr64_req_ack;
 
 //detect 4-KB boundary
 assign req_l_addr = device_rc ? apb_cmd_l_addr[12:0] : dma_cmd_l_addr[12:0];

@@ -16,13 +16,11 @@ reg         mrd64_req_ack;
 
 wire        o_mwr64_req;
 wire        o_tx_restart;
-wire        o_frame_req_ack_pulse;
 wire        o_frame_done_pulse;
 
 integer cycle;
 integer tx_restart_cycle;
 integer req_cycle;
-integer req_ack_cycle;
 integer busy_rise_cycle;
 reg     mwr_tx_busy_d;
 
@@ -76,7 +74,6 @@ ips2l_pcie_dma_controller #(
     .i_mwr_tx_busy          (mwr_tx_busy),
     .i_dma_check_result     (64'd0),
     .o_tx_restart           (o_tx_restart),
-    .o_frame_req_ack_pulse  (o_frame_req_ack_pulse),
     .o_cross_4kb_boundary   (),
     .o_frame_done_pulse     (o_frame_done_pulse),
     .o_prep_ctrl            (),
@@ -95,7 +92,6 @@ always @(posedge clk or negedge rst_n) begin
         cycle <= 0;
         tx_restart_cycle <= -1;
         req_cycle <= -1;
-        req_ack_cycle <= -1;
         busy_rise_cycle <= -1;
         mwr_tx_busy_d <= 1'b0;
     end else begin
@@ -106,8 +102,6 @@ always @(posedge clk or negedge rst_n) begin
             tx_restart_cycle <= cycle;
         if (o_mwr64_req && req_cycle < 0)
             req_cycle <= cycle;
-        if (o_frame_req_ack_pulse && req_ack_cycle < 0)
-            req_ack_cycle <= cycle;
         if (mwr_tx_busy && !mwr_tx_busy_d && busy_rise_cycle < 0)
             busy_rise_cycle <= cycle;
     end
@@ -148,20 +142,20 @@ initial begin
     wait (o_frame_done_pulse);
     @(posedge clk);
 
-    $display("TRACE tx_restart_cycle=%0d req_cycle=%0d req_ack_cycle=%0d busy_rise_cycle=%0d",
-             tx_restart_cycle, req_cycle, req_ack_cycle, busy_rise_cycle);
+    $display("TRACE tx_restart_cycle=%0d req_cycle=%0d busy_rise_cycle=%0d",
+             tx_restart_cycle, req_cycle, busy_rise_cycle);
 
-    if (tx_restart_cycle < 0 || req_cycle < 0 || req_ack_cycle < 0 || busy_rise_cycle < 0) begin
+    if (tx_restart_cycle < 0 || req_cycle < 0 || busy_rise_cycle < 0) begin
         $display("ERROR: failed to observe controller write/start ordering");
         $fatal;
     end
 
-    if (!(tx_restart_cycle < req_cycle && req_cycle <= req_ack_cycle && req_ack_cycle < busy_rise_cycle)) begin
-        $display("ERROR: expected BAR1 L_ADDR pulse before MWR request, request-ack pulse, and tx busy rise");
+    if (!(tx_restart_cycle < req_cycle && req_cycle < busy_rise_cycle)) begin
+        $display("ERROR: expected BAR1 L_ADDR pulse before MWR request/tx busy rise");
         $fatal;
     end
 
-    $display("PASS: o_tx_restart follows BAR1+0x110, frame request accept happens later, and MWR busy rises after that.");
+    $display("PASS: o_tx_restart follows BAR1+0x110, while real frame-mode DMA starts later on MWR busy rise.");
     $finish;
 end
 

@@ -181,9 +181,7 @@ wire			mwr_rd_clk_en;
 wire	[11:0]	mwr_rd_addr;
 wire	[127:0]	mwr_rd_data;
 wire			mwr_cmd_start;
-wire			frame_req_ack_pulse;
 wire			frame_done_pulse;
-wire			mwr_tx_busy;
 wire			mwr_payload_fire;
 wire			mwr_payload_active;
 wire    [31:0]  fpga_prep_ctrl;
@@ -403,9 +401,7 @@ ips2l_pcie_dma #(
 	.o_apb_prdata			(p_rdata_dma),
 	.o_cross_4kb_boundary	(cross_4kb_boundary),	//4k杈圭晫
 	.o_tx_restart_ext		(mwr_cmd_start),
-	.o_frame_req_ack_pulse_ext	(frame_req_ack_pulse),
 	.o_frame_done_pulse_ext	(frame_done_pulse),
-	.o_mwr_tx_busy_ext		(mwr_tx_busy),
 	.o_prep_ctrl_ext		(fpga_prep_ctrl),
 	.o_prep_clahe_ext		(fpga_prep_clahe),
 	.o_prep_usm_ext			(fpga_prep_usm),
@@ -2083,7 +2079,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
     end
 end
 
-assign dma_session_start = frame_req_ack_pulse & ~dma_session_active;
+assign dma_session_start = mwr_cmd_start & ~dma_session_active;
 assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
 assign mwr_rd_data = FORCE_PATTERN_POST_DDR ? post_ddr_pattern_data : frame_dma_data;
 
