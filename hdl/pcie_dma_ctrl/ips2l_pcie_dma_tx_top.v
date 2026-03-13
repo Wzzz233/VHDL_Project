@@ -90,7 +90,8 @@ module ips2l_pcie_dma_tx_top #(
     //rst tlp cnt
     input                               i_tx_restart
     ,
-    output  wire                        o_mwr_tx_busy
+    output  wire                        o_mwr_tx_busy,
+    output  wire                        o_mwr_payload_fire
     //output  wire    [13:0]              o_dbg_bus_mrd_tx        ,
     //output  wire    [72:0]              o_dbg_bus_mwr_tx
 
@@ -273,5 +274,6 @@ u_ips2l_pcie_dma_mwr_tx_ctrl
 );
 
 assign o_mwr_tx_busy = mwr_tx_busy;
+assign o_mwr_payload_fire = mwr_tlp_tx && o_axis_slave2_tvld && i_axis_slave2_trdy;
 
 endmodule
