@@ -822,6 +822,7 @@ reg  [11:0]                mwr_rd_addr_d;
 reg                        mwr_rd_clk_en_d;
 reg  [127:0]               frame_rd_data_hold;
 reg                        raw_startup_active;
+reg                        raw_startup_wait_capture;
 reg                        raw_start_word_valid;
 reg  [127:0]               raw_start_word;
 reg  [7:0]                 frame_id;
@@ -1483,7 +1484,8 @@ wire        out_pair_pop = bar2_addr_step & (~dma_expand_mode | dma_expand_phase
 wire        raw_capture_fire = dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1;
 wire        raw_frame_hold_en = raw_capture_fire;
 wire        raw_start_capture_now = raw_startup_active && raw_capture_fire && !raw_start_word_valid;
-wire        raw_startup_use_word = raw_startup_active && (raw_start_word_valid || raw_start_capture_now);
+wire        raw_startup_use_word = raw_startup_active && !raw_startup_wait_capture &&
+                                   (raw_start_word_valid || raw_start_capture_now);
 wire        raw_startup_done = raw_startup_use_word && out_pair_pop;
 wire [127:0] raw_start_src_word = raw_start_word_valid ? raw_start_word : frame_rd_data;
 wire [127:0] raw_lo_src_word = raw_startup_use_word ? raw_start_src_word : frame_rd_data;
@@ -1635,7 +1637,7 @@ wire [127:0] frame_dma_data = dma_expand_mode
     ? (prep_output_active ? frame_dma_data_prep : frame_dma_data_raw)
     : frame_rd_data;
 wire        raw_stream_ready = (dma_expand_mode && raw_startup_active)
-    ? raw_start_word_valid
+    ? (raw_startup_wait_capture ? raw_capture_fire : raw_start_word_valid)
     : frame_rd_data_ready;
 wire        prep_pipe_valid = prep_active_latched ? (out_pair_active_valid & prep_pair_active_valid)
                                                   : raw_stream_ready;
@@ -1678,6 +1680,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         dma_expand_phase <= 1'b0;
         frame_rd_data_hold <= 128'd0;
         raw_startup_active <= 1'b0;
+        raw_startup_wait_capture <= 1'b0;
         raw_start_word_valid <= 1'b0;
         raw_start_word <= 128'd0;
         frame_id <= 8'd0;
@@ -1766,6 +1769,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         frame_src_bootstrap_count <= 3'd0;
         dma_expand_phase <= 1'b0;
         raw_startup_active <= 1'b0;
+        raw_startup_wait_capture <= 1'b0;
         raw_start_word_valid <= 1'b0;
         raw_start_word <= 128'd0;
         prep_session_en <= 1'b0;
@@ -1847,6 +1851,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             dma_expand_phase <= 1'b0;
             frame_rd_data_hold <= 128'd0;
             raw_startup_active <= ~prep_active;
+            raw_startup_wait_capture <= 1'b0;
             raw_start_word_valid <= 1'b0;
             raw_start_word <= 128'd0;
             frame_id <= frame_id + 8'd1;
@@ -1973,8 +1978,19 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 end
             end
 
-            if (raw_startup_done)
-                raw_startup_active <= 1'b0;
+            if (raw_startup_active) begin
+                if (raw_startup_wait_capture) begin
+                    if (raw_capture_fire) begin
+                        raw_startup_active <= 1'b0;
+                        raw_startup_wait_capture <= 1'b0;
+                    end
+                end else if (raw_startup_done) begin
+                    if (raw_capture_fire)
+                        raw_startup_active <= 1'b0;
+                    else
+                        raw_startup_wait_capture <= 1'b1;
+                end
+            end
 
             if (rd_fsync_stretch_cnt != 6'd0)
                 rd_fsync_stretch_cnt <= rd_fsync_stretch_cnt - 6'd1;
