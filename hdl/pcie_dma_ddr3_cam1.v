@@ -184,6 +184,7 @@ wire			mwr_cmd_start;
 wire			frame_done_pulse;
 wire			mwr_payload_fire;
 wire			mwr_payload_active;
+wire			mwr_req_start_pulse;
 wire    [31:0]  fpga_prep_ctrl;
 wire    [31:0]  fpga_prep_clahe;
 wire    [31:0]  fpga_prep_usm;
@@ -411,6 +412,7 @@ ips2l_pcie_dma #(
 	.o_roi_ctrl_ext			(fpga_roi_ctrl),
 	.o_mwr_payload_fire_ext	(mwr_payload_fire),
 	.o_mwr_payload_active_ext	(mwr_payload_active),
+	.o_mwr_req_start_pulse_ext	(mwr_req_start_pulse),
 	// External BAR2 read override for MWR frame data
 	.o_bar2_rd_clk_en_ext	(mwr_rd_clk_en),
 	.o_bar2_rd_addr_ext		(mwr_rd_addr),
@@ -2079,7 +2081,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
     end
 end
 
-assign dma_session_start = mwr_cmd_start & ~dma_session_active;
+assign dma_session_start = mwr_req_start_pulse & ~dma_session_active;
 assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
 assign mwr_rd_data = FORCE_PATTERN_POST_DDR ? post_ddr_pattern_data : frame_dma_data;
 

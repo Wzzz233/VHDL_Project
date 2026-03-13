@@ -88,6 +88,7 @@ module ips2l_pcie_dma #(
     output  wire    [31:0]              o_roi_ctrl_ext          ,
     output  wire                        o_mwr_payload_fire_ext  ,
     output  wire                        o_mwr_payload_active_ext,
+    output  wire                        o_mwr_req_start_pulse_ext,
     //external BAR2 read data override (for frame data via MWR)
     output  wire                        o_bar2_rd_clk_en_ext    ,
     output  wire    [ADDR_WIDTH-1:0]    o_bar2_rd_addr_ext      ,
@@ -159,6 +160,7 @@ wire                            dma_axis_slave2_tlast;
 wire                            dma_axis_slave2_tuser;
 wire                            mwr_payload_fire;
 wire                            mwr_payload_active;
+wire                            mwr_req_start_pulse;
 
 //**********************************************************************
 //bar0 rd interface
@@ -196,6 +198,7 @@ assign o_roi_x2y2_ext       = roi_x2y2_cfg;
 assign o_roi_ctrl_ext       = roi_ctrl_cfg;
 assign o_mwr_payload_fire_ext = mwr_payload_fire;
 assign o_mwr_payload_active_ext = mwr_payload_active;
+assign o_mwr_req_start_pulse_ext = mwr_req_start_pulse;
 //**********************************************************************
 //debug bus
 //wire        [42:0]              dbg_bus_rx_ctrl;
@@ -402,7 +405,8 @@ u_ips2l_pcie_dma_tx_top
     .i_tx_restart               (tx_restart                 ),
     .o_mwr_tx_busy              (mwr_tx_busy                ),
     .o_mwr_payload_fire         (mwr_payload_fire           ),
-    .o_mwr_payload_active       (mwr_payload_active         )
+    .o_mwr_payload_active       (mwr_payload_active         ),
+    .o_mwr_req_start_pulse      (mwr_req_start_pulse        )
     //debug
     //.o_dbg_bus_mrd_tx           (dbg_bus_mrd_tx             ),
     //.o_dbg_bus_mwr_tx           (dbg_bus_mwr_tx             )

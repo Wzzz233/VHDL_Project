@@ -49,6 +49,7 @@ module ips2l_pcie_dma_mwr_tx_ctrl #(
     output  reg                         o_mwr_tx_busy           ,
     output  wire                        o_mwr_tx_hold           ,
     output  wire                        o_mwr_tlp_tx            ,
+    output  wire                        o_mwr_req_start_pulse   ,
     //debug
     input                               i_tx_restart
     //output  wire      [13:0]              o_dbg_bus
@@ -112,6 +113,7 @@ assign data_vlad = i_gen_tlp_start;
 assign tx_done  = o_axis_slave2_tlast && i_axis_slave2_trdy && o_axis_slave2_tvld;
 
 assign mwr_req_start = mwr_req_rcv && mwr_req_ack;
+assign o_mwr_req_start_pulse = mwr_req_start;
 
 assign max_payload_size = (i_cfg_max_payload_size == 3'd0) ? 10'h20 :
                           (i_cfg_max_payload_size == 3'd1) ? 10'h40 :

@@ -130,6 +130,7 @@ ips2l_pcie_dma_mwr_tx_ctrl #(
     .o_mwr_tx_busy          (mwr_tx_busy),
     .o_mwr_tx_hold          (mwr_tx_hold),
     .o_mwr_tlp_tx           (mwr_payload_active),
+    .o_mwr_req_start_pulse  (),
     .i_tx_restart           (1'b0)
 );
 
