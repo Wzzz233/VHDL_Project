@@ -1480,13 +1480,13 @@ wire [63:0] prep_luma_word_top = (prep_data_line_y == 10'd0) ? prep_luma_word_cu
                                  (prep_data_line_y == 10'd1) ? prep_linebuf_prev1_rd_d1 : prep_linebuf_prev2_rd_d1;
 wire [63:0] prep_luma_word_mid = (prep_data_line_y == 10'd0) ? prep_luma_word_cur : prep_linebuf_prev1_rd_d1;
 wire        out_pair_pop = bar2_addr_step & (~dma_expand_mode | dma_expand_phase);
-wire        raw_capture_fire = dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1;
+wire        raw_capture_fire = dma_session_active && frame_rd_data_valid;
 wire        raw_frame_hold_en = raw_capture_fire;
 wire        raw_start_capture_now = raw_startup_active && raw_capture_fire && !raw_start_word_valid;
 wire        raw_startup_use_word = raw_startup_active && (raw_start_word_valid || raw_start_capture_now);
 wire        raw_startup_done = raw_startup_use_word && out_pair_pop;
 wire [127:0] raw_start_src_word = raw_start_word_valid ? raw_start_word : frame_rd_data;
-wire [127:0] raw_lo_src_word = raw_startup_use_word ? raw_start_src_word : frame_rd_data;
+wire [127:0] raw_lo_src_word = raw_startup_use_word ? raw_start_src_word : frame_rd_data_hold;
 wire [127:0] raw_hi_src_word = raw_startup_use_word ? raw_start_src_word : frame_rd_data_hold;
 wire        prep_capture_fire = dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1;
 wire        prep_capture_first_word = (prep_data_word_x == 8'd0) && (prep_data_line_y == 10'd0);

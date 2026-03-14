@@ -36,6 +36,23 @@ integer busy_rise_cycle;
 reg     mwr_tx_busy_d;
 wire    tx_done = axis_slave2_tvld && axis_slave2_tlast;
 
+// Backpressure: deassert ready for 4 cycles after mwr_tx_busy rises.
+reg        axis_trdy_bp;
+reg  [3:0] trdy_delay_cnt;
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        axis_trdy_bp   <= 1'b0;
+        trdy_delay_cnt <= 4'd0;
+    end else if (mwr_tx_busy && !mwr_tx_busy_d) begin
+        axis_trdy_bp   <= 1'b0;
+        trdy_delay_cnt <= 4'd4;
+    end else if (trdy_delay_cnt != 4'd0) begin
+        trdy_delay_cnt <= trdy_delay_cnt - 4'd1;
+        if (trdy_delay_cnt == 4'd1)
+            axis_trdy_bp <= 1'b1;
+    end
+end
+
 task bar1_write;
     input [11:0] addr;
     input [31:0] data32;
@@ -118,7 +135,7 @@ ips2l_pcie_dma_mwr_tx_ctrl #(
     .i_gen_tlp_start        (gen_tlp_start),
     .i_rd_data              (128'h0123_4567_89ab_cdef_fedc_ba98_7654_3210),
     .i_last_data            (1'b1),
-    .i_axis_slave2_trdy     (1'b1),
+    .i_axis_slave2_trdy     (axis_trdy_bp),
     .o_axis_slave2_tvld     (axis_slave2_tvld),
     .o_axis_slave2_tdata    (axis_slave2_tdata),
     .o_axis_slave2_tlast    (axis_slave2_tlast),

@@ -248,6 +248,34 @@ always @(posedge clk) begin
     end
 end
 
+// First-beat assertions: verify startup-to-steady transition word ordering.
+// In BGRX mode the first 4 beats should be:
+//   beat 0 (lo phase): word 0
+//   beat 1 (hi phase): word 0
+//   beat 2 (lo phase): word 1
+//   beat 3 (hi phase): word 1
+reg [7:0] first_beat_expected [0:3];
+reg [2:0] first_beat_idx;
+reg       first_beat_fail;
+initial begin
+    first_beat_expected[0] = 8'd0;
+    first_beat_expected[1] = 8'd0;
+    first_beat_expected[2] = 8'd1;
+    first_beat_expected[3] = 8'd1;
+    first_beat_idx = 3'd0;
+    first_beat_fail = 1'b0;
+end
+always @(posedge clk) begin
+    if (rst_n && good_payload_fire && first_beat_idx < 3'd4) begin
+        if (good_payload_word_id !== first_beat_expected[first_beat_idx]) begin
+            $display("FIRST-BEAT ERROR: beat %0d expected word %0d got %0d",
+                     first_beat_idx, first_beat_expected[first_beat_idx], good_payload_word_id);
+            first_beat_fail = 1'b1;
+        end
+        first_beat_idx = first_beat_idx + 3'd1;
+    end
+end
+
 initial begin
     clk = 1'b0;
     rst_n = 1'b0;
@@ -298,6 +326,11 @@ initial begin
 
     if (bad_payload_count >= good_payload_count) begin
         $display("ERROR: non-pending raw request model did not show the expected progress loss");
+        $fatal;
+    end
+
+    if (first_beat_fail) begin
+        $display("ERROR: startup-to-steady transition word ordering was incorrect");
         $fatal;
     end
 
