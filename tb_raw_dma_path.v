@@ -205,7 +205,8 @@ wire [31:0] good_mismatch_count;
 wire [31:0] good_drop_count;
 
 raw_dma_pending_case #(
-    .USE_PENDING(1'b0)
+    .USE_PENDING(1'b0),
+    .RAW_BOOTSTRAP_WORDS(3'd2)
 ) u_bad (
     .clk(clk),
     .rst_n(rst_n),
@@ -220,7 +221,8 @@ raw_dma_pending_case #(
 );
 
 raw_dma_pending_case #(
-    .USE_PENDING(1'b1)
+    .USE_PENDING(1'b1),
+    .RAW_BOOTSTRAP_WORDS(3'd2)
 ) u_good (
     .clk(clk),
     .rst_n(rst_n),
@@ -248,7 +250,8 @@ always @(posedge clk) begin
     end
 end
 
-// First-beat assertions: verify startup-to-steady transition word ordering.
+// Semantic model assertions: verify startup-to-steady transition ordering for
+// the queue-only raw scheduler with RAW_BOOTSTRAP_WORDS=2.
 // In BGRX mode the first 4 beats should be:
 //   beat 0 (lo phase): word 0
 //   beat 1 (hi phase): word 0
@@ -334,7 +337,7 @@ initial begin
         $fatal;
     end
 
-    $display("PASS: pending raw requests preserved ordered output and resumed after ready stalls.");
+    $display("PASS: pending raw request model preserved ordered queue output and resumed after ready stalls.");
     $finish;
 end
 

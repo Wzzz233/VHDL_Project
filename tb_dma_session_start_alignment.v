@@ -33,15 +33,17 @@ integer tx_restart_cycle;
 integer req_cycle;
 integer req_start_cycle;
 integer busy_rise_cycle;
+integer timeout_cycles;
 reg     mwr_tx_busy_d;
 wire    tx_done = axis_slave2_tvld && axis_slave2_tlast;
+reg     frame_done_seen;
 
 // Backpressure: deassert ready for 4 cycles after mwr_tx_busy rises.
 reg        axis_trdy_bp;
 reg  [3:0] trdy_delay_cnt;
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        axis_trdy_bp   <= 1'b0;
+        axis_trdy_bp   <= 1'b1;
         trdy_delay_cnt <= 4'd0;
     end else if (mwr_tx_busy && !mwr_tx_busy_d) begin
         axis_trdy_bp   <= 1'b0;
@@ -182,6 +184,13 @@ always @(posedge clk or negedge rst_n) begin
     end
 end
 
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)
+        frame_done_seen <= 1'b0;
+    else if (o_frame_done_pulse)
+        frame_done_seen <= 1'b1;
+end
+
 initial begin
     clk = 1'b0;
     rst_n = 1'b0;
@@ -200,7 +209,15 @@ initial begin
     bar1_write(12'h110, 32'h7EB0_0000);
     bar1_write(12'h100, 32'h8000_0004);
 
-    wait (o_frame_done_pulse);
+    timeout_cycles = 0;
+    while (!frame_done_seen && timeout_cycles < 200) begin
+        @(posedge clk);
+        timeout_cycles = timeout_cycles + 1;
+    end
+    if (!frame_done_seen) begin
+        $display("ERROR: timeout waiting for frame_done_pulse under startup backpressure");
+        $fatal;
+    end
     @(posedge clk);
 
     $display("TRACE tx_restart_cycle=%0d req_cycle=%0d req_start_cycle=%0d busy_rise_cycle=%0d req_addr=%h req_len=%0d",
@@ -221,7 +238,7 @@ initial begin
         $fatal;
     end
 
-    $display("PASS: startup uses BAR1 write ordering, but the effective DMA session start now aligns with MWR request accept instead of the early 0x110 pulse.");
+    $display("PASS: controller/TX startup ordering survived post-busy backpressure without stalling frame completion.");
     $finish;
 end
 
