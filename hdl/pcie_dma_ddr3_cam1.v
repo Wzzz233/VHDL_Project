@@ -821,8 +821,10 @@ reg  [63:0]                prep_linebuf_prev2_rd_d1;
 reg  [2:0]                 frame_src_bootstrap_count;
 reg                        dma_expand_phase;
 reg                        raw_req_pending;
+reg                        mwr_first_beat_seen;
 reg  [11:0]                mwr_rd_addr_d;
 reg                        mwr_rd_clk_en_d;
+reg  [127:0]               frame_rd_data_hold;
 reg                        raw_startup_active;
 reg                        raw_start_word_valid;
 reg  [127:0]               raw_start_word;
@@ -932,33 +934,18 @@ wire [2:0]                 frame_bootstrap_words = prep_active_latched ? PREP_BO
 // Count chunk first beat as a valid step to prevent boundary phase slip.
 wire                       bar2_addr_step = mwr_rd_clk_en &&
                                             ((mwr_rd_addr != mwr_rd_addr_d) || (~mwr_rd_clk_en_d));
-wire                       out_pair_pop = (~raw_startup_active) &&
-                                          bar2_addr_step &&
-                                          (~dma_expand_mode | dma_expand_phase);
-wire                       raw_start_bootstrap_req = raw_startup_active &&
-                                                    (frame_src_bootstrap_count < RAW_BOOTSTRAP_WORDS);
-// Keep raw on a stable 2-deep queue: bootstrap fills the queue up front,
-// then low beats create demand and high beats retire the active word.
-wire                       raw_output_need = !prep_active_latched &&
-                                             bar2_addr_step &&
-                                             (~dma_expand_mode | ~dma_expand_phase);
-wire                       raw_queue_has_room = !out_pair_active_valid ||
-                                               !out_pair_next_valid ||
-                                               out_pair_pop;
-wire                       raw_req_need = raw_start_bootstrap_req ||
-                                         raw_req_pending ||
-                                         raw_output_need;
+wire                       out_pair_pop = bar2_addr_step & (~dma_expand_mode | dma_expand_phase);
+wire                       frame_rd_fetch_en = bar2_addr_step & (~dma_expand_mode | ~dma_expand_phase);
 wire                       frame_rd_req_en_raw = dma_session_active &&
                                                 frame_rd_data_ready &&
-                                                raw_queue_has_room &&
-                                                (frame_src_req_count < FRAME_SRC_WORDS) &&
-                                                raw_req_need;
+                                                frame_rd_fetch_en;
 wire                       frame_rd_req_en_prep = dma_session_active &&
                                                  frame_rd_data_ready &&
                                                  (frame_src_req_count < FRAME_SRC_WORDS) &&
                                                  ((frame_src_bootstrap_count < frame_bootstrap_words) ||
                                                   (bar2_addr_step & (~dma_expand_mode | ~dma_expand_phase)));
-wire                       frame_rd_req_en = prep_active_latched ? frame_rd_req_en_prep : frame_rd_req_en_raw;
+wire                       frame_rd_req_en = prep_active_latched ? frame_rd_req_en_prep : 1'b0;
+wire                       frame_rd_en = prep_active_latched ? frame_rd_req_en_prep : frame_rd_fetch_en;
 wire [11:0]                post_ddr_x_pix = dma_expand_mode ? {1'b0, post_ddr_word_x, 2'b00}
                                                              : {post_ddr_word_x, 3'b000};
 wire [15:0]                post_ddr_color_base = color_bar_bgr565(post_ddr_x_pix);
@@ -1416,6 +1403,13 @@ begin
 end
 endfunction
 
+wire [127:0] frame_rd_data_bgrx_lo = pack_4pix_bgrx(
+    frame_rd_data[15:0], frame_rd_data[31:16], frame_rd_data[47:32], frame_rd_data[63:48],
+    8'hFF, 8'hFF, 8'hFF, 8'hFF);
+wire [127:0] frame_rd_hold_bgrx_hi = pack_4pix_bgrx(
+    frame_rd_data_hold[79:64], frame_rd_data_hold[95:80], frame_rd_data_hold[111:96], frame_rd_data_hold[127:112],
+    8'hFF, 8'hFF, 8'hFF, 8'hFF);
+
 function [31:0] prep_pixel_bgrx32;
     input [15:0] pix565;
     input [7:0]  y_new;
@@ -1496,18 +1490,11 @@ wire [63:0] prep_luma_word_top = (prep_data_line_y == 10'd0) ? prep_luma_word_cu
                                  (prep_data_line_y == 10'd1) ? prep_linebuf_prev1_rd_d1 : prep_linebuf_prev2_rd_d1;
 wire [63:0] prep_luma_word_mid = (prep_data_line_y == 10'd0) ? prep_luma_word_cur : prep_linebuf_prev1_rd_d1;
 wire        raw_capture_fire = dma_session_active && frame_rd_data_valid;
-wire        raw_start_capture_now = raw_startup_active && !raw_start_word_valid && raw_capture_fire;
-wire        raw_queue_capture_fire = raw_capture_fire && (!raw_startup_active || raw_start_word_valid);
-wire        raw_bootstrap_ready = raw_start_word_valid;
-wire        raw_startup_done = raw_startup_active &&
-                               raw_bootstrap_ready &&
-                               bar2_addr_step &&
-                               (~dma_expand_mode | dma_expand_phase);
-wire [127:0] raw_pair_src_word = raw_startup_active ? raw_start_word : out_pair_active_src_word;
 wire        prep_capture_fire = dma_session_active && frame_rd_data_valid && prep_linebuf_req_valid_d1;
 wire        prep_capture_first_word = (prep_data_word_x == 8'd0) && (prep_data_line_y == 10'd0);
-wire        pair_capture_fire = prep_active_latched ? prep_capture_fire : raw_queue_capture_fire;
+wire        pair_capture_fire = prep_active_latched ? prep_capture_fire : 1'b0;
 wire        pair_capture_first_word = prep_active_latched ? prep_capture_first_word : 1'b0;
+wire [127:0] raw_pair_src_word = out_pair_active_src_word;
 
 wire [1:0] prep_roi_mode_0 = roi_boost_mode_xy(prep_x_pix_base + 12'd0, {1'b0, prep_data_line_y},
                                                roi_session_active, roi_session_left_bias,
@@ -1641,7 +1628,7 @@ wire [127:0] prep_pair_active_prep_hi_pack = pack_4prep_bgrx(
     prep_a_fmt_yenh_latched,
     1'b0,
     frame_id);
-wire [127:0] frame_dma_data_raw = dma_expand_phase ? out_pair_active_raw_hi_pack : out_pair_active_raw_lo_pack;
+wire [127:0] frame_dma_data_raw = dma_expand_phase ? frame_rd_hold_bgrx_hi : frame_rd_data_bgrx_lo;
 wire [127:0] frame_dma_data_prep = dma_expand_phase ? prep_pair_active_prep_hi_pack : prep_pair_active_prep_lo_pack;
 wire        prep_output_active = prep_active_latched & out_pair_active_valid & prep_pair_active_valid;
 wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
@@ -1649,12 +1636,10 @@ wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_dat
 wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
 wire [127:0] frame_dma_data = dma_expand_mode
     ? (prep_output_active ? frame_dma_data_prep : frame_dma_data_raw)
-    : raw_pair_src_word;
-wire        raw_stream_ready = raw_startup_active ? raw_bootstrap_ready
-                                                  : out_pair_active_valid;
-wire        prep_pipe_valid = prep_active_latched ? (out_pair_active_valid & prep_pair_active_valid)
-                                                  : raw_stream_ready;
-wire        frame_stream_ready = ~dma_session_active | prep_pipe_valid;
+    : frame_rd_data;
+wire        frame_stream_ready = prep_active_latched
+    ? (out_pair_active_valid & prep_pair_active_valid)
+    : (~dma_session_active | ~mwr_first_beat_seen | frame_rd_data_ready);
 
 // Board-proven startup hotfix: do not gate slave2 ready in top level.
 // The raw DMA path must self-stabilize without blocking PCIe TX progress.
@@ -1694,6 +1679,8 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         frame_src_bootstrap_count <= 3'd0;
         dma_expand_phase <= 1'b0;
         raw_req_pending <= 1'b0;
+        mwr_first_beat_seen <= 1'b0;
+        frame_rd_data_hold <= 128'd0;
         raw_startup_active <= 1'b0;
         raw_start_word_valid <= 1'b0;
         raw_start_word <= 128'd0;
@@ -1783,6 +1770,8 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         frame_src_bootstrap_count <= 3'd0;
         dma_expand_phase <= 1'b0;
         raw_req_pending <= 1'b0;
+        mwr_first_beat_seen <= 1'b0;
+        frame_rd_data_hold <= 128'd0;
         raw_startup_active <= 1'b0;
         raw_start_word_valid <= 1'b0;
         raw_start_word <= 128'd0;
@@ -1864,6 +1853,8 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             frame_src_bootstrap_count <= 3'd0;
             dma_expand_phase <= 1'b0;
             raw_req_pending <= 1'b0;
+            mwr_first_beat_seen <= 1'b0;
+            frame_rd_data_hold <= 128'd0;
             raw_startup_active <= ~prep_active;
             raw_start_word_valid <= 1'b0;
             raw_start_word <= 128'd0;
@@ -1983,43 +1974,32 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             if (dma_expand_mode && dma_session_active && bar2_addr_step)
                 dma_expand_phase <= ~dma_expand_phase;
 
-            if (!prep_active_latched && dma_session_active) begin
-                if (frame_rd_req_en_raw)
-                    raw_req_pending <= 1'b0;
-                else if (raw_output_need)
-                    raw_req_pending <= 1'b1;
-            end
+            if (dma_session_active && bar2_addr_step)
+                mwr_first_beat_seen <= 1'b1;
 
-            if (raw_start_capture_now) begin
-                raw_start_word_valid <= 1'b1;
-                raw_start_word <= frame_rd_data;
-            end
-
-            if (raw_startup_done)
-                raw_startup_active <= 1'b0;
+            if (frame_rd_fetch_en)
+                frame_rd_data_hold <= frame_rd_data;
 
             if (rd_fsync_stretch_cnt != 6'd0)
                 rd_fsync_stretch_cnt <= rd_fsync_stretch_cnt - 6'd1;
 
-            if (frame_rd_req_en) begin
+            if (prep_active_latched && frame_rd_req_en_prep) begin
                 frame_src_req_count <= frame_src_req_count + 18'd1;
                 if (frame_src_bootstrap_count != frame_bootstrap_words)
                     frame_src_bootstrap_count <= frame_src_bootstrap_count + 3'd1;
-                if (prep_active_latched) begin
-                    prep_linebuf_req_valid_d0 <= 1'b1;
-                    prep_linebuf_req_word_x_d0 <= prep_word_x;
-                    prep_linebuf_req_line_y_d0 <= prep_line_y;
-                    prep_linebuf_prev1_rd_d0 <= prep_linebuf_prev1[prep_word_x];
-                    prep_linebuf_prev2_rd_d0 <= prep_linebuf_prev2[prep_word_x];
-                    if (prep_word_x == (PREP_FETCH_WORDS_PER_LINE - 1'b1)) begin
-                        prep_word_x <= 8'd0;
-                        if (prep_line_y == 10'd719)
-                            prep_line_y <= 10'd0;
-                        else
-                            prep_line_y <= prep_line_y + 10'd1;
-                    end else begin
-                        prep_word_x <= prep_word_x + 8'd1;
-                    end
+                prep_linebuf_req_valid_d0 <= 1'b1;
+                prep_linebuf_req_word_x_d0 <= prep_word_x;
+                prep_linebuf_req_line_y_d0 <= prep_line_y;
+                prep_linebuf_prev1_rd_d0 <= prep_linebuf_prev1[prep_word_x];
+                prep_linebuf_prev2_rd_d0 <= prep_linebuf_prev2[prep_word_x];
+                if (prep_word_x == (PREP_FETCH_WORDS_PER_LINE - 1'b1)) begin
+                    prep_word_x <= 8'd0;
+                    if (prep_line_y == 10'd719)
+                        prep_line_y <= 10'd0;
+                    else
+                        prep_line_y <= prep_line_y + 10'd1;
+                end else begin
+                    prep_word_x <= prep_word_x + 8'd1;
                 end
             end
 
@@ -2170,7 +2150,7 @@ fram_buf #(
     // Read output (for future PCIe DMA) - tied off for now
     .vout_clk           (pclk_div2),
     .rd_fsync           (rd_fsync_pclk_div2),
-    .rd_en              (frame_rd_req_en),
+    .rd_en              (frame_rd_en),
     .vout_de            (frame_rd_data_valid),
     .vout_data          (frame_rd_data),
     .rd_data_ready      (frame_rd_data_ready),
