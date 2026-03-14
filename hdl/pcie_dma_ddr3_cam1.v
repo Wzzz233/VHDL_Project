@@ -1656,7 +1656,9 @@ wire        prep_pipe_valid = prep_active_latched ? (out_pair_active_valid & pre
                                                   : raw_stream_ready;
 wire        frame_stream_ready = ~dma_session_active | prep_pipe_valid;
 
-assign axis_slave2_tready_fc = axis_slave2_tready_raw & (~mwr_payload_active | frame_stream_ready);
+// Board-proven startup hotfix: do not gate slave2 ready in top level.
+// The raw DMA path must self-stabilize without blocking PCIe TX progress.
+assign axis_slave2_tready_fc = axis_slave2_tready_raw;
 always @(posedge pclk_div2 or negedge core_rst_n) begin
     if (!core_rst_n)
         mwr_rd_addr_d <= 12'd0;
