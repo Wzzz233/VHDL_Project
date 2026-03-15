@@ -909,6 +909,26 @@ reg  [7:0]                 prep_stage_a_mid_hist_0;
 reg  [7:0]                 prep_stage_a_mid_hist_1;
 reg  [7:0]                 prep_stage_a_bot_hist_0;
 reg  [7:0]                 prep_stage_a_bot_hist_1;
+reg                        prep_stage_b1_valid;
+reg  [127:0]               prep_stage_b1_src_word;
+reg  [63:0]                prep_stage_b1_luma_bot_word;
+reg  [15:0]                prep_stage_b1_roi_mode_word;
+reg                        prep_stage_b1_first_word;
+reg  [63:0]                prep_stage_b1_top_hist_0_word;
+reg  [63:0]                prep_stage_b1_top_hist_1_word;
+reg  [63:0]                prep_stage_b1_top_cur_word;
+reg  [63:0]                prep_stage_b1_mid_hist_0_word;
+reg  [63:0]                prep_stage_b1_mid_hist_1_word;
+reg  [63:0]                prep_stage_b1_mid_cur_word;
+reg  [63:0]                prep_stage_b1_bot_hist_0_word;
+reg  [63:0]                prep_stage_b1_bot_hist_1_word;
+reg  [63:0]                prep_stage_b1_bot_cur_word;
+reg  [63:0]                prep_stage_b1_top_min_word;
+reg  [63:0]                prep_stage_b1_mid_min_word;
+reg  [63:0]                prep_stage_b1_bot_min_word;
+reg  [63:0]                prep_stage_b1_top_max_word;
+reg  [63:0]                prep_stage_b1_mid_max_word;
+reg  [63:0]                prep_stage_b1_bot_max_word;
 reg                        prep_stage_b_valid;
 reg  [127:0]               prep_stage_b_src_word;
 reg  [63:0]                prep_stage_b_luma_bot_word;
@@ -1495,6 +1515,21 @@ begin
 end
 endfunction
 
+reg  [63:0] prep_stage_b1_top_hist_0_word_c;
+reg  [63:0] prep_stage_b1_top_hist_1_word_c;
+reg  [63:0] prep_stage_b1_top_cur_word_c;
+reg  [63:0] prep_stage_b1_mid_hist_0_word_c;
+reg  [63:0] prep_stage_b1_mid_hist_1_word_c;
+reg  [63:0] prep_stage_b1_mid_cur_word_c;
+reg  [63:0] prep_stage_b1_bot_hist_0_word_c;
+reg  [63:0] prep_stage_b1_bot_hist_1_word_c;
+reg  [63:0] prep_stage_b1_bot_cur_word_c;
+reg  [63:0] prep_stage_b1_top_min_word_c;
+reg  [63:0] prep_stage_b1_mid_min_word_c;
+reg  [63:0] prep_stage_b1_bot_min_word_c;
+reg  [63:0] prep_stage_b1_top_max_word_c;
+reg  [63:0] prep_stage_b1_mid_max_word_c;
+reg  [63:0] prep_stage_b1_bot_max_word_c;
 reg  [63:0] prep_stage_b_median_word_c;
 reg  [63:0] prep_stage_b_min_word_c;
 reg  [63:0] prep_stage_b_max_word_c;
@@ -1576,10 +1611,23 @@ wire [7:0] prep_stage_a_bot_hist_0_seed = (prep_data_word_x == 8'd0) ? prep_luma
 wire [7:0] prep_stage_a_bot_hist_1_seed = (prep_data_word_x == 8'd0) ? prep_luma_word_cur[7:0] :
                                           (prep_stage_a_valid ? prep_stage_a_luma_bot_word[63:56] : prep_bot_hist_1_q);
 
+// Split the prep neighborhood walk from the final median/min/max reduction.
 always @* begin
-    prep_stage_b_median_word_c = 64'd0;
-    prep_stage_b_min_word_c = 64'd0;
-    prep_stage_b_max_word_c = 64'd0;
+    prep_stage_b1_top_hist_0_word_c = 64'd0;
+    prep_stage_b1_top_hist_1_word_c = 64'd0;
+    prep_stage_b1_top_cur_word_c = 64'd0;
+    prep_stage_b1_mid_hist_0_word_c = 64'd0;
+    prep_stage_b1_mid_hist_1_word_c = 64'd0;
+    prep_stage_b1_mid_cur_word_c = 64'd0;
+    prep_stage_b1_bot_hist_0_word_c = 64'd0;
+    prep_stage_b1_bot_hist_1_word_c = 64'd0;
+    prep_stage_b1_bot_cur_word_c = 64'd0;
+    prep_stage_b1_top_min_word_c = 64'd0;
+    prep_stage_b1_mid_min_word_c = 64'd0;
+    prep_stage_b1_bot_min_word_c = 64'd0;
+    prep_stage_b1_top_max_word_c = 64'd0;
+    prep_stage_b1_mid_max_word_c = 64'd0;
+    prep_stage_b1_bot_max_word_c = 64'd0;
     prep_top_hist_0_d = prep_stage_a_top_hist_0;
     prep_top_hist_1_d = prep_stage_a_top_hist_1;
     prep_mid_hist_0_d = prep_stage_a_mid_hist_0;
@@ -1597,20 +1645,53 @@ always @* begin
         prep_top_max_r = max3_u8(prep_top_hist_0_d, prep_top_hist_1_d, prep_top_cur_r);
         prep_mid_max_r = max3_u8(prep_mid_hist_0_d, prep_mid_hist_1_d, prep_mid_cur_r);
         prep_bot_max_r = max3_u8(prep_bot_hist_0_d, prep_bot_hist_1_d, prep_bot_cur_r);
-        prep_y_med_r = median9_u8(prep_top_hist_0_d, prep_top_hist_1_d, prep_top_cur_r,
-                                  prep_mid_hist_0_d, prep_mid_hist_1_d, prep_mid_cur_r,
-                                  prep_bot_hist_0_d, prep_bot_hist_1_d, prep_bot_cur_r);
-        prep_y_min_r = min3_u8(prep_top_min_r, prep_mid_min_r, prep_bot_min_r);
-        prep_y_max_r = max3_u8(prep_top_max_r, prep_mid_max_r, prep_bot_max_r);
-        prep_stage_b_median_word_c[(prep_k * 8) +: 8] = prep_y_med_r;
-        prep_stage_b_min_word_c[(prep_k * 8) +: 8] = prep_y_min_r;
-        prep_stage_b_max_word_c[(prep_k * 8) +: 8] = prep_y_max_r;
+        prep_stage_b1_top_hist_0_word_c[(prep_k * 8) +: 8] = prep_top_hist_0_d;
+        prep_stage_b1_top_hist_1_word_c[(prep_k * 8) +: 8] = prep_top_hist_1_d;
+        prep_stage_b1_top_cur_word_c[(prep_k * 8) +: 8] = prep_top_cur_r;
+        prep_stage_b1_mid_hist_0_word_c[(prep_k * 8) +: 8] = prep_mid_hist_0_d;
+        prep_stage_b1_mid_hist_1_word_c[(prep_k * 8) +: 8] = prep_mid_hist_1_d;
+        prep_stage_b1_mid_cur_word_c[(prep_k * 8) +: 8] = prep_mid_cur_r;
+        prep_stage_b1_bot_hist_0_word_c[(prep_k * 8) +: 8] = prep_bot_hist_0_d;
+        prep_stage_b1_bot_hist_1_word_c[(prep_k * 8) +: 8] = prep_bot_hist_1_d;
+        prep_stage_b1_bot_cur_word_c[(prep_k * 8) +: 8] = prep_bot_cur_r;
+        prep_stage_b1_top_min_word_c[(prep_k * 8) +: 8] = prep_top_min_r;
+        prep_stage_b1_mid_min_word_c[(prep_k * 8) +: 8] = prep_mid_min_r;
+        prep_stage_b1_bot_min_word_c[(prep_k * 8) +: 8] = prep_bot_min_r;
+        prep_stage_b1_top_max_word_c[(prep_k * 8) +: 8] = prep_top_max_r;
+        prep_stage_b1_mid_max_word_c[(prep_k * 8) +: 8] = prep_mid_max_r;
+        prep_stage_b1_bot_max_word_c[(prep_k * 8) +: 8] = prep_bot_max_r;
         prep_top_hist_0_d = prep_top_hist_1_d;
         prep_top_hist_1_d = prep_top_cur_r;
         prep_mid_hist_0_d = prep_mid_hist_1_d;
         prep_mid_hist_1_d = prep_mid_cur_r;
         prep_bot_hist_0_d = prep_bot_hist_1_d;
         prep_bot_hist_1_d = prep_bot_cur_r;
+    end
+end
+
+always @* begin
+    prep_stage_b_median_word_c = 64'd0;
+    prep_stage_b_min_word_c = 64'd0;
+    prep_stage_b_max_word_c = 64'd0;
+    for (prep_k = 0; prep_k < 8; prep_k = prep_k + 1) begin
+        prep_y_med_r = median9_u8(prep_stage_b1_top_hist_0_word[(prep_k * 8) +: 8],
+                                  prep_stage_b1_top_hist_1_word[(prep_k * 8) +: 8],
+                                  prep_stage_b1_top_cur_word[(prep_k * 8) +: 8],
+                                  prep_stage_b1_mid_hist_0_word[(prep_k * 8) +: 8],
+                                  prep_stage_b1_mid_hist_1_word[(prep_k * 8) +: 8],
+                                  prep_stage_b1_mid_cur_word[(prep_k * 8) +: 8],
+                                  prep_stage_b1_bot_hist_0_word[(prep_k * 8) +: 8],
+                                  prep_stage_b1_bot_hist_1_word[(prep_k * 8) +: 8],
+                                  prep_stage_b1_bot_cur_word[(prep_k * 8) +: 8]);
+        prep_y_min_r = min3_u8(prep_stage_b1_top_min_word[(prep_k * 8) +: 8],
+                               prep_stage_b1_mid_min_word[(prep_k * 8) +: 8],
+                               prep_stage_b1_bot_min_word[(prep_k * 8) +: 8]);
+        prep_y_max_r = max3_u8(prep_stage_b1_top_max_word[(prep_k * 8) +: 8],
+                               prep_stage_b1_mid_max_word[(prep_k * 8) +: 8],
+                               prep_stage_b1_bot_max_word[(prep_k * 8) +: 8]);
+        prep_stage_b_median_word_c[(prep_k * 8) +: 8] = prep_y_med_r;
+        prep_stage_b_min_word_c[(prep_k * 8) +: 8] = prep_y_min_r;
+        prep_stage_b_max_word_c[(prep_k * 8) +: 8] = prep_y_max_r;
     end
 end
 
@@ -1765,6 +1846,26 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_stage_a_mid_hist_1 <= 8'd0;
         prep_stage_a_bot_hist_0 <= 8'd0;
         prep_stage_a_bot_hist_1 <= 8'd0;
+        prep_stage_b1_valid <= 1'b0;
+        prep_stage_b1_src_word <= 128'd0;
+        prep_stage_b1_luma_bot_word <= 64'd0;
+        prep_stage_b1_roi_mode_word <= 16'd0;
+        prep_stage_b1_first_word <= 1'b0;
+        prep_stage_b1_top_hist_0_word <= 64'd0;
+        prep_stage_b1_top_hist_1_word <= 64'd0;
+        prep_stage_b1_top_cur_word <= 64'd0;
+        prep_stage_b1_mid_hist_0_word <= 64'd0;
+        prep_stage_b1_mid_hist_1_word <= 64'd0;
+        prep_stage_b1_mid_cur_word <= 64'd0;
+        prep_stage_b1_bot_hist_0_word <= 64'd0;
+        prep_stage_b1_bot_hist_1_word <= 64'd0;
+        prep_stage_b1_bot_cur_word <= 64'd0;
+        prep_stage_b1_top_min_word <= 64'd0;
+        prep_stage_b1_mid_min_word <= 64'd0;
+        prep_stage_b1_bot_min_word <= 64'd0;
+        prep_stage_b1_top_max_word <= 64'd0;
+        prep_stage_b1_mid_max_word <= 64'd0;
+        prep_stage_b1_bot_max_word <= 64'd0;
         prep_stage_b_valid <= 1'b0;
         prep_stage_b_src_word <= 128'd0;
         prep_stage_b_luma_bot_word <= 64'd0;
@@ -1847,6 +1948,26 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
         prep_stage_a_mid_hist_1 <= 8'd0;
         prep_stage_a_bot_hist_0 <= 8'd0;
         prep_stage_a_bot_hist_1 <= 8'd0;
+        prep_stage_b1_valid <= 1'b0;
+        prep_stage_b1_src_word <= 128'd0;
+        prep_stage_b1_luma_bot_word <= 64'd0;
+        prep_stage_b1_roi_mode_word <= 16'd0;
+        prep_stage_b1_first_word <= 1'b0;
+        prep_stage_b1_top_hist_0_word <= 64'd0;
+        prep_stage_b1_top_hist_1_word <= 64'd0;
+        prep_stage_b1_top_cur_word <= 64'd0;
+        prep_stage_b1_mid_hist_0_word <= 64'd0;
+        prep_stage_b1_mid_hist_1_word <= 64'd0;
+        prep_stage_b1_mid_cur_word <= 64'd0;
+        prep_stage_b1_bot_hist_0_word <= 64'd0;
+        prep_stage_b1_bot_hist_1_word <= 64'd0;
+        prep_stage_b1_bot_cur_word <= 64'd0;
+        prep_stage_b1_top_min_word <= 64'd0;
+        prep_stage_b1_mid_min_word <= 64'd0;
+        prep_stage_b1_bot_min_word <= 64'd0;
+        prep_stage_b1_top_max_word <= 64'd0;
+        prep_stage_b1_mid_max_word <= 64'd0;
+        prep_stage_b1_bot_max_word <= 64'd0;
         prep_stage_b_valid <= 1'b0;
         prep_stage_b_src_word <= 128'd0;
         prep_stage_b_luma_bot_word <= 64'd0;
@@ -1932,6 +2053,26 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
             prep_stage_a_mid_hist_1 <= 8'd0;
             prep_stage_a_bot_hist_0 <= 8'd0;
             prep_stage_a_bot_hist_1 <= 8'd0;
+            prep_stage_b1_valid <= 1'b0;
+            prep_stage_b1_src_word <= 128'd0;
+            prep_stage_b1_luma_bot_word <= 64'd0;
+            prep_stage_b1_roi_mode_word <= 16'd0;
+            prep_stage_b1_first_word <= 1'b0;
+            prep_stage_b1_top_hist_0_word <= 64'd0;
+            prep_stage_b1_top_hist_1_word <= 64'd0;
+            prep_stage_b1_top_cur_word <= 64'd0;
+            prep_stage_b1_mid_hist_0_word <= 64'd0;
+            prep_stage_b1_mid_hist_1_word <= 64'd0;
+            prep_stage_b1_mid_cur_word <= 64'd0;
+            prep_stage_b1_bot_hist_0_word <= 64'd0;
+            prep_stage_b1_bot_hist_1_word <= 64'd0;
+            prep_stage_b1_bot_cur_word <= 64'd0;
+            prep_stage_b1_top_min_word <= 64'd0;
+            prep_stage_b1_mid_min_word <= 64'd0;
+            prep_stage_b1_bot_min_word <= 64'd0;
+            prep_stage_b1_top_max_word <= 64'd0;
+            prep_stage_b1_mid_max_word <= 64'd0;
+            prep_stage_b1_bot_max_word <= 64'd0;
             prep_stage_b_valid <= 1'b0;
             prep_stage_b_src_word <= 128'd0;
             prep_stage_b_luma_bot_word <= 64'd0;
@@ -2065,7 +2206,7 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 end
             end
 
-            prep_stage_b_valid <= prep_stage_a_valid;
+            prep_stage_b1_valid <= prep_stage_a_valid;
             if (prep_stage_a_valid) begin
                 prep_top_hist_0_q <= prep_stage_a_luma_top_word[55:48];
                 prep_top_hist_1_q <= prep_stage_a_luma_top_word[63:56];
@@ -2073,10 +2214,33 @@ always @(posedge pclk_div2 or negedge core_rst_n) begin
                 prep_mid_hist_1_q <= prep_stage_a_luma_mid_word[63:56];
                 prep_bot_hist_0_q <= prep_stage_a_luma_bot_word[55:48];
                 prep_bot_hist_1_q <= prep_stage_a_luma_bot_word[63:56];
-                prep_stage_b_src_word <= prep_stage_a_src_word;
-                prep_stage_b_luma_bot_word <= prep_stage_a_luma_bot_word;
-                prep_stage_b_roi_mode_word <= prep_stage_a_roi_mode_word;
-                prep_stage_b_first_word <= prep_stage_a_first_word;
+                prep_stage_b1_src_word <= prep_stage_a_src_word;
+                prep_stage_b1_luma_bot_word <= prep_stage_a_luma_bot_word;
+                prep_stage_b1_roi_mode_word <= prep_stage_a_roi_mode_word;
+                prep_stage_b1_first_word <= prep_stage_a_first_word;
+                prep_stage_b1_top_hist_0_word <= prep_stage_b1_top_hist_0_word_c;
+                prep_stage_b1_top_hist_1_word <= prep_stage_b1_top_hist_1_word_c;
+                prep_stage_b1_top_cur_word <= prep_stage_b1_top_cur_word_c;
+                prep_stage_b1_mid_hist_0_word <= prep_stage_b1_mid_hist_0_word_c;
+                prep_stage_b1_mid_hist_1_word <= prep_stage_b1_mid_hist_1_word_c;
+                prep_stage_b1_mid_cur_word <= prep_stage_b1_mid_cur_word_c;
+                prep_stage_b1_bot_hist_0_word <= prep_stage_b1_bot_hist_0_word_c;
+                prep_stage_b1_bot_hist_1_word <= prep_stage_b1_bot_hist_1_word_c;
+                prep_stage_b1_bot_cur_word <= prep_stage_b1_bot_cur_word_c;
+                prep_stage_b1_top_min_word <= prep_stage_b1_top_min_word_c;
+                prep_stage_b1_mid_min_word <= prep_stage_b1_mid_min_word_c;
+                prep_stage_b1_bot_min_word <= prep_stage_b1_bot_min_word_c;
+                prep_stage_b1_top_max_word <= prep_stage_b1_top_max_word_c;
+                prep_stage_b1_mid_max_word <= prep_stage_b1_mid_max_word_c;
+                prep_stage_b1_bot_max_word <= prep_stage_b1_bot_max_word_c;
+            end
+
+            prep_stage_b_valid <= prep_stage_b1_valid;
+            if (prep_stage_b1_valid) begin
+                prep_stage_b_src_word <= prep_stage_b1_src_word;
+                prep_stage_b_luma_bot_word <= prep_stage_b1_luma_bot_word;
+                prep_stage_b_roi_mode_word <= prep_stage_b1_roi_mode_word;
+                prep_stage_b_first_word <= prep_stage_b1_first_word;
                 prep_stage_b_median_word <= prep_stage_b_median_word_c;
                 prep_stage_b_min_word <= prep_stage_b_min_word_c;
                 prep_stage_b_max_word <= prep_stage_b_max_word_c;
