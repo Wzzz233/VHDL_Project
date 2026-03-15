@@ -1548,6 +1548,9 @@ reg  [7:0]  prep_stage_c_y_med_r;
 reg  [7:0]  prep_stage_c_y_min_r;
 reg  [7:0]  prep_stage_c_y_max_r;
 reg  [1:0]  prep_stage_c_roi_mode_r;
+reg  [7:0]  prep_stage_b_lo_bound_r;
+reg  [7:0]  prep_stage_b_mid_bound_r;
+reg  [7:0]  prep_stage_b_hi_bound_r;
 integer     prep_k;
 integer     prep_stage_c_k;
 
@@ -1656,16 +1659,16 @@ always @* begin
     prep_stage_b_min_word_c = 64'd0;
     prep_stage_b_max_word_c = 64'd0;
     for (prep_k = 0; prep_k < 8; prep_k = prep_k + 1) begin
-        prep_top_cur_r = max3_u8(prep_stage_b1_top_min_word[(prep_k * 8) +: 8],
-                                 prep_stage_b1_mid_min_word[(prep_k * 8) +: 8],
-                                 prep_stage_b1_bot_min_word[(prep_k * 8) +: 8]);
-        prep_mid_cur_r = median3_u8(prep_stage_b1_top_med_word[(prep_k * 8) +: 8],
-                                    prep_stage_b1_mid_med_word[(prep_k * 8) +: 8],
-                                    prep_stage_b1_bot_med_word[(prep_k * 8) +: 8]);
-        prep_bot_cur_r = min3_u8(prep_stage_b1_top_max_word[(prep_k * 8) +: 8],
-                                 prep_stage_b1_mid_max_word[(prep_k * 8) +: 8],
-                                 prep_stage_b1_bot_max_word[(prep_k * 8) +: 8]);
-        prep_y_med_r = median3_u8(prep_top_cur_r, prep_mid_cur_r, prep_bot_cur_r);
+        prep_stage_b_lo_bound_r = max3_u8(prep_stage_b1_top_min_word[(prep_k * 8) +: 8],
+                                          prep_stage_b1_mid_min_word[(prep_k * 8) +: 8],
+                                          prep_stage_b1_bot_min_word[(prep_k * 8) +: 8]);
+        prep_stage_b_mid_bound_r = median3_u8(prep_stage_b1_top_med_word[(prep_k * 8) +: 8],
+                                              prep_stage_b1_mid_med_word[(prep_k * 8) +: 8],
+                                              prep_stage_b1_bot_med_word[(prep_k * 8) +: 8]);
+        prep_stage_b_hi_bound_r = min3_u8(prep_stage_b1_top_max_word[(prep_k * 8) +: 8],
+                                          prep_stage_b1_mid_max_word[(prep_k * 8) +: 8],
+                                          prep_stage_b1_bot_max_word[(prep_k * 8) +: 8]);
+        prep_y_med_r = median3_u8(prep_stage_b_lo_bound_r, prep_stage_b_mid_bound_r, prep_stage_b_hi_bound_r);
         prep_y_min_r = min3_u8(prep_stage_b1_top_min_word[(prep_k * 8) +: 8],
                                prep_stage_b1_mid_min_word[(prep_k * 8) +: 8],
                                prep_stage_b1_bot_min_word[(prep_k * 8) +: 8]);
