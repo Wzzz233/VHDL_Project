@@ -121,41 +121,6 @@ enum ocr_preproc_mode {
     OCR_PREPROC_BIN,
 };
 
-enum fpga_preproc_profile {
-    FPGA_PREP_PROFILE_RAW = 0,
-    FPGA_PREP_PROFILE_CLAHE,
-    FPGA_PREP_PROFILE_CLAHE_USM,
-    FPGA_PREP_PROFILE_MEDIAN,
-    FPGA_PREP_PROFILE_MEDIAN_CLAHE_USM,
-    FPGA_PREP_PROFILE_OCR_STROKE,
-};
-
-enum fpga_preproc_target {
-    FPGA_PREP_TARGET_OCR = 0,
-    FPGA_PREP_TARGET_ALL,
-};
-
-enum fpga_a_format {
-    FPGA_A_FMT_FLAGS = 0,
-    FPGA_A_FMT_YENH,
-};
-
-#define FPGA_PREP_CTRL_ENABLE            (1U << 0)
-#define FPGA_PREP_CTRL_BYPASS            (1U << 1)
-#define FPGA_PREP_CTRL_MEDIAN            (1U << 2)
-#define FPGA_PREP_CTRL_CLAHE             (1U << 3)
-#define FPGA_PREP_CTRL_USM               (1U << 4)
-#define FPGA_PREP_CTRL_TARGET_OCR        (1U << 5)
-#define FPGA_PREP_CTRL_A_FMT_YENH        (1U << 6)
-#define FPGA_PREP_CTRL_OCR_STROKE        (1U << 7)
-
-#define FPGA_ROI_CTRL_ENABLE             (1U << 0)
-#define FPGA_ROI_CTRL_LEFT_BIAS_ENABLE   (1U << 1)
-#define FPGA_ROI_CTRL_TIMEOUT_SHIFT      8
-#define FPGA_ROI_CTRL_TIMEOUT_MASK       (0xFFU << FPGA_ROI_CTRL_TIMEOUT_SHIFT)
-#define FPGA_ROI_CTRL_UPDATE_TOGGLE      (1U << 31)
-#define FPGA_ROI_TIMEOUT_FRAMES          3U
-
 struct options {
     const char *device_path;
     const char *drm_card_path;
@@ -180,17 +145,6 @@ struct options {
     int plate_only;
     int sw_preproc;
     int fpga_a_mask;
-    int fpga_preproc_profile;
-    int fpga_preproc_target;
-    int fpga_a_format;
-    int fpga_clahe_tile_w;
-    int fpga_clahe_tile_h;
-    int fpga_clahe_clip;
-    int fpga_clahe_strength;
-    float fpga_usm_gain;
-    int fpga_usm_thr;
-    int fpga_usm_limit;
-    int fpga_med_noise_gate;
     float a_proj_ratio;
     float a_roi_iou_min;
     int ped_event;
@@ -211,8 +165,6 @@ struct options {
     int ocr_ctc_diag;
     int ocr_crop_dump_max;
     const char *ocr_crop_dump_dir;
-    const char *fpga_preproc_dump_path;
-    int fpga_preproc_dump_max;
     int offline_detect_plate;
     bool swap16;
 };
@@ -341,14 +293,6 @@ struct app_ctx {
     bool src_is_bgrx;
     uint32_t frame_bpp;
     size_t frame_size;
-    uint32_t fpga_prep_ctrl_reg;
-    uint32_t fpga_prep_clahe_reg;
-    uint32_t fpga_prep_usm_reg;
-    uint32_t fpga_prep_med_reg;
-    uint32_t fpga_roi_x1y1_reg;
-    uint32_t fpga_roi_x2y2_reg;
-    uint32_t fpga_roi_ctrl_reg;
-    uint32_t fpga_roi_epoch;
 
     struct frame_slot *slots;
     int slot_count;
@@ -393,7 +337,6 @@ struct app_ctx {
     FILE *pred_log_fp;
     FILE *ocr_crop_index_fp;
     int ocr_crop_dumped;
-    int fpga_preproc_dumped;
     pthread_mutex_t pred_log_lock;
     char labels[MAX_LABELS][MAX_LABEL_LEN];
     int label_count;
@@ -439,13 +382,8 @@ static void resize_rgb888_letterbox_kernel(const uint8_t *src, int sw, int sh,
                                            uint8_t *dst, int dw, int dh, uint8_t pad,
                                            int kernel, struct letterbox_meta *meta);
 static void ocr_preprocess_rgb888(uint8_t *rgb, int w, int h, int mode);
-static int parse_fpga_clahe_arg(const char *arg, struct options *opt);
-static int parse_fpga_usm_arg(const char *arg, struct options *opt);
-static int apply_fpga_preproc_cfg(struct app_ctx *ctx);
 static float box_iou(const struct det_box *a, const struct det_box *b);
 static float laplacian_variance_rgb888(const uint8_t *rgb, int w, int h);
-static void apply_y_map_to_crop_rgb(const uint8_t *a_map, int img_w, const struct det_box *crop, uint8_t *dst_rgb);
-static void apply_y_map_to_full_rgb(const uint8_t *a_map, int img_w, int img_h, uint8_t *dst_rgb);
 static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
                                          const uint8_t *crop_rgb, int crop_w, int crop_h,
                                          float *occ_ratio_out);
@@ -467,54 +405,6 @@ static void signal_handler(int signo)
 {
     if (signo == SIGINT || signo == SIGTERM)
         g_stop = 1;
-}
-
-static int ilog2_pow2_u32(uint32_t v)
-{
-    int n = 0;
-    if (v == 0U)
-        return -1;
-    while (v > 1U) {
-        if (v & 1U)
-            return -1;
-        v >>= 1;
-        n++;
-    }
-    return n;
-}
-
-static int parse_fpga_clahe_arg(const char *arg, struct options *opt)
-{
-    int tw, th, clip, strength;
-    if (!arg || !opt)
-        return -1;
-
-    if (sscanf(arg, "tile=%dx%d,clip=%d,strength=%d", &tw, &th, &clip, &strength) != 4 &&
-        sscanf(arg, "%dx%d,%d,%d", &tw, &th, &clip, &strength) != 4)
-        return -1;
-
-    opt->fpga_clahe_tile_w = tw;
-    opt->fpga_clahe_tile_h = th;
-    opt->fpga_clahe_clip = clip;
-    opt->fpga_clahe_strength = strength;
-    return 0;
-}
-
-static int parse_fpga_usm_arg(const char *arg, struct options *opt)
-{
-    float gain;
-    int thr, limit;
-    if (!arg || !opt)
-        return -1;
-
-    if (sscanf(arg, "gain=%f,thr=%d,limit=%d", &gain, &thr, &limit) != 3 &&
-        sscanf(arg, "%f,%d,%d", &gain, &thr, &limit) != 3)
-        return -1;
-
-    opt->fpga_usm_gain = gain;
-    opt->fpga_usm_thr = thr;
-    opt->fpga_usm_limit = limit;
-    return 0;
 }
 
 static void print_usage(const char *prog)
@@ -546,11 +436,6 @@ static void print_usage(const char *prog)
             "  --plate-only <0|1>      Disable vehicle dependency for plate output (default: 1)\n"
             "  --sw-preproc <0|1>      Enable software preproc A/B path (default: 0)\n"
             "  --fpga-a-mask <0|1>     Enable FPGA A-channel ROI fusion (default: 0)\n"
-            "  --fpga-preproc-profile <m>  raw|clahe|clahe_usm|median|median_clahe_usm|ocr_stroke (default: ocr_stroke)\n"
-            "  --fpga-preproc-target <m>   ocr|all (default: ocr)\n"
-            "  --fpga-a-format <m>         flags|yenh (default: yenh)\n"
-            "  --fpga-clahe <cfg>          tile=32x32,clip=16,strength=128\n"
-            "  --fpga-usm <cfg>            gain=0.375,thr=3,limit=10\n"
             "  --a-proj-ratio <v>      A-channel projection threshold ratio (default: 0.35)\n"
             "  --a-roi-iou-min <v>     Min IoU for A-ROI filtering (default: 0.05)\n"
             "  --ped-event <0|1>       Enable pedestrian red-light event (default: 0)\n"
@@ -559,20 +444,18 @@ static void print_usage(const char *prog)
             "  --stopline-ratio <v>    Stopline Y ratio [0,1] (default: 0.55)\n"
             "  --det-resize-mode <m>   Detect resize: stretch|letterbox (default: letterbox)\n"
             "  --plate-refine <0|1>    Enable local high-res plate refine (default: 1)\n"
-            "  --ocr-channel-order <m> OCR input order: rgb|bgr (default: bgr)\n"
-            "  --ocr-crop-mode <m>     OCR crop mode: fixed|box|tight|box-pad|match (default: match)\n"
-            "  --ocr-resize-mode <m>   OCR resize: stretch|letterbox (default: letterbox)\n"
+            "  --ocr-channel-order <m> OCR input order: rgb|bgr (default: rgb)\n"
+            "  --ocr-crop-mode <m>     OCR crop mode: fixed|box|tight|box-pad|match (default: fixed)\n"
+            "  --ocr-resize-mode <m>   OCR resize: stretch|letterbox (default: stretch)\n"
             "  --ocr-resize-kernel <m> OCR resize kernel: nn|bilinear (default: nn)\n"
             "  --ocr-preproc <m>       OCR crop preproc: none|gray|bin (default: none)\n"
             "  --show-crop-box <0|1>   Overlay OCR crop box in red (default: 0)\n"
             "  --ocr-min-plate-h <n>   Skip OCR if plate box h < n (default: 24)\n"
             "  --ocr-min-sharpness <v> Skip OCR if Laplacian var < v (default: 20)\n"
-            "  --ocr-min-occ-ratio <v> Re-crop once if OCR width occupancy < v (default: 0.90)\n"
+            "  --ocr-min-occ-ratio <v> Re-crop once if OCR width occupancy < v (default: 0)\n"
             "  --ocr-ctc-diag <0|1>    Print CTC decode diagnostics (default: 0)\n"
             "  --ocr-crop-dump-dir <p> Dump OCR crops+inputs to directory (default: off)\n"
             "  --ocr-crop-dump-max <n> Max dumped OCR samples (default: 20)\n"
-            "  --fpga-preproc-dump-path <p> Dump full preprocessed RGB frame to .ppm path (default: off)\n"
-            "  --fpga-preproc-dump-max <n> Max dumped preprocessed frames (default: 1)\n"
             "  --help                  Show this help\n",
             prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD, DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
             DEFAULT_STATS_INTERVAL, DEFAULT_COPY_BUFFERS, DEFAULT_QUEUE_DEPTH);
@@ -606,11 +489,6 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"plate-only", required_argument, NULL, 20},
         {"sw-preproc", required_argument, NULL, 21},
         {"fpga-a-mask", required_argument, NULL, 22},
-        {"fpga-preproc-profile", required_argument, NULL, 46},
-        {"fpga-preproc-target", required_argument, NULL, 47},
-        {"fpga-a-format", required_argument, NULL, 48},
-        {"fpga-clahe", required_argument, NULL, 49},
-        {"fpga-usm", required_argument, NULL, 50},
         {"a-proj-ratio", required_argument, NULL, 23},
         {"a-roi-iou-min", required_argument, NULL, 24},
         {"ped-event", required_argument, NULL, 25},
@@ -631,8 +509,6 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"ocr-ctc-diag", required_argument, NULL, 33},
         {"ocr-crop-dump-dir", required_argument, NULL, 34},
         {"ocr-crop-dump-max", required_argument, NULL, 35},
-        {"fpga-preproc-dump-path", required_argument, NULL, 51},
-        {"fpga-preproc-dump-max", required_argument, NULL, 52},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -655,17 +531,6 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->plate_only = 1;
     opt->sw_preproc = 0;
     opt->fpga_a_mask = 0;
-    opt->fpga_preproc_profile = FPGA_PREP_PROFILE_OCR_STROKE;
-    opt->fpga_preproc_target = FPGA_PREP_TARGET_OCR;
-    opt->fpga_a_format = FPGA_A_FMT_YENH;
-    opt->fpga_clahe_tile_w = 32;
-    opt->fpga_clahe_tile_h = 32;
-    opt->fpga_clahe_clip = 16;
-    opt->fpga_clahe_strength = 128;
-    opt->fpga_usm_gain = 0.375f;
-    opt->fpga_usm_thr = 3;
-    opt->fpga_usm_limit = 10;
-    opt->fpga_med_noise_gate = 12;
     opt->a_proj_ratio = 0.35f;
     opt->a_roi_iou_min = 0.05f;
     opt->ped_event = 0;
@@ -674,20 +539,18 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->stopline_ratio = 0.55f;
     opt->det_resize_mode = DET_RESIZE_LETTERBOX;
     opt->plate_refine = 1;
-    opt->ocr_channel_order = OCR_CH_BGR;
-    opt->ocr_crop_mode = OCR_CROP_MATCH;
-    opt->ocr_resize_mode = OCR_RESIZE_LETTERBOX;
+    opt->ocr_channel_order = OCR_CH_RGB;
+    opt->ocr_crop_mode = OCR_CROP_FIXED;
+    opt->ocr_resize_mode = OCR_RESIZE_STRETCH;
     opt->ocr_resize_kernel = OCR_KERNEL_NN;
     opt->ocr_preproc_mode = OCR_PREPROC_NONE;
     opt->show_crop_box = 0;
     opt->ocr_min_plate_h = 24;
     opt->ocr_min_sharpness = 20.0f;
-    opt->ocr_min_occ_ratio = 0.90f;
+    opt->ocr_min_occ_ratio = 0.0f;
     opt->ocr_ctc_diag = 0;
     opt->ocr_crop_dump_max = 20;
     opt->ocr_crop_dump_dir = NULL;
-    opt->fpga_preproc_dump_path = NULL;
-    opt->fpga_preproc_dump_max = 1;
     opt->offline_detect_plate = 1;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
@@ -724,46 +587,6 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 20: opt->plate_only = atoi(optarg) ? 1 : 0; break;
         case 21: opt->sw_preproc = atoi(optarg) ? 1 : 0; break;
         case 22: opt->fpga_a_mask = atoi(optarg) ? 1 : 0; break;
-        case 46:
-            if (strcmp(optarg, "raw") == 0)
-                opt->fpga_preproc_profile = FPGA_PREP_PROFILE_RAW;
-            else if (strcmp(optarg, "clahe") == 0)
-                opt->fpga_preproc_profile = FPGA_PREP_PROFILE_CLAHE;
-            else if (strcmp(optarg, "clahe_usm") == 0)
-                opt->fpga_preproc_profile = FPGA_PREP_PROFILE_CLAHE_USM;
-            else if (strcmp(optarg, "median") == 0)
-                opt->fpga_preproc_profile = FPGA_PREP_PROFILE_MEDIAN;
-            else if (strcmp(optarg, "median_clahe_usm") == 0)
-                opt->fpga_preproc_profile = FPGA_PREP_PROFILE_MEDIAN_CLAHE_USM;
-            else if (strcmp(optarg, "ocr_stroke") == 0)
-                opt->fpga_preproc_profile = FPGA_PREP_PROFILE_OCR_STROKE;
-            else
-                return -1;
-            break;
-        case 47:
-            if (strcmp(optarg, "ocr") == 0)
-                opt->fpga_preproc_target = FPGA_PREP_TARGET_OCR;
-            else if (strcmp(optarg, "all") == 0)
-                opt->fpga_preproc_target = FPGA_PREP_TARGET_ALL;
-            else
-                return -1;
-            break;
-        case 48:
-            if (strcmp(optarg, "flags") == 0)
-                opt->fpga_a_format = FPGA_A_FMT_FLAGS;
-            else if (strcmp(optarg, "yenh") == 0)
-                opt->fpga_a_format = FPGA_A_FMT_YENH;
-            else
-                return -1;
-            break;
-        case 49:
-            if (parse_fpga_clahe_arg(optarg, opt) < 0)
-                return -1;
-            break;
-        case 50:
-            if (parse_fpga_usm_arg(optarg, opt) < 0)
-                return -1;
-            break;
         case 23: opt->a_proj_ratio = (float)atof(optarg); break;
         case 24: opt->a_roi_iou_min = (float)atof(optarg); break;
         case 25: opt->ped_event = atoi(optarg) ? 1 : 0; break;
@@ -834,8 +657,6 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 33: opt->ocr_ctc_diag = atoi(optarg) ? 1 : 0; break;
         case 34: opt->ocr_crop_dump_dir = optarg; break;
         case 35: opt->ocr_crop_dump_max = atoi(optarg); break;
-        case 51: opt->fpga_preproc_dump_path = optarg; break;
-        case 52: opt->fpga_preproc_dump_max = atoi(optarg); break;
         case 'h':
             print_usage(argv[0]);
             exit(0);
@@ -868,34 +689,6 @@ static int parse_options(int argc, char **argv, struct options *opt)
         return -1;
     if (opt->ocr_crop_dump_max < 0 || opt->ocr_crop_dump_max > 100000)
         return -1;
-    if (opt->fpga_preproc_dump_max < 0 || opt->fpga_preproc_dump_max > 100000)
-        return -1;
-    if (opt->fpga_clahe_tile_w < 8 || opt->fpga_clahe_tile_w > 1024 ||
-        opt->fpga_clahe_tile_h < 8 || opt->fpga_clahe_tile_h > 1024)
-        return -1;
-    if ((opt->fpga_clahe_tile_w & (opt->fpga_clahe_tile_w - 1)) != 0 ||
-        (opt->fpga_clahe_tile_h & (opt->fpga_clahe_tile_h - 1)) != 0)
-        return -1;
-    if (opt->fpga_clahe_clip < 0 || opt->fpga_clahe_clip > 255 ||
-        opt->fpga_clahe_strength < 0 || opt->fpga_clahe_strength > 255)
-        return -1;
-    if (opt->fpga_usm_gain < 0.0f || opt->fpga_usm_gain > 15.9375f)
-        return -1;
-    if (opt->fpga_usm_thr < 0 || opt->fpga_usm_thr > 255 ||
-        opt->fpga_usm_limit < 0 || opt->fpga_usm_limit > 255)
-        return -1;
-    if (opt->fpga_med_noise_gate < 0 || opt->fpga_med_noise_gate > 255)
-        return -1;
-    if (opt->fpga_a_mask && opt->fpga_a_format == FPGA_A_FMT_YENH)
-        return -1;
-    if (opt->ped_event && opt->fpga_a_format == FPGA_A_FMT_YENH)
-        return -1;
-    if (opt->fpga_preproc_profile == FPGA_PREP_PROFILE_OCR_STROKE) {
-        if (opt->fpga_preproc_target != FPGA_PREP_TARGET_OCR)
-            return -1;
-        if (opt->fpga_a_format != FPGA_A_FMT_YENH)
-            return -1;
-    }
     if (opt->offline_image_path && opt->offline_image_path[0] != '\0') {
         if (!opt->plate_model_path || !opt->ocr_model_path || !opt->ocr_keys_path)
             return -1;
@@ -1325,241 +1118,6 @@ out:
     return ret;
 }
 
-static int fpga_write_bar1_reg(int fd, uint32_t offset, uint32_t value)
-{
-    struct fpga_bar1_reg reg_io;
-    memset(&reg_io, 0, sizeof(reg_io));
-    reg_io.offset = offset;
-    reg_io.value = value;
-    return ioctl(fd, FPGA_DMA_SET_BAR1_REG, &reg_io);
-}
-
-static uint32_t pack_fpga_roi_xy(int x, int y)
-{
-    if (x < 0)
-        x = 0;
-    if (y < 0)
-        y = 0;
-    if (x > 0xFFFF)
-        x = 0xFFFF;
-    if (y > 0xFFFF)
-        y = 0xFFFF;
-    return ((uint32_t)(y & 0xFFFF) << 16) | (uint32_t)(x & 0xFFFF);
-}
-
-static bool fpga_roi_feedback_enabled(const struct app_ctx *ctx)
-{
-    return ctx && ctx->dev_fd >= 0 && ctx->src_is_bgrx &&
-           ctx->opt.fpga_preproc_profile == FPGA_PREP_PROFILE_OCR_STROKE &&
-           ctx->opt.fpga_preproc_target == FPGA_PREP_TARGET_OCR &&
-           ctx->opt.fpga_a_format == FPGA_A_FMT_YENH;
-}
-
-static void fpga_clear_roi_shadow(struct app_ctx *ctx)
-{
-    if (!ctx)
-        return;
-    ctx->fpga_roi_x1y1_reg = 0;
-    ctx->fpga_roi_x2y2_reg = 0;
-    ctx->fpga_roi_ctrl_reg = 0;
-    ctx->fpga_roi_epoch = 0;
-}
-
-static int fpga_write_roi_cfg(struct app_ctx *ctx, uint32_t x1y1, uint32_t x2y2, uint32_t ctrl)
-{
-    int ret;
-
-    if (!ctx || ctx->dev_fd < 0)
-        return -1;
-
-    ret = fpga_write_bar1_reg(ctx->dev_fd, BAR1_ROI_X1Y1, x1y1);
-    if (ret < 0)
-        return -1;
-    ret = fpga_write_bar1_reg(ctx->dev_fd, BAR1_ROI_X2Y2, x2y2);
-    if (ret < 0)
-        return -1;
-    ret = fpga_write_bar1_reg(ctx->dev_fd, BAR1_ROI_CTRL, ctrl);
-    if (ret < 0)
-        return -1;
-
-    ctx->fpga_roi_x1y1_reg = x1y1;
-    ctx->fpga_roi_x2y2_reg = x2y2;
-    ctx->fpga_roi_ctrl_reg = ctrl;
-    return 0;
-}
-
-static int fpga_reset_roi_cfg(struct app_ctx *ctx)
-{
-    fpga_clear_roi_shadow(ctx);
-    if (!ctx || ctx->dev_fd < 0)
-        return -1;
-    return fpga_write_roi_cfg(ctx, 0, 0, 0);
-}
-
-static int fpga_update_roi_feedback(struct app_ctx *ctx, const struct lpr_results *r)
-{
-    const struct plate_det *best = NULL;
-    float best_conf = -1.0f;
-    int best_area = -1;
-    int i;
-
-    if (!fpga_roi_feedback_enabled(ctx) || !r)
-        return 0;
-
-    for (i = 0; i < r->plate_count; i++) {
-        const struct plate_det *pd = &r->plates[i];
-        int bw = pd->box.x2 - pd->box.x1 + 1;
-        int bh = pd->box.y2 - pd->box.y1 + 1;
-        int area;
-
-        if (bw <= 0 || bh <= 0)
-            continue;
-        area = bw * bh;
-        if (pd->box.conf > best_conf ||
-            (fabsf(pd->box.conf - best_conf) < 1e-6f && area > best_area)) {
-            best = pd;
-            best_conf = pd->box.conf;
-            best_area = area;
-        }
-    }
-
-    if (!best)
-        return 0;
-
-    ctx->fpga_roi_epoch ^= 1U;
-    return fpga_write_roi_cfg(
-        ctx,
-        pack_fpga_roi_xy(best->box.x1, best->box.y1),
-        pack_fpga_roi_xy(best->box.x2, best->box.y2),
-        FPGA_ROI_CTRL_ENABLE |
-        FPGA_ROI_CTRL_LEFT_BIAS_ENABLE |
-        ((FPGA_ROI_TIMEOUT_FRAMES & 0xFFU) << FPGA_ROI_CTRL_TIMEOUT_SHIFT) |
-        (ctx->fpga_roi_epoch ? FPGA_ROI_CTRL_UPDATE_TOGGLE : 0U));
-}
-
-static int apply_fpga_preproc_cfg(struct app_ctx *ctx)
-{
-    uint32_t ctrl = 0;
-    uint32_t clahe = 0;
-    uint32_t usm = 0;
-    uint32_t med = 0;
-    int profile;
-    int target;
-    int a_format;
-    int tile_w;
-    int tile_h;
-    int clip;
-    int strength;
-    float usm_gain;
-    int usm_thr;
-    int usm_limit;
-    int med_noise_gate;
-    int grad_gate = 0;
-    int tw_log2;
-    int th_log2;
-    int gain_q4_4;
-    int ret;
-
-    if (!ctx || ctx->dev_fd < 0)
-        return -1;
-
-    profile = ctx->opt.fpga_preproc_profile;
-    target = ctx->opt.fpga_preproc_target;
-    a_format = ctx->opt.fpga_a_format;
-    tile_w = ctx->opt.fpga_clahe_tile_w;
-    tile_h = ctx->opt.fpga_clahe_tile_h;
-    clip = ctx->opt.fpga_clahe_clip;
-    strength = ctx->opt.fpga_clahe_strength;
-    usm_gain = ctx->opt.fpga_usm_gain;
-    usm_thr = ctx->opt.fpga_usm_thr;
-    usm_limit = ctx->opt.fpga_usm_limit;
-    med_noise_gate = ctx->opt.fpga_med_noise_gate;
-
-    if (profile == FPGA_PREP_PROFILE_OCR_STROKE) {
-        target = FPGA_PREP_TARGET_OCR;
-        a_format = FPGA_A_FMT_YENH;
-        tile_w = 32;
-        tile_h = 32;
-        clip = 16;
-        strength = 128;
-        usm_gain = 0.375f;
-        usm_thr = 3;
-        usm_limit = 10;
-        med_noise_gate = 12;
-        grad_gate = 18;
-    }
-
-    tw_log2 = ilog2_pow2_u32((uint32_t)tile_w);
-    th_log2 = ilog2_pow2_u32((uint32_t)tile_h);
-    if (tw_log2 < 0 || th_log2 < 0)
-        return -1;
-
-    if (profile == FPGA_PREP_PROFILE_RAW) {
-        ctrl |= FPGA_PREP_CTRL_BYPASS;
-    } else {
-        ctrl |= FPGA_PREP_CTRL_ENABLE;
-        if (profile == FPGA_PREP_PROFILE_MEDIAN ||
-            profile == FPGA_PREP_PROFILE_MEDIAN_CLAHE_USM ||
-            profile == FPGA_PREP_PROFILE_OCR_STROKE)
-            ctrl |= FPGA_PREP_CTRL_MEDIAN;
-        if (profile == FPGA_PREP_PROFILE_CLAHE ||
-            profile == FPGA_PREP_PROFILE_CLAHE_USM ||
-            profile == FPGA_PREP_PROFILE_MEDIAN_CLAHE_USM ||
-            profile == FPGA_PREP_PROFILE_OCR_STROKE)
-            ctrl |= FPGA_PREP_CTRL_CLAHE;
-        if (profile == FPGA_PREP_PROFILE_CLAHE_USM ||
-            profile == FPGA_PREP_PROFILE_MEDIAN_CLAHE_USM ||
-            profile == FPGA_PREP_PROFILE_OCR_STROKE)
-            ctrl |= FPGA_PREP_CTRL_USM;
-        if (profile == FPGA_PREP_PROFILE_OCR_STROKE)
-            ctrl |= FPGA_PREP_CTRL_OCR_STROKE;
-    }
-
-    if (target == FPGA_PREP_TARGET_OCR)
-        ctrl |= FPGA_PREP_CTRL_TARGET_OCR;
-    if (a_format == FPGA_A_FMT_YENH)
-        ctrl |= FPGA_PREP_CTRL_A_FMT_YENH;
-
-    gain_q4_4 = (int)lroundf(usm_gain * 16.0f);
-    if (gain_q4_4 < 0)
-        gain_q4_4 = 0;
-    if (gain_q4_4 > 255)
-        gain_q4_4 = 255;
-
-    clahe = ((uint32_t)(strength & 0xFF) << 24) |
-            ((uint32_t)(clip & 0xFF) << 16) |
-            ((uint32_t)(th_log2 & 0xFF) << 8) |
-            (uint32_t)(tw_log2 & 0xFF);
-
-    usm = ((uint32_t)(usm_limit & 0xFF) << 16) |
-          ((uint32_t)(usm_thr & 0xFF) << 8) |
-          (uint32_t)(gain_q4_4 & 0xFF);
-
-    med = ((uint32_t)(grad_gate & 0xFF) << 8) |
-          (uint32_t)(med_noise_gate & 0xFF);
-
-    ret = fpga_write_bar1_reg(ctx->dev_fd, BAR1_PREP_CLAHE, clahe);
-    if (ret < 0)
-        return -1;
-    ret = fpga_write_bar1_reg(ctx->dev_fd, BAR1_PREP_USM, usm);
-    if (ret < 0)
-        return -1;
-    ret = fpga_write_bar1_reg(ctx->dev_fd, BAR1_PREP_MED, med);
-    if (ret < 0)
-        return -1;
-    ret = fpga_write_bar1_reg(ctx->dev_fd, BAR1_PREP_CTRL, ctrl);
-    if (ret < 0)
-        return -1;
-
-    ctx->fpga_prep_ctrl_reg = ctrl;
-    ctx->fpga_prep_clahe_reg = clahe;
-    ctx->fpga_prep_usm_reg = usm;
-    ctx->fpga_prep_med_reg = med;
-    if (fpga_reset_roi_cfg(ctx) < 0)
-        return -1;
-    return 0;
-}
-
 static int init_fpga_dma(struct app_ctx *ctx)
 {
     struct fpga_info info;
@@ -1599,16 +1157,6 @@ static int init_fpga_dma(struct app_ctx *ctx)
 
     if (ctx->src_is_bgrx)
         ctx->opt.swap16 = false;
-
-    if (apply_fpga_preproc_cfg(ctx) < 0) {
-        fprintf(stderr,
-                "[fpga-prep] WARN: BAR1 preproc config failed, fallback to raw stream\n");
-        ctx->fpga_prep_ctrl_reg = 0;
-        ctx->fpga_prep_clahe_reg = 0;
-        ctx->fpga_prep_usm_reg = 0;
-        ctx->fpga_prep_med_reg = 0;
-        fpga_clear_roi_shadow(ctx);
-    }
 
     memset(&map, 0, sizeof(map));
     map.index = 0;
@@ -3054,83 +2602,6 @@ static void copy_crop_rgb888(const uint8_t *rgb, int img_w, const struct det_box
     }
 }
 
-static void apply_y_map_to_crop_rgb(const uint8_t *a_map, int img_w, const struct det_box *crop, uint8_t *dst_rgb)
-{
-    int x, y;
-    int crop_w;
-    int crop_h;
-
-    if (!a_map || !crop || !dst_rgb || img_w <= 0)
-        return;
-
-    crop_w = crop->x2 - crop->x1 + 1;
-    crop_h = crop->y2 - crop->y1 + 1;
-    if (crop_w <= 0 || crop_h <= 0)
-        return;
-
-    for (y = 0; y < crop_h; y++) {
-        for (x = 0; x < crop_w; x++) {
-            size_t src_idx = (size_t)(crop->y1 + y) * (size_t)img_w + (size_t)(crop->x1 + x);
-            size_t dst_idx = ((size_t)y * (size_t)crop_w + (size_t)x) * 3U;
-            int y_new = a_map[src_idx];
-            int r = dst_rgb[dst_idx + 0];
-            int g = dst_rgb[dst_idx + 1];
-            int b = dst_rgb[dst_idx + 2];
-            int y_old = (77 * r + 150 * g + 29 * b) >> 8;
-            int scale_q8;
-
-            if (y_old < 12)
-                scale_q8 = 256;
-            else {
-                scale_q8 = (y_new << 8) / y_old;
-                if (scale_q8 < 218)
-                    scale_q8 = 218;
-                else if (scale_q8 > 320)
-                    scale_q8 = 320;
-            }
-
-            dst_rgb[dst_idx + 0] = clip_u8((r * scale_q8) >> 8);
-            dst_rgb[dst_idx + 1] = clip_u8((g * scale_q8) >> 8);
-            dst_rgb[dst_idx + 2] = clip_u8((b * scale_q8) >> 8);
-        }
-    }
-}
-
-static void apply_y_map_to_full_rgb(const uint8_t *a_map, int img_w, int img_h, uint8_t *dst_rgb)
-{
-    int x, y;
-
-    if (!a_map || !dst_rgb || img_w <= 0 || img_h <= 0)
-        return;
-
-    for (y = 0; y < img_h; y++) {
-        for (x = 0; x < img_w; x++) {
-            size_t idx = ((size_t)y * (size_t)img_w + (size_t)x);
-            size_t rgb_idx = idx * 3U;
-            int y_new = a_map[idx];
-            int r = dst_rgb[rgb_idx + 0];
-            int g = dst_rgb[rgb_idx + 1];
-            int b = dst_rgb[rgb_idx + 2];
-            int y_old = (77 * r + 150 * g + 29 * b) >> 8;
-            int scale_q8;
-
-            if (y_old < 12)
-                scale_q8 = 256;
-            else {
-                scale_q8 = (y_new << 8) / y_old;
-                if (scale_q8 < 218)
-                    scale_q8 = 218;
-                else if (scale_q8 > 320)
-                    scale_q8 = 320;
-            }
-
-            dst_rgb[rgb_idx + 0] = clip_u8((r * scale_q8) >> 8);
-            dst_rgb[rgb_idx + 1] = clip_u8((g * scale_q8) >> 8);
-            dst_rgb[rgb_idx + 2] = clip_u8((b * scale_q8) >> 8);
-        }
-    }
-}
-
 static bool refine_plate_box_local(struct app_ctx *ctx, const uint8_t *rgb_full, int img_w, int img_h,
                                    const struct det_box *seed_box, uint8_t *det_rgb, uint8_t *plate_in,
                                    struct det_box *out_box)
@@ -3924,26 +3395,6 @@ static const char *ocr_preproc_mode_str(int mode)
     return "none";
 }
 
-static const char *fpga_preproc_profile_str(int mode)
-{
-    if (mode == FPGA_PREP_PROFILE_CLAHE) return "clahe";
-    if (mode == FPGA_PREP_PROFILE_CLAHE_USM) return "clahe_usm";
-    if (mode == FPGA_PREP_PROFILE_MEDIAN) return "median";
-    if (mode == FPGA_PREP_PROFILE_MEDIAN_CLAHE_USM) return "median_clahe_usm";
-    if (mode == FPGA_PREP_PROFILE_OCR_STROKE) return "ocr_stroke";
-    return "raw";
-}
-
-static const char *fpga_preproc_target_str(int mode)
-{
-    return (mode == FPGA_PREP_TARGET_ALL) ? "all" : "ocr";
-}
-
-static const char *fpga_a_format_str(int mode)
-{
-    return (mode == FPGA_A_FMT_YENH) ? "yenh" : "flags";
-}
-
 static const char *det_resize_mode_str(int mode)
 {
     return (mode == DET_RESIZE_LETTERBOX) ? "letterbox" : "stretch";
@@ -4504,25 +3955,18 @@ static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t t
                                const struct plate_det *pd)
 {
     char safe_text[64];
-    int prep_bypass;
     if (!ctx->pred_log_fp)
         return;
     csv_safe_text(pd->ocr_text, safe_text, sizeof(safe_text));
-    prep_bypass = (int)((ctx->fpga_prep_ctrl_reg >> 1) & 0x1U);
     pthread_mutex_lock(&ctx->pred_log_lock);
     fprintf(ctx->pred_log_fp,
-            "%" PRIu64 ",%s,%s,%.4f,%d,%d,%d,%d,%" PRId64 ",%s,%s,%s,%d,%" PRIu64 "\n",
+            "%" PRIu64 ",%s,%s,%.4f,%d,%d,%d,%d,%" PRId64 "\n",
             frame_id,
             safe_text,
             plate_type_str(pd->type),
             pd->ocr_conf,
             pd->box.x1, pd->box.y1, pd->box.x2, pd->box.y2,
-            ts_us,
-            fpga_preproc_profile_str(ctx->opt.fpga_preproc_profile),
-            fpga_preproc_target_str(ctx->opt.fpga_preproc_target),
-            fpga_a_format_str(ctx->opt.fpga_a_format),
-            prep_bypass,
-            frame_id);
+            ts_us);
     fflush(ctx->pred_log_fp);
     pthread_mutex_unlock(&ctx->pred_log_lock);
 }
@@ -4567,28 +4011,17 @@ static void build_overlay_ascii_text(const struct plate_det *pd, char *out, size
 static void *infer_thread_main(void *arg)
 {
     struct app_ctx *ctx = (struct app_ctx *)arg;
-    size_t full_rgb_bytes = (size_t)ctx->frame_width * ctx->frame_height * 3U;
     uint8_t *raw_local = malloc(ctx->src_frame_size);
-    uint8_t *rgb_full = malloc(full_rgb_bytes);
-    uint8_t *rgb_detect = malloc(full_rgb_bytes);
+    uint8_t *rgb_full = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
+    uint8_t *rgb_detect = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
     uint8_t *a_map = malloc((size_t)ctx->frame_width * ctx->frame_height);
     uint8_t *algo_rgb = malloc((size_t)ALGO_STREAM_SIZE * ALGO_STREAM_SIZE * 3U);
     uint8_t *veh_in = malloc((size_t)ctx->veh_model.in_w * ctx->veh_model.in_h * 3U);
     uint8_t *plate_in = malloc((size_t)ctx->plate_model.in_w * ctx->plate_model.in_h * 3U);
     uint8_t *plate_crop = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
-    uint8_t *prep_dump_rgb = NULL;
-
-    if (ctx->opt.fpga_preproc_dump_path &&
-        ctx->opt.fpga_preproc_dump_path[0] != '\0' &&
-        ctx->opt.fpga_preproc_dump_max > 0) {
-        prep_dump_rgb = malloc(full_rgb_bytes);
-    }
-
-    if (!raw_local || !rgb_full || !rgb_detect || !a_map || !algo_rgb || !veh_in || !plate_in || !plate_crop ||
-        ((ctx->opt.fpga_preproc_dump_path && ctx->opt.fpga_preproc_dump_path[0] != '\0' &&
-          ctx->opt.fpga_preproc_dump_max > 0) && !prep_dump_rgb)) {
+    if (!raw_local || !rgb_full || !rgb_detect || !a_map || !algo_rgb || !veh_in || !plate_in || !plate_crop) {
         free(raw_local); free(rgb_full); free(rgb_detect); free(a_map); free(algo_rgb);
-        free(veh_in); free(plate_in); free(plate_crop); free(prep_dump_rgb);
+        free(veh_in); free(plate_in); free(plate_crop);
         return NULL;
     }
 
@@ -4641,55 +4074,6 @@ static void *infer_thread_main(void *arg)
         } else {
             raw565_to_rgb888_full(ctx, raw_local, rgb_full);
             memset(a_map, 0, (size_t)ctx->frame_width * ctx->frame_height);
-        }
-        if (ctx->opt.fpga_preproc_dump_path &&
-            ctx->opt.fpga_preproc_dump_path[0] != '\0' &&
-            ctx->opt.fpga_preproc_dump_max > 0 &&
-            ctx->fpga_preproc_dumped < ctx->opt.fpga_preproc_dump_max) {
-            const uint8_t *dump_rgb = rgb_full;
-            const char *dump_mode = "raw-rgb";
-            char dump_path[768];
-
-            if (ctx->src_is_bgrx &&
-                ctx->opt.fpga_preproc_profile != FPGA_PREP_PROFILE_RAW &&
-                ctx->opt.fpga_preproc_target == FPGA_PREP_TARGET_OCR &&
-                ctx->opt.fpga_a_format == FPGA_A_FMT_YENH) {
-                memcpy(prep_dump_rgb, rgb_full, full_rgb_bytes);
-                apply_y_map_to_full_rgb(a_map, (int)ctx->frame_width, (int)ctx->frame_height, prep_dump_rgb);
-                dump_rgb = prep_dump_rgb;
-                dump_mode = "ocr-yenh";
-            } else if (ctx->src_is_bgrx &&
-                       ctx->opt.fpga_preproc_profile != FPGA_PREP_PROFILE_RAW &&
-                       ctx->opt.fpga_preproc_target == FPGA_PREP_TARGET_ALL) {
-                dump_mode = "all-rgb";
-            } else if (ctx->opt.fpga_preproc_profile != FPGA_PREP_PROFILE_RAW) {
-                dump_mode = "profile-no-y-map";
-            }
-
-            if (ctx->opt.fpga_preproc_dump_max <= 1) {
-                snprintf(dump_path, sizeof(dump_path), "%s", ctx->opt.fpga_preproc_dump_path);
-            } else {
-                const char *base = ctx->opt.fpga_preproc_dump_path;
-                const char *dot = strrchr(base, '.');
-                if (dot && strcmp(dot, ".ppm") == 0) {
-                    size_t stem_len = (size_t)(dot - base);
-                    snprintf(dump_path, sizeof(dump_path), "%.*s_%04d%s",
-                             (int)stem_len, base, ctx->fpga_preproc_dumped, dot);
-                } else {
-                    snprintf(dump_path, sizeof(dump_path), "%s_%04d.ppm",
-                             base, ctx->fpga_preproc_dumped);
-                }
-            }
-
-            if (write_ppm_rgb888(dump_path, dump_rgb, (int)ctx->frame_width, (int)ctx->frame_height) == 0) {
-                ctx->fpga_preproc_dumped++;
-                fprintf(stderr,
-                        "[fpga-prep] dump=%d/%d mode=%s frame=%" PRIu64 " path=%s\n",
-                        ctx->fpga_preproc_dumped, ctx->opt.fpga_preproc_dump_max,
-                        dump_mode, seq, dump_path);
-            } else {
-                fprintf(stderr, "[fpga-prep] WARN: failed to dump preproc frame: %s\n", dump_path);
-            }
         }
         if (ctx->opt.sw_preproc) {
             memcpy(rgb_detect, rgb_full, (size_t)ctx->frame_width * ctx->frame_height * 3U);
@@ -4815,12 +4199,6 @@ static void *infer_thread_main(void *arg)
             crop_w = pd.crop_box.x2 - pd.crop_box.x1 + 1;
             crop_h = pd.crop_box.y2 - pd.crop_box.y1 + 1;
             copy_crop_rgb888(rgb_full, (int)ctx->frame_width, &pd.crop_box, plate_crop);
-            if (ctx->src_is_bgrx &&
-                ctx->opt.fpga_preproc_profile != FPGA_PREP_PROFILE_RAW &&
-                ctx->opt.fpga_preproc_target == FPGA_PREP_TARGET_OCR &&
-                ctx->opt.fpga_a_format == FPGA_A_FMT_YENH) {
-                apply_y_map_to_crop_rgb(a_map, (int)ctx->frame_width, &pd.crop_box, plate_crop);
-            }
             occ_ratio = estimate_ocr_occ_ratio(ctx, crop_w, crop_h);
             if (ctx->opt.ocr_min_occ_ratio > 0.0f &&
                 occ_ratio < ctx->opt.ocr_min_occ_ratio &&
@@ -4847,12 +4225,6 @@ static void *infer_thread_main(void *arg)
                     new_w = recrop_box.x2 - recrop_box.x1 + 1;
                     new_h = recrop_box.y2 - recrop_box.y1 + 1;
                     copy_crop_rgb888(rgb_full, (int)ctx->frame_width, &recrop_box, plate_crop);
-                    if (ctx->src_is_bgrx &&
-                        ctx->opt.fpga_preproc_profile != FPGA_PREP_PROFILE_RAW &&
-                        ctx->opt.fpga_preproc_target == FPGA_PREP_TARGET_OCR &&
-                        ctx->opt.fpga_a_format == FPGA_A_FMT_YENH) {
-                        apply_y_map_to_crop_rgb(a_map, (int)ctx->frame_width, &recrop_box, plate_crop);
-                    }
                     pd.crop_box = recrop_box;
                     crop_w = new_w;
                     crop_h = new_h;
@@ -4954,7 +4326,6 @@ static void *infer_thread_main(void *arg)
         r.overlay_text_nonempty_count = overlay_nonempty_count;
         r.frame_seq = seq;
         r.infer_ms_last = (double)(t1 - t0) / 1000.0;
-        fpga_update_roi_feedback(ctx, &r);
         pthread_mutex_lock(&ctx->result_lock);
         r.infer_frames_total = ctx->results.infer_frames_total + 1;
         r.infer_ms_total = ctx->results.infer_ms_total + r.infer_ms_last;
@@ -4965,7 +4336,7 @@ static void *infer_thread_main(void *arg)
     }
 
     free(raw_local); free(rgb_full); free(rgb_detect); free(a_map); free(algo_rgb);
-    free(veh_in); free(plate_in); free(plate_crop); free(prep_dump_rgb);
+    free(veh_in); free(plate_in); free(plate_crop);
     return NULL;
 }
 
@@ -5164,9 +4535,7 @@ int main(int argc, char **argv)
         ctx.pred_log_fp = fopen(ctx.opt.pred_log_path, "w");
         if (!ctx.pred_log_fp)
             goto out;
-        fprintf(ctx.pred_log_fp,
-                "frame_id,plate_text_pred,plate_type_pred,conf,x1,y1,x2,y2,ts_us,"
-                "prep_profile,prep_target,prep_params,prep_bypass,prep_frame_id\n");
+        fprintf(ctx.pred_log_fp, "frame_id,plate_text_pred,plate_type_pred,conf,x1,y1,x2,y2,ts_us\n");
         fflush(ctx.pred_log_fp);
     }
     if (ctx.opt.ocr_crop_dump_dir && ctx.opt.ocr_crop_dump_dir[0] != '\0') {
@@ -5183,25 +4552,11 @@ int main(int argc, char **argv)
                 "crop_path,ocr_input_path\n");
         fflush(ctx.ocr_crop_index_fp);
     }
-    if (ctx.opt.fpga_preproc_dump_path && ctx.opt.fpga_preproc_dump_path[0] != '\0') {
-        const char *p = strrchr(ctx.opt.fpga_preproc_dump_path, '/');
-        if (p && p != ctx.opt.fpga_preproc_dump_path) {
-            char dir_path[640];
-            size_t n = (size_t)(p - ctx.opt.fpga_preproc_dump_path);
-            if (n >= sizeof(dir_path))
-                goto out;
-            memcpy(dir_path, ctx.opt.fpga_preproc_dump_path, n);
-            dir_path[n] = '\0';
-            if (mkdir_p_simple(dir_path) < 0)
-                goto out;
-        }
-    }
 
     if (offline_mode) {
         fprintf(stderr,
                 "Start OFFLINE OCR: image=%s roi=%s auto_det=%d min_plate=%.2f det_resize=%s plate_refine=%d "
                 "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_kernel=%s ocr_pp=%s min_h=%d min_sharp=%.2f min_occ=%.2f "
-                "prep_profile=%s prep_target=%s prep_params=%s "
                 "crop_src=fullres_raw det_src=%s\n",
                 ctx.opt.offline_image_path,
                 (ctx.opt.offline_roi_arg && ctx.opt.offline_roi_arg[0]) ? ctx.opt.offline_roi_arg : "<none>",
@@ -5217,9 +4572,6 @@ int main(int argc, char **argv)
                 ctx.opt.ocr_min_plate_h,
                 ctx.opt.ocr_min_sharpness,
                 ctx.opt.ocr_min_occ_ratio,
-                fpga_preproc_profile_str(ctx.opt.fpga_preproc_profile),
-                fpga_preproc_target_str(ctx.opt.fpga_preproc_target),
-                fpga_a_format_str(ctx.opt.fpga_a_format),
                 ctx.opt.sw_preproc ? "preproc" : "raw");
         if (run_offline_once(&ctx) < 0)
             goto out;
@@ -5239,10 +4591,7 @@ int main(int argc, char **argv)
             "Start LPR loop: fps=%d src=%s pixel=%s swap16=%s min_car=%.2f min_plate=%.2f plate_only=%d "
             "sw_preproc=%d fpga_a_mask=%d ped_event=%d det_resize=%s plate_refine=%d "
             "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_kernel=%s ocr_pp=%s min_h=%d min_sharp=%.2f min_occ=%.2f show_crop=%d "
-            "prep_session_latched=1 prep_phase_align=1 "
-            "prep_profile=%s prep_target=%s prep_params=%s prep_ctrl=0x%08x prep_clahe=0x%08x prep_usm=0x%08x prep_med=0x%08x "
-            "roi_ctrl=0x%08x roi_x1y1=0x%08x roi_x2y2=0x%08x "
-            "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d prep_dump=%s max=%d pred_log=%s\n",
+            "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d pred_log=%s\n",
             ctx.opt.fps,
             ctx.src_is_bgrx ? "bgrx8888" : "bgr565",
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
@@ -5263,22 +4612,10 @@ int main(int argc, char **argv)
             ctx.opt.ocr_min_sharpness,
             ctx.opt.ocr_min_occ_ratio,
             ctx.opt.show_crop_box,
-            fpga_preproc_profile_str(ctx.opt.fpga_preproc_profile),
-            fpga_preproc_target_str(ctx.opt.fpga_preproc_target),
-            fpga_a_format_str(ctx.opt.fpga_a_format),
-            ctx.fpga_prep_ctrl_reg,
-            ctx.fpga_prep_clahe_reg,
-            ctx.fpga_prep_usm_reg,
-            ctx.fpga_prep_med_reg,
-            ctx.fpga_roi_ctrl_reg,
-            ctx.fpga_roi_x1y1_reg,
-            ctx.fpga_roi_x2y2_reg,
             ctx.opt.sw_preproc ? "preproc" : "raw",
             ctx.opt.ocr_ctc_diag,
             ctx.opt.ocr_crop_dump_dir ? ctx.opt.ocr_crop_dump_dir : "<off>",
             ctx.opt.ocr_crop_dump_max,
-            ctx.opt.fpga_preproc_dump_path ? ctx.opt.fpga_preproc_dump_path : "<off>",
-            ctx.opt.fpga_preproc_dump_max,
             ctx.opt.pred_log_path ? ctx.opt.pred_log_path : "<off>");
 
     ctx.last_stats_us = mono_us();

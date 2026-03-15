@@ -42,12 +42,9 @@ set_input_delay -clock [get_clocks {cmos1_pclk}] -min 0.5 [get_ports {cmos1_data
 ###==== END "set_min_delay"
 
 ###==== BEGIN "set_multicycle_path"
-set_multicycle_path 2 -from [get_clocks {ddrphy_sysclk}] -to [get_clocks {phy_dq_sysclk_0}]
-set_multicycle_path 2 -from [get_clocks {ddrphy_sysclk}] -to [get_clocks {phy_dq_sysclk_1}]
 ###==== END "set_multicycle_path"
 
 ###==== BEGIN "set_false_path"
-set_false_path -through [get_nets {ddr_rstn}]
 ###==== END "set_false_path"
 
 ###==== BEGIN Attributes - (Populated from tab in SCOPE, do not edit)
@@ -439,6 +436,8 @@ define_attribute {p:sys_clk} {PAP_IO_LOC} {V4}
 define_attribute {p:sys_clk} {PAP_IO_VCCIO} {1.5}
 define_attribute {p:sys_clk} {PAP_IO_STANDARD} {HSTL15_I}
 define_attribute {p:sys_clk} {PAP_IO_UNUSED} {TRUE}
+create_clock -name {sys_clk} [get_ports sys_clk] -period {40} -waveform {0.000 5.000} -add
+create_generated_clock -name {cfg_clk} -source [get_ports {sys_clk}] [get_nets {u_pll.clkout0}] -master_clock [get_clocks {sys_clk}] -multiply_by {2} -divide_by {5}
 define_attribute {n:cmos1_pclk} {PAP_CLOCK_DEDICATED_ROUTE} {FALSE}
 define_attribute {p:mem_dqs[1]} {PAP_IO_DIRECTION} {INOUT}
 define_attribute {p:mem_dqs[1]} {PAP_IO_LOC} {M1}

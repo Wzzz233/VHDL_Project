@@ -22,7 +22,6 @@ wire        mwr64_req_ack;
 wire        mwr_tx_busy;
 wire        o_tx_restart;
 wire        o_frame_done_pulse;
-wire        o_mwr_req_start_pulse;
 wire        axis_slave2_tvld;
 wire [127:0] axis_slave2_tdata;
 wire        axis_slave2_tlast;
@@ -31,14 +30,13 @@ wire        axis_slave2_tuser;
 integer cycle;
 integer tx_restart_cycle;
 integer req_cycle;
-integer req_start_cycle;
+integer req_ack_cycle;
 integer busy_rise_cycle;
 integer timeout_cycles;
 reg     mwr_tx_busy_d;
 wire    tx_done = axis_slave2_tvld && axis_slave2_tlast;
 reg     frame_done_seen;
 
-// Backpressure: deassert ready for 4 cycles after mwr_tx_busy rises.
 reg        axis_trdy_bp;
 reg  [3:0] trdy_delay_cnt;
 always @(posedge clk or negedge rst_n) begin
@@ -106,14 +104,7 @@ ips2l_pcie_dma_controller #(
     .i_dma_check_result     (64'd0),
     .o_tx_restart           (o_tx_restart),
     .o_cross_4kb_boundary   (),
-    .o_frame_done_pulse     (o_frame_done_pulse),
-    .o_prep_ctrl            (),
-    .o_prep_clahe           (),
-    .o_prep_usm             (),
-    .o_prep_med             (),
-    .o_roi_x1y1             (),
-    .o_roi_x2y2             (),
-    .o_roi_ctrl             ()
+    .o_frame_done_pulse     (o_frame_done_pulse)
 );
 
 ips2l_pcie_dma_mwr_tx_ctrl #(
@@ -145,7 +136,6 @@ ips2l_pcie_dma_mwr_tx_ctrl #(
     .o_mwr_tx_busy          (mwr_tx_busy),
     .o_mwr_tx_hold          (),
     .o_mwr_tlp_tx           (),
-    .o_mwr_req_start_pulse  (o_mwr_req_start_pulse),
     .i_tx_restart           (o_tx_restart)
 );
 
@@ -156,7 +146,7 @@ always @(posedge clk or negedge rst_n) begin
         gen_tlp_start <= 1'b0;
     end else if (tx_done) begin
         gen_tlp_start <= 1'b0;
-    end else if (o_mwr_req_start_pulse) begin
+    end else if (mwr64_req_ack) begin
         gen_tlp_start <= 1'b1;
     end
 end
@@ -166,7 +156,7 @@ always @(posedge clk or negedge rst_n) begin
         cycle <= 0;
         tx_restart_cycle <= -1;
         req_cycle <= -1;
-        req_start_cycle <= -1;
+        req_ack_cycle <= -1;
         busy_rise_cycle <= -1;
         mwr_tx_busy_d <= 1'b0;
     end else begin
@@ -177,8 +167,8 @@ always @(posedge clk or negedge rst_n) begin
             tx_restart_cycle <= cycle;
         if (o_mwr64_req && req_cycle < 0)
             req_cycle <= cycle;
-        if (o_mwr_req_start_pulse && req_start_cycle < 0)
-            req_start_cycle <= cycle;
+        if (mwr64_req_ack && req_ack_cycle < 0)
+            req_ack_cycle <= cycle;
         if (mwr_tx_busy && !mwr_tx_busy_d && busy_rise_cycle < 0)
             busy_rise_cycle <= cycle;
     end
@@ -203,8 +193,6 @@ initial begin
     #30;
     rst_n = 1'b1;
 
-    // Match the Linux driver write order: BAR1+0x120 -> BAR1+0x110 -> BAR1+0x100.
-    // Use one 128-bit beat so the TX path can complete with i_last_data=1.
     bar1_write(12'h120, 32'h0000_0000);
     bar1_write(12'h110, 32'h7EB0_0000);
     bar1_write(12'h100, 32'h8000_0004);
@@ -220,15 +208,15 @@ initial begin
     end
     @(posedge clk);
 
-    $display("TRACE tx_restart_cycle=%0d req_cycle=%0d req_start_cycle=%0d busy_rise_cycle=%0d req_addr=%h req_len=%0d",
-             tx_restart_cycle, req_cycle, req_start_cycle, busy_rise_cycle, req_addr, req_length);
+    $display("TRACE tx_restart_cycle=%0d req_cycle=%0d req_ack_cycle=%0d busy_rise_cycle=%0d req_addr=%h req_len=%0d",
+             tx_restart_cycle, req_cycle, req_ack_cycle, busy_rise_cycle, req_addr, req_length);
 
-    if (tx_restart_cycle < 0 || req_cycle < 0 || req_start_cycle < 0 || busy_rise_cycle < 0) begin
+    if (tx_restart_cycle < 0 || req_cycle < 0 || req_ack_cycle < 0 || busy_rise_cycle < 0) begin
         $display("ERROR: failed to observe command pulse / request / accept / busy ordering");
         $fatal;
     end
 
-    if (!(tx_restart_cycle < req_cycle && req_cycle <= req_start_cycle && req_start_cycle <= busy_rise_cycle)) begin
+    if (!(tx_restart_cycle < req_cycle && req_cycle <= req_ack_cycle && req_ack_cycle <= busy_rise_cycle)) begin
         $display("ERROR: expected BAR1+0x110 pulse before MWR request, and MWR accept before tx busy rise");
         $fatal;
     end

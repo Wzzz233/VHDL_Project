@@ -43,15 +43,6 @@
 #define BAR1_DMA_CMD_REG     0x100  /* DMA command register */
 #define BAR1_DMA_L_ADDR      0x110  /* Lower 32-bit target address */
 #define BAR1_DMA_H_ADDR      0x120  /* Upper 32-bit target address (64-bit mode) */
-/* FPGA AI-ISP preproc register block (BAR1 write-only in this design). */
-#define BAR1_PREP_CTRL       0x200
-#define BAR1_PREP_CLAHE      0x204
-#define BAR1_PREP_USM        0x208
-#define BAR1_PREP_MED        0x20C
-#define BAR1_PREP_STAT       0x210
-#define BAR1_ROI_X1Y1        0x214
-#define BAR1_ROI_X2Y2        0x218
-#define BAR1_ROI_CTRL        0x21C
 
 /* DMA Command Register Bit Fields */
 #define DMA_CMD_LEN_MASK     0x3FF  /* Bits [9:0] - Transfer length in DWORDs minus 1 */
@@ -74,8 +65,6 @@
 #define FPGA_DMA_GET_INFO    _IOR(FPGA_DMA_IOC_MAGIC, 1, struct fpga_info)
 #define FPGA_DMA_READ_FRAME  _IOWR(FPGA_DMA_IOC_MAGIC, 2, struct dma_transfer)
 #define FPGA_DMA_MAP_BUFFER  _IOWR(FPGA_DMA_IOC_MAGIC, 3, struct buffer_map)
-#define FPGA_DMA_SET_BAR1_REG _IOW(FPGA_DMA_IOC_MAGIC, 4, struct fpga_bar1_reg)
-#define FPGA_DMA_GET_BAR1_REG _IOWR(FPGA_DMA_IOC_MAGIC, 5, struct fpga_bar1_reg)
 
 /**
  * struct fpga_info - FPGA device information
@@ -130,16 +119,6 @@ struct buffer_map {
     __u32 index;
     __u32 size;
     __u64 offset;
-};
-
-/**
- * struct fpga_bar1_reg - BAR1 register access payload
- * @offset: BAR1 register byte offset
- * @value: register value (write input / read output)
- */
-struct fpga_bar1_reg {
-    __u32 offset;
-    __u32 value;
 };
 
 #endif /* _PCIE_FPGA_DMA_H */
