@@ -47,6 +47,7 @@ set_multicycle_path 2 -from [get_clocks {ddrphy_sysclk}] -to [get_clocks {phy_dq
 ###==== END "set_multicycle_path"
 
 ###==== BEGIN "set_false_path"
+set_false_path -through [get_nets {ddr_rstn}]
 ###==== END "set_false_path"
 
 ###==== BEGIN Attributes - (Populated from tab in SCOPE, do not edit)

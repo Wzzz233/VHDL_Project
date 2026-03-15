@@ -142,6 +142,12 @@ reg		[22:0]	ref_led_cnt;
 reg		[26:0]	pclk_led_cnt;
 wire			smlh_link_up;
 wire			rdlh_link_up/*synthesis PAP_MARK_DEBUG="1"*/;
+reg		[1:0]	ref_smlh_link_up_sync;
+reg		[1:0]	ref_rdlh_link_up_sync;
+reg		[1:0]	pclk_smlh_link_up_sync;
+reg		[1:0]	pclk_rdlh_link_up_sync;
+wire			ref_link_up_ready;
+wire			pclk_link_up_ready;
 
 // Uart to APB 32bits
 wire			uart_p_sel;
@@ -255,11 +261,34 @@ hsst_rst_sync_v1_0  u_pclk_core_rstn_sync (
 );
 
 // Clk led
+assign ref_link_up_ready = &ref_smlh_link_up_sync & &ref_rdlh_link_up_sync;
+assign pclk_link_up_ready = &pclk_smlh_link_up_sync & &pclk_rdlh_link_up_sync;
+
+always @(posedge ref_clk or negedge sync_perst_n) begin
+	if (!sync_perst_n) begin
+		ref_smlh_link_up_sync <= 2'b00;
+		ref_rdlh_link_up_sync <= 2'b00;
+	end else begin
+		ref_smlh_link_up_sync <= {ref_smlh_link_up_sync[0], smlh_link_up};
+		ref_rdlh_link_up_sync <= {ref_rdlh_link_up_sync[0], rdlh_link_up};
+	end
+end
+
+always @(posedge pclk or negedge s_pclk_rstn) begin
+	if (!s_pclk_rstn) begin
+		pclk_smlh_link_up_sync <= 2'b00;
+		pclk_rdlh_link_up_sync <= 2'b00;
+	end else begin
+		pclk_smlh_link_up_sync <= {pclk_smlh_link_up_sync[0], smlh_link_up};
+		pclk_rdlh_link_up_sync <= {pclk_rdlh_link_up_sync[0], rdlh_link_up};
+	end
+end
+
 always @(posedge ref_clk or negedge sync_perst_n) begin
 	if (!sync_perst_n) begin
 		ref_led_cnt <= 23'd0;
 		ref_led <= 1'b1;
-	end else if (smlh_link_up & rdlh_link_up) begin
+	end else if (ref_link_up_ready) begin
 		ref_led_cnt <= ref_led_cnt + 23'd1;
 		if(&ref_led_cnt)
 			ref_led <= ~ref_led;
@@ -270,7 +299,7 @@ always @(posedge pclk or negedge s_pclk_rstn) begin
 	if (!s_pclk_rstn) begin
 		pclk_led_cnt <= 27'd0;
 		pclk_led <= 1'b1;
-	end else if (smlh_link_up & rdlh_link_up) begin
+	end else if (pclk_link_up_ready) begin
 		pclk_led_cnt <= pclk_led_cnt + 27'd1;
 		if(&pclk_led_cnt)
 			pclk_led <= ~pclk_led;
@@ -634,10 +663,22 @@ wire ddr_rstn = (rstn_1ms == 16'h2710);
 wire camera_rstn;
 wire camera_pwnd;
 wire initial_en;
+reg  sys_init_rstn_meta;
+reg  sys_init_rstn_sync;
+
+always @(posedge sys_clk or negedge ddr_rstn) begin
+    if (!ddr_rstn) begin
+        sys_init_rstn_meta <= 1'b0;
+        sys_init_rstn_sync <= 1'b0;
+    end else begin
+        sys_init_rstn_meta <= 1'b1;
+        sys_init_rstn_sync <= sys_init_rstn_meta;
+    end
+end
 
 power_on_delay u_power_on_delay (
     .clk_50M        (sys_clk),      // Stage 1: keep delay logic in 25MHz system clock domain
-    .reset_n        (ddr_rstn),
+    .reset_n        (sys_init_rstn_sync),
     .camera1_rstn   (camera_rstn),
     .camera2_rstn   (),
     .camera_pwnd    (camera_pwnd),
