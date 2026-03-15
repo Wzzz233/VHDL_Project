@@ -14,6 +14,8 @@ ipcore/
 sim/
 *.vcd
 *.wlf
+modelsim.ini
+transcript
 
 # Build outputs
 impl/

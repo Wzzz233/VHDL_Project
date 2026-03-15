@@ -3,14 +3,29 @@ create_clock -name {pclk} [get_pins u_ips2l_pcie_wrap.U_IPS2L_PCIE_TOP.U_IPS2L_H
 create_clock -name {pclk_div2} [get_pins u_ips2l_pcie_wrap.U_IPS2L_PCIE_TOP.U_IPS2L_HSSTLP_PCIE_SOFT_PHY.pclk_div2] -period {8} -waveform {0.000 4.000} -add
 create_clock -name {ref_clk} [get_pins u_ips2l_pcie_wrap.U_IPS2L_PCIE_TOP.U_IPS2L_HSSTLP_PCIE_SOFT_PHY/P_REFCK2CORE_0] -period {10} -waveform {0.000 5.000} -add
 create_clock -name {cmos1_pclk} [get_ports {cmos1_pclk}] -period {11.900} -waveform {0.000 5.950}
+create_clock -name {sys_clk} [get_ports {sys_clk}] -period {40} -waveform {0.000 20.000} -add
 ###==== END "create_clock"
+###==== BEGIN "create_generated_clock"
+create_generated_clock -name {cfg_clk} -source [get_ports {sys_clk}] [get_nets {u_pll.clkout0}] -master_clock [get_clocks {sys_clk}] -multiply_by {297} -divide_by {200}
+create_generated_clock -name {ddr_rst_clk} -source [get_ports {sys_clk}] [get_pins {u_DDR3/u_ddrphy_top/rst_clk_gpll/clkout0}] -master_clock [get_clocks {sys_clk}] -multiply_by {84} -divide_by {84}
+create_generated_clock -name {ddrphy_sysclk} -source [get_ports {sys_clk}] [get_pins {u_DDR3/u_ddrphy_top/ddrphy_gpll/clkout0}] -master_clock [get_clocks {sys_clk}] -multiply_by {84} -divide_by {16}
+create_generated_clock -name {phy_dq_clk_0} -source [get_ports {sys_clk}] [get_pins {u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[0].ddrphy_ppll/clkoutphy}] -master_clock [get_clocks {sys_clk}] -multiply_by {84} -divide_by {2}
+create_generated_clock -name {phy_dq_sysclk_0} -source [get_pins {u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[0].ddrphy_ppll/clkoutphy}] [get_pins {u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[0].u_ddrphy_ioclkdiv/CLKDIVOUT}] -master_clock [get_clocks {phy_dq_clk_0}] -edges {5 13 21} -edge_shift {0 0 0}
+create_generated_clock -name {phy_dq_clk_1} -source [get_ports {sys_clk}] [get_pins {u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[1].ddrphy_ppll/clkoutphy}] -master_clock [get_clocks {sys_clk}] -multiply_by {84} -divide_by {2}
+create_generated_clock -name {phy_dq_sysclk_1} -source [get_pins {u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[1].ddrphy_ppll/clkoutphy}] [get_pins {u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_bank[1].u_ddrphy_ioclkdiv/CLKDIVOUT}] -master_clock [get_clocks {phy_dq_clk_1}] -edges {5 13 21} -edge_shift {0 0 0}
+create_generated_clock -name {clock_20k} -source [get_ports {sys_clk}] [get_nets {u_cmos1_config.clock_20k}] -master_clock [get_clocks {sys_clk}] -divide_by {2500}
+###==== END "create_generated_clock"
 ###==== BEGIN "set_clock_latency"
 ###==== END "set_clock_latency"
 ###==== BEGIN "set_clock_uncertainty"
 set_clock_uncertainty {0.200} [get_clocks {cmos1_pclk}] -setup -hold
+set_clock_uncertainty {0.400} -from [get_clocks {ddrphy_sysclk}] -to [get_clocks {phy_dq_sysclk_0}] -setup -hold
+set_clock_uncertainty {0.400} -from [get_clocks {phy_dq_sysclk_0}] -to [get_clocks {ddrphy_sysclk}] -setup -hold
+set_clock_uncertainty {0.400} -from [get_clocks {ddrphy_sysclk}] -to [get_clocks {phy_dq_sysclk_1}] -setup -hold
+set_clock_uncertainty {0.400} -from [get_clocks {phy_dq_sysclk_1}] -to [get_clocks {ddrphy_sysclk}] -setup -hold
 ###==== END "set_clock_uncertainty"
 ###==== BEGIN "set_clock_groups"
-set_clock_groups -name {async_domains} -asynchronous -group [get_clocks {pclk pclk_div2 ref_clk}] -group [get_clocks {sys_clk cfg_clk}] -group [get_clocks {cmos1_pclk}]
+set_clock_groups -name {async_domains} -asynchronous -group [get_clocks {pclk pclk_div2 ref_clk}] -group [get_clocks {sys_clk cfg_clk ddr_rst_clk ddrphy_sysclk phy_dq_clk_0 phy_dq_sysclk_0 phy_dq_clk_1 phy_dq_sysclk_1 clock_20k}] -group [get_clocks {cmos1_pclk}]
 ###==== END "set_clock_groups"
 ###==== BEGIN "set_input_delay"
 set_input_delay -clock [get_clocks {cmos1_pclk}] -max 2.5 [get_ports {cmos1_data[0] cmos1_data[1] cmos1_data[2] cmos1_data[3] cmos1_data[4] cmos1_data[5] cmos1_data[6] cmos1_data[7] cmos1_href cmos1_vsync}]
