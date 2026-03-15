@@ -81,6 +81,7 @@ add_design "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/power_on_delay.v"
 add_design "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/rd_buf.v"
 add_design "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/rd_ctrl.v"
 add_design "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/reg_config.v"
+add_design "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/i2c_com.v"
 add_design "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/wr_buf.v"
 add_design "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/wr_ctrl.v"
 add_design "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/wr_rd_ctrl_top.v"
@@ -1182,3 +1183,4 @@ report_timing
 gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
 remove_design -verilog "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/i2c_com.v"
 set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
