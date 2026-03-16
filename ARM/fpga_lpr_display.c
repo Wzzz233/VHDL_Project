@@ -57,6 +57,7 @@
 #define COLOR_CYAN_565 0x07FF
 #define COLOR_RED_565 0xF800
 #define COLOR_GREEN_565 0x07E0
+#define OVERLAY_TEXT_SCALE 3
 
 enum pixel_order {
     PIXEL_ORDER_BGR565 = 0,
@@ -1321,21 +1322,35 @@ static uint8_t glyph5x7(char ch, int row)
     }
 }
 
-static void draw_text_565(uint16_t *pix, int w, int h, int x, int y, const char *s, uint16_t c)
+static void draw_text_565(uint16_t *pix, int w, int h, int x, int y, const char *s, uint16_t c, int scale)
 {
     int i;
+    int advance;
+    if (!s || scale < 1)
+        return;
+    advance = 6 * scale;
     for (i = 0; s[i] != '\0'; i++) {
         int row;
         int col;
-        int ox = x + i * 6;
+        int ox = x + i * advance;
         for (row = 0; row < 7; row++) {
             uint8_t bits = glyph5x7(s[i], row);
             for (col = 0; col < 5; col++) {
                 if (bits & (1U << (4 - col))) {
-                    int px = ox + col;
-                    int py = y + row;
-                    if (px >= 0 && px < w && py >= 0 && py < h)
-                        pix[py * w + px] = c;
+                    int sy;
+                    int sx;
+                    int px0 = ox + col * scale;
+                    int py0 = y + row * scale;
+                    for (sy = 0; sy < scale; sy++) {
+                        int py = py0 + sy;
+                        if (py < 0 || py >= h)
+                            continue;
+                        for (sx = 0; sx < scale; sx++) {
+                            int px = px0 + sx;
+                            if (px >= 0 && px < w)
+                                pix[py * w + px] = c;
+                        }
+                    }
                 }
             }
         }
@@ -4358,13 +4373,20 @@ static void overlay_results_on_slot(struct app_ctx *ctx, uint8_t *slot_data)
     for (i = 0; i < r.plate_count; i++) {
         char txt[32];
         int tx = r.plates[i].box.x1;
-        int ty = r.plates[i].box.y1 - 10;
-        if (ty < 0) ty = r.plates[i].box.y1 + 2;
+        int text_scale = OVERLAY_TEXT_SCALE;
+        int text_h = 7 * text_scale;
+        int ty = r.plates[i].box.y1 - (text_h + 3);
+        if (ty < 0)
+            ty = r.plates[i].box.y1 + 3;
+        if (ty + text_h >= (int)ctx->frame_height)
+            ty = (int)ctx->frame_height - text_h - 1;
+        if (ty < 0)
+            ty = 0;
         build_overlay_ascii_text(&r.plates[i], txt, sizeof(txt));
         draw_rect_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, &r.plates[i].box, COLOR_CYAN_565);
         if (ctx->opt.show_crop_box)
             draw_rect_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, &r.plates[i].crop_box, COLOR_RED_565);
-        draw_text_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, tx, ty, txt, COLOR_CYAN_565);
+        draw_text_565(pix, (int)ctx->frame_width, (int)ctx->frame_height, tx, ty, txt, COLOR_CYAN_565, text_scale);
     }
 
     if (ctx->opt.fpga_a_mask && r.a_roi_valid)
