@@ -682,7 +682,7 @@ wire [15:0] cmos1_rgb565_fmt = CAM_SWAP_RB ?
 
 // Debug injection switches (default disabled).
 localparam FORCE_COLOR_BAR_PRE_DDR = 1'b0;
-localparam FORCE_PATTERN_POST_DDR  = 1'b0;
+localparam FORCE_PATTERN_POST_DDR  = 1'b1;
 localparam DMA_OUTPUT_BGRX         = 1'b1;
 // Mainline V3 default: keep bypass unless explicitly enabled.
 localparam PREPROC_ENABLE_DEFAULT  = 1'b0;
