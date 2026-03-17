@@ -687,7 +687,7 @@ localparam DMA_OUTPUT_BGRX         = 1'b1;
 // YUV422 byte order selector at camera output:
 //   1'b0: YUYV (Y0 U Y1 V)  [default, 0x4300=0x30]
 //   1'b1: UYVY (U Y0 V Y1)  [use when color/speckle indicates byte-phase/order mismatch]
-localparam YUV422_ORDER_UYVY       = 1'b0;
+localparam YUV422_ORDER_UYVY       = 1'b1;
 // Mainline V3 default: keep bypass unless explicitly enabled.
 localparam PREPROC_ENABLE_DEFAULT  = 1'b0;
 
