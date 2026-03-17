@@ -219,8 +219,8 @@ always@(reg_index)
 	 153  :reg_data  <=24'h3004ff ;//       
 	 154  :reg_data  <=24'h300e58 ;//       
 	 155  :reg_data  <=24'h302e00 ;//       
-	 156  :reg_data  <=24'h430060 ;//       
-	 157  :reg_data  <=24'h501f01 ;//       
+	 156  :reg_data  <=24'h430030 ;// YUV422, YUYV sequence
+	 157  :reg_data  <=24'h501f00 ;// ISP output select: YUV422
 	 158  :reg_data  <=24'h440e00 ;//       
 	 159  :reg_data  <=24'h5000a7 ;//     
 	 160  :reg_data  <=24'h3a0f30 ;//       
