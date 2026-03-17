@@ -686,8 +686,8 @@ localparam FORCE_PATTERN_POST_DDR  = 1'b0;
 localparam DMA_OUTPUT_BGRX         = 1'b1;
 // YUV422 byte order selector at camera output:
 //   1'b0: YUYV (Y0 U Y1 V)  [default, 0x4300=0x30]
-//   1'b1: UYVY (U Y0 V Y1)  [use when color/speckle indicates byte-phase/order mismatch]
-localparam YUV422_ORDER_UYVY       = 1'b1;
+//   1'b1: UYVY (U Y0 V Y1)  [for A/B debug only]
+localparam YUV422_ORDER_UYVY       = 1'b0;
 // Mainline V3 default: keep bypass unless explicitly enabled.
 localparam PREPROC_ENABLE_DEFAULT  = 1'b0;
 
@@ -1091,7 +1091,7 @@ fram_buf #(
     .ddr_init_ready     (ddr_init_done),
     
     // Camera input (write to DDR)
-    .vin_clk            (cmos1_pclk),
+    .vin_clk            (cmos1_pclk_16bit),
     .wr_fsync           (cmos1_vsync_16bit),
     .wr_en              (cmos1_href_16bit),
     .wr_data_vld        (cmos1_pix_vld),
