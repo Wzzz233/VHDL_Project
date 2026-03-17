@@ -31,6 +31,10 @@ RED_RATIO_THR="0.002"
 STOPLINE_RATIO="0.55"
 DET_RESIZE_MODE="letterbox"
 PLATE_REFINE="1"
+PLATE_DETECTOR_TYPE="yolov5"
+PLATE_NMS_IOU="0.45"
+PLATE_MAX_DET="128"
+PLATE_CLASS_ID="-1"
 OCR_CHANNEL_ORDER="rgb"
 OCR_CROP_MODE="fixed"
 OCR_RESIZE_MODE="stretch"
@@ -83,8 +87,12 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --stopline-ratio <v>       Stopline Y ratio [0,1] (default: ${STOPLINE_RATIO})
   --det-resize-mode <m>      Detect resize: stretch|letterbox (default: ${DET_RESIZE_MODE})
   --plate-refine <0|1>       Enable local high-res plate refine (default: ${PLATE_REFINE})
+  --plate-detector-type <m>  Plate detector: yolov5|yolov8_obb_rknn (default: ${PLATE_DETECTOR_TYPE})
+  --plate-nms-iou <v>        Plate NMS IoU threshold (default: ${PLATE_NMS_IOU})
+  --plate-max-det <n>        Plate max detections after NMS (default: ${PLATE_MAX_DET})
+  --plate-class-id <n>       Optional class filter for plate model (-1 disables, default: ${PLATE_CLASS_ID})
   --ocr-channel-order <m>    OCR input order: rgb|bgr (default: ${OCR_CHANNEL_ORDER})
-  --ocr-crop-mode <m>        OCR crop mode: fixed|box|tight|box-pad|match (default: ${OCR_CROP_MODE})
+  --ocr-crop-mode <m>        OCR crop mode: fixed|box|tight|box-pad|match|obb_warp (default: ${OCR_CROP_MODE})
   --ocr-resize-mode <m>      OCR resize mode: stretch|letterbox (default: ${OCR_RESIZE_MODE})
   --ocr-resize-kernel <m>    OCR resize kernel: nn|bilinear (default: ${OCR_RESIZE_KERNEL})
   --ocr-preproc <m>          OCR crop preproc: none|gray|bin (default: ${OCR_PREPROC})
@@ -133,6 +141,10 @@ while [[ $# -gt 0 ]]; do
     --stopline-ratio) STOPLINE_RATIO="$2"; shift 2 ;;
     --det-resize-mode) DET_RESIZE_MODE="$2"; shift 2 ;;
     --plate-refine) PLATE_REFINE="$2"; shift 2 ;;
+    --plate-detector-type) PLATE_DETECTOR_TYPE="$2"; shift 2 ;;
+    --plate-nms-iou) PLATE_NMS_IOU="$2"; shift 2 ;;
+    --plate-max-det) PLATE_MAX_DET="$2"; shift 2 ;;
+    --plate-class-id) PLATE_CLASS_ID="$2"; shift 2 ;;
     --ocr-channel-order) OCR_CHANNEL_ORDER="$2"; shift 2 ;;
     --ocr-crop-mode) OCR_CROP_MODE="$2"; shift 2 ;;
     --ocr-resize-mode) OCR_RESIZE_MODE="$2"; shift 2 ;;
@@ -223,6 +235,10 @@ CMD=(./fpga_lpr_display
   --ocr-model "$OCR_MODEL"
   --ocr-keys "$OCR_KEYS"
   --min-plate-conf "$MIN_PLATE_CONF"
+  --plate-detector-type "$PLATE_DETECTOR_TYPE"
+  --plate-nms-iou "$PLATE_NMS_IOU"
+  --plate-max-det "$PLATE_MAX_DET"
+  --plate-class-id "$PLATE_CLASS_ID"
   --ocr-channel-order "$OCR_CHANNEL_ORDER"
   --ocr-crop-mode "$OCR_CROP_MODE"
   --ocr-resize-mode "$OCR_RESIZE_MODE"

@@ -52,12 +52,17 @@
 #define ALGO_STREAM_SIZE 640
 #define OCR_CROP_WIDTH 150
 #define OCR_CROP_HEIGHT 50
+#define OBB_POINT_COUNT 8400
 
 #define COLOR_YELLOW_565 0xFFE0
 #define COLOR_CYAN_565 0x07FF
 #define COLOR_RED_565 0xF800
 #define COLOR_GREEN_565 0x07E0
 #define OVERLAY_TEXT_SCALE 3
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 enum pixel_order {
     PIXEL_ORDER_BGR565 = 0,
@@ -86,6 +91,7 @@ enum plate_decode_mode {
     PLATE_DECODE_ROWS,
     PLATE_DECODE_HEADS,
     PLATE_DECODE_MERGED,
+    PLATE_DECODE_OBB,
 };
 
 enum ocr_channel_order {
@@ -99,6 +105,12 @@ enum ocr_crop_mode {
     OCR_CROP_TIGHT,
     OCR_CROP_BOX_PAD,
     OCR_CROP_MATCH,
+    OCR_CROP_OBB_WARP,
+};
+
+enum detector_type {
+    DETECTOR_YOLOV5 = 0,
+    DETECTOR_YOLOV8_OBB_RKNN,
 };
 
 enum ocr_resize_mode {
@@ -154,6 +166,10 @@ struct options {
     float stopline_ratio;
     int det_resize_mode;
     int plate_refine;
+    int plate_detector_type;
+    float plate_nms_iou;
+    int plate_max_det;
+    int plate_class_id;
     int ocr_channel_order;
     int ocr_crop_mode;
     int ocr_resize_mode;
@@ -177,6 +193,13 @@ struct det_box {
     int y2;
     float conf;
     int cls;
+    int has_obb;
+    float cx;
+    float cy;
+    float w;
+    float h;
+    float angle;
+    float quad[8];
 };
 
 struct plate_det {
@@ -185,7 +208,7 @@ struct plate_det {
     enum plate_color color;
     enum plate_type type;
     int parent_car;
-    char ocr_text[24];
+    char ocr_text[64];
     float ocr_conf;
     float ocr_blank_top1;
     float ocr_in_occ_ratio;
@@ -266,6 +289,10 @@ struct yolo_model {
     uint32_t in_h;
     uint32_t in_c;
     int class_count;
+    int detector_type;
+    float nms_iou_thr;
+    int max_det;
+    int class_filter;
 };
 
 struct ocr_model {
@@ -388,6 +415,7 @@ static float laplacian_variance_rgb888(const uint8_t *rgb, int w, int h);
 static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
                                          const uint8_t *crop_rgb, int crop_w, int crop_h,
                                          float *occ_ratio_out);
+static bool append_utf8_token(char *dst, size_t dst_len, const char *token);
 static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src_w, int src_h,
                             float conf_thr, struct det_box *out, int *out_count,
                             struct detect_decode_diag *diag);
@@ -396,6 +424,7 @@ static void dump_ocr_pair(struct app_ctx *ctx, uint64_t frame_id, const struct p
                           const uint8_t *ocr_in, int ocr_w, int ocr_h);
 static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t ts_us,
                                const struct plate_det *pd);
+static const char *detector_type_str(int mode);
 
 static int64_t mono_us(void)
 {
@@ -445,8 +474,12 @@ static void print_usage(const char *prog)
             "  --stopline-ratio <v>    Stopline Y ratio [0,1] (default: 0.55)\n"
             "  --det-resize-mode <m>   Detect resize: stretch|letterbox (default: letterbox)\n"
             "  --plate-refine <0|1>    Enable local high-res plate refine (default: 1)\n"
+            "  --plate-detector-type <m> Plate detector: yolov5|yolov8_obb_rknn (default: yolov5)\n"
+            "  --plate-nms-iou <v>     Plate NMS IoU threshold (default: 0.45)\n"
+            "  --plate-max-det <n>     Plate max detections after NMS (default: 128)\n"
+            "  --plate-class-id <n>    Optional class filter for plate model (-1: disabled)\n"
             "  --ocr-channel-order <m> OCR input order: rgb|bgr (default: rgb)\n"
-            "  --ocr-crop-mode <m>     OCR crop mode: fixed|box|tight|box-pad|match (default: fixed)\n"
+            "  --ocr-crop-mode <m>     OCR crop mode: fixed|box|tight|box-pad|match|obb_warp (default: fixed)\n"
             "  --ocr-resize-mode <m>   OCR resize: stretch|letterbox (default: stretch)\n"
             "  --ocr-resize-kernel <m> OCR resize kernel: nn|bilinear (default: nn)\n"
             "  --ocr-preproc <m>       OCR crop preproc: none|gray|bin (default: none)\n"
@@ -498,6 +531,10 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"stopline-ratio", required_argument, NULL, 28},
         {"det-resize-mode", required_argument, NULL, 39},
         {"plate-refine", required_argument, NULL, 40},
+        {"plate-detector-type", required_argument, NULL, 46},
+        {"plate-nms-iou", required_argument, NULL, 47},
+        {"plate-max-det", required_argument, NULL, 48},
+        {"plate-class-id", required_argument, NULL, 49},
         {"ocr-channel-order", required_argument, NULL, 29},
         {"ocr-crop-mode", required_argument, NULL, 30},
         {"ocr-resize-mode", required_argument, NULL, 31},
@@ -540,6 +577,10 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->stopline_ratio = 0.55f;
     opt->det_resize_mode = DET_RESIZE_LETTERBOX;
     opt->plate_refine = 1;
+    opt->plate_detector_type = DETECTOR_YOLOV5;
+    opt->plate_nms_iou = 0.45f;
+    opt->plate_max_det = MAX_DETS;
+    opt->plate_class_id = -1;
     opt->ocr_channel_order = OCR_CH_RGB;
     opt->ocr_crop_mode = OCR_CROP_FIXED;
     opt->ocr_resize_mode = OCR_RESIZE_STRETCH;
@@ -603,6 +644,17 @@ static int parse_options(int argc, char **argv, struct options *opt)
                 return -1;
             break;
         case 40: opt->plate_refine = atoi(optarg) ? 1 : 0; break;
+        case 46:
+            if (strcmp(optarg, "yolov5") == 0)
+                opt->plate_detector_type = DETECTOR_YOLOV5;
+            else if (strcmp(optarg, "yolov8_obb_rknn") == 0)
+                opt->plate_detector_type = DETECTOR_YOLOV8_OBB_RKNN;
+            else
+                return -1;
+            break;
+        case 47: opt->plate_nms_iou = (float)atof(optarg); break;
+        case 48: opt->plate_max_det = atoi(optarg); break;
+        case 49: opt->plate_class_id = atoi(optarg); break;
         case 29:
             if (strcmp(optarg, "rgb") == 0)
                 opt->ocr_channel_order = OCR_CH_RGB;
@@ -622,6 +674,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
                 opt->ocr_crop_mode = OCR_CROP_BOX_PAD;
             else if (strcmp(optarg, "match") == 0)
                 opt->ocr_crop_mode = OCR_CROP_MATCH;
+            else if (strcmp(optarg, "obb_warp") == 0 || strcmp(optarg, "obb-warp") == 0)
+                opt->ocr_crop_mode = OCR_CROP_OBB_WARP;
             else
                 return -1;
             break;
@@ -681,6 +735,12 @@ static int parse_options(int argc, char **argv, struct options *opt)
     if (opt->red_ratio_thr < 0.0f || opt->red_ratio_thr > 1.0f)
         return -1;
     if (opt->stopline_ratio <= 0.05f || opt->stopline_ratio >= 0.95f)
+        return -1;
+    if (opt->plate_nms_iou < 0.0f || opt->plate_nms_iou > 1.0f)
+        return -1;
+    if (opt->plate_max_det <= 0 || opt->plate_max_det > MAX_DETS)
+        return -1;
+    if (opt->plate_class_id < -1)
         return -1;
     if (opt->ocr_min_plate_h < 0 || opt->ocr_min_plate_h > 512)
         return -1;
@@ -773,14 +833,21 @@ static int load_ocr_keys(struct app_ctx *ctx, const char *path)
     }
     while (fgets(line, sizeof(line), fp) && idx < MAX_OCR_KEYS) {
         char *nl = strchr(line, '\n');
+        char *src = line;
         size_t n;
         if (nl) *nl = '\0';
         nl = strchr(line, '\r');
         if (nl) *nl = '\0';
-        if (line[0] == '\0' || line[0] == '#')
+        if (src[0] == '\0' || src[0] == '#')
             continue;
-        n = strnlen(line, MAX_OCR_KEY_LEN - 1);
-        memcpy(ctx->ocr_keys[idx], line, n);
+        if (idx == 0 &&
+            (unsigned char)src[0] == 0xEF &&
+            (unsigned char)src[1] == 0xBB &&
+            (unsigned char)src[2] == 0xBF) {
+            src += 3;
+        }
+        n = strnlen(src, MAX_OCR_KEY_LEN - 1);
+        memcpy(ctx->ocr_keys[idx], src, n);
         ctx->ocr_keys[idx][n] = '\0';
         idx++;
     }
@@ -955,12 +1022,9 @@ static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_str
         }
         if (best_c >= 0 && best_c < ctx->ocr_key_count) {
             float prob = 0.0f;
-            size_t left;
             exp_sum = (exp_sum > 1e-8f) ? exp_sum : 1e-8f;
             prob = expf(best_logit - max_logit) / exp_sum;
-            left = text_len - strnlen(text, text_len);
-            if (left > 1) {
-                strncat(text, ctx->ocr_keys[best_c], left - 1);
+            if (append_utf8_token(text, text_len, ctx->ocr_keys[best_c])) {
                 emitted++;
                 conf_sum += prob;
             }
@@ -975,6 +1039,26 @@ static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_str
         diag->blank_top1_ratio = (t_size > 0) ? ((float)blank_top1_count / (float)t_size) : 0.0f;
     }
     return 0;
+}
+
+static bool append_utf8_token(char *dst, size_t dst_len, const char *token)
+{
+    size_t cur;
+    size_t tok_len;
+
+    if (!dst || dst_len == 0 || !token)
+        return false;
+    cur = strnlen(dst, dst_len);
+    if (cur >= dst_len - 1)
+        return false;
+    tok_len = strnlen(token, MAX_OCR_KEY_LEN - 1);
+    if (tok_len == 0)
+        return false;
+    if (tok_len >= dst_len - cur)
+        return false;
+    memcpy(dst + cur, token, tok_len);
+    dst[cur + tok_len] = '\0';
+    return true;
 }
 
 static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
@@ -1545,6 +1629,11 @@ static float sigmoidf_local(float x)
     return 1.0f / (1.0f + expf(-x));
 }
 
+struct point2f {
+    float x;
+    float y;
+};
+
 static float box_iou(const struct det_box *a, const struct det_box *b)
 {
     int x1 = a->x1 > b->x1 ? a->x1 : b->x1;
@@ -1595,6 +1684,202 @@ static void nms_inplace(struct det_box *dets, int *count, float iou_thr)
     *count = out;
 }
 
+static void det_quad_from_obb(struct det_box *d)
+{
+    float c = cosf(d->angle);
+    float s = sinf(d->angle);
+    float hw = d->w * 0.5f;
+    float hh = d->h * 0.5f;
+    static const float local[4][2] = {
+        {-1.0f, -1.0f},
+        { 1.0f, -1.0f},
+        { 1.0f,  1.0f},
+        {-1.0f,  1.0f},
+    };
+    int i;
+    float min_x = 1e30f, min_y = 1e30f;
+    float max_x = -1e30f, max_y = -1e30f;
+    for (i = 0; i < 4; i++) {
+        float lx = local[i][0] * hw;
+        float ly = local[i][1] * hh;
+        float x = d->cx + lx * c - ly * s;
+        float y = d->cy + lx * s + ly * c;
+        d->quad[i * 2 + 0] = x;
+        d->quad[i * 2 + 1] = y;
+        if (x < min_x) min_x = x;
+        if (x > max_x) max_x = x;
+        if (y < min_y) min_y = y;
+        if (y > max_y) max_y = y;
+    }
+    d->x1 = (int)floorf(min_x);
+    d->y1 = (int)floorf(min_y);
+    d->x2 = (int)ceilf(max_x);
+    d->y2 = (int)ceilf(max_y);
+    d->has_obb = 1;
+}
+
+static float polygon_area_signed(const struct point2f *pts, int n)
+{
+    float acc = 0.0f;
+    int i;
+    for (i = 0; i < n; i++) {
+        const struct point2f *a = &pts[i];
+        const struct point2f *b = &pts[(i + 1) % n];
+        acc += a->x * b->y - b->x * a->y;
+    }
+    return 0.5f * acc;
+}
+
+static float polygon_area_abs(const struct point2f *pts, int n)
+{
+    float a = polygon_area_signed(pts, n);
+    return (a >= 0.0f) ? a : -a;
+}
+
+static bool clip_inside(const struct point2f *p, const struct point2f *a,
+                        const struct point2f *b, float orient_sign)
+{
+    float cross = (b->x - a->x) * (p->y - a->y) - (b->y - a->y) * (p->x - a->x);
+    if (orient_sign >= 0.0f)
+        return cross >= -1e-6f;
+    return cross <= 1e-6f;
+}
+
+static struct point2f line_intersection(const struct point2f *s, const struct point2f *e,
+                                        const struct point2f *a, const struct point2f *b)
+{
+    struct point2f out = *e;
+    float x1 = s->x, y1 = s->y;
+    float x2 = e->x, y2 = e->y;
+    float x3 = a->x, y3 = a->y;
+    float x4 = b->x, y4 = b->y;
+    float den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    if (fabsf(den) < 1e-8f)
+        return out;
+    out.x = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / den;
+    out.y = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / den;
+    return out;
+}
+
+static int convex_clip_polygon(const struct point2f *subject, int subject_n,
+                               const struct point2f *clip, int clip_n,
+                               struct point2f *out, int out_cap)
+{
+    struct point2f in_buf[16];
+    struct point2f out_buf[16];
+    int in_n = subject_n;
+    int i;
+    if (subject_n <= 0 || clip_n <= 0 || out_cap <= 0)
+        return 0;
+    if (subject_n > 16 || clip_n > 16)
+        return 0;
+    memcpy(in_buf, subject, (size_t)subject_n * sizeof(subject[0]));
+    for (i = 0; i < clip_n; i++) {
+        struct point2f a = clip[i];
+        struct point2f b = clip[(i + 1) % clip_n];
+        float orient = polygon_area_signed(clip, clip_n);
+        int j;
+        int out_n = 0;
+        if (in_n <= 0)
+            return 0;
+        for (j = 0; j < in_n; j++) {
+            struct point2f cur = in_buf[j];
+            struct point2f prev = in_buf[(j + in_n - 1) % in_n];
+            bool cur_in = clip_inside(&cur, &a, &b, orient);
+            bool prev_in = clip_inside(&prev, &a, &b, orient);
+            if (cur_in) {
+                if (!prev_in && out_n < 16)
+                    out_buf[out_n++] = line_intersection(&prev, &cur, &a, &b);
+                if (out_n < 16)
+                    out_buf[out_n++] = cur;
+            } else if (prev_in) {
+                if (out_n < 16)
+                    out_buf[out_n++] = line_intersection(&prev, &cur, &a, &b);
+            }
+        }
+        memcpy(in_buf, out_buf, (size_t)out_n * sizeof(out_buf[0]));
+        in_n = out_n;
+    }
+    if (in_n > out_cap)
+        in_n = out_cap;
+    memcpy(out, in_buf, (size_t)in_n * sizeof(out[0]));
+    return in_n;
+}
+
+static void det_to_quad_points(const struct det_box *d, struct point2f q[4])
+{
+    if (d->has_obb) {
+        int i;
+        for (i = 0; i < 4; i++) {
+            q[i].x = d->quad[i * 2 + 0];
+            q[i].y = d->quad[i * 2 + 1];
+        }
+        return;
+    }
+    q[0].x = (float)d->x1; q[0].y = (float)d->y1;
+    q[1].x = (float)d->x2; q[1].y = (float)d->y1;
+    q[2].x = (float)d->x2; q[2].y = (float)d->y2;
+    q[3].x = (float)d->x1; q[3].y = (float)d->y2;
+}
+
+static float rotated_iou(const struct det_box *a, const struct det_box *b)
+{
+    struct point2f qa[4];
+    struct point2f qb[4];
+    struct point2f inter[16];
+    float area_a;
+    float area_b;
+    float inter_area;
+    float denom;
+    int inter_n;
+    if (box_iou(a, b) <= 0.0f)
+        return 0.0f;
+    det_to_quad_points(a, qa);
+    det_to_quad_points(b, qb);
+    area_a = polygon_area_abs(qa, 4);
+    area_b = polygon_area_abs(qb, 4);
+    if (area_a <= 1e-6f || area_b <= 1e-6f)
+        return 0.0f;
+    inter_n = convex_clip_polygon(qa, 4, qb, 4, inter, 16);
+    if (inter_n <= 2)
+        return 0.0f;
+    inter_area = polygon_area_abs(inter, inter_n);
+    if (inter_area <= 1e-6f)
+        return 0.0f;
+    denom = area_a + area_b - inter_area;
+    if (denom <= 1e-6f)
+        return 0.0f;
+    return inter_area / denom;
+}
+
+static void rotated_nms_inplace(struct det_box *dets, int *count, float iou_thr, int max_det)
+{
+    bool removed[MAX_DETS * 4];
+    int n = *count;
+    int i;
+    int j;
+    int out = 0;
+    if (max_det <= 0 || max_det > MAX_DETS)
+        max_det = MAX_DETS;
+    if (n < 0)
+        n = 0;
+    if (n > (int)(sizeof(removed) / sizeof(removed[0])))
+        n = (int)(sizeof(removed) / sizeof(removed[0]));
+    memset(removed, 0, sizeof(removed));
+    qsort(dets, (size_t)n, sizeof(dets[0]), det_conf_cmp);
+    for (i = 0; i < n && out < max_det; i++) {
+        if (removed[i]) continue;
+        dets[out++] = dets[i];
+        for (j = i + 1; j < n; j++) {
+            if (removed[j] || dets[i].cls != dets[j].cls)
+                continue;
+            if (rotated_iou(&dets[i], &dets[j]) > iou_thr)
+                removed[j] = true;
+        }
+    }
+    *count = out;
+}
+
 static const char *tensor_fmt_name(rknn_tensor_format fmt)
 {
     switch (fmt) {
@@ -1635,7 +1920,8 @@ static const char *tensor_type_name(rknn_tensor_type t)
     }
 }
 
-static int rknn_model_load(struct yolo_model *m, const char *name, const char *path, int class_count)
+static int rknn_model_load(struct yolo_model *m, const char *name, const char *path,
+                           int class_count, int detector_type)
 {
     FILE *fp;
     long sz;
@@ -1645,6 +1931,10 @@ static int rknn_model_load(struct yolo_model *m, const char *name, const char *p
     m->name = name;
     m->path = path;
     m->class_count = class_count;
+    m->detector_type = detector_type;
+    m->nms_iou_thr = 0.45f;
+    m->max_det = MAX_DETS;
+    m->class_filter = -1;
 
     fp = fopen(path, "rb");
     if (!fp) return -1;
@@ -1680,8 +1970,9 @@ static int rknn_model_load(struct yolo_model *m, const char *name, const char *p
         if (rknn_query(m->ctx, RKNN_QUERY_OUTPUT_ATTR, &m->output_attrs[i], sizeof(m->output_attrs[i])) < 0)
             return -1;
     }
-    fprintf(stderr, "[%s] loaded input=%ux%ux%u outputs=%u\n",
-            name, m->in_w, m->in_h, m->in_c, m->io_num.n_output);
+    fprintf(stderr, "[%s] loaded input=%ux%ux%u outputs=%u detector=%s\n",
+            name, m->in_w, m->in_h, m->in_c, m->io_num.n_output,
+            detector_type_str(m->detector_type));
     for (i = 0; i < m->io_num.n_output; i++) {
         const rknn_tensor_attr *a = &m->output_attrs[i];
         fprintf(stderr,
@@ -2415,6 +2706,59 @@ static void map_box_from_letterbox(struct det_box *b, const struct letterbox_met
     clamp_box(b, lb->src_w, lb->src_h);
 }
 
+static void map_point_from_letterbox(float *x, float *y, const struct letterbox_meta *lb)
+{
+    if (!x || !y || !lb || !lb->valid || lb->scale <= 0.0f)
+        return;
+    *x = (*x - (float)lb->pad_x) / lb->scale;
+    *y = (*y - (float)lb->pad_y) / lb->scale;
+}
+
+static void map_point_between_spaces(float *x, float *y, int src_w, int src_h, int dst_w, int dst_h)
+{
+    if (!x || !y || src_w <= 0 || src_h <= 0)
+        return;
+    *x = *x * (float)dst_w / (float)src_w;
+    *y = *y * (float)dst_h / (float)src_h;
+}
+
+static void map_obb_from_detect_space(struct det_box *b, int det_resize_mode,
+                                      const struct letterbox_meta *lb,
+                                      int src_w, int src_h, int det_w, int det_h)
+{
+    int i;
+    float min_x = 1e30f, min_y = 1e30f;
+    float max_x = -1e30f, max_y = -1e30f;
+    for (i = 0; i < 4; i++) {
+        float x = b->quad[i * 2 + 0];
+        float y = b->quad[i * 2 + 1];
+        if (det_resize_mode == DET_RESIZE_LETTERBOX)
+            map_point_from_letterbox(&x, &y, lb);
+        else
+            map_point_between_spaces(&x, &y, det_w, det_h, src_w, src_h);
+        if (x < 0.0f) x = 0.0f;
+        if (y < 0.0f) y = 0.0f;
+        if (x > (float)(src_w - 1)) x = (float)(src_w - 1);
+        if (y > (float)(src_h - 1)) y = (float)(src_h - 1);
+        b->quad[i * 2 + 0] = x;
+        b->quad[i * 2 + 1] = y;
+        if (x < min_x) min_x = x;
+        if (x > max_x) max_x = x;
+        if (y < min_y) min_y = y;
+        if (y > max_y) max_y = y;
+    }
+    b->x1 = (int)floorf(min_x);
+    b->y1 = (int)floorf(min_y);
+    b->x2 = (int)ceilf(max_x);
+    b->y2 = (int)ceilf(max_y);
+    b->cx = 0.25f * (b->quad[0] + b->quad[2] + b->quad[4] + b->quad[6]);
+    b->cy = 0.25f * (b->quad[1] + b->quad[3] + b->quad[5] + b->quad[7]);
+    b->w = hypotf(b->quad[2] - b->quad[0], b->quad[3] - b->quad[1]);
+    b->h = hypotf(b->quad[6] - b->quad[0], b->quad[7] - b->quad[1]);
+    b->angle = atan2f(b->quad[3] - b->quad[1], b->quad[2] - b->quad[0]);
+    clamp_box(b, src_w, src_h);
+}
+
 static void map_box_from_detect_space(struct det_box *b, int det_resize_mode,
                                       const struct letterbox_meta *lb,
                                       int src_w, int src_h, int det_w, int det_h)
@@ -2465,8 +2809,13 @@ static int run_detect_on_rgb(struct app_ctx *ctx, struct yolo_model *m,
         return -1;
     }
     for (i = 0; i < *out_count; i++) {
-        map_box_from_detect_space(&out[i], ctx->opt.det_resize_mode, &lb,
-                                  src_w, src_h, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE);
+        if (out[i].has_obb) {
+            map_obb_from_detect_space(&out[i], ctx->opt.det_resize_mode, &lb,
+                                      src_w, src_h, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE);
+        } else {
+            map_box_from_detect_space(&out[i], ctx->opt.det_resize_mode, &lb,
+                                      src_w, src_h, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE);
+        }
     }
     return 0;
 }
@@ -2510,7 +2859,8 @@ static void compute_expand_crop_box(const struct det_box *src, int img_w, int im
 static void compute_ocr_crop_box(const struct app_ctx *ctx, const struct det_box *src,
                                  struct det_box *crop)
 {
-    if (ctx->opt.ocr_crop_mode == OCR_CROP_MATCH) {
+    if (ctx->opt.ocr_crop_mode == OCR_CROP_MATCH ||
+        ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP) {
         *crop = *src;
         clamp_box(crop, (int)ctx->frame_width, (int)ctx->frame_height);
         return;
@@ -2617,6 +2967,288 @@ static void copy_crop_rgb888(const uint8_t *rgb, int img_w, const struct det_box
     }
 }
 
+static void order_quad_points(const float in[8], float out[8])
+{
+    int i;
+    int tl = 0, tr = 0, br = 0, bl = 0;
+    float min_sum = 1e30f, max_sum = -1e30f;
+    float min_diff = 1e30f, max_diff = -1e30f;
+    for (i = 0; i < 4; i++) {
+        float x = in[i * 2 + 0];
+        float y = in[i * 2 + 1];
+        float sum = x + y;
+        float diff = y - x;
+        if (sum < min_sum) { min_sum = sum; tl = i; }
+        if (sum > max_sum) { max_sum = sum; br = i; }
+        if (diff < min_diff) { min_diff = diff; tr = i; }
+        if (diff > max_diff) { max_diff = diff; bl = i; }
+    }
+    out[0] = in[tl * 2 + 0]; out[1] = in[tl * 2 + 1];
+    out[2] = in[tr * 2 + 0]; out[3] = in[tr * 2 + 1];
+    out[4] = in[br * 2 + 0]; out[5] = in[br * 2 + 1];
+    out[6] = in[bl * 2 + 0]; out[7] = in[bl * 2 + 1];
+}
+
+static void bbox_from_quad(const float quad[8], int img_w, int img_h, struct det_box *box)
+{
+    int i;
+    float min_x = 1e30f, min_y = 1e30f;
+    float max_x = -1e30f, max_y = -1e30f;
+    memset(box, 0, sizeof(*box));
+    for (i = 0; i < 4; i++) {
+        float x = quad[i * 2 + 0];
+        float y = quad[i * 2 + 1];
+        if (x < min_x) min_x = x;
+        if (x > max_x) max_x = x;
+        if (y < min_y) min_y = y;
+        if (y > max_y) max_y = y;
+    }
+    box->x1 = (int)floorf(min_x);
+    box->y1 = (int)floorf(min_y);
+    box->x2 = (int)ceilf(max_x);
+    box->y2 = (int)ceilf(max_y);
+    clamp_box(box, img_w, img_h);
+}
+
+static bool solve_linear_8x8(float a[8][9], float x[8])
+{
+    int i;
+    int j;
+    int k;
+    for (i = 0; i < 8; i++) {
+        int piv = i;
+        float max_v = fabsf(a[i][i]);
+        for (j = i + 1; j < 8; j++) {
+            float v = fabsf(a[j][i]);
+            if (v > max_v) {
+                max_v = v;
+                piv = j;
+            }
+        }
+        if (max_v < 1e-8f)
+            return false;
+        if (piv != i) {
+            for (k = i; k < 9; k++) {
+                float t = a[i][k];
+                a[i][k] = a[piv][k];
+                a[piv][k] = t;
+            }
+        }
+        {
+            float div = a[i][i];
+            for (k = i; k < 9; k++)
+                a[i][k] /= div;
+        }
+        for (j = 0; j < 8; j++) {
+            float mul;
+            if (j == i)
+                continue;
+            mul = a[j][i];
+            if (fabsf(mul) < 1e-8f)
+                continue;
+            for (k = i; k < 9; k++)
+                a[j][k] -= mul * a[i][k];
+        }
+    }
+    for (i = 0; i < 8; i++)
+        x[i] = a[i][8];
+    return true;
+}
+
+static bool get_homography_4pt(const float src[8], const float dst[8], float h[9])
+{
+    float mat[8][9];
+    float sol[8];
+    int i;
+    memset(mat, 0, sizeof(mat));
+    for (i = 0; i < 4; i++) {
+        float x = src[i * 2 + 0];
+        float y = src[i * 2 + 1];
+        float u = dst[i * 2 + 0];
+        float v = dst[i * 2 + 1];
+        int r0 = i * 2;
+        int r1 = r0 + 1;
+        mat[r0][0] = x;
+        mat[r0][1] = y;
+        mat[r0][2] = 1.0f;
+        mat[r0][6] = -u * x;
+        mat[r0][7] = -u * y;
+        mat[r0][8] = u;
+
+        mat[r1][3] = x;
+        mat[r1][4] = y;
+        mat[r1][5] = 1.0f;
+        mat[r1][6] = -v * x;
+        mat[r1][7] = -v * y;
+        mat[r1][8] = v;
+    }
+    if (!solve_linear_8x8(mat, sol))
+        return false;
+    h[0] = sol[0]; h[1] = sol[1]; h[2] = sol[2];
+    h[3] = sol[3]; h[4] = sol[4]; h[5] = sol[5];
+    h[6] = sol[6]; h[7] = sol[7]; h[8] = 1.0f;
+    return true;
+}
+
+static bool invert_homography(const float h[9], float inv[9])
+{
+    float det = h[0] * (h[4] * h[8] - h[5] * h[7]) -
+                h[1] * (h[3] * h[8] - h[5] * h[6]) +
+                h[2] * (h[3] * h[7] - h[4] * h[6]);
+    if (fabsf(det) < 1e-8f)
+        return false;
+    inv[0] =  (h[4] * h[8] - h[5] * h[7]) / det;
+    inv[1] = -(h[1] * h[8] - h[2] * h[7]) / det;
+    inv[2] =  (h[1] * h[5] - h[2] * h[4]) / det;
+    inv[3] = -(h[3] * h[8] - h[5] * h[6]) / det;
+    inv[4] =  (h[0] * h[8] - h[2] * h[6]) / det;
+    inv[5] = -(h[0] * h[5] - h[2] * h[3]) / det;
+    inv[6] =  (h[3] * h[7] - h[4] * h[6]) / det;
+    inv[7] = -(h[0] * h[7] - h[1] * h[6]) / det;
+    inv[8] =  (h[0] * h[4] - h[1] * h[3]) / det;
+    return true;
+}
+
+static void bilinear_sample_rgb888(const uint8_t *rgb, int img_w, int img_h,
+                                   float x, float y, uint8_t out[3])
+{
+    int x0 = (int)floorf(x);
+    int y0 = (int)floorf(y);
+    int x1;
+    int y1;
+    float wx;
+    float wy;
+    int c;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x0 > img_w - 1) x0 = img_w - 1;
+    if (y0 > img_h - 1) y0 = img_h - 1;
+    x1 = x0 + 1; if (x1 > img_w - 1) x1 = img_w - 1;
+    y1 = y0 + 1; if (y1 > img_h - 1) y1 = img_h - 1;
+    wx = x - (float)x0;
+    wy = y - (float)y0;
+    if (wx < 0.0f) wx = 0.0f;
+    if (wx > 1.0f) wx = 1.0f;
+    if (wy < 0.0f) wy = 0.0f;
+    if (wy > 1.0f) wy = 1.0f;
+    for (c = 0; c < 3; c++) {
+        const uint8_t *p00 = rgb + ((size_t)y0 * (size_t)img_w + (size_t)x0) * 3U + (size_t)c;
+        const uint8_t *p01 = rgb + ((size_t)y0 * (size_t)img_w + (size_t)x1) * 3U + (size_t)c;
+        const uint8_t *p10 = rgb + ((size_t)y1 * (size_t)img_w + (size_t)x0) * 3U + (size_t)c;
+        const uint8_t *p11 = rgb + ((size_t)y1 * (size_t)img_w + (size_t)x1) * 3U + (size_t)c;
+        float v0 = (1.0f - wx) * (float)(*p00) + wx * (float)(*p01);
+        float v1 = (1.0f - wx) * (float)(*p10) + wx * (float)(*p11);
+        float v = (1.0f - wy) * v0 + wy * v1;
+        if (v < 0.0f) v = 0.0f;
+        if (v > 255.0f) v = 255.0f;
+        out[c] = (uint8_t)(v + 0.5f);
+    }
+}
+
+static bool warp_quad_to_rect_rgb888(const uint8_t *rgb, int img_w, int img_h, const float quad_in[8],
+                                     uint8_t *dst, int dst_cap_w, int dst_cap_h,
+                                     int *out_w, int *out_h)
+{
+    float quad[8];
+    float dst_quad[8];
+    float h[9];
+    float inv_h[9];
+    float w_top;
+    float w_bottom;
+    float h_left;
+    float h_right;
+    int dw;
+    int dh;
+    int y;
+    int x;
+    if (!rgb || !quad_in || !dst || !out_w || !out_h)
+        return false;
+    order_quad_points(quad_in, quad);
+    w_top = hypotf(quad[2] - quad[0], quad[3] - quad[1]);
+    w_bottom = hypotf(quad[4] - quad[6], quad[5] - quad[7]);
+    h_left = hypotf(quad[6] - quad[0], quad[7] - quad[1]);
+    h_right = hypotf(quad[4] - quad[2], quad[5] - quad[3]);
+    dw = (int)(fmaxf(w_top, w_bottom) + 0.5f);
+    dh = (int)(fmaxf(h_left, h_right) + 0.5f);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    if (dw > dst_cap_w) dw = dst_cap_w;
+    if (dh > dst_cap_h) dh = dst_cap_h;
+    if (dw <= 0 || dh <= 0)
+        return false;
+
+    dst_quad[0] = 0.0f;         dst_quad[1] = 0.0f;
+    dst_quad[2] = (float)dw - 1.0f; dst_quad[3] = 0.0f;
+    dst_quad[4] = (float)dw - 1.0f; dst_quad[5] = (float)dh - 1.0f;
+    dst_quad[6] = 0.0f;         dst_quad[7] = (float)dh - 1.0f;
+    if (!get_homography_4pt(quad, dst_quad, h))
+        return false;
+    if (!invert_homography(h, inv_h))
+        return false;
+
+    for (y = 0; y < dh; y++) {
+        for (x = 0; x < dw; x++) {
+            float fx = (float)x;
+            float fy = (float)y;
+            float den = inv_h[6] * fx + inv_h[7] * fy + inv_h[8];
+            float sx;
+            float sy;
+            uint8_t pix[3];
+            uint8_t *q;
+            if (fabsf(den) < 1e-8f)
+                den = (den >= 0.0f) ? 1e-8f : -1e-8f;
+            sx = (inv_h[0] * fx + inv_h[1] * fy + inv_h[2]) / den;
+            sy = (inv_h[3] * fx + inv_h[4] * fy + inv_h[5]) / den;
+            if (sx < 0.0f) sx = 0.0f;
+            if (sy < 0.0f) sy = 0.0f;
+            if (sx > (float)(img_w - 1)) sx = (float)(img_w - 1);
+            if (sy > (float)(img_h - 1)) sy = (float)(img_h - 1);
+            bilinear_sample_rgb888(rgb, img_w, img_h, sx, sy, pix);
+            q = dst + ((size_t)y * (size_t)dw + (size_t)x) * 3U;
+            q[0] = pix[0];
+            q[1] = pix[1];
+            q[2] = pix[2];
+        }
+    }
+    *out_w = dw;
+    *out_h = dh;
+    return true;
+}
+
+static bool prepare_plate_crop_rgb888(const struct app_ctx *ctx,
+                                      const uint8_t *rgb, int img_w, int img_h,
+                                      const struct det_box *plate_box,
+                                      uint8_t *crop_buf, int crop_cap_w, int crop_cap_h,
+                                      struct det_box *crop_box, int *crop_w, int *crop_h,
+                                      float *occ_ratio, bool *used_obb_warp)
+{
+    if (!ctx || !rgb || !plate_box || !crop_buf || !crop_box || !crop_w || !crop_h || !occ_ratio || !used_obb_warp)
+        return false;
+    *used_obb_warp = false;
+
+    if (ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP && plate_box->has_obb) {
+        float ordered[8];
+        order_quad_points(plate_box->quad, ordered);
+        if (warp_quad_to_rect_rgb888(rgb, img_w, img_h, ordered,
+                                     crop_buf, crop_cap_w, crop_cap_h,
+                                     crop_w, crop_h)) {
+            bbox_from_quad(ordered, img_w, img_h, crop_box);
+            *occ_ratio = estimate_ocr_occ_ratio(ctx, *crop_w, *crop_h);
+            *used_obb_warp = true;
+            return true;
+        }
+    }
+
+    compute_ocr_crop_box(ctx, plate_box, crop_box);
+    *crop_w = crop_box->x2 - crop_box->x1 + 1;
+    *crop_h = crop_box->y2 - crop_box->y1 + 1;
+    if (*crop_w <= 0 || *crop_h <= 0 || *crop_w > crop_cap_w || *crop_h > crop_cap_h)
+        return false;
+    copy_crop_rgb888(rgb, img_w, crop_box, crop_buf);
+    *occ_ratio = estimate_ocr_occ_ratio(ctx, *crop_w, *crop_h);
+    return true;
+}
+
 static bool refine_plate_box_local(struct app_ctx *ctx, const uint8_t *rgb_full, int img_w, int img_h,
                                    const struct det_box *seed_box, uint8_t *det_rgb, uint8_t *plate_in,
                                    struct det_box *out_box)
@@ -2679,6 +3311,15 @@ static bool refine_plate_box_local(struct app_ctx *ctx, const uint8_t *rgb_full,
     out_box->x2 += roi.x1;
     out_box->y1 += roi.y1;
     out_box->y2 += roi.y1;
+    if (out_box->has_obb) {
+        int k;
+        out_box->cx += (float)roi.x1;
+        out_box->cy += (float)roi.y1;
+        for (k = 0; k < 4; k++) {
+            out_box->quad[k * 2 + 0] += (float)roi.x1;
+            out_box->quad[k * 2 + 1] += (float)roi.y1;
+        }
+    }
     clamp_box(out_box, img_w, img_h);
 
     free(roi_rgb);
@@ -2779,6 +3420,7 @@ static int decode_rows_mode_xywh(const float *buf, bool transposed, int n_rows, 
             bh *= (float)in_h;
         }
 
+        memset(&b, 0, sizeof(b));
         b.x1 = (int)((cx - bw * 0.5f) * ((float)src_w / (float)in_w));
         b.y1 = (int)((cy - bh * 0.5f) * ((float)src_h / (float)in_h));
         b.x2 = (int)((cx + bw * 0.5f) * ((float)src_w / (float)in_w));
@@ -2840,6 +3482,7 @@ static int decode_rows_mode_xyxy_clsid(const float *buf, bool transposed, int n_
         max_x = fmaxf(fabsf(x1), fabsf(x2));
         max_y = fmaxf(fabsf(y1), fabsf(y2));
 
+        memset(&b, 0, sizeof(b));
         if (max_x <= (float)in_w * 1.5f && max_y <= (float)in_h * 1.5f) {
             b.x1 = (int)(x1 * ((float)src_w / (float)in_w));
             b.y1 = (int)(y1 * ((float)src_h / (float)in_h));
@@ -3096,6 +3739,7 @@ static void decode_yolo_head_output(const float *buf, const struct yolo_head_vie
                 bw = powf(sigmoidf_local(tw) * 2.0f, 2.0f) * anchors[a][0];
                 bh = powf(sigmoidf_local(th) * 2.0f, 2.0f) * anchors[a][1];
 
+                memset(&b, 0, sizeof(b));
                 b.x1 = (int)((bx - bw * 0.5f) * ((float)src_w / (float)in_w));
                 b.y1 = (int)((by - bh * 0.5f) * ((float)src_h / (float)in_h));
                 b.x2 = (int)((bx + bw * 0.5f) * ((float)src_w / (float)in_w));
@@ -3154,6 +3798,321 @@ static void decode_yolo_heads_outputs(const struct yolo_model *m, const rknn_out
     }
 }
 
+struct tensor_cn_view {
+    const float *buf;
+    int c;
+    int n;
+    bool c_major;
+};
+
+static bool build_tensor_cn_view(const rknn_tensor_attr *a, const float *buf, struct tensor_cn_view *tv)
+{
+    int dims[4];
+    int k = 0;
+    int i;
+    if (!a || !buf || !tv)
+        return false;
+    memset(tv, 0, sizeof(*tv));
+    if (a->n_dims == 3) {
+        int d1 = (int)a->dims[1];
+        int d2 = (int)a->dims[2];
+        if (d1 <= 0 || d2 <= 0)
+            return false;
+        if (d2 == OBB_POINT_COUNT) {
+            tv->buf = buf;
+            tv->c = d1;
+            tv->n = d2;
+            tv->c_major = true;
+            return tv->c > 0;
+        }
+        if (d1 == OBB_POINT_COUNT) {
+            tv->buf = buf;
+            tv->c = d2;
+            tv->n = d1;
+            tv->c_major = false;
+            return tv->c > 0;
+        }
+        return false;
+    }
+
+    for (i = 1; i < (int)a->n_dims && i < 4; i++) {
+        int d = (int)a->dims[i];
+        if (d > 1)
+            dims[k++] = d;
+    }
+    if (k == 1 && dims[0] == OBB_POINT_COUNT) {
+        tv->buf = buf;
+        tv->c = 1;
+        tv->n = OBB_POINT_COUNT;
+        tv->c_major = true;
+        return true;
+    }
+    if (k != 2)
+        return false;
+    if (dims[1] == OBB_POINT_COUNT) {
+        tv->buf = buf;
+        tv->c = dims[0];
+        tv->n = dims[1];
+        tv->c_major = true;
+        return tv->c > 0;
+    }
+    if (dims[0] == OBB_POINT_COUNT) {
+        tv->buf = buf;
+        tv->c = dims[1];
+        tv->n = dims[0];
+        tv->c_major = false;
+        return tv->c > 0;
+    }
+    return false;
+}
+
+static float tensor_cn_read(const struct tensor_cn_view *tv, int c, int n)
+{
+    if (tv->c_major)
+        return tv->buf[(size_t)c * (size_t)tv->n + (size_t)n];
+    return tv->buf[(size_t)n * (size_t)tv->c + (size_t)c];
+}
+
+static void tensor_sample_minmax(const struct tensor_cn_view *tv, float *min_v, float *max_v)
+{
+    int sample_n;
+    int i;
+    float mn = 1e30f;
+    float mx = -1e30f;
+    if (!tv || !min_v || !max_v || tv->c <= 0 || tv->n <= 0) {
+        if (min_v) *min_v = 0.0f;
+        if (max_v) *max_v = 0.0f;
+        return;
+    }
+    sample_n = tv->n < 256 ? tv->n : 256;
+    for (i = 0; i < sample_n; i++) {
+        float v = tensor_cn_read(tv, 0, i);
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    *min_v = mn;
+    *max_v = mx;
+}
+
+struct obb_anchor_cache {
+    bool init;
+    float x[OBB_POINT_COUNT];
+    float y[OBB_POINT_COUNT];
+    float stride[OBB_POINT_COUNT];
+};
+
+static bool build_obb_anchor_cache(struct obb_anchor_cache *cache)
+{
+    static const int strides[3] = {8, 16, 32};
+    int idx = 0;
+    int si;
+    if (!cache)
+        return false;
+    if (cache->init)
+        return true;
+    for (si = 0; si < 3; si++) {
+        int s = strides[si];
+        int gh = ALGO_STREAM_SIZE / s;
+        int gw = ALGO_STREAM_SIZE / s;
+        int gy;
+        int gx;
+        for (gy = 0; gy < gh; gy++) {
+            for (gx = 0; gx < gw; gx++) {
+                if (idx >= OBB_POINT_COUNT)
+                    return false;
+                cache->x[idx] = (float)gx + 0.5f;
+                cache->y[idx] = (float)gy + 0.5f;
+                cache->stride[idx] = (float)s;
+                idx++;
+            }
+        }
+    }
+    if (idx != OBB_POINT_COUNT)
+        return false;
+    cache->init = true;
+    return true;
+}
+
+static bool infer_obb_output_views(const struct yolo_model *m, const rknn_output *outs,
+                                   struct tensor_cn_view *dist_view,
+                                   struct tensor_cn_view *cls_view,
+                                   struct tensor_cn_view *angle_view)
+{
+    int dist_idx = -1;
+    int cls_idx = -1;
+    int angle_idx = -1;
+    int ones[4];
+    int ones_count = 0;
+    uint32_t i;
+
+    for (i = 0; i < m->io_num.n_output; i++) {
+        struct tensor_cn_view tv;
+        if (!build_tensor_cn_view(&m->output_attrs[i], (const float *)outs[i].buf, &tv))
+            continue;
+        if (tv.n != OBB_POINT_COUNT)
+            continue;
+        if (tv.c == 4 && dist_idx < 0) {
+            dist_idx = (int)i;
+            continue;
+        }
+        if (tv.c > 1 && cls_idx < 0) {
+            cls_idx = (int)i;
+            continue;
+        }
+        if (tv.c == 1 && ones_count < 4)
+            ones[ones_count++] = (int)i;
+    }
+
+    if (dist_idx < 0)
+        return false;
+    if (cls_idx < 0 && ones_count == 2) {
+        struct tensor_cn_view t0;
+        struct tensor_cn_view t1;
+        float mn0, mx0, mn1, mx1;
+        build_tensor_cn_view(&m->output_attrs[ones[0]], (const float *)outs[ones[0]].buf, &t0);
+        build_tensor_cn_view(&m->output_attrs[ones[1]], (const float *)outs[ones[1]].buf, &t1);
+        tensor_sample_minmax(&t0, &mn0, &mx0);
+        tensor_sample_minmax(&t1, &mn1, &mx1);
+        if (mn0 >= -1.2f && mx0 <= 3.2f) {
+            angle_idx = ones[0];
+            cls_idx = ones[1];
+        } else if (mn1 >= -1.2f && mx1 <= 3.2f) {
+            angle_idx = ones[1];
+            cls_idx = ones[0];
+        } else {
+            angle_idx = ones[0];
+            cls_idx = ones[1];
+        }
+    }
+    if (angle_idx < 0 && ones_count > 0) {
+        angle_idx = ones[0];
+        if (cls_idx < 0 && ones_count > 1)
+            cls_idx = ones[1];
+    }
+    if (cls_idx < 0 || angle_idx < 0)
+        return false;
+
+    if (!build_tensor_cn_view(&m->output_attrs[dist_idx], (const float *)outs[dist_idx].buf, dist_view))
+        return false;
+    if (!build_tensor_cn_view(&m->output_attrs[cls_idx], (const float *)outs[cls_idx].buf, cls_view))
+        return false;
+    if (!build_tensor_cn_view(&m->output_attrs[angle_idx], (const float *)outs[angle_idx].buf, angle_view))
+        return false;
+    return dist_view->c == 4 && angle_view->c == 1 && cls_view->c >= 1 &&
+           dist_view->n == OBB_POINT_COUNT && cls_view->n == OBB_POINT_COUNT &&
+           angle_view->n == OBB_POINT_COUNT;
+}
+
+static int decode_yolov8_obb_outputs(const struct yolo_model *m, const rknn_output *outs,
+                                     float conf_thr, int src_w, int src_h,
+                                     struct det_box *out, int *out_count)
+{
+    static struct obb_anchor_cache anchor_cache = {0};
+    struct det_box cand[MAX_DETS * 4];
+    struct tensor_cn_view dist_view;
+    struct tensor_cn_view cls_view;
+    struct tensor_cn_view angle_view;
+    const int pre_nms_cap = MAX_DETS * 4;
+    int cls_count;
+    int cls_start = 0;
+    int cls_end;
+    int i;
+    int count = 0;
+
+    *out_count = 0;
+    if (m->in_w != ALGO_STREAM_SIZE || m->in_h != ALGO_STREAM_SIZE)
+        return -1;
+    if (!build_obb_anchor_cache(&anchor_cache))
+        return -1;
+    if (!infer_obb_output_views(m, outs, &dist_view, &cls_view, &angle_view))
+        return -1;
+
+    cls_count = cls_view.c;
+    if (m->class_count > 0 && m->class_count < cls_count)
+        cls_count = m->class_count;
+    cls_end = cls_count;
+    if (m->class_filter >= 0 && m->class_filter < cls_count) {
+        cls_start = m->class_filter;
+        cls_end = cls_start + 1;
+    }
+
+    for (i = 0; i < OBB_POINT_COUNT; i++) {
+        int c;
+        int best_id = cls_start;
+        float best = -1.0f;
+        float l;
+        float t;
+        float r;
+        float b;
+        float angle;
+        float off_x;
+        float off_y;
+        float cos_a;
+        float sin_a;
+        float stride;
+        struct det_box det;
+
+        for (c = cls_start; c < cls_end; c++) {
+            float p = sigmoidf_local(tensor_cn_read(&cls_view, c, i));
+            if (p > best) {
+                best = p;
+                best_id = c;
+            }
+        }
+        if (best < conf_thr)
+            continue;
+
+        l = tensor_cn_read(&dist_view, 0, i);
+        t = tensor_cn_read(&dist_view, 1, i);
+        r = tensor_cn_read(&dist_view, 2, i);
+        b = tensor_cn_read(&dist_view, 3, i);
+        angle = tensor_cn_read(&angle_view, 0, i);
+        if (!(l >= 0.0f && t >= 0.0f && r >= 0.0f && b >= 0.0f))
+            continue;
+
+        off_x = (r - l) * 0.5f;
+        off_y = (b - t) * 0.5f;
+        cos_a = cosf(angle);
+        sin_a = sinf(angle);
+        stride = anchor_cache.stride[i];
+
+        memset(&det, 0, sizeof(det));
+        det.cx = (anchor_cache.x[i] + off_x * cos_a - off_y * sin_a) * stride;
+        det.cy = (anchor_cache.y[i] + off_x * sin_a + off_y * cos_a) * stride;
+        det.w = (l + r) * stride;
+        det.h = (t + b) * stride;
+        det.angle = angle;
+        det.conf = best;
+        det.cls = best_id;
+        if (det.w < 2.0f || det.h < 2.0f)
+            continue;
+        det_quad_from_obb(&det);
+        clamp_box(&det, src_w, src_h);
+        if (count < pre_nms_cap) {
+            cand[count++] = det;
+        } else {
+            int k;
+            int min_i = 0;
+            float min_conf = cand[0].conf;
+            for (k = 1; k < pre_nms_cap; k++) {
+                if (cand[k].conf < min_conf) {
+                    min_conf = cand[k].conf;
+                    min_i = k;
+                }
+            }
+            if (det.conf > min_conf)
+                cand[min_i] = det;
+        }
+    }
+
+    rotated_nms_inplace(cand, &count, m->nms_iou_thr, m->max_det);
+    if (count > MAX_DETS)
+        count = MAX_DETS;
+    memcpy(out, cand, (size_t)count * sizeof(out[0]));
+    *out_count = count;
+    return 0;
+}
+
 static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src_w, int src_h,
                             float conf_thr, struct det_box *out, int *out_count,
                             struct detect_decode_diag *diag)
@@ -3188,6 +4147,24 @@ static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src
     ret = rknn_outputs_get(m->ctx, m->io_num.n_output, outs, NULL);
     if (ret < 0) return ret;
 
+    if (m->detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
+        ret = decode_yolov8_obb_outputs(m, outs, conf_thr, src_w, src_h, out, out_count);
+        if (ret < 0) {
+            *out_count = 0;
+            rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+            return ret;
+        }
+        if (diag) {
+            diag->rows_raw = 0;
+            diag->heads_raw = *out_count;
+            diag->rows_keep = 0;
+            diag->heads_keep = *out_count;
+            diag->mode = (*out_count > 0) ? PLATE_DECODE_OBB : PLATE_DECODE_NONE;
+        }
+        rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+        return 0;
+    }
+
     for (i = 0; i < m->io_num.n_output; i++) {
         const rknn_tensor_attr *a = &m->output_attrs[i];
         if (a->n_dims == 3 && rows_count == 0)
@@ -3213,7 +4190,7 @@ static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src
         for (i2 = 0; i2 < heads_count && n < MAX_DETS; i2++)
             out[n++] = heads_out[i2];
         *out_count = n;
-        nms_inplace(out, out_count, 0.45f);
+        nms_inplace(out, out_count, m->nms_iou_thr);
         if (diag) {
             diag->mode = PLATE_DECODE_MERGED;
             diag->rows_keep = rows_count;
@@ -3222,7 +4199,7 @@ static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src
     } else if (rows_count > 0) {
         memcpy(out, rows_out, (size_t)rows_count * sizeof(out[0]));
         *out_count = rows_count;
-        nms_inplace(out, out_count, 0.45f);
+        nms_inplace(out, out_count, m->nms_iou_thr);
         if (diag) {
             diag->mode = PLATE_DECODE_ROWS;
             diag->rows_keep = *out_count;
@@ -3230,7 +4207,7 @@ static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src
     } else if (heads_count > 0) {
         memcpy(out, heads_out, (size_t)heads_count * sizeof(out[0]));
         *out_count = heads_count;
-        nms_inplace(out, out_count, 0.45f);
+        nms_inplace(out, out_count, m->nms_iou_thr);
         if (diag) {
             diag->mode = PLATE_DECODE_HEADS;
             diag->heads_keep = *out_count;
@@ -3242,6 +4219,8 @@ static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src
         }
     }
 
+    if (*out_count > m->max_det)
+        *out_count = m->max_det;
     if (*out_count > MAX_DETS)
         *out_count = MAX_DETS;
 
@@ -3376,7 +4355,15 @@ static const char *plate_decode_mode_str(int mode)
     if (mode == PLATE_DECODE_ROWS) return "rows";
     if (mode == PLATE_DECODE_HEADS) return "heads";
     if (mode == PLATE_DECODE_MERGED) return "merged";
+    if (mode == PLATE_DECODE_OBB) return "obb";
     return "none";
+}
+
+static const char *detector_type_str(int mode)
+{
+    if (mode == DETECTOR_YOLOV8_OBB_RKNN)
+        return "yolov8_obb_rknn";
+    return "yolov5";
 }
 
 static const char *ocr_channel_order_str(int mode)
@@ -3390,6 +4377,7 @@ static const char *ocr_crop_mode_str(int mode)
     if (mode == OCR_CROP_TIGHT) return "tight";
     if (mode == OCR_CROP_BOX_PAD) return "box-pad";
     if (mode == OCR_CROP_MATCH) return "match";
+    if (mode == OCR_CROP_OBB_WARP) return "obb_warp";
     return "fixed";
 }
 
@@ -3671,6 +4659,13 @@ static int parse_roi_arg(const char *arg, struct det_box *b)
     b->y2 = y2;
     b->conf = 1.0f;
     b->cls = 0;
+    b->has_obb = 0;
+    b->cx = 0.0f;
+    b->cy = 0.0f;
+    b->w = 0.0f;
+    b->h = 0.0f;
+    b->angle = 0.0f;
+    memset(b->quad, 0, sizeof(b->quad));
     return 0;
 }
 
@@ -3699,6 +4694,7 @@ static int run_offline_once(struct app_ctx *ctx)
     int64_t ts_us;
     const uint8_t *det_src_rgb = NULL;
     float occ_ratio = 0.0f;
+    bool used_obb_warp = false;
 
     if (read_ppm_rgb888(ctx->opt.offline_image_path, &rgb, &w, &h) < 0) {
         fprintf(stderr, "Offline image load failed (need PPM P6): %s\n",
@@ -3708,6 +4704,9 @@ static int run_offline_once(struct app_ctx *ctx)
     ctx->frame_width = (uint32_t)w;
     ctx->frame_height = (uint32_t)h;
     det_src_rgb = rgb;
+    plate_crop = malloc((size_t)w * h * 3U);
+    if (!plate_crop)
+        goto out;
     if (ctx->opt.sw_preproc) {
         rgb_detect = malloc((size_t)w * h * 3U);
         if (!rgb_detect)
@@ -3798,21 +4797,17 @@ static int run_offline_once(struct app_ctx *ctx)
 
     pd.box = box;
     pd.color = classify_plate_color_rgb(rgb, w, h, &pd.box);
-    compute_ocr_crop_box(ctx, &pd.box, &pd.crop_box);
-    crop_w = pd.crop_box.x2 - pd.crop_box.x1 + 1;
-    crop_h = pd.crop_box.y2 - pd.crop_box.y1 + 1;
-    plate_crop = malloc((size_t)crop_w * crop_h * 3U);
-    if (!plate_crop)
+    if (!prepare_plate_crop_rgb888(ctx, rgb, w, h, &pd.box,
+                                   plate_crop, w, h, &pd.crop_box, &crop_w, &crop_h,
+                                   &occ_ratio, &used_obb_warp))
         goto out;
-    copy_crop_rgb888(rgb, w, &pd.crop_box, plate_crop);
-    occ_ratio = estimate_ocr_occ_ratio(ctx, crop_w, crop_h);
     if (ctx->opt.ocr_min_occ_ratio > 0.0f &&
         occ_ratio < ctx->opt.ocr_min_occ_ratio &&
-        ctx->opt.ocr_crop_mode != OCR_CROP_TIGHT) {
+        ctx->opt.ocr_crop_mode != OCR_CROP_TIGHT &&
+        !used_obb_warp) {
         struct det_box recrop_box;
         float old_occ = occ_ratio;
         int new_w, new_h;
-        uint8_t *new_crop;
         const char *mode_tag = "tight";
         bool have_recap = false;
         bool is_match_mode = (ctx->opt.ocr_crop_mode == OCR_CROP_MATCH);
@@ -3829,11 +4824,8 @@ static int run_offline_once(struct app_ctx *ctx)
         } else {
             new_w = recrop_box.x2 - recrop_box.x1 + 1;
             new_h = recrop_box.y2 - recrop_box.y1 + 1;
-            new_crop = malloc((size_t)new_w * new_h * 3U);
-            if (new_crop) {
-                copy_crop_rgb888(rgb, w, &recrop_box, new_crop);
-                free(plate_crop);
-                plate_crop = new_crop;
+            if (new_w > 0 && new_h > 0 && new_w <= w && new_h <= h) {
+                copy_crop_rgb888(rgb, w, &recrop_box, plate_crop);
                 pd.crop_box = recrop_box;
                 crop_w = new_w;
                 crop_h = new_h;
@@ -4196,6 +5188,7 @@ static void *infer_thread_main(void *arg)
             int plate_h;
             float sharpness = 0.0f;
             float occ_ratio = 0.0f;
+            bool used_obb_warp = false;
             char overlay_txt[32];
             pd.box = stable_plates[i];
             if (ctx->opt.plate_refine) {
@@ -4210,14 +5203,14 @@ static void *infer_thread_main(void *arg)
                 continue;
             pd.parent_car = parent;
             pd.color = classify_plate_color_rgb(rgb_full, (int)ctx->frame_width, (int)ctx->frame_height, &pd.box);
-            compute_ocr_crop_box(ctx, &pd.box, &pd.crop_box);
-            crop_w = pd.crop_box.x2 - pd.crop_box.x1 + 1;
-            crop_h = pd.crop_box.y2 - pd.crop_box.y1 + 1;
-            copy_crop_rgb888(rgb_full, (int)ctx->frame_width, &pd.crop_box, plate_crop);
-            occ_ratio = estimate_ocr_occ_ratio(ctx, crop_w, crop_h);
+            if (!prepare_plate_crop_rgb888(ctx, rgb_full, (int)ctx->frame_width, (int)ctx->frame_height,
+                                           &pd.box, plate_crop, (int)ctx->frame_width, (int)ctx->frame_height,
+                                           &pd.crop_box, &crop_w, &crop_h, &occ_ratio, &used_obb_warp))
+                continue;
             if (ctx->opt.ocr_min_occ_ratio > 0.0f &&
                 occ_ratio < ctx->opt.ocr_min_occ_ratio &&
-                ctx->opt.ocr_crop_mode != OCR_CROP_TIGHT) {
+                ctx->opt.ocr_crop_mode != OCR_CROP_TIGHT &&
+                !used_obb_warp) {
                 struct det_box recrop_box;
                 float old_occ = occ_ratio;
                 int new_w, new_h;
@@ -4239,14 +5232,17 @@ static void *infer_thread_main(void *arg)
                 } else {
                     new_w = recrop_box.x2 - recrop_box.x1 + 1;
                     new_h = recrop_box.y2 - recrop_box.y1 + 1;
-                    copy_crop_rgb888(rgb_full, (int)ctx->frame_width, &recrop_box, plate_crop);
-                    pd.crop_box = recrop_box;
-                    crop_w = new_w;
-                    crop_h = new_h;
-                    occ_ratio = estimate_ocr_occ_ratio(ctx, crop_w, crop_h);
-                    fprintf(stderr,
-                            "[ocr-recrop] frame=%" PRIu64 " trigger=1 old_occ=%.3f new_mode=%s new_occ=%.3f\n",
-                            seq, old_occ, mode_tag, occ_ratio);
+                    if (new_w > 0 && new_h > 0 &&
+                        new_w <= (int)ctx->frame_width && new_h <= (int)ctx->frame_height) {
+                        copy_crop_rgb888(rgb_full, (int)ctx->frame_width, &recrop_box, plate_crop);
+                        pd.crop_box = recrop_box;
+                        crop_w = new_w;
+                        crop_h = new_h;
+                        occ_ratio = estimate_ocr_occ_ratio(ctx, crop_w, crop_h);
+                        fprintf(stderr,
+                                "[ocr-recrop] frame=%" PRIu64 " trigger=1 old_occ=%.3f new_mode=%s new_occ=%.3f\n",
+                                seq, old_occ, mode_tag, occ_ratio);
+                    }
                 }
             }
             pd.ocr_in_occ_ratio = occ_ratio;
@@ -4525,6 +5521,30 @@ int main(int argc, char **argv)
         print_usage(argv[0]);
         goto out;
     }
+    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+        ctx.opt.ocr_crop_mode != OCR_CROP_OBB_WARP) {
+        fprintf(stderr,
+                "[cfg] detector=yolov8_obb_rknn requires ocr-crop-mode=obb_warp, force switching\n");
+        ctx.opt.ocr_crop_mode = OCR_CROP_OBB_WARP;
+    }
+    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+        ctx.opt.ocr_channel_order != OCR_CH_BGR) {
+        fprintf(stderr,
+                "[cfg] detector=yolov8_obb_rknn keeps OCR contract, force ocr-channel-order=bgr\n");
+        ctx.opt.ocr_channel_order = OCR_CH_BGR;
+    }
+    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+        ctx.opt.ocr_resize_mode != OCR_RESIZE_LETTERBOX) {
+        fprintf(stderr,
+                "[cfg] detector=yolov8_obb_rknn keeps OCR contract, force ocr-resize-mode=letterbox\n");
+        ctx.opt.ocr_resize_mode = OCR_RESIZE_LETTERBOX;
+    }
+    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+        ctx.opt.ocr_resize_kernel != OCR_KERNEL_NN) {
+        fprintf(stderr,
+                "[cfg] detector=yolov8_obb_rknn keeps OCR contract, force ocr-resize-kernel=nn\n");
+        ctx.opt.ocr_resize_kernel = OCR_KERNEL_NN;
+    }
     offline_mode = (ctx.opt.offline_image_path && ctx.opt.offline_image_path[0] != '\0');
 
     signal(SIGINT, signal_handler);
@@ -4546,10 +5566,16 @@ int main(int argc, char **argv)
     if (!offline_mode && init_copy_slots(&ctx) < 0)
         goto out;
     if (!offline_mode &&
-        rknn_model_load(&ctx.veh_model, "vehicle", ctx.opt.veh_model_path, ctx.label_count) < 0)
+        rknn_model_load(&ctx.veh_model, "vehicle", ctx.opt.veh_model_path,
+                        ctx.label_count, DETECTOR_YOLOV5) < 0)
         goto out;
-    if (rknn_model_load(&ctx.plate_model, "plate", ctx.opt.plate_model_path, 1) < 0)
+    if (rknn_model_load(&ctx.plate_model, "plate", ctx.opt.plate_model_path,
+                        (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) ? 0 : 1,
+                        ctx.opt.plate_detector_type) < 0)
         goto out;
+    ctx.plate_model.nms_iou_thr = ctx.opt.plate_nms_iou;
+    ctx.plate_model.max_det = ctx.opt.plate_max_det;
+    ctx.plate_model.class_filter = ctx.opt.plate_class_id;
     if (rknn_ocr_model_load(&ctx.ocr_model, "ocr", ctx.opt.ocr_model_path) < 0)
         goto out;
 
@@ -4578,6 +5604,7 @@ int main(int argc, char **argv)
     if (offline_mode) {
         fprintf(stderr,
                 "Start OFFLINE OCR: image=%s roi=%s auto_det=%d min_plate=%.2f det_resize=%s plate_refine=%d "
+                "plate_det=%s nms_iou=%.2f max_det=%d cls_filter=%d "
                 "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_kernel=%s ocr_pp=%s min_h=%d min_sharp=%.2f min_occ=%.2f "
                 "crop_src=fullres_raw det_src=%s\n",
                 ctx.opt.offline_image_path,
@@ -4586,6 +5613,10 @@ int main(int argc, char **argv)
                 ctx.opt.min_plate_conf,
                 det_resize_mode_str(ctx.opt.det_resize_mode),
                 ctx.opt.plate_refine,
+                detector_type_str(ctx.opt.plate_detector_type),
+                ctx.opt.plate_nms_iou,
+                ctx.opt.plate_max_det,
+                ctx.opt.plate_class_id,
                 ocr_channel_order_str(ctx.opt.ocr_channel_order),
                 ocr_crop_mode_str(ctx.opt.ocr_crop_mode),
                 ocr_resize_mode_str(ctx.opt.ocr_resize_mode),
@@ -4612,6 +5643,7 @@ int main(int argc, char **argv)
     fprintf(stderr,
             "Start LPR loop: fps=%d src=%s pixel=%s swap16=%s min_car=%.2f min_plate=%.2f plate_only=%d "
             "sw_preproc=%d fpga_a_mask=%d ped_event=%d det_resize=%s plate_refine=%d "
+            "plate_det=%s nms_iou=%.2f max_det=%d cls_filter=%d "
             "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_kernel=%s ocr_pp=%s min_h=%d min_sharp=%.2f min_occ=%.2f show_crop=%d "
             "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d pred_log=%s\n",
             ctx.opt.fps,
@@ -4625,6 +5657,10 @@ int main(int argc, char **argv)
             ctx.opt.ped_event,
             det_resize_mode_str(ctx.opt.det_resize_mode),
             ctx.opt.plate_refine,
+            detector_type_str(ctx.opt.plate_detector_type),
+            ctx.opt.plate_nms_iou,
+            ctx.opt.plate_max_det,
+            ctx.opt.plate_class_id,
             ocr_channel_order_str(ctx.opt.ocr_channel_order),
             ocr_crop_mode_str(ctx.opt.ocr_crop_mode),
             ocr_resize_mode_str(ctx.opt.ocr_resize_mode),
