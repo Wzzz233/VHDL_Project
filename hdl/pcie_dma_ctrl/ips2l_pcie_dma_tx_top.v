@@ -90,10 +90,7 @@ module ips2l_pcie_dma_tx_top #(
     //rst tlp cnt
     input                               i_tx_restart
     ,
-    output  wire                        o_mwr_tx_busy,
-    output  wire                        o_mwr_payload_fire,
-    output  wire                        o_mwr_payload_active,
-    output  wire                        o_mwr_req_start_pulse
+    output  wire                        o_mwr_tx_busy
     //output  wire    [13:0]              o_dbg_bus_mrd_tx        ,
     //output  wire    [72:0]              o_dbg_bus_mwr_tx
 
@@ -104,7 +101,6 @@ wire      [9:0]     mwr_rd_length;
 wire                mwr_tx_busy;
 wire                mwr_tx_hold;
 wire                mwr_tlp_tx;
-wire                mwr_req_start_pulse;
 wire                mwr_gen_tlp_start;
 wire      [127:0]   mwr_rd_data;
 wire                mwr_last_data;
@@ -271,15 +267,11 @@ u_ips2l_pcie_dma_mwr_tx_ctrl
     .o_mwr_tx_busy              (mwr_tx_busy                ),
     .o_mwr_tx_hold              (mwr_tx_hold                ),
     .o_mwr_tlp_tx               (mwr_tlp_tx                 ),
-    .o_mwr_req_start_pulse      (mwr_req_start_pulse        ),
     .i_tx_restart               (i_tx_restart               )
     //debug
     //.o_dbg_bus                  (o_dbg_bus_mwr_tx           )
 );
 
 assign o_mwr_tx_busy = mwr_tx_busy;
-assign o_mwr_payload_fire = mwr_tlp_tx && o_axis_slave2_tvld && i_axis_slave2_trdy;
-assign o_mwr_payload_active = mwr_tlp_tx;
-assign o_mwr_req_start_pulse = mwr_req_start_pulse;
 
 endmodule

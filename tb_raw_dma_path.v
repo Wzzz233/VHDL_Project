@@ -250,13 +250,6 @@ always @(posedge clk) begin
     end
 end
 
-// Semantic model assertions: verify startup-to-steady transition ordering for
-// the queue-only raw scheduler with RAW_BOOTSTRAP_WORDS=2.
-// In BGRX mode the first 4 beats should be:
-//   beat 0 (lo phase): word 0
-//   beat 1 (hi phase): word 0
-//   beat 2 (lo phase): word 1
-//   beat 3 (hi phase): word 1
 reg [7:0] first_beat_expected [0:3];
 reg [2:0] first_beat_idx;
 reg       first_beat_fail;

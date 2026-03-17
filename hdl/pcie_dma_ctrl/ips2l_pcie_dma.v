@@ -79,16 +79,6 @@ module ips2l_pcie_dma #(
     output  wire                        o_cross_4kb_boundary    ,
     output  wire                        o_tx_restart_ext        ,
     output  wire                        o_frame_done_pulse_ext  ,
-    output  wire    [31:0]              o_prep_ctrl_ext         ,
-    output  wire    [31:0]              o_prep_clahe_ext        ,
-    output  wire    [31:0]              o_prep_usm_ext          ,
-    output  wire    [31:0]              o_prep_med_ext          ,
-    output  wire    [31:0]              o_roi_x1y1_ext          ,
-    output  wire    [31:0]              o_roi_x2y2_ext          ,
-    output  wire    [31:0]              o_roi_ctrl_ext          ,
-    output  wire                        o_mwr_payload_fire_ext  ,
-    output  wire                        o_mwr_payload_active_ext,
-    output  wire                        o_mwr_req_start_pulse_ext,
     //external BAR2 read data override (for frame data via MWR)
     output  wire                        o_bar2_rd_clk_en_ext    ,
     output  wire    [ADDR_WIDTH-1:0]    o_bar2_rd_addr_ext      ,
@@ -131,13 +121,6 @@ wire                            mrd64_req_ack;
 wire        [9:0]               req_length;
 wire        [63:0]              req_addr;
 wire        [31:0]              req_data;
-wire        [31:0]              prep_ctrl_cfg;
-wire        [31:0]              prep_clahe_cfg;
-wire        [31:0]              prep_usm_cfg;
-wire        [31:0]              prep_med_cfg;
-wire        [31:0]              roi_x1y1_cfg;
-wire        [31:0]              roi_x2y2_cfg;
-wire        [31:0]              roi_ctrl_cfg;
 
 
 //axis_slave0 interface
@@ -158,9 +141,6 @@ wire                            dma_axis_slave2_tvld ;
 wire        [127:0]             dma_axis_slave2_tdata;
 wire                            dma_axis_slave2_tlast;
 wire                            dma_axis_slave2_tuser;
-wire                            mwr_payload_fire;
-wire                            mwr_payload_active;
-wire                            mwr_req_start_pulse;
 
 //**********************************************************************
 //bar0 rd interface
@@ -177,11 +157,6 @@ wire                            bar2_rd_clk_en;
 wire        [ADDR_WIDTH-1:0]    bar2_rd_addr;
 wire        [127:0]             bar2_rd_data_int;  // from internal BAR2 RAM
 wire        [127:0]             bar2_rd_data;      // muxed: internal or external
-//rst tlp cnt
-wire                            tx_restart;
-wire        [63:0]              dma_check_result;
-wire                            mwr_tx_busy;
-wire                            frame_done_pulse;
 
 // External BAR2 read override for MWR frame data
 assign o_bar2_rd_clk_en_ext = bar2_rd_clk_en;
@@ -189,17 +164,12 @@ assign o_bar2_rd_addr_ext   = bar2_rd_addr;
 assign bar2_rd_data         = i_ext_bar2_rd_sel ? i_ext_bar2_rd_data : bar2_rd_data_int;
 assign o_tx_restart_ext     = tx_restart;
 assign o_frame_done_pulse_ext = frame_done_pulse;
-assign o_prep_ctrl_ext      = prep_ctrl_cfg;
-assign o_prep_clahe_ext     = prep_clahe_cfg;
-assign o_prep_usm_ext       = prep_usm_cfg;
-assign o_prep_med_ext       = prep_med_cfg;
-assign o_roi_x1y1_ext       = roi_x1y1_cfg;
-assign o_roi_x2y2_ext       = roi_x2y2_cfg;
-assign o_roi_ctrl_ext       = roi_ctrl_cfg;
-assign o_mwr_payload_fire_ext = mwr_payload_fire;
-assign o_mwr_payload_active_ext = mwr_payload_active;
-assign o_mwr_req_start_pulse_ext = mwr_req_start_pulse;
 //**********************************************************************
+//rst tlp cnt
+wire                            tx_restart;
+wire        [63:0]              dma_check_result;
+wire                            mwr_tx_busy;
+wire                            frame_done_pulse;
 //debug bus
 //wire        [42:0]              dbg_bus_rx_ctrl;
 //wire        [43:0]              dbg_bus_mrd_tx;
@@ -314,13 +284,6 @@ u_ips2l_pcie_dma_controller
     .o_cross_4kb_boundary       (o_cross_4kb_boundary       ),
     .i_mwr_tx_busy              (mwr_tx_busy                ),
     .o_frame_done_pulse         (frame_done_pulse           ),
-    .o_prep_ctrl                (prep_ctrl_cfg              ),
-    .o_prep_clahe               (prep_clahe_cfg             ),
-    .o_prep_usm                 (prep_usm_cfg               ),
-    .o_prep_med                 (prep_med_cfg               ),
-    .o_roi_x1y1                 (roi_x1y1_cfg               ),
-    .o_roi_x2y2                 (roi_x2y2_cfg               ),
-    .o_roi_ctrl                 (roi_ctrl_cfg               ),
     //rst tlp cnt
     .i_dma_check_result         (dma_check_result           ),
     .o_tx_restart               (tx_restart                 )
@@ -403,10 +366,7 @@ u_ips2l_pcie_dma_tx_top
     .o_tag_full                 (tag_full                   ),
     //rst tlp cnt
     .i_tx_restart               (tx_restart                 ),
-    .o_mwr_tx_busy              (mwr_tx_busy                ),
-    .o_mwr_payload_fire         (mwr_payload_fire           ),
-    .o_mwr_payload_active       (mwr_payload_active         ),
-    .o_mwr_req_start_pulse      (mwr_req_start_pulse        )
+    .o_mwr_tx_busy              (mwr_tx_busy                )
     //debug
     //.o_dbg_bus_mrd_tx           (dbg_bus_mrd_tx             ),
     //.o_dbg_bus_mwr_tx           (dbg_bus_mwr_tx             )

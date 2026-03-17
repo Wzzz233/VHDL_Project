@@ -23,11 +23,6 @@ PLATE_ON_CAR_ONLY="0"
 PLATE_ONLY="1"
 SW_PREPROC="0"
 FPGA_A_MASK="0"
-FPGA_PREPROC_PROFILE="ocr_stroke"
-FPGA_PREPROC_TARGET="ocr"
-FPGA_A_FORMAT="yenh"
-FPGA_CLAHE="tile=32x32,clip=16,strength=128"
-FPGA_USM="gain=0.375,thr=3,limit=10"
 A_PROJ_RATIO="0.35"
 A_ROI_IOU_MIN="0.05"
 PED_EVENT="0"
@@ -36,20 +31,22 @@ RED_RATIO_THR="0.002"
 STOPLINE_RATIO="0.55"
 DET_RESIZE_MODE="letterbox"
 PLATE_REFINE="1"
-OCR_CHANNEL_ORDER="bgr"
-OCR_CROP_MODE="match"
-OCR_RESIZE_MODE="letterbox"
+PLATE_DETECTOR_TYPE="yolov5"
+PLATE_NMS_IOU="0.45"
+PLATE_MAX_DET="128"
+PLATE_CLASS_ID="-1"
+OCR_CHANNEL_ORDER="rgb"
+OCR_CROP_MODE="fixed"
+OCR_RESIZE_MODE="stretch"
 OCR_RESIZE_KERNEL="nn"
 OCR_PREPROC="none"
 SHOW_CROP_BOX="0"
 OCR_MIN_PLATE_H="24"
 OCR_MIN_SHARPNESS="20"
-OCR_MIN_OCC_RATIO="0.90"
+OCR_MIN_OCC_RATIO="0"
 OCR_CTC_DIAG="0"
 OCR_CROP_DUMP_DIR=""
 OCR_CROP_DUMP_MAX="20"
-FPGA_PREPROC_DUMP_PATH=""
-FPGA_PREPROC_DUMP_MAX="1"
 OFFLINE_IMAGE=""
 OFFLINE_ROI=""
 OFFLINE_DETECT_PLATE="1"
@@ -82,11 +79,6 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --plate-only <0|1>         Disable vehicle dependency for plate output (default: ${PLATE_ONLY})
   --sw-preproc <0|1>         Enable software preproc A/B path (default: ${SW_PREPROC})
   --fpga-a-mask <0|1>        Enable FPGA A-channel ROI fusion (default: ${FPGA_A_MASK})
-  --fpga-preproc-profile <m> raw|clahe|clahe_usm|median|median_clahe_usm|ocr_stroke (default: ${FPGA_PREPROC_PROFILE})
-  --fpga-preproc-target <m>  ocr|all (default: ${FPGA_PREPROC_TARGET})
-  --fpga-a-format <m>        flags|yenh (default: ${FPGA_A_FORMAT})
-  --fpga-clahe <cfg>         tile=32x32,clip=16,strength=128 (default: ${FPGA_CLAHE})
-  --fpga-usm <cfg>           gain=0.375,thr=3,limit=10 (default: ${FPGA_USM})
   --a-proj-ratio <v>         A-channel projection threshold ratio (default: ${A_PROJ_RATIO})
   --a-roi-iou-min <v>        Min IoU for A-ROI filtering (default: ${A_ROI_IOU_MIN})
   --ped-event <0|1>          Enable pedestrian red-light event (default: ${PED_EVENT})
@@ -95,8 +87,12 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --stopline-ratio <v>       Stopline Y ratio [0,1] (default: ${STOPLINE_RATIO})
   --det-resize-mode <m>      Detect resize: stretch|letterbox (default: ${DET_RESIZE_MODE})
   --plate-refine <0|1>       Enable local high-res plate refine (default: ${PLATE_REFINE})
+  --plate-detector-type <m>  Plate detector: yolov5|yolov8_obb_rknn (default: ${PLATE_DETECTOR_TYPE})
+  --plate-nms-iou <v>        Plate NMS IoU threshold (default: ${PLATE_NMS_IOU})
+  --plate-max-det <n>        Plate max detections after NMS (default: ${PLATE_MAX_DET})
+  --plate-class-id <n>       Optional class filter for plate model (-1 disables, default: ${PLATE_CLASS_ID})
   --ocr-channel-order <m>    OCR input order: rgb|bgr (default: ${OCR_CHANNEL_ORDER})
-  --ocr-crop-mode <m>        OCR crop mode: fixed|box|tight|box-pad|match (default: ${OCR_CROP_MODE})
+  --ocr-crop-mode <m>        OCR crop mode: fixed|box|tight|box-pad|match|obb_warp (default: ${OCR_CROP_MODE})
   --ocr-resize-mode <m>      OCR resize mode: stretch|letterbox (default: ${OCR_RESIZE_MODE})
   --ocr-resize-kernel <m>    OCR resize kernel: nn|bilinear (default: ${OCR_RESIZE_KERNEL})
   --ocr-preproc <m>          OCR crop preproc: none|gray|bin (default: ${OCR_PREPROC})
@@ -107,8 +103,6 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --ocr-ctc-diag <0|1>       Print CTC decode diagnostics (default: ${OCR_CTC_DIAG})
   --ocr-crop-dump-dir <p>    Dump OCR crops+inputs to directory (default: off)
   --ocr-crop-dump-max <n>    Max dumped OCR samples (default: ${OCR_CROP_DUMP_MAX})
-  --fpga-preproc-dump-path <p> Dump preprocessed full frame to PPM path (default: off)
-  --fpga-preproc-dump-max <n>  Max dumped preprocessed full frames (default: ${FPGA_PREPROC_DUMP_MAX})
 EOF
 }
 
@@ -139,11 +133,6 @@ while [[ $# -gt 0 ]]; do
     --plate-only) PLATE_ONLY="$2"; shift 2 ;;
     --sw-preproc) SW_PREPROC="$2"; shift 2 ;;
     --fpga-a-mask) FPGA_A_MASK="$2"; shift 2 ;;
-    --fpga-preproc-profile) FPGA_PREPROC_PROFILE="$2"; shift 2 ;;
-    --fpga-preproc-target) FPGA_PREPROC_TARGET="$2"; shift 2 ;;
-    --fpga-a-format) FPGA_A_FORMAT="$2"; shift 2 ;;
-    --fpga-clahe) FPGA_CLAHE="$2"; shift 2 ;;
-    --fpga-usm) FPGA_USM="$2"; shift 2 ;;
     --a-proj-ratio) A_PROJ_RATIO="$2"; shift 2 ;;
     --a-roi-iou-min) A_ROI_IOU_MIN="$2"; shift 2 ;;
     --ped-event) PED_EVENT="$2"; shift 2 ;;
@@ -152,6 +141,10 @@ while [[ $# -gt 0 ]]; do
     --stopline-ratio) STOPLINE_RATIO="$2"; shift 2 ;;
     --det-resize-mode) DET_RESIZE_MODE="$2"; shift 2 ;;
     --plate-refine) PLATE_REFINE="$2"; shift 2 ;;
+    --plate-detector-type) PLATE_DETECTOR_TYPE="$2"; shift 2 ;;
+    --plate-nms-iou) PLATE_NMS_IOU="$2"; shift 2 ;;
+    --plate-max-det) PLATE_MAX_DET="$2"; shift 2 ;;
+    --plate-class-id) PLATE_CLASS_ID="$2"; shift 2 ;;
     --ocr-channel-order) OCR_CHANNEL_ORDER="$2"; shift 2 ;;
     --ocr-crop-mode) OCR_CROP_MODE="$2"; shift 2 ;;
     --ocr-resize-mode) OCR_RESIZE_MODE="$2"; shift 2 ;;
@@ -164,8 +157,6 @@ while [[ $# -gt 0 ]]; do
     --ocr-ctc-diag) OCR_CTC_DIAG="$2"; shift 2 ;;
     --ocr-crop-dump-dir) OCR_CROP_DUMP_DIR="$2"; shift 2 ;;
     --ocr-crop-dump-max) OCR_CROP_DUMP_MAX="$2"; shift 2 ;;
-    --fpga-preproc-dump-path) FPGA_PREPROC_DUMP_PATH="$2"; shift 2 ;;
-    --fpga-preproc-dump-max) FPGA_PREPROC_DUMP_MAX="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -244,6 +235,10 @@ CMD=(./fpga_lpr_display
   --ocr-model "$OCR_MODEL"
   --ocr-keys "$OCR_KEYS"
   --min-plate-conf "$MIN_PLATE_CONF"
+  --plate-detector-type "$PLATE_DETECTOR_TYPE"
+  --plate-nms-iou "$PLATE_NMS_IOU"
+  --plate-max-det "$PLATE_MAX_DET"
+  --plate-class-id "$PLATE_CLASS_ID"
   --ocr-channel-order "$OCR_CHANNEL_ORDER"
   --ocr-crop-mode "$OCR_CROP_MODE"
   --ocr-resize-mode "$OCR_RESIZE_MODE"
@@ -253,14 +248,8 @@ CMD=(./fpga_lpr_display
   --ocr-min-plate-h "$OCR_MIN_PLATE_H"
   --ocr-min-sharpness "$OCR_MIN_SHARPNESS"
   --ocr-min-occ-ratio "$OCR_MIN_OCC_RATIO"
-  --fpga-preproc-profile "$FPGA_PREPROC_PROFILE"
-  --fpga-preproc-target "$FPGA_PREPROC_TARGET"
-  --fpga-a-format "$FPGA_A_FORMAT"
-  --fpga-clahe "$FPGA_CLAHE"
-  --fpga-usm "$FPGA_USM"
   --ocr-ctc-diag "$OCR_CTC_DIAG"
-  --ocr-crop-dump-max "$OCR_CROP_DUMP_MAX"
-  --fpga-preproc-dump-max "$FPGA_PREPROC_DUMP_MAX")
+  --ocr-crop-dump-max "$OCR_CROP_DUMP_MAX")
 
 if [[ "$OFFLINE_MODE" == "0" ]]; then
   CMD+=(
@@ -302,9 +291,6 @@ fi
 
 if [[ -n "$OCR_CROP_DUMP_DIR" ]]; then
   CMD+=(--ocr-crop-dump-dir "$OCR_CROP_DUMP_DIR")
-fi
-if [[ -n "$FPGA_PREPROC_DUMP_PATH" ]]; then
-  CMD+=(--fpga-preproc-dump-path "$FPGA_PREPROC_DUMP_PATH")
 fi
 
 if [[ -n "$CONNECTOR_ID" ]]; then
