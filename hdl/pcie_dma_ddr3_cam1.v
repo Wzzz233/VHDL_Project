@@ -684,6 +684,10 @@ wire [15:0] cmos1_rgb565_fmt = CAM_SWAP_RB ?
 localparam FORCE_COLOR_BAR_PRE_DDR = 1'b0;
 localparam FORCE_PATTERN_POST_DDR  = 1'b0;
 localparam DMA_OUTPUT_BGRX         = 1'b1;
+// YUV422 byte order selector at camera output:
+//   1'b0: YUYV (Y0 U Y1 V)  [default, 0x4300=0x30]
+//   1'b1: UYVY (U Y0 V Y1)  [use when color/speckle indicates byte-phase/order mismatch]
+localparam YUV422_ORDER_UYVY       = 1'b0;
 // Mainline V3 default: keep bypass unless explicitly enabled.
 localparam PREPROC_ENABLE_DEFAULT  = 1'b0;
 
@@ -909,6 +913,7 @@ function [127:0] pack_4pix_yuyv_to_bgrx;
     input [15:0] w1;
     input [15:0] w2;
     input [15:0] w3;
+    input        order_uyvy;
     input [7:0]  a0;
     input [7:0]  a1;
     input [7:0]  a2;
@@ -922,14 +927,27 @@ function [127:0] pack_4pix_yuyv_to_bgrx;
     reg [7:0] u1;
     reg [7:0] v1;
 begin
-    y0 = w0[15:8];
-    u0 = w0[7:0];
-    y1 = w1[15:8];
-    v0 = w1[7:0];
-    y2 = w2[15:8];
-    u1 = w2[7:0];
-    y3 = w3[15:8];
-    v1 = w3[7:0];
+    if (!order_uyvy) begin
+        // YUYV: w0={Y0,U0}, w1={Y1,V0}, w2={Y2,U1}, w3={Y3,V1}
+        y0 = w0[15:8];
+        u0 = w0[7:0];
+        y1 = w1[15:8];
+        v0 = w1[7:0];
+        y2 = w2[15:8];
+        u1 = w2[7:0];
+        y3 = w3[15:8];
+        v1 = w3[7:0];
+    end else begin
+        // UYVY: w0={U0,Y0}, w1={V0,Y1}, w2={U1,Y2}, w3={V1,Y3}
+        u0 = w0[15:8];
+        y0 = w0[7:0];
+        v0 = w1[15:8];
+        y1 = w1[7:0];
+        u1 = w2[15:8];
+        y2 = w2[7:0];
+        v1 = w3[15:8];
+        y3 = w3[7:0];
+    end
 
     pack_4pix_yuyv_to_bgrx = {
         yuv_to_bgrx32(y3, u1, v1, a3),
@@ -956,10 +974,10 @@ wire [7:0] alpha_lo_0 = (preproc_en && first_pixel_word) ? frame_id : alpha_lo_0
 
 wire [127:0] frame_rd_data_bgrx_lo = pack_4pix_yuyv_to_bgrx(
     frame_rd_data[15:0], frame_rd_data[31:16], frame_rd_data[47:32], frame_rd_data[63:48],
-    alpha_lo_0, alpha_lo_1, alpha_lo_2, alpha_lo_3);
+    YUV422_ORDER_UYVY, alpha_lo_0, alpha_lo_1, alpha_lo_2, alpha_lo_3);
 wire [127:0] frame_rd_hold_bgrx_hi = pack_4pix_yuyv_to_bgrx(
     frame_rd_data_hold[79:64], frame_rd_data_hold[95:80], frame_rd_data_hold[111:96], frame_rd_data_hold[127:112],
-    alpha_hi_0, alpha_hi_1, alpha_hi_2, alpha_hi_3);
+    YUV422_ORDER_UYVY, alpha_hi_0, alpha_hi_1, alpha_hi_2, alpha_hi_3);
 wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
 wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data, preproc_en ? 8'h80 : 8'h00)}};
 wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
