@@ -52,12 +52,10 @@ set_input_delay -clock [get_clocks {cmos1_pclk}] -min 0.5 [get_ports {cmos1_data
 set_false_path -to [get_pins {u_sys_ddr_rstn_sync/sig_async}]
 set_false_path -to [get_pins {u_cmos1_init_done_sync/sig_async}]
 
-# ref_clk <-> pclk_div2 CDC bridge endpoints (point constraints only).
-# Note: constrain synchronizer async inputs only (RTL-visible pins), and
-# avoid mapping-specific primitive pins (opit_*/D, */RS) to keep import robust.
-set_false_path -to [get_pins {*/tx_rst_done_sync/sig_async}]
-set_false_path -to [get_pins {*/phy_rstn_sync/sig_async}]
-set_false_path -to [get_pins {*/word_align_multi_sw_sync/sig_async}]
+# ref_clk <-> pclk_div2 CDC bridge endpoints:
+# keep only deterministic local synchronizers in this FDC file.
+# Deep IP-internal synchronizers are excluded here to avoid import-time
+# failures from implementation-dependent instance naming.
 
 # Local synchronizers in ref_clk domain.
 set_false_path -to [get_pins {u_ref_smlh_linkup_sync/sig_async}]
