@@ -936,40 +936,73 @@ begin
 end
 endfunction
 
-function [7:0] clip_to_u8;
-    input integer value;
+function [7:0] clip_to_u8_s11;
+    input signed [10:0] value;
 begin
-    if (value < 0)
-        clip_to_u8 = 8'd0;
-    else if (value > 255)
-        clip_to_u8 = 8'hFF;
+    if (value < 11'sd0)
+        clip_to_u8_s11 = 8'd0;
+    else if (value > 11'sd255)
+        clip_to_u8_s11 = 8'hFF;
     else
-        clip_to_u8 = value[7:0];
+        clip_to_u8_s11 = value[7:0];
 end
 endfunction
 
-// BT.601 full-range YUV -> BGRX conversion.
-function [31:0] yuv_to_bgrx32;
-    input [7:0] y8;
+// BT.601 full-range YUV -> BGRX conversion for two Y samples sharing one U/V pair.
+function [63:0] pack_2pix_yuv_to_bgrx;
+    input [7:0] y0;
+    input [7:0] y1;
     input [7:0] u8;
     input [7:0] v8;
-    input [7:0] alpha8;
-    integer y_i;
-    integer du;
-    integer dv;
-    integer r_calc;
-    integer g_calc;
-    integer b_calc;
+    input [7:0] a0;
+    input [7:0] a1;
+    reg signed [8:0]  du_s;
+    reg signed [8:0]  dv_s;
+    reg signed [18:0] rv_mul;
+    reg signed [18:0] bu_mul;
+    reg signed [18:0] gu_mul;
+    reg signed [18:0] gv_mul;
+    reg signed [18:0] g_uv_mul;
+    reg signed [10:0] rv_term;
+    reg signed [10:0] bu_term;
+    reg signed [10:0] g_uv_term;
+    reg signed [10:0] y0_s;
+    reg signed [10:0] y1_s;
+    reg signed [10:0] r0_calc;
+    reg signed [10:0] g0_calc;
+    reg signed [10:0] b0_calc;
+    reg signed [10:0] r1_calc;
+    reg signed [10:0] g1_calc;
+    reg signed [10:0] b1_calc;
 begin
-    y_i = $signed({1'b0, y8});
-    du = $signed({1'b0, u8}) - 9'sd128;
-    dv = $signed({1'b0, v8}) - 9'sd128;
+    du_s = $signed({1'b0, u8}) - 9'sd128;
+    dv_s = $signed({1'b0, v8}) - 9'sd128;
 
-    r_calc = y_i + ((11'sd359 * dv) >>> 8);
-    g_calc = y_i - (((8'sd88 * du) + (9'sd183 * dv)) >>> 8);
-    b_calc = y_i + ((11'sd454 * du) >>> 8);
+    rv_mul = 10'sd359 * dv_s;
+    bu_mul = 10'sd454 * du_s;
+    gu_mul = 8'sd88 * du_s;
+    gv_mul = 9'sd183 * dv_s;
+    g_uv_mul = gu_mul + gv_mul;
 
-    yuv_to_bgrx32 = {alpha8, clip_to_u8(r_calc), clip_to_u8(g_calc), clip_to_u8(b_calc)};
+    rv_term = rv_mul >>> 8;
+    bu_term = bu_mul >>> 8;
+    g_uv_term = g_uv_mul >>> 8;
+
+    y0_s = $signed({3'b000, y0});
+    y1_s = $signed({3'b000, y1});
+
+    r0_calc = y0_s + rv_term;
+    g0_calc = y0_s - g_uv_term;
+    b0_calc = y0_s + bu_term;
+
+    r1_calc = y1_s + rv_term;
+    g1_calc = y1_s - g_uv_term;
+    b1_calc = y1_s + bu_term;
+
+    pack_2pix_yuv_to_bgrx = {
+        a1, clip_to_u8_s11(r1_calc), clip_to_u8_s11(g1_calc), clip_to_u8_s11(b1_calc),
+        a0, clip_to_u8_s11(r0_calc), clip_to_u8_s11(g0_calc), clip_to_u8_s11(b0_calc)
+    };
 end
 endfunction
 
@@ -993,6 +1026,8 @@ function [127:0] pack_4pix_yuyv_to_bgrx;
     reg [7:0] v0;
     reg [7:0] u1;
     reg [7:0] v1;
+    reg [63:0] pix01;
+    reg [63:0] pix23;
 begin
     if (!order_uyvy) begin
         // YUYV: w0={Y0,U0}, w1={Y1,V0}, w2={Y2,U1}, w3={Y3,V1}
@@ -1016,12 +1051,10 @@ begin
         y3 = w3[7:0];
     end
 
-    pack_4pix_yuyv_to_bgrx = {
-        yuv_to_bgrx32(y3, u1, v1, a3),
-        yuv_to_bgrx32(y2, u1, v1, a2),
-        yuv_to_bgrx32(y1, u0, v0, a1),
-        yuv_to_bgrx32(y0, u0, v0, a0)
-    };
+    pix01 = pack_2pix_yuv_to_bgrx(y0, y1, u0, v0, a0, a1);
+    pix23 = pack_2pix_yuv_to_bgrx(y2, y3, u1, v1, a2, a3);
+
+    pack_4pix_yuyv_to_bgrx = {pix23, pix01};
 end
 endfunction
 
