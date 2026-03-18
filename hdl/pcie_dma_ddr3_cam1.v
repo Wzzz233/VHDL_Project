@@ -86,6 +86,10 @@ wire			sync_button_rst_n;
 wire			sync_perst_n;
 wire			ref_core_rst_n;				
 wire			s_pclk_rstn;				
+wire			pclk_div2_core_rst_n;
+wire			sys_perst_rst_n;
+wire			ddr_rstn_sys;
+wire			cmos1_init_done_pclk;
 
 // Internal signal
 wire			pclk_div2/*synthesis PAP_MARK_DEBUG="1"*/;  	// 闁活潿鍔嶉崺娑㈠籍閸洘瀵柨娑樼槗2 5gt/s闁哄啳顔愮槐婵囩▔?25MHZ 2.5gt/s闁哄啯婀圭拹?2.5
@@ -204,8 +208,8 @@ assign ven_msi_tc		=	3'd0;
 assign cfg_msi_pending	=	32'd0;
 assign ven_msi_req		=	msi_pending & cfg_msi_en;
 
-always @(posedge pclk_div2 or negedge core_rst_n) begin
-	if (!core_rst_n) begin
+always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
+	if (!pclk_div2_core_rst_n) begin
 		msi_pending <= 1'b0;
 	end else begin
 		if (ven_msi_grant)
@@ -244,6 +248,20 @@ hsst_rst_sync_v1_0  u_pclk_core_rstn_sync (
     .rst_n				(core_rst_n),		
     .sig_async			(1'b1),
     .sig_synced			(s_pclk_rstn)		
+);
+
+hsst_rst_sync_v1_0  u_pclk_div2_core_rstn_sync (
+    .clk				(pclk_div2),
+    .rst_n				(core_rst_n),
+    .sig_async			(1'b1),
+    .sig_synced			(pclk_div2_core_rst_n)
+);
+
+hsst_rst_sync_v1_0  u_sys_perst_rstn_sync (
+    .clk				(sys_clk),
+    .rst_n				(sync_perst_n),
+    .sig_async			(1'b1),
+    .sig_synced			(sys_perst_rst_n)
 );
 
 // Clk led
@@ -302,7 +320,7 @@ ips2l_expd_apb_mux u_ips2l_pcie_expd_apb_mux (
     .o_uart_p_rdata			(uart_p_rdata),		
 	// To pclk_div2 clock domain
     .i_pclk_div2_clk		(pclk_div2),		
-    .i_pclk_div2_rst_n		(core_rst_n),		
+    .i_pclk_div2_rst_n		(pclk_div2_core_rst_n),
 
     .o_pclk_div2_p_strb		(p_strb),			
     .o_pclk_div2_p_addr		(p_addr),			
@@ -332,7 +350,7 @@ ips2l_pcie_dma #(
     .AXIS_SLAVE_NUM			(AXIS_SLAVE_NUM)
 ) u_ips2l_pcie_dma (
     .clk					(pclk_div2),				
-    .rst_n					(core_rst_n),				
+    .rst_n					(pclk_div2_core_rst_n),
 
 	// Num
     .i_cfg_pbus_num			(cfg_pbus_num),				
@@ -407,7 +425,7 @@ generate
 		pcie_cfg_ctrl u_pcie_cfg_ctrl (
 			//from APB
 		    .pclk_div2				(pclk_div2),				//125mhz    x2 5gt/s
-		    .apb_rst_n				(core_rst_n),				
+		    .apb_rst_n				(pclk_div2_core_rst_n),
 		    .p_sel					(p_sel_cfg),				
 		    .p_strb					(p_strb),					
 		    .p_addr					(p_addr[7:0]),				
@@ -604,13 +622,21 @@ PLL u_pll (
 
 // Reset generation from PLL
 reg [15:0] rstn_1ms;
-always @(posedge cfg_clk or negedge pll_locked) begin
+always @(posedge cfg_clk) begin
     if (!pll_locked)
         rstn_1ms <= 16'd0;
     else if (rstn_1ms != 16'h2710)
         rstn_1ms <= rstn_1ms + 1'b1;
 end
-wire ddr_rstn = (rstn_1ms == 16'h2710);
+wire ddr_rstn_cfg = (rstn_1ms == 16'h2710);
+wire ddr_rstn = ddr_rstn_cfg;
+
+hsst_rst_sync_v1_0 u_sys_ddr_rstn_sync (
+    .clk            (sys_clk),
+    .rst_n          (sys_perst_rst_n),
+    .sig_async      (ddr_rstn_cfg),
+    .sig_synced     (ddr_rstn_sys)
+);
 
 //=============================================================================
 // Camera power-on delay
@@ -621,7 +647,7 @@ wire initial_en;
 
 power_on_delay u_power_on_delay (
     .clk_50M        (sys_clk),      // Stage 1: keep delay logic in 25MHz system clock domain
-    .reset_n        (ddr_rstn),
+    .reset_n        (ddr_rstn_sys),
     .camera1_rstn   (camera_rstn),
     .camera2_rstn   (),
     .camera_pwnd    (camera_pwnd),
@@ -649,6 +675,13 @@ reg_config #(
     .clock_20k      ()                  // Debug: I2C clock
 );
 
+hsst_rst_sync_v1_0 u_cmos1_init_done_sync (
+    .clk            (cmos1_pclk),
+    .rst_n          (camera_rstn),
+    .sig_async      (cmos1_init_done),
+    .sig_synced     (cmos1_init_done_pclk)
+);
+
 //=============================================================================
 // Camera 1 Data Capture (8-bit bus to 16-bit packed words; YUYV in this mode)
 //=============================================================================
@@ -663,7 +696,7 @@ cmos_8_16bit #(
     .CAPTURE_ON_NEGEDGE (CMOS1_CAPTURE_NEGEDGE)
 ) u_cmos1_8_16bit (
     .pclk       (cmos1_pclk),           // Pixel clock from camera
-    .rst_n      (cmos1_init_done),      // Reset after I2C config done
+    .rst_n      (cmos1_init_done_pclk), // Camera-domain reset after I2C config sync
     .pdata_i    (cmos1_data),           // 8-bit input data
     .de_i       (cmos1_href),           // Data enable (href)
     .vs_i       (cmos1_vsync),          // Vsync
@@ -709,8 +742,8 @@ begin
 end
 endfunction
 
-always @(posedge cmos1_pclk or negedge cmos1_init_done) begin
-    if (!cmos1_init_done) begin
+always @(posedge cmos1_pclk or negedge cmos1_init_done_pclk) begin
+    if (!cmos1_init_done_pclk) begin
         cmos1_bar_x <= 12'd0;
         cmos1_href_16bit_d <= 1'b0;
         cmos1_vsync_16bit_d <= 1'b0;
@@ -990,22 +1023,22 @@ wire        frame_stream_ready = ~dma_session_active | ~mwr_first_beat_seen | fr
 
 assign axis_slave2_tready_fc = axis_slave2_tready_raw & frame_stream_ready;
 
-always @(posedge pclk_div2 or negedge core_rst_n) begin
-    if (!core_rst_n)
+always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
+    if (!pclk_div2_core_rst_n)
         mwr_rd_addr_d <= 12'd0;
     else
         mwr_rd_addr_d <= mwr_rd_addr;
 end
 
-always @(posedge pclk_div2 or negedge core_rst_n) begin
-    if (!core_rst_n)
+always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
+    if (!pclk_div2_core_rst_n)
         mwr_rd_clk_en_d <= 1'b0;
     else
         mwr_rd_clk_en_d <= mwr_rd_clk_en;
 end
 
-always @(posedge pclk_div2 or negedge core_rst_n) begin
-    if (!core_rst_n) begin
+always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
+    if (!pclk_div2_core_rst_n) begin
         dma_session_active <= 1'b0;
         dma_rd_word_count <= 18'd0;
         rd_fsync_stretch_cnt <= 6'd0;
@@ -1057,8 +1090,8 @@ assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
 assign mwr_rd_data = FORCE_PATTERN_POST_DDR ? post_ddr_pattern_data : frame_dma_data;
 
 // Post-DDR pattern coordinate counters (only used when FORCE_PATTERN_POST_DDR=1)
-always @(posedge pclk_div2 or negedge core_rst_n) begin
-    if (!core_rst_n) begin
+always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
+    if (!pclk_div2_core_rst_n) begin
         post_ddr_word_x <= 9'd0;
         post_ddr_line_y <= 10'd0;
     end else if (dma_session_start) begin
