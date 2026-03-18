@@ -889,18 +889,20 @@ function [31:0] yuv_to_bgrx32;
     input [7:0] u8;
     input [7:0] v8;
     input [7:0] alpha8;
+    integer y_i;
     integer du;
     integer dv;
     integer r_calc;
     integer g_calc;
     integer b_calc;
 begin
+    y_i = $signed({1'b0, y8});
     du = $signed({1'b0, u8}) - 9'sd128;
     dv = $signed({1'b0, v8}) - 9'sd128;
 
-    r_calc = y8 + ((359 * dv) >>> 8);
-    g_calc = y8 - (((88 * du) + (183 * dv)) >>> 8);
-    b_calc = y8 + ((454 * du) >>> 8);
+    r_calc = y_i + ((11'sd359 * dv) >>> 8);
+    g_calc = y_i - (((8'sd88 * du) + (9'sd183 * dv)) >>> 8);
+    b_calc = y_i + ((11'sd454 * du) >>> 8);
 
     yuv_to_bgrx32 = {alpha8, clip_to_u8(r_calc), clip_to_u8(g_calc), clip_to_u8(b_calc)};
 end
