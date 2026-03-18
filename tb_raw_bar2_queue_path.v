@@ -1,8 +1,6 @@
 `timescale 1ns / 1ps
 
-module raw_bar2_queue_path_case #(
-    parameter [2:0] RAW_BOOTSTRAP_WORDS = 3'd2
-) (
+module raw_bar2_queue_path_case (
     input  wire clk,
     input  wire rst_n,
     input  wire start_pulse,
@@ -14,64 +12,33 @@ module raw_bar2_queue_path_case #(
     output reg  [31:0] queue_phase_mismatch_count,
     output reg  [31:0] pending_timeout_count,
     output reg  [31:0] invalid_queue_read_count
-) ;
+);
 
 reg        dma_session_active_r;
-reg        dma_expand_phase_r;
-reg        raw_req_pending_r;
 reg [17:0] frame_src_req_count_r;
-reg [2:0]  frame_src_bootstrap_count_r;
-reg        raw_startup_active_r;
-reg        raw_start_word_valid_r;
-reg [7:0]  raw_start_word_r;
+reg [7:0]  next_req_word_r;
 reg        req_pipe0_valid_r;
 reg        req_pipe1_valid_r;
 reg [7:0]  req_pipe0_word_r;
 reg [7:0]  req_pipe1_word_r;
-reg [7:0]  next_req_word_r;
-reg        out_pair_active_valid_r;
-reg        out_pair_next_valid_r;
-reg [7:0]  out_pair_active_word_r;
-reg [7:0]  out_pair_next_word_r;
+reg        src_word_valid_r;
+reg [7:0]  src_word_r;
 reg [11:0] bar_rd_addr_d_r;
 reg        bar_rd_clk_en_d_r;
-reg        low_phase_pending_r;
-reg [7:0]  low_phase_word_r;
-reg [4:0]  pending_age_r;
 reg        rd_start_pulse_r;
+reg [4:0]  pending_age_r;
 reg        prev_output_valid_r;
 reg [7:0]  prev_output_word_r;
 
-wire [7:0] consumer_word = raw_startup_active_r ? raw_start_word_r : out_pair_active_word_r;
-wire       raw_bootstrap_ready = raw_start_word_valid_r;
-wire       raw_stream_ready = raw_startup_active_r ? raw_bootstrap_ready
-                                                   : out_pair_active_valid_r;
 wire       bar_rd_clk_en;
 wire [11:0] bar_rd_addr;
 wire       bar2_addr_step = bar_rd_clk_en &&
                             ((bar_rd_addr != bar_rd_addr_d_r) || (~bar_rd_clk_en_d_r));
-wire       out_pair_pop = !raw_startup_active_r && bar2_addr_step && dma_expand_phase_r;
-wire       raw_output_need = bar2_addr_step && !dma_expand_phase_r;
-wire       raw_queue_has_room = !out_pair_active_valid_r || !out_pair_next_valid_r || out_pair_pop;
-wire       raw_start_bootstrap_req = raw_startup_active_r &&
-                                     (frame_src_bootstrap_count_r < RAW_BOOTSTRAP_WORDS);
-wire       raw_req_need = raw_start_bootstrap_req || raw_req_pending_r || raw_output_need;
-wire       frame_rd_req_en_raw = dma_session_active_r &&
-                                 frame_data_ready_allow &&
-                                 raw_queue_has_room &&
-                                 (frame_src_req_count_r < 18'd64) &&
-                                 raw_req_need;
-wire       frame_rd_data_valid = req_pipe1_valid_r;
-wire [7:0] frame_rd_word_id = req_pipe1_word_r;
-wire       raw_capture_fire = dma_session_active_r && frame_rd_data_valid;
-wire       raw_start_capture_now = raw_startup_active_r && !raw_start_word_valid_r && raw_capture_fire;
-wire       raw_queue_capture_fire = raw_capture_fire && (!raw_startup_active_r || raw_start_word_valid_r);
-wire       raw_startup_done = raw_startup_active_r &&
-                              raw_bootstrap_ready &&
-                              bar2_addr_step &&
-                              dma_expand_phase_r;
-
-wire [7:0] active_word_or_invalid = raw_stream_ready ? consumer_word : 8'hEE;
+wire       bootstrap_fetch = dma_session_active_r && !rd_started && frame_data_ready_allow &&
+                             (frame_src_req_count_r < 18'd4);
+wire       stream_fetch = dma_session_active_r && rd_started && bar2_addr_step && frame_data_ready_allow;
+wire       frame_rd_fetch_en = bootstrap_fetch || stream_fetch;
+wire [7:0] active_word_or_invalid = src_word_valid_r ? src_word_r : 8'hEE;
 wire [127:0] bar_rd_data = {16{active_word_or_invalid}};
 
 wire       rd_data_valid;
@@ -101,28 +68,18 @@ ips2l_pcie_dma_rd_ctrl #(
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         dma_session_active_r <= 1'b0;
-        dma_expand_phase_r <= 1'b0;
-        raw_req_pending_r <= 1'b0;
         frame_src_req_count_r <= 18'd0;
-        frame_src_bootstrap_count_r <= 3'd0;
-        raw_startup_active_r <= 1'b0;
-        raw_start_word_valid_r <= 1'b0;
-        raw_start_word_r <= 8'd0;
+        next_req_word_r <= 8'd0;
         req_pipe0_valid_r <= 1'b0;
         req_pipe1_valid_r <= 1'b0;
         req_pipe0_word_r <= 8'd0;
         req_pipe1_word_r <= 8'd0;
-        next_req_word_r <= 8'd0;
-        out_pair_active_valid_r <= 1'b0;
-        out_pair_next_valid_r <= 1'b0;
-        out_pair_active_word_r <= 8'd0;
-        out_pair_next_word_r <= 8'd0;
+        src_word_valid_r <= 1'b0;
+        src_word_r <= 8'd0;
         bar_rd_addr_d_r <= 12'd0;
         bar_rd_clk_en_d_r <= 1'b0;
-        low_phase_pending_r <= 1'b0;
-        low_phase_word_r <= 8'd0;
-        pending_age_r <= 5'd0;
         rd_start_pulse_r <= 1'b0;
+        pending_age_r <= 5'd0;
         prev_output_valid_r <= 1'b0;
         prev_output_word_r <= 8'd0;
         rd_started <= 1'b0;
@@ -141,49 +98,42 @@ always @(posedge clk or negedge rst_n) begin
 
         if (start_pulse && !dma_session_active_r) begin
             dma_session_active_r <= 1'b1;
-            dma_expand_phase_r <= 1'b0;
-            raw_req_pending_r <= 1'b0;
             frame_src_req_count_r <= 18'd0;
-            frame_src_bootstrap_count_r <= 3'd0;
-            raw_startup_active_r <= 1'b1;
-            raw_start_word_valid_r <= 1'b0;
-            raw_start_word_r <= 8'd0;
+            next_req_word_r <= 8'd0;
             req_pipe0_valid_r <= 1'b0;
             req_pipe1_valid_r <= 1'b0;
             req_pipe0_word_r <= 8'd0;
             req_pipe1_word_r <= 8'd0;
-            next_req_word_r <= 8'd0;
-            out_pair_active_valid_r <= 1'b0;
-            out_pair_next_valid_r <= 1'b0;
-            out_pair_active_word_r <= 8'd0;
-            out_pair_next_word_r <= 8'd0;
-            low_phase_pending_r <= 1'b0;
-            low_phase_word_r <= 8'd0;
+            src_word_valid_r <= 1'b0;
+            src_word_r <= 8'd0;
             pending_age_r <= 5'd0;
-            rd_started <= 1'b0;
             prev_output_valid_r <= 1'b0;
             prev_output_word_r <= 8'd0;
+            rd_started <= 1'b0;
             beat_count <= 32'd0;
             mismatch_count <= 32'd0;
             queue_phase_mismatch_count <= 32'd0;
             pending_timeout_count <= 32'd0;
             invalid_queue_read_count <= 32'd0;
         end else if (dma_session_active_r) begin
-            if (!rd_started && raw_bootstrap_ready) begin
+            if (!rd_started && req_pipe1_valid_r) begin
                 rd_start_pulse_r <= 1'b1;
                 rd_started <= 1'b1;
             end
 
-            if (frame_rd_req_en_raw) begin
+            if (frame_rd_fetch_en) begin
                 frame_src_req_count_r <= frame_src_req_count_r + 18'd1;
-                if (frame_src_bootstrap_count_r != RAW_BOOTSTRAP_WORDS)
-                    frame_src_bootstrap_count_r <= frame_src_bootstrap_count_r + 3'd1;
                 req_pipe0_valid_r <= 1'b1;
                 req_pipe0_word_r <= next_req_word_r;
                 next_req_word_r <= next_req_word_r + 8'd1;
             end
 
-            if (raw_req_pending_r) begin
+            if (req_pipe1_valid_r) begin
+                src_word_valid_r <= 1'b1;
+                src_word_r <= req_pipe1_word_r;
+            end
+
+            if (rd_started && bar2_addr_step && !frame_data_ready_allow) begin
                 if (pending_age_r != 5'd31)
                     pending_age_r <= pending_age_r + 5'd1;
                 if (pending_age_r >= 5'd12)
@@ -192,62 +142,19 @@ always @(posedge clk or negedge rst_n) begin
                 pending_age_r <= 5'd0;
             end
 
-            if (raw_req_pending_r && frame_rd_req_en_raw)
-                raw_req_pending_r <= 1'b0;
-            else if (raw_output_need && !frame_rd_req_en_raw)
-                raw_req_pending_r <= 1'b1;
-
-            if (raw_start_capture_now) begin
-                raw_start_word_valid_r <= 1'b1;
-                raw_start_word_r <= frame_rd_word_id;
-            end
-
-            if (bar2_addr_step) begin
-                if (dma_expand_phase_r && low_phase_pending_r) begin
-                    if (consumer_word != low_phase_word_r)
-                        queue_phase_mismatch_count <= queue_phase_mismatch_count + 32'd1;
-                    low_phase_pending_r <= 1'b0;
-                end else if (!dma_expand_phase_r) begin
-                    low_phase_pending_r <= 1'b1;
-                    low_phase_word_r <= consumer_word;
-                end
-                dma_expand_phase_r <= ~dma_expand_phase_r;
-            end
-
-            if (raw_startup_done)
-                raw_startup_active_r <= 1'b0;
-
-            if (out_pair_pop) begin
-                if (out_pair_next_valid_r) begin
-                    out_pair_active_valid_r <= 1'b1;
-                    out_pair_active_word_r <= out_pair_next_word_r;
-                    out_pair_next_valid_r <= 1'b0;
-                end else begin
-                    out_pair_active_valid_r <= 1'b0;
-                end
-            end
-
-            if (raw_queue_capture_fire) begin
-                if (!out_pair_active_valid_r || (out_pair_pop && !out_pair_next_valid_r)) begin
-                    out_pair_active_valid_r <= 1'b1;
-                    out_pair_active_word_r <= frame_rd_word_id;
-                end else if (!out_pair_next_valid_r || out_pair_pop) begin
-                    out_pair_next_valid_r <= 1'b1;
-                    out_pair_next_word_r <= frame_rd_word_id;
-                end
+            if (rd_started && bar2_addr_step && bar_rd_clk_en_d_r) begin
+                if (bar_rd_addr != (bar_rd_addr_d_r + 12'd1))
+                    queue_phase_mismatch_count <= queue_phase_mismatch_count + 32'd1;
             end
 
             if (beat_fire) begin
                 beat_count <= beat_count + 32'd1;
                 if (rd_data[7:0] == 8'hEE)
                     invalid_queue_read_count <= invalid_queue_read_count + 32'd1;
-                if (!prev_output_valid_r) begin
-                    if (rd_data[7:0] != 8'd0)
-                        mismatch_count <= mismatch_count + 32'd1;
-                end else if ((rd_data[7:0] != prev_output_word_r) &&
-                             (rd_data[7:0] != (prev_output_word_r + 8'd1))) begin
+                if (prev_output_valid_r &&
+                    (rd_data[7:0] != prev_output_word_r) &&
+                    (rd_data[7:0] != (prev_output_word_r + 8'd1)))
                     mismatch_count <= mismatch_count + 32'd1;
-                end
                 prev_output_valid_r <= 1'b1;
                 prev_output_word_r <= rd_data[7:0];
             end
@@ -310,7 +217,7 @@ initial begin
         timeout_cycles = timeout_cycles + 1;
     end
     if (!rd_started) begin
-        $display("ERROR: timeout waiting for BAR2 read start after raw bootstrap");
+        $display("ERROR: timeout waiting for BAR2 read start in linear mode");
         $fatal;
     end
 
@@ -321,7 +228,7 @@ initial begin
 
     wait (beat_count >= 32'd8);
     frame_data_ready_allow = 1'b0;
-    repeat (4) @(posedge clk);
+    repeat (3) @(posedge clk);
     frame_data_ready_allow = 1'b1;
 
     wait (beat_count >= 32'd12);
@@ -335,41 +242,41 @@ initial begin
         timeout_cycles = timeout_cycles + 1;
     end
     if (beat_count < 32'd16) begin
-        $display("ERROR: timeout waiting for all BAR2 queue beats");
+        $display("ERROR: timeout waiting for all BAR2 beats in linear mode");
         $fatal;
     end
     repeat (4) @(posedge clk);
 
-    $display("SUMMARY beats=%0d mismatches=%0d queue_phase=%0d pending_timeout=%0d invalid_reads=%0d",
+    $display("SUMMARY beats=%0d mismatches=%0d addr_jumps=%0d pending_timeout=%0d invalid_reads=%0d",
              beat_count, mismatch_count, queue_phase_mismatch_count,
              pending_timeout_count, invalid_queue_read_count);
 
     if (beat_count != 32'd16) begin
-        $display("ERROR: expected exactly 16 beats from 8 source words");
+        $display("ERROR: expected exactly 16 beats from linear BAR2 stream");
         $fatal;
     end
 
     if (mismatch_count != 32'd0) begin
-        $display("ERROR: BAR2 consumer observed non-monotonic queue beat ordering");
+        $display("ERROR: BAR2 consumer observed non-monotonic beat ordering in linear mode");
         $fatal;
     end
 
     if (queue_phase_mismatch_count != 32'd0) begin
-        $display("ERROR: queue head changed before the matching high beat retired");
+        $display("ERROR: BAR2 address steps were not strictly monotonic");
         $fatal;
     end
 
     if (pending_timeout_count != 32'd0) begin
-        $display("ERROR: raw_req_pending did not resolve within the allowed window");
+        $display("ERROR: frame read fetch requests stalled too long in linear mode");
         $fatal;
     end
 
     if (invalid_queue_read_count != 32'd0) begin
-        $display("ERROR: BAR2 reader sampled queue data before bootstrap completed");
+        $display("ERROR: BAR2 reader consumed data before source stream became valid");
         $fatal;
     end
 
-    $display("PASS: queue-only raw BAR2 path preserved stable queue pairing and monotonic consumer ordering through backpressure.");
+    $display("PASS: linear BAR2 read model kept monotonic source ordering through backpressure.");
     $finish;
 end
 

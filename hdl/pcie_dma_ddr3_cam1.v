@@ -748,7 +748,6 @@ wire [15:0] cmos1_rgb565_fmt = CAM_SWAP_RB ?
 // Debug injection switches (default disabled).
 localparam FORCE_COLOR_BAR_PRE_DDR = 1'b0;
 localparam FORCE_PATTERN_POST_DDR  = 1'b0;
-localparam DMA_OUTPUT_BGRX         = 1'b1;
 // YUV422 byte order selector at camera output:
 //   1'b0: YUYV (Y0 U Y1 V)  [default, 0x4300=0x30]
 //   1'b1: UYVY (U Y0 V Y1)  [for A/B debug only]
@@ -759,6 +758,12 @@ localparam PREPROC_ENABLE_DEFAULT  = 1'b0;
 reg [11:0] cmos1_bar_x;
 reg        cmos1_href_16bit_d;
 reg        cmos1_vsync_16bit_d;
+reg        cam_pair_half;
+reg [15:0] cam_pair_word0;
+reg        cam_pending_valid;
+reg [31:0] cam_pending_pixel;
+reg        cam_bgrx_vld_r;
+reg [31:0] cam_bgrx_data_r;
 
 function [15:0] color_bar_bgr565;
     input [11:0] x;
@@ -797,8 +802,9 @@ always @(posedge cmos1_pclk or negedge cmos1_init_done_pclk) begin
 end
 
 wire [15:0] cmos1_bar_data = color_bar_bgr565(cmos1_bar_x);
-wire [15:0] cmos1_wr_data_pre = FORCE_COLOR_BAR_PRE_DDR ? cmos1_bar_data : cmos1_rgb565_fmt;
-wire [15:0] cmos1_wr_data = cmos1_wr_data_pre;
+wire        cmos1_frame_start = (~cmos1_vsync_16bit_d) && cmos1_vsync_16bit;
+wire        cmos1_line_start  = (~cmos1_href_16bit_d) && cmos1_href_16bit;
+wire [15:0] cmos1_yuv_word_in = FORCE_COLOR_BAR_PRE_DDR ? cmos1_bar_data : cmos1_rgb565_fmt;
 
 //=============================================================================
 // Frame Buffer (Camera 闁?DDR3)
@@ -837,33 +843,27 @@ wire                       frame_rd_data_ready;
 //=============================================================================
 // Start one read session on DMA command start and keep the session
 // active across chunk gaps until a full frame has been consumed.
-localparam [17:0]          FRAME_WORDS_565  = (1280 * 720 * 16) / 128;
 localparam [17:0]          FRAME_WORDS_BGRX = (1280 * 720 * 32) / 128;
 reg                        dma_session_active;
 reg  [17:0]                dma_rd_word_count;
 reg  [5:0]                 rd_fsync_stretch_cnt;
 reg  [8:0]                 post_ddr_word_x;
 reg  [9:0]                 post_ddr_line_y;
-reg                        dma_expand_phase;
 reg                        mwr_first_beat_seen;
 reg  [11:0]                mwr_rd_addr_d;
 reg                        mwr_rd_clk_en_d;
-reg  [127:0]               frame_rd_data_hold;
-reg  [7:0]                 frame_id;
 wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
-wire                       dma_expand_mode = DMA_OUTPUT_BGRX;
 wire                       preproc_en = PREPROC_ENABLE_DEFAULT;
-wire [17:0]                frame_words_cfg = dma_expand_mode ? FRAME_WORDS_BGRX : FRAME_WORDS_565;
+wire [17:0]                frame_words_cfg = FRAME_WORDS_BGRX;
 // Count chunk first beat as a valid step to prevent boundary phase slip.
 wire                       bar2_addr_step = mwr_rd_clk_en &&
                                             ((mwr_rd_addr != mwr_rd_addr_d) || (~mwr_rd_clk_en_d));
-wire                       frame_rd_fetch_en = bar2_addr_step & (~dma_expand_mode | ~dma_expand_phase);
-wire [11:0]                post_ddr_x_pix = dma_expand_mode ? {1'b0, post_ddr_word_x, 2'b00}
-                                                             : {post_ddr_word_x, 3'b000};
+wire                       frame_rd_fetch_en = bar2_addr_step;
+wire [11:0]                post_ddr_x_pix = {1'b0, post_ddr_word_x, 2'b00};
 wire [15:0]                post_ddr_color_base = color_bar_bgr565(post_ddr_x_pix);
 wire [15:0]                post_ddr_color_data = post_ddr_color_base;
-wire [8:0]                 post_ddr_words_per_line = dma_expand_mode ? 9'd320 : 9'd160;
+wire [8:0]                 post_ddr_words_per_line = 9'd320;
 
 function [7:0] expand5_to_8;
     input [4:0] value5;
@@ -1006,82 +1006,92 @@ begin
 end
 endfunction
 
-// 4x16b YUYV words -> 4xBGRX pixels:
-// w0={Y0,U0}, w1={Y1,V0}, w2={Y2,U1}, w3={Y3,V1}
-function [127:0] pack_4pix_yuyv_to_bgrx;
+// 2x16b YUYV words -> 2xBGRX pixels:
+// w0={Y0,U0}, w1={Y1,V0}  or UYVY when order_uyvy=1
+function [63:0] pack_2pix_yuv_words_to_bgrx;
     input [15:0] w0;
     input [15:0] w1;
-    input [15:0] w2;
-    input [15:0] w3;
     input        order_uyvy;
     input [7:0]  a0;
     input [7:0]  a1;
-    input [7:0]  a2;
-    input [7:0]  a3;
     reg [7:0] y0;
     reg [7:0] y1;
-    reg [7:0] y2;
-    reg [7:0] y3;
     reg [7:0] u0;
     reg [7:0] v0;
-    reg [7:0] u1;
-    reg [7:0] v1;
-    reg [63:0] pix01;
-    reg [63:0] pix23;
 begin
     if (!order_uyvy) begin
-        // YUYV: w0={Y0,U0}, w1={Y1,V0}, w2={Y2,U1}, w3={Y3,V1}
+        // YUYV: w0={Y0,U0}, w1={Y1,V0}
         y0 = w0[15:8];
         u0 = w0[7:0];
         y1 = w1[15:8];
         v0 = w1[7:0];
-        y2 = w2[15:8];
-        u1 = w2[7:0];
-        y3 = w3[15:8];
-        v1 = w3[7:0];
     end else begin
-        // UYVY: w0={U0,Y0}, w1={V0,Y1}, w2={U1,Y2}, w3={V1,Y3}
+        // UYVY: w0={U0,Y0}, w1={V0,Y1}
         u0 = w0[15:8];
         y0 = w0[7:0];
         v0 = w1[15:8];
         y1 = w1[7:0];
-        u1 = w2[15:8];
-        y2 = w2[7:0];
-        v1 = w3[15:8];
-        y3 = w3[7:0];
     end
 
-    pix01 = pack_2pix_yuv_to_bgrx(y0, y1, u0, v0, a0, a1);
-    pix23 = pack_2pix_yuv_to_bgrx(y2, y3, u1, v1, a2, a3);
-
-    pack_4pix_yuyv_to_bgrx = {pix23, pix01};
+    pack_2pix_yuv_words_to_bgrx = pack_2pix_yuv_to_bgrx(y0, y1, u0, v0, a0, a1);
 end
 endfunction
 
-// Phase-select source words first, then run a single conversion chain.
-wire [15:0] frame_conv_w0 = dma_expand_phase ? frame_rd_data_hold[79:64]   : frame_rd_data[15:0];
-wire [15:0] frame_conv_w1 = dma_expand_phase ? frame_rd_data_hold[95:80]   : frame_rd_data[31:16];
-wire [15:0] frame_conv_w2 = dma_expand_phase ? frame_rd_data_hold[111:96]  : frame_rd_data[47:32];
-wire [15:0] frame_conv_w3 = dma_expand_phase ? frame_rd_data_hold[127:112] : frame_rd_data[63:48];
+wire [7:0]  cmos1_bar_alpha = preproc_en ? preproc_alpha_from_bgr565(cmos1_bar_data) : 8'h00;
+wire [31:0] cmos1_bar_bgrx = bgr565_to_bgrx32(cmos1_bar_data, cmos1_bar_alpha);
+wire [63:0] cmos1_pair_bgrx = pack_2pix_yuv_words_to_bgrx(
+    cam_pair_word0, cmos1_yuv_word_in, YUV422_ORDER_UYVY, 8'h00, 8'h00);
+wire        cmos1_wr_data_vld = cam_bgrx_vld_r;
+wire [31:0] cmos1_wr_data = cam_bgrx_data_r;
+wire        cmos1_wr_en = cmos1_href_16bit | cam_pending_valid;
 
-wire [7:0] frame_alpha_0_base = preproc_en ? preproc_alpha_from_bgr565(frame_conv_w0) : 8'h00;
-wire [7:0] frame_alpha_1 = preproc_en ? preproc_alpha_from_bgr565(frame_conv_w1) : 8'h00;
-wire [7:0] frame_alpha_2 = preproc_en ? preproc_alpha_from_bgr565(frame_conv_w2) : 8'h00;
-wire [7:0] frame_alpha_3 = preproc_en ? preproc_alpha_from_bgr565(frame_conv_w3) : 8'h00;
+always @(posedge cmos1_pclk or negedge cmos1_init_done_pclk) begin
+    if (!cmos1_init_done_pclk) begin
+        cam_pair_half <= 1'b0;
+        cam_pair_word0 <= 16'd0;
+        cam_pending_valid <= 1'b0;
+        cam_pending_pixel <= 32'd0;
+        cam_bgrx_vld_r <= 1'b0;
+        cam_bgrx_data_r <= 32'd0;
+    end else begin
+        cam_bgrx_vld_r <= 1'b0;
 
-// Reserve Pixel[0,0].A as frame watermark for future sideband lockstep.
-wire first_pixel_word = dma_session_active && (dma_rd_word_count == 18'd0) && (dma_expand_phase == 1'b0);
-wire [7:0] frame_alpha_0 = (preproc_en && first_pixel_word) ? frame_id : frame_alpha_0_base;
+        if (cmos1_frame_start || cmos1_line_start)
+            cam_pair_half <= 1'b0;
 
-wire [127:0] frame_dma_data_bgrx = pack_4pix_yuyv_to_bgrx(
-    frame_conv_w0, frame_conv_w1, frame_conv_w2, frame_conv_w3,
-    YUV422_ORDER_UYVY, frame_alpha_0, frame_alpha_1, frame_alpha_2, frame_alpha_3);
-wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
+        if (FORCE_COLOR_BAR_PRE_DDR) begin
+            cam_pair_half <= 1'b0;
+            cam_pending_valid <= 1'b0;
+            if (cmos1_pix_vld) begin
+                cam_bgrx_vld_r <= 1'b1;
+                cam_bgrx_data_r <= cmos1_bar_bgrx;
+            end
+        end else begin
+            if (cam_pending_valid) begin
+                cam_bgrx_vld_r <= 1'b1;
+                cam_bgrx_data_r <= cam_pending_pixel;
+                cam_pending_valid <= 1'b0;
+            end
+
+            if (cmos1_pix_vld) begin
+                if (!cam_pair_half) begin
+                    cam_pair_word0 <= cmos1_yuv_word_in;
+                    cam_pair_half <= 1'b1;
+                end else begin
+                    cam_bgrx_vld_r <= 1'b1;
+                    cam_bgrx_data_r <= cmos1_pair_bgrx[31:0];
+                    cam_pending_pixel <= cmos1_pair_bgrx[63:32];
+                    cam_pending_valid <= 1'b1;
+                    cam_pair_half <= 1'b0;
+                end
+            end
+        end
+    end
+end
+
 wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data, preproc_en ? 8'h80 : 8'h00)}};
-wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
-wire [127:0] frame_dma_data = dma_expand_mode
-    ? frame_dma_data_bgrx
-    : frame_rd_data;
+wire [127:0] post_ddr_pattern_data = post_ddr_pattern_data_bgrx;
+wire [127:0] frame_dma_data = frame_rd_data;
 wire        frame_stream_ready = ~dma_session_active | ~mwr_first_beat_seen | frame_rd_data_ready;
 
 assign axis_slave2_tready_fc = axis_slave2_tready_raw & frame_stream_ready;
@@ -1105,24 +1115,18 @@ always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
         dma_session_active <= 1'b0;
         dma_rd_word_count <= 18'd0;
         rd_fsync_stretch_cnt <= 6'd0;
-        dma_expand_phase <= 1'b0;
         mwr_first_beat_seen <= 1'b0;
-        frame_rd_data_hold <= 128'd0;
-        frame_id <= 8'd0;
     end else if (frame_done_pulse) begin
         dma_session_active <= 1'b0;
         dma_rd_word_count <= 18'd0;
         rd_fsync_stretch_cnt <= 6'd0;
-        dma_expand_phase <= 1'b0;
         mwr_first_beat_seen <= 1'b0;
     end else begin
         if (dma_session_start) begin
             dma_session_active <= 1'b1;
             dma_rd_word_count <= 18'd0;
             rd_fsync_stretch_cnt <= 6'd31;
-            dma_expand_phase <= 1'b0;
             mwr_first_beat_seen <= 1'b0;
-            frame_id <= frame_id + 8'd1;
         end else begin
             if (dma_session_active && bar2_addr_step)
                 mwr_first_beat_seen <= 1'b1;
@@ -1135,12 +1139,6 @@ always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
                     dma_rd_word_count <= dma_rd_word_count + 18'd1;
                 end
             end
-
-            if (dma_expand_mode && dma_session_active && bar2_addr_step)
-                dma_expand_phase <= ~dma_expand_phase;
-
-            if (frame_rd_fetch_en)
-                frame_rd_data_hold <= frame_rd_data;
 
             if (rd_fsync_stretch_cnt != 6'd0)
                 rd_fsync_stretch_cnt <= rd_fsync_stretch_cnt - 6'd1;
@@ -1181,7 +1179,7 @@ fram_buf #(
     .MEM_DQ_WIDTH       (MEM_DQ_WIDTH),
     .H_NUM              (12'd1280),     // 720p horizontal
     .V_NUM              (12'd720),      // 720p vertical
-    .PIX_WIDTH          (16)            // 16-bit packed stream (YUYV words)
+    .PIX_WIDTH          (32)            // 32-bit BGRX stream
 ) u_fram_buf (
     // DDR clock domain
     .ddr_clk            (core_clk_ddr),
@@ -1191,8 +1189,8 @@ fram_buf #(
     // Camera input (write to DDR)
     .vin_clk            (cmos1_pclk),
     .wr_fsync           (cmos1_vsync_16bit),
-    .wr_en              (cmos1_href_16bit),
-    .wr_data_vld        (cmos1_pix_vld),
+    .wr_en              (cmos1_wr_en),
+    .wr_data_vld        (cmos1_wr_data_vld),
     .wr_data            (cmos1_wr_data),
     .init_done          (fram_buf_init_done),
     
