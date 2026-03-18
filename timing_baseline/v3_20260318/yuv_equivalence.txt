@@ -1,0 +1,3 @@
+﻿PASS exhaustive 256^3 compare, mismatches=0
+Formula: BT.601 full-range, strict pixel-level equivalence check (legacy integer model vs fixed-width signed model)
+Date: 2026-03-18
