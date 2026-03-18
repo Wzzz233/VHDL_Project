@@ -1,0 +1,18 @@
+Warning count snapshot (v4 baseline)
+Date: 2026-03-18 12:11:42)
+
+[run.log]
+STA-3003: 20
+DeviceMap-2011: 1
+Place-2028: 1
+Route-2036: 3
+Timing-4086: 38
+Timing-4087: 116
+
+[report_timing/run.log]
+STA-3003: 16
+DeviceMap-2011: 0
+Place-2028: 0
+Route-2036: 0
+Timing-4086: 19
+Timing-4087: 58
