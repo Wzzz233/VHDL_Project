@@ -1,0 +1,317 @@
+Performance Summary:
+****************************************************************************************************
+                              Requested       Estimated      Requested      Estimated               
+ Clock                        Frequency       Frequency      Period         Period             Slack
+----------------------------------------------------------------------------------------------------
+ pclk                      250.0000 MHz    276.4722 MHz         4.0000         3.6170          0.383
+ pclk_div2                 125.0000 MHz     93.7734 MHz         8.0000        10.6640         -2.664
+ ref_clk                   100.0000 MHz    195.8480 MHz        10.0000         5.1060          4.894
+ cmos1_pclk                 84.0336 MHz    198.5309 MHz        11.9000         5.0370          6.863
+ sys_clk                    25.0000 MHz    306.6544 MHz        40.0000         3.2610         36.739
+ cfg_clk                    37.1250 MHz    193.2365 MHz        26.9360         5.1750         21.761
+ ddr_rst_clk                25.0000 MHz    258.8662 MHz        40.0000         3.8630         36.137
+ ddrphy_sysclk             131.2500 MHz    135.5189 MHz         7.6190         7.3790          0.240
+ clock_20k                   0.0100 MHz    233.6995 MHz    100000.0000         4.2790      99995.721
+ DebugCore_JCLK             20.0000 MHz    246.8526 MHz        50.0000         4.0510         45.949
+====================================================================================================
+
+Design Summary : Some Constraints Violated.
+
+
+Setup Summary(Slow Corner):
+****************************************************************************************************
+                                                                          TNS Failing      TNS Total
+ Launch Clock           Capture Clock              WNS(ns)     TNS(ns)      Endpoints      Endpoints
+----------------------------------------------------------------------------------------------------
+ pclk                   pclk                         0.383       0.000              0           1027
+ pclk_div2              pclk                         1.497       0.000              0              2
+ pclk_div2              pclk_div2                   -2.664    -260.499            237          17457
+ ref_clk                pclk_div2                   -0.440      -6.293             50             62
+ ref_clk                ref_clk                      4.894       0.000              0           1834
+ pclk_div2              ref_clk                     -1.398      -6.113              7              7
+ cmos1_pclk             cmos1_pclk                   6.863       0.000              0            276
+ sys_clk                sys_clk                     36.739       0.000              0            168
+ cfg_clk                cfg_clk                     21.761       0.000              0             25
+ ddrphy_sysclk          ddr_rst_clk                 -1.836      -7.316              5              5
+ ddr_rst_clk            ddr_rst_clk                 36.137       0.000              0            427
+ phy_dq_sysclk_0        ddr_rst_clk                 -1.650      -1.650              1              1
+ ddrphy_sysclk          ddrphy_sysclk                0.240       0.000              0          11669
+ phy_dq_sysclk_1        ddrphy_sysclk                1.804       0.000              0            130
+ phy_dq_sysclk_0        ddrphy_sysclk                3.474       0.000              0              1
+ ddr_rst_clk            ddrphy_sysclk               -3.913     -10.909              3              3
+ ddrphy_sysclk          phy_dq_sysclk_0             -3.519    -594.239            196            196
+ ddrphy_sysclk          phy_dq_sysclk_1             -3.775    -637.832            210            210
+ sys_clk                clock_20k                   36.441       0.000              0             48
+ clock_20k              clock_20k                99995.721       0.000              0            182
+ DebugCore_JCLK         DebugCore_JCLK              24.123       0.000              0            234
+ DebugCore_CAPTURE      DebugCore_JCLK              22.057       0.000              0             89
+ DebugCore_JCLK         DebugCore_CAPTURE           47.691       0.000              0             16
+====================================================================================================
+
+Hold Summary(Slow Corner):
+****************************************************************************************************
+                                                                          THS Failing      THS Total
+ Launch Clock           Capture Clock              WHS(ns)     THS(ns)      Endpoints      Endpoints
+----------------------------------------------------------------------------------------------------
+ pclk                   pclk                         0.240       0.000              0           1027
+ pclk_div2              pclk                         0.728       0.000              0              2
+ pclk_div2              pclk_div2                    0.145       0.000              0          17457
+ ref_clk                pclk_div2                    0.255       0.000              0             62
+ ref_clk                ref_clk                      0.165       0.000              0           1834
+ pclk_div2              ref_clk                      1.116       0.000              0              7
+ cmos1_pclk             cmos1_pclk                   0.115       0.000              0            276
+ sys_clk                sys_clk                      0.291       0.000              0            168
+ cfg_clk                cfg_clk                      0.300       0.000              0             25
+ ddrphy_sysclk          ddr_rst_clk                  0.126       0.000              0              5
+ ddr_rst_clk            ddr_rst_clk                  0.214       0.000              0            427
+ phy_dq_sysclk_0        ddr_rst_clk                  0.789       0.000              0              1
+ ddrphy_sysclk          ddrphy_sysclk                0.141       0.000              0          11669
+ phy_dq_sysclk_1        ddrphy_sysclk                0.601       0.000              0            130
+ phy_dq_sysclk_0        ddrphy_sysclk                0.991       0.000              0              1
+ ddr_rst_clk            ddrphy_sysclk                1.703       0.000              0              3
+ ddrphy_sysclk          phy_dq_sysclk_0              6.979       0.000              0            196
+ ddrphy_sysclk          phy_dq_sysclk_1              6.809       0.000              0            210
+ sys_clk                clock_20k                    0.604       0.000              0             48
+ clock_20k              clock_20k                    0.235       0.000              0            182
+ DebugCore_JCLK         DebugCore_JCLK               0.308       0.000              0            234
+ DebugCore_CAPTURE      DebugCore_JCLK              23.833       0.000              0             89
+ DebugCore_JCLK         DebugCore_CAPTURE            0.205       0.000              0             16
+====================================================================================================
+
+
+Setup Summary(Fast Corner):
+****************************************************************************************************
+                                                                          TNS Failing      TNS Total
+ Launch Clock           Capture Clock              WNS(ns)     TNS(ns)      Endpoints      Endpoints
+----------------------------------------------------------------------------------------------------
+ pclk                   pclk                         1.765       0.000              0           1027
+ pclk_div2              pclk                         2.498       0.000              0              2
+ pclk_div2              pclk_div2                    1.163       0.000              0          17457
+ ref_clk                pclk_div2                    0.481       0.000              0             62
+ ref_clk                ref_clk                      7.109       0.000              0           1834
+ pclk_div2              ref_clk                     -0.191      -0.336              3              7
+ cmos1_pclk             cmos1_pclk                   7.689       0.000              0            276
+ sys_clk                sys_clk                     37.992       0.000              0            168
+ cfg_clk                cfg_clk                     23.938       0.000              0             25
+ ddrphy_sysclk          ddr_rst_clk                 -1.034      -4.554              5              5
+ ddr_rst_clk            ddr_rst_clk                 37.820       0.000              0            427
+ phy_dq_sysclk_0        ddr_rst_clk                 -0.314      -0.314              1              1
+ ddrphy_sysclk          ddrphy_sysclk                3.188       0.000              0          11669
+ phy_dq_sysclk_1        ddrphy_sysclk                3.904       0.000              0            130
+ phy_dq_sysclk_0        ddrphy_sysclk                4.746       0.000              0              1
+ ddr_rst_clk            ddrphy_sysclk               -1.066      -2.850              3              3
+ ddrphy_sysclk          phy_dq_sysclk_0             -2.389    -409.389            196            196
+ ddrphy_sysclk          phy_dq_sysclk_1             -2.488    -441.182            210            210
+ sys_clk                clock_20k                   37.927       0.000              0             48
+ clock_20k              clock_20k                99997.572       0.000              0            182
+ DebugCore_JCLK         DebugCore_JCLK              24.509       0.000              0            234
+ DebugCore_CAPTURE      DebugCore_JCLK              23.520       0.000              0             89
+ DebugCore_JCLK         DebugCore_CAPTURE           48.484       0.000              0             16
+====================================================================================================
+
+Hold Summary(Fast Corner):
+****************************************************************************************************
+                                                                          THS Failing      THS Total
+ Launch Clock           Capture Clock              WHS(ns)     THS(ns)      Endpoints      Endpoints
+----------------------------------------------------------------------------------------------------
+ pclk                   pclk                         0.157       0.000              0           1027
+ pclk_div2              pclk                         0.421       0.000              0              2
+ pclk_div2              pclk_div2                    0.100       0.000              0          17457
+ ref_clk                pclk_div2                    0.137       0.000              0             62
+ ref_clk                ref_clk                      0.113       0.000              0           1834
+ pclk_div2              ref_clk                      0.704       0.000              0              7
+ cmos1_pclk             cmos1_pclk                   0.100       0.000              0            276
+ sys_clk                sys_clk                      0.193       0.000              0            168
+ cfg_clk                cfg_clk                      0.189       0.000              0             25
+ ddrphy_sysclk          ddr_rst_clk                  0.567       0.000              0              5
+ ddr_rst_clk            ddr_rst_clk                  0.147       0.000              0            427
+ phy_dq_sysclk_0        ddr_rst_clk                  0.286       0.000              0              1
+ ddrphy_sysclk          ddrphy_sysclk                0.101       0.000              0          11669
+ phy_dq_sysclk_1        ddrphy_sysclk                0.101       0.000              0            130
+ phy_dq_sysclk_0        ddrphy_sysclk                0.324       0.000              0              1
+ ddr_rst_clk            ddrphy_sysclk                0.266       0.000              0              3
+ ddrphy_sysclk          phy_dq_sysclk_0              6.973       0.000              0            196
+ ddrphy_sysclk          phy_dq_sysclk_1              6.789       0.000              0            210
+ sys_clk                clock_20k                    0.423       0.000              0             48
+ clock_20k              clock_20k                    0.201       0.000              0            182
+ DebugCore_JCLK         DebugCore_JCLK               0.200       0.000              0            234
+ DebugCore_CAPTURE      DebugCore_JCLK              24.251       0.000              0             89
+ DebugCore_JCLK         DebugCore_CAPTURE            0.398       0.000              0             16
+====================================================================================================
+
+
+Recovery Summary(Slow Corner):
+****************************************************************************************************
+                                                                          TNS Failing      TNS Total
+ Launch Clock           Capture Clock              WNS(ns)     TNS(ns)      Endpoints      Endpoints
+----------------------------------------------------------------------------------------------------
+ pclk                   pclk                         0.975       0.000              0            112
+ pclk_div2              pclk                         1.667       0.000              0              1
+ ref_clk                pclk                        -0.018      -0.018              1              1
+ pclk_div2              pclk_div2                    3.380       0.000              0           2413
+ ref_clk                ref_clk                      7.103       0.000              0            411
+ pclk_div2              ref_clk                     -1.837      -2.739              2              2
+ cmos1_pclk             cmos1_pclk                   7.335       0.000              0             40
+ sys_clk                sys_clk                     38.655       0.000              0              2
+ ddr_rst_clk            ddr_rst_clk                 38.128       0.000              0            101
+ cfg_clk                ddr_rst_clk                 -5.593      -5.593              1              1
+ ddrphy_sysclk          ddrphy_sysclk                4.341       0.000              0           2395
+ cfg_clk                ddrphy_sysclk               -6.838    -123.481             19             19
+ ddr_rst_clk            ddrphy_sysclk               -3.768      -9.046              3              3
+ ddr_rst_clk            phy_dq_clk_0                -3.669    -107.343             34             34
+ ddrphy_sysclk          phy_dq_clk_0                -3.195      -8.891              3              3
+ ddr_rst_clk            phy_dq_sysclk_0             -2.523     -68.178             35             35
+ ddr_rst_clk            phy_dq_clk_1                -4.304    -150.446             42             42
+ ddrphy_sysclk          phy_dq_clk_1                -3.350      -6.539              2              2
+ ddr_rst_clk            phy_dq_sysclk_1             -3.262    -105.046             42             42
+====================================================================================================
+
+
+Recovery Summary(Fast Corner):
+****************************************************************************************************
+                                                                          TNS Failing      TNS Total
+ Launch Clock           Capture Clock              WNS(ns)     TNS(ns)      Endpoints      Endpoints
+----------------------------------------------------------------------------------------------------
+ pclk                   pclk                         2.195       0.000              0            112
+ pclk_div2              pclk                         2.565       0.000              0              1
+ ref_clk                pclk                         0.888       0.000              0              1
+ pclk_div2              pclk_div2                    5.145       0.000              0           2413
+ ref_clk                ref_clk                      8.337       0.000              0            411
+ pclk_div2              ref_clk                     -0.362      -0.362              1              2
+ cmos1_pclk             cmos1_pclk                   8.984       0.000              0             40
+ sys_clk                sys_clk                     39.248       0.000              0              2
+ ddr_rst_clk            ddr_rst_clk                 38.823       0.000              0            101
+ cfg_clk                ddr_rst_clk                 -3.298      -3.298              1              1
+ ddrphy_sysclk          ddrphy_sysclk                5.514       0.000              0           2395
+ cfg_clk                ddrphy_sysclk               -3.395     -61.166             19             19
+ ddr_rst_clk            ddrphy_sysclk               -0.907      -1.343              2              3
+ ddr_rst_clk            phy_dq_clk_0                -2.271     -58.975             34             34
+ ddrphy_sysclk          phy_dq_clk_0                -2.402      -6.749              3              3
+ ddr_rst_clk            phy_dq_sysclk_0             -0.923     -21.847             35             35
+ ddr_rst_clk            phy_dq_clk_1                -2.440     -84.216             42             42
+ ddrphy_sysclk          phy_dq_clk_1                -2.515      -4.918              2              2
+ ddr_rst_clk            phy_dq_sysclk_1             -1.366     -40.744             42             42
+====================================================================================================
+
+
+Removal Summary(Slow Corner):
+****************************************************************************************************
+                                                                          THS Failing      THS Total
+ Launch Clock           Capture Clock              WHS(ns)     THS(ns)      Endpoints      Endpoints
+----------------------------------------------------------------------------------------------------
+ pclk                   pclk                         0.419       0.000              0            112
+ pclk_div2              pclk                         0.797       0.000              0              1
+ ref_clk                pclk                         0.230       0.000              0              1
+ pclk_div2              pclk_div2                    0.364       0.000              0           2413
+ ref_clk                ref_clk                      0.363       0.000              0            411
+ pclk_div2              ref_clk                      1.476       0.000              0              2
+ cmos1_pclk             cmos1_pclk                   0.451       0.000              0             40
+ sys_clk                sys_clk                      0.667       0.000              0              2
+ ddr_rst_clk            ddr_rst_clk                  0.421       0.000              0            101
+ cfg_clk                ddr_rst_clk                  1.737       0.000              0              1
+ ddrphy_sysclk          ddrphy_sysclk                0.364       0.000              0           2395
+ cfg_clk                ddrphy_sysclk                1.265       0.000              0             19
+ ddr_rst_clk            ddrphy_sysclk                0.786       0.000              0              3
+ ddr_rst_clk            phy_dq_clk_0                 2.005       0.000              0             34
+ ddrphy_sysclk          phy_dq_clk_0                 1.768       0.000              0              3
+ ddr_rst_clk            phy_dq_sysclk_0              1.849       0.000              0             35
+ ddr_rst_clk            phy_dq_clk_1                 2.237       0.000              0             42
+ ddrphy_sysclk          phy_dq_clk_1                 1.800       0.000              0              2
+ ddr_rst_clk            phy_dq_sysclk_1              2.290       0.000              0             42
+====================================================================================================
+
+Minimum Pulse Width Summary(Slow Corner):
+****************************************************************************************************
+                                                                         WPWS Failing     WPWS Total
+ Clock                                            WPWS(ns)    TPWS(ns)      Endpoints      Endpoints
+----------------------------------------------------------------------------------------------------
+ pclk                                                1.040       0.000              0            114
+ pclk_div2                                           3.040       0.000              0           2880
+ ref_clk                                             4.800       0.000              0            415
+ cmos1_pclk                                          4.990       0.000              0            101
+ sys_clk                                            19.800       0.000              0             28
+ cfg_clk                                            13.268       0.000              0              5
+ ddr_rst_clk                                        19.800       0.000              0            102
+ ddrphy_sysclk                                       2.849       0.000              0           2673
+ phy_dq_clk_0                                        0.011       0.000              0             35
+ phy_dq_sysclk_0                                     1.659       0.000              0             35
+ phy_dq_clk_1                                        0.011       0.000              0             42
+ phy_dq_sysclk_1                                     2.209       0.000              0             42
+ clock_20k                                       49999.040       0.000              0             31
+ DebugCore_JCLK                                     24.040       0.000              0             71
+ DebugCore_CAPTURE                                  49.800       0.000              0             11
+====================================================================================================
+
+
+Removal Summary(Fast Corner):
+****************************************************************************************************
+                                                                          THS Failing      THS Total
+ Launch Clock           Capture Clock              WHS(ns)     THS(ns)      Endpoints      Endpoints
+----------------------------------------------------------------------------------------------------
+ pclk                   pclk                         0.283       0.000              0            112
+ pclk_div2              pclk                         0.423       0.000              0              1
+ ref_clk                pclk                         0.110       0.000              0              1
+ pclk_div2              pclk_div2                    0.248       0.000              0           2413
+ ref_clk                ref_clk                      0.248       0.000              0            411
+ pclk_div2              ref_clk                      0.901       0.000              0              2
+ cmos1_pclk             cmos1_pclk                   0.192       0.000              0             40
+ sys_clk                sys_clk                      0.443       0.000              0              2
+ ddr_rst_clk            ddr_rst_clk                  0.283       0.000              0            101
+ cfg_clk                ddr_rst_clk                  1.139       0.000              0              1
+ ddrphy_sysclk          ddrphy_sysclk                0.248       0.000              0           2395
+ cfg_clk                ddrphy_sysclk                0.159       0.000              0             19
+ ddr_rst_clk            ddrphy_sysclk               -0.250      -0.250              1              3
+ ddr_rst_clk            phy_dq_clk_0                 1.274       0.000              0             34
+ ddrphy_sysclk          phy_dq_clk_0                 1.532       0.000              0              3
+ ddr_rst_clk            phy_dq_sysclk_0              1.191       0.000              0             35
+ ddr_rst_clk            phy_dq_clk_1                 1.426       0.000              0             42
+ ddrphy_sysclk          phy_dq_clk_1                 1.513       0.000              0              2
+ ddr_rst_clk            phy_dq_sysclk_1              1.448       0.000              0             42
+====================================================================================================
+
+Minimum Pulse Width Summary(Fast Corner):
+****************************************************************************************************
+                                                                         WPWS Failing     WPWS Total
+ Clock                                            WPWS(ns)    TPWS(ns)      Endpoints      Endpoints
+----------------------------------------------------------------------------------------------------
+ pclk                                                1.430       0.000              0            114
+ pclk_div2                                           3.430       0.000              0           2880
+ ref_clk                                             4.800       0.000              0            415
+ cmos1_pclk                                          5.380       0.000              0            101
+ sys_clk                                            19.800       0.000              0             28
+ cfg_clk                                            13.268       0.000              0              5
+ ddr_rst_clk                                        19.800       0.000              0            102
+ ddrphy_sysclk                                       3.239       0.000              0           2673
+ phy_dq_clk_0                                        0.011       0.000              0             35
+ phy_dq_sysclk_0                                     1.659       0.000              0             35
+ phy_dq_clk_1                                        0.011       0.000              0             42
+ phy_dq_sysclk_1                                     2.209       0.000              0             42
+ clock_20k                                       49999.430       0.000              0             31
+ DebugCore_JCLK                                     24.430       0.000              0             71
+ DebugCore_CAPTURE                                  49.800       0.000              0             11
+====================================================================================================
+
+Slow Corner
+****************************************************************************************************
+====================================================================================================
+
+Startpoint  : u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_PCIE_HARD_CTRL/pcie2_iip_exrcvdata_rams/U_ipm2l_sdpram_rcv_data_ram/ADDR_LOOP[0].DATA_LOOP[2].U_GTP_DRM18K_E1/gopdrm_18k_inv/CLKB
+Endpoint    : u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_PCIE_HARD_CTRL/u_gtp_pcie/gateop/P_DATAQ_DATAOUT[46]
+Path Group  : pclk
+Path Type   : max (slow corner)
+Path Class  : sequential timing path
+Clock Skew  :    -0.073  (Capture Clock Delay - Launch Clock Delay + Clock Pessimism Removal)
+  Capture Clock Delay     :  2.133
+  Launch Clock Delay      :  2.505
+  Clock Pessimism Removal :  0.299
+
+ Location                          Delay Type             Incr        Path         Logical Resource 
+----------------------------------------------------------------------------------------------------
+
+ Clock pclk (rising edge)                                0.000       0.000 r                        
+ HSSTLP_292_612/TCLK2FABRIC[1]                           0.000       0.000 r       u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_HSSTLP_PCIE_SOFT_PHY/x2.GTP_HSST_2LANE_TOP/U_GTP_HSSTLP_WRAPPER/CHANNEL1_ENABLE.U_GTP_HSSTLP_LANE1/gophsst/P_TCLK2FABRIC
+                                   net (fanout=1)        0.901       0.901         pclk             
+ USCM_167_324/CLKOUT               td                    0.177       1.078 r       clkbufg_4/gopclkbufg/CLKOUT
+                                   net (fanout=2)        0.651       1.729         ntclkbufg_1      
+ HCKB_165_803/CLKOUT               td                    0.302       2.031 r       HCKBROUTE_12/CLKOUT
+                                   net (fanout=133)      0.474       2.505         _N109            

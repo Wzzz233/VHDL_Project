@@ -1,0 +1,28 @@
+﻿Warning count snapshot (v5 baseline)
+Date: 2026-03-18 13:08:48
+
+[report_timing/run.log]
+Timing-4003: 0
+CommandTiming-0057: 0
+SDC-2023: 0
+ConstraintEditor-0046: 0
+SDC-2017: 0
+STA-3003: 16
+DeviceMap-2011: 0
+Place-2028: 0
+Route-2036: 0
+Timing-4086: 19
+Timing-4087: 58
+
+[run.log]
+Timing-4003: 8
+CommandTiming-0057: 8
+SDC-2023: 8
+ConstraintEditor-0046: 8
+SDC-2017: 0
+STA-3003: 40
+DeviceMap-2011: 2
+Place-2028: 2
+Route-2036: 6
+Timing-4086: 76
+Timing-4087: 232

@@ -45,6 +45,21 @@ set_input_delay -clock [get_clocks {cmos1_pclk}] -min 0.5 [get_ports {cmos1_data
 ###==== END "set_multicycle_path"
 
 ###==== BEGIN "set_false_path"
+# CDC/reset synchronizer constraints (strict):
+# 1) Only constrain first-stage synchronizer D pins.
+# 2) A structural synchronizer must exist before applying false_path.
+# 3) Do not false-path functional datapaths.
+set_false_path -to [get_pins {u_sys_ddr_rstn_sync/sig_async}]
+set_false_path -to [get_pins {u_cmos1_init_done_sync/sig_async}]
+
+# ref_clk <-> pclk_div2 CDC bridge endpoints:
+# keep only deterministic local synchronizers in this FDC file.
+# Deep IP-internal synchronizers are excluded here to avoid import-time
+# failures from implementation-dependent instance naming.
+
+# Local synchronizers in ref_clk domain.
+set_false_path -to [get_pins {u_ref_smlh_linkup_sync/sig_async}]
+set_false_path -to [get_pins {u_ref_rdlh_linkup_sync/sig_async}]
 ###==== END "set_false_path"
 
 ###==== BEGIN Attributes - (Populated from tab in SCOPE, do not edit)
@@ -436,8 +451,6 @@ define_attribute {p:sys_clk} {PAP_IO_LOC} {V4}
 define_attribute {p:sys_clk} {PAP_IO_VCCIO} {1.5}
 define_attribute {p:sys_clk} {PAP_IO_STANDARD} {HSTL15_I}
 define_attribute {p:sys_clk} {PAP_IO_UNUSED} {TRUE}
-create_clock -name {sys_clk} [get_ports sys_clk] -period {40} -waveform {0.000 5.000} -add
-create_generated_clock -name {cfg_clk} -source [get_ports {sys_clk}] [get_nets {u_pll.clkout0}] -master_clock [get_clocks {sys_clk}] -multiply_by {2} -divide_by {5}
 define_attribute {n:cmos1_pclk} {PAP_CLOCK_DEDICATED_ROUTE} {FALSE}
 define_attribute {p:mem_dqs[1]} {PAP_IO_DIRECTION} {INOUT}
 define_attribute {p:mem_dqs[1]} {PAP_IO_LOC} {M1}
