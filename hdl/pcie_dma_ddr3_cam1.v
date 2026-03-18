@@ -1058,31 +1058,29 @@ begin
 end
 endfunction
 
-wire [7:0] alpha_lo_0_base = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[15:0]) : 8'h00;
-wire [7:0] alpha_lo_1 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[31:16]) : 8'h00;
-wire [7:0] alpha_lo_2 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[47:32]) : 8'h00;
-wire [7:0] alpha_lo_3 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[63:48]) : 8'h00;
+// Phase-select source words first, then run a single conversion chain.
+wire [15:0] frame_conv_w0 = dma_expand_phase ? frame_rd_data_hold[79:64]   : frame_rd_data[15:0];
+wire [15:0] frame_conv_w1 = dma_expand_phase ? frame_rd_data_hold[95:80]   : frame_rd_data[31:16];
+wire [15:0] frame_conv_w2 = dma_expand_phase ? frame_rd_data_hold[111:96]  : frame_rd_data[47:32];
+wire [15:0] frame_conv_w3 = dma_expand_phase ? frame_rd_data_hold[127:112] : frame_rd_data[63:48];
 
-wire [7:0] alpha_hi_0 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data_hold[79:64]) : 8'h00;
-wire [7:0] alpha_hi_1 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data_hold[95:80]) : 8'h00;
-wire [7:0] alpha_hi_2 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data_hold[111:96]) : 8'h00;
-wire [7:0] alpha_hi_3 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data_hold[127:112]) : 8'h00;
+wire [7:0] frame_alpha_0_base = preproc_en ? preproc_alpha_from_bgr565(frame_conv_w0) : 8'h00;
+wire [7:0] frame_alpha_1 = preproc_en ? preproc_alpha_from_bgr565(frame_conv_w1) : 8'h00;
+wire [7:0] frame_alpha_2 = preproc_en ? preproc_alpha_from_bgr565(frame_conv_w2) : 8'h00;
+wire [7:0] frame_alpha_3 = preproc_en ? preproc_alpha_from_bgr565(frame_conv_w3) : 8'h00;
 
 // Reserve Pixel[0,0].A as frame watermark for future sideband lockstep.
 wire first_pixel_word = dma_session_active && (dma_rd_word_count == 18'd0) && (dma_expand_phase == 1'b0);
-wire [7:0] alpha_lo_0 = (preproc_en && first_pixel_word) ? frame_id : alpha_lo_0_base;
+wire [7:0] frame_alpha_0 = (preproc_en && first_pixel_word) ? frame_id : frame_alpha_0_base;
 
-wire [127:0] frame_rd_data_bgrx_lo = pack_4pix_yuyv_to_bgrx(
-    frame_rd_data[15:0], frame_rd_data[31:16], frame_rd_data[47:32], frame_rd_data[63:48],
-    YUV422_ORDER_UYVY, alpha_lo_0, alpha_lo_1, alpha_lo_2, alpha_lo_3);
-wire [127:0] frame_rd_hold_bgrx_hi = pack_4pix_yuyv_to_bgrx(
-    frame_rd_data_hold[79:64], frame_rd_data_hold[95:80], frame_rd_data_hold[111:96], frame_rd_data_hold[127:112],
-    YUV422_ORDER_UYVY, alpha_hi_0, alpha_hi_1, alpha_hi_2, alpha_hi_3);
+wire [127:0] frame_dma_data_bgrx = pack_4pix_yuyv_to_bgrx(
+    frame_conv_w0, frame_conv_w1, frame_conv_w2, frame_conv_w3,
+    YUV422_ORDER_UYVY, frame_alpha_0, frame_alpha_1, frame_alpha_2, frame_alpha_3);
 wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
 wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data, preproc_en ? 8'h80 : 8'h00)}};
 wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
 wire [127:0] frame_dma_data = dma_expand_mode
-    ? (dma_expand_phase ? frame_rd_hold_bgrx_hi : frame_rd_data_bgrx_lo)
+    ? frame_dma_data_bgrx
     : frame_rd_data;
 wire        frame_stream_ready = ~dma_session_active | ~mwr_first_beat_seen | frame_rd_data_ready;
 
