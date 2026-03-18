@@ -57,7 +57,11 @@ reg                         shift_data_out_valid;
 reg                         ram_data_out_vld;
 wire                        ram_last_data_rd  ;
 reg                         data_in_valid;
+reg     [127:0]             data_in_pipe_data;
+reg                         data_in_pipe_valid;
 wire                        data_in_ready;
+wire                        data_in_pipe_ready;
+wire                        data_in_pipe_fire;
 wire                        fifo_data_in;
 wire                        fifo_data_out;
 reg     [7:0]               fifo_data_cnt;
@@ -192,7 +196,7 @@ begin
     begin
         if(shift_data_cnt_ff > 11'b0)
             shift_data_out_valid <= 1'b1;
-        else if(~(|shift_data_cnt_ff) && fifo_data_in)
+        else if(~(|shift_data_cnt_ff) && data_in_pipe_fire)
             shift_data_out_valid <= 1'b0;
     end
 end
@@ -204,10 +208,30 @@ always@(posedge clk or negedge rst_n)
 begin
     if(!rst_n)
         data_in_valid <= 1'b0;
-    else if(o_rd_ram_hold || ram_last_data_rd && data_in_valid)
+    else if(ram_last_data_rd && data_in_valid && data_in_pipe_fire)
         data_in_valid <= 1'b0;
     else if(((fifo_data_cnt == FIFO_DEEP - 8'd3) && shift_data_out_valid)  || ram_data_out_vld)
         data_in_valid <= 1'b1;
+end
+
+assign data_in_pipe_ready = ~data_in_pipe_valid || data_in_ready;
+assign data_in_pipe_fire  = data_in_valid && data_in_pipe_ready;
+
+// Insert one input pipeline stage before the prefetch FIFO to break the
+// longest pclk_div2 combinational path into FIFO DI.
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+    begin
+        data_in_pipe_data  <= 128'b0;
+        data_in_pipe_valid <= 1'b0;
+    end
+    else if(data_in_pipe_ready)
+    begin
+        data_in_pipe_valid <= data_in_valid;
+        if(data_in_valid)
+            data_in_pipe_data <= data_shift_out;
+    end
 end
 
     pgs_pciex4_prefetch_fifo_v1_2
@@ -220,8 +244,8 @@ end
     .clk                (clk            ),
     .rst_n              (rst_n          ),
 
-    .data_in_valid      (data_in_valid  ),
-    .data_in            (data_shift_out ),
+    .data_in_valid      (data_in_pipe_valid),
+    .data_in            (data_in_pipe_data ),
     .data_in_ready      (data_in_ready  ),
 
     .data_out_ready     (data_out_ready ),
@@ -229,7 +253,7 @@ end
     .data_out_valid     (data_out_valid )
     );
 
-assign fifo_data_in  = data_in_valid  && data_in_ready ;
+assign fifo_data_in  = data_in_pipe_valid && data_in_ready;
 assign fifo_data_out = data_out_ready && data_out_valid;
 
 always@(posedge clk or negedge rst_n)
@@ -244,7 +268,7 @@ begin
         fifo_data_cnt <= fifo_data_cnt - 8'h1;
 end
 
-assign o_rd_ram_hold = (fifo_data_cnt >= FIFO_DEEP - 8'd2) ? 1'b1 : 1'b0;
+assign o_rd_ram_hold = (fifo_data_cnt >= FIFO_DEEP - 8'd2) || (data_in_pipe_valid && !data_in_ready);
 
 always@(posedge clk or negedge rst_n)
 begin
