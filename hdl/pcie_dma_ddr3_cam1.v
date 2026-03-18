@@ -816,7 +816,7 @@ reg                        dma_expand_phase;
 reg                        mwr_first_beat_seen;
 reg  [11:0]                mwr_rd_addr_d;
 reg                        mwr_rd_clk_en_d;
-reg  [127:0]               frame_rd_data_hold;
+reg  [17:0]                bgrx_fetch_word_count;
 reg  [7:0]                 frame_id;
 wire                       dma_session_start;
 wire                       rd_fsync_pclk_div2;
@@ -826,7 +826,6 @@ wire [17:0]                frame_words_cfg = dma_expand_mode ? FRAME_WORDS_BGRX 
 // Count chunk first beat as a valid step to prevent boundary phase slip.
 wire                       bar2_addr_step = mwr_rd_clk_en &&
                                             ((mwr_rd_addr != mwr_rd_addr_d) || (~mwr_rd_clk_en_d));
-wire                       frame_rd_fetch_en = bar2_addr_step & (~dma_expand_mode | ~dma_expand_phase);
 wire [11:0]                post_ddr_x_pix = dma_expand_mode ? {1'b0, post_ddr_word_x, 2'b00}
                                                              : {post_ddr_word_x, 3'b000};
 wire [15:0]                post_ddr_color_base = color_bar_bgr565(post_ddr_x_pix);
@@ -993,35 +992,292 @@ begin
 end
 endfunction
 
-wire [7:0] alpha_lo_0_base = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[15:0]) : 8'h00;
-wire [7:0] alpha_lo_1 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[31:16]) : 8'h00;
-wire [7:0] alpha_lo_2 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[47:32]) : 8'h00;
-wire [7:0] alpha_lo_3 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[63:48]) : 8'h00;
+// YUYV/UYVY -> BGRX pipeline (S0 unpack, S1 multiply, S2 sum, S3 clip/pack).
+function [7:0] clip_s11_to_u8;
+    input signed [10:0] value;
+begin
+    if (value[10])
+        clip_s11_to_u8 = 8'd0;
+    else if (value > 11'sd255)
+        clip_s11_to_u8 = 8'hFF;
+    else
+        clip_s11_to_u8 = value[7:0];
+end
+endfunction
 
-wire [7:0] alpha_hi_0 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data_hold[79:64]) : 8'h00;
-wire [7:0] alpha_hi_1 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data_hold[95:80]) : 8'h00;
-wire [7:0] alpha_hi_2 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data_hold[111:96]) : 8'h00;
-wire [7:0] alpha_hi_3 = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data_hold[127:112]) : 8'h00;
+localparam [2:0]        BGRX_PIPE_TARGET = 3'd2;
+localparam signed [10:0] YUV_MUL_RV = 11'sd359;
+localparam signed [10:0] YUV_MUL_GU = 11'sd88;
+localparam signed [10:0] YUV_MUL_GV = 11'sd183;
+localparam signed [10:0] YUV_MUL_BU = 11'sd454;
 
-// Reserve Pixel[0,0].A as frame watermark for future sideband lockstep.
-wire first_pixel_word = dma_session_active && (dma_rd_word_count == 18'd0) && (dma_expand_phase == 1'b0);
-wire [7:0] alpha_lo_0 = (preproc_en && first_pixel_word) ? frame_id : alpha_lo_0_base;
+wire [7:0] s0_y0_src = YUV422_ORDER_UYVY ? frame_rd_data[7:0]     : frame_rd_data[15:8];
+wire [7:0] s0_y1_src = YUV422_ORDER_UYVY ? frame_rd_data[23:16]   : frame_rd_data[31:24];
+wire [7:0] s0_y2_src = YUV422_ORDER_UYVY ? frame_rd_data[39:32]   : frame_rd_data[47:40];
+wire [7:0] s0_y3_src = YUV422_ORDER_UYVY ? frame_rd_data[55:48]   : frame_rd_data[63:56];
+wire [7:0] s0_y4_src = YUV422_ORDER_UYVY ? frame_rd_data[71:64]   : frame_rd_data[79:72];
+wire [7:0] s0_y5_src = YUV422_ORDER_UYVY ? frame_rd_data[87:80]   : frame_rd_data[95:88];
+wire [7:0] s0_y6_src = YUV422_ORDER_UYVY ? frame_rd_data[103:96]  : frame_rd_data[111:104];
+wire [7:0] s0_y7_src = YUV422_ORDER_UYVY ? frame_rd_data[119:112] : frame_rd_data[127:120];
 
-wire [127:0] frame_rd_data_bgrx_lo = pack_4pix_yuyv_to_bgrx(
-    frame_rd_data[15:0], frame_rd_data[31:16], frame_rd_data[47:32], frame_rd_data[63:48],
-    YUV422_ORDER_UYVY, alpha_lo_0, alpha_lo_1, alpha_lo_2, alpha_lo_3);
-wire [127:0] frame_rd_hold_bgrx_hi = pack_4pix_yuyv_to_bgrx(
-    frame_rd_data_hold[79:64], frame_rd_data_hold[95:80], frame_rd_data_hold[111:96], frame_rd_data_hold[127:112],
-    YUV422_ORDER_UYVY, alpha_hi_0, alpha_hi_1, alpha_hi_2, alpha_hi_3);
+wire [7:0] s0_u0_src = YUV422_ORDER_UYVY ? frame_rd_data[15:8]    : frame_rd_data[7:0];
+wire [7:0] s0_v0_src = YUV422_ORDER_UYVY ? frame_rd_data[31:24]   : frame_rd_data[23:16];
+wire [7:0] s0_u1_src = YUV422_ORDER_UYVY ? frame_rd_data[47:40]   : frame_rd_data[39:32];
+wire [7:0] s0_v1_src = YUV422_ORDER_UYVY ? frame_rd_data[63:56]   : frame_rd_data[55:48];
+wire [7:0] s0_u2_src = YUV422_ORDER_UYVY ? frame_rd_data[79:72]   : frame_rd_data[71:64];
+wire [7:0] s0_v2_src = YUV422_ORDER_UYVY ? frame_rd_data[95:88]   : frame_rd_data[87:80];
+wire [7:0] s0_u3_src = YUV422_ORDER_UYVY ? frame_rd_data[111:104] : frame_rd_data[103:96];
+wire [7:0] s0_v3_src = YUV422_ORDER_UYVY ? frame_rd_data[127:120] : frame_rd_data[119:112];
+
+wire [7:0] s0_a0_base = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[15:0])    : 8'h00;
+wire [7:0] s0_a1_base = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[31:16])   : 8'h00;
+wire [7:0] s0_a2_base = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[47:32])   : 8'h00;
+wire [7:0] s0_a3_base = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[63:48])   : 8'h00;
+wire [7:0] s0_a4_base = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[79:64])   : 8'h00;
+wire [7:0] s0_a5_base = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[95:80])   : 8'h00;
+wire [7:0] s0_a6_base = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[111:96])  : 8'h00;
+wire [7:0] s0_a7_base = preproc_en ? preproc_alpha_from_bgr565(frame_rd_data[127:112]) : 8'h00;
+
+reg yuv_s0_valid;
+reg [7:0] yuv_s0_y0, yuv_s0_y1, yuv_s0_y2, yuv_s0_y3, yuv_s0_y4, yuv_s0_y5, yuv_s0_y6, yuv_s0_y7;
+reg signed [8:0] yuv_s0_du0, yuv_s0_dv0, yuv_s0_du1, yuv_s0_dv1, yuv_s0_du2, yuv_s0_dv2, yuv_s0_du3, yuv_s0_dv3;
+reg [7:0] yuv_s0_a0, yuv_s0_a1, yuv_s0_a2, yuv_s0_a3, yuv_s0_a4, yuv_s0_a5, yuv_s0_a6, yuv_s0_a7;
+
+reg yuv_s1_valid;
+reg [7:0] yuv_s1_y0, yuv_s1_y1, yuv_s1_y2, yuv_s1_y3, yuv_s1_y4, yuv_s1_y5, yuv_s1_y6, yuv_s1_y7;
+reg [7:0] yuv_s1_a0, yuv_s1_a1, yuv_s1_a2, yuv_s1_a3, yuv_s1_a4, yuv_s1_a5, yuv_s1_a6, yuv_s1_a7;
+reg signed [19:0] yuv_s1_rv0, yuv_s1_gu0, yuv_s1_gv0, yuv_s1_bu0;
+reg signed [19:0] yuv_s1_rv1, yuv_s1_gu1, yuv_s1_gv1, yuv_s1_bu1;
+reg signed [19:0] yuv_s1_rv2, yuv_s1_gu2, yuv_s1_gv2, yuv_s1_bu2;
+reg signed [19:0] yuv_s1_rv3, yuv_s1_gu3, yuv_s1_gv3, yuv_s1_bu3;
+
+reg yuv_s2_valid;
+reg signed [10:0] yuv_s2_r0, yuv_s2_g0, yuv_s2_b0;
+reg signed [10:0] yuv_s2_r1, yuv_s2_g1, yuv_s2_b1;
+reg signed [10:0] yuv_s2_r2, yuv_s2_g2, yuv_s2_b2;
+reg signed [10:0] yuv_s2_r3, yuv_s2_g3, yuv_s2_b3;
+reg signed [10:0] yuv_s2_r4, yuv_s2_g4, yuv_s2_b4;
+reg signed [10:0] yuv_s2_r5, yuv_s2_g5, yuv_s2_b5;
+reg signed [10:0] yuv_s2_r6, yuv_s2_g6, yuv_s2_b6;
+reg signed [10:0] yuv_s2_r7, yuv_s2_g7, yuv_s2_b7;
+reg [7:0] yuv_s2_a0, yuv_s2_a1, yuv_s2_a2, yuv_s2_a3, yuv_s2_a4, yuv_s2_a5, yuv_s2_a6, yuv_s2_a7;
+
+reg yuv_s3_valid;
+reg [127:0] yuv_s3_lo_word;
+reg [127:0] yuv_s3_hi_word;
+
+reg [127:0] bgrx_pair_lo_fifo [0:3];
+reg [127:0] bgrx_pair_hi_fifo [0:3];
+reg [1:0]   bgrx_fifo_wptr;
+reg [1:0]   bgrx_fifo_rptr;
+reg [2:0]   bgrx_pair_count;
+reg [127:0] bgrx_active_hi_word;
+reg         bgrx_active_hi_valid;
+
+wire bgrx_phase0_consume = dma_expand_mode && dma_session_active && bar2_addr_step && ~dma_expand_phase;
+wire bgrx_phase1_consume = dma_expand_mode && dma_session_active && bar2_addr_step && dma_expand_phase;
+wire [3:0] bgrx_inflight_count = {1'b0, bgrx_pair_count} + {3'd0, yuv_s0_valid} + {3'd0, yuv_s1_valid} + {3'd0, yuv_s2_valid} + {3'd0, yuv_s3_valid};
+wire [3:0] bgrx_inflight_after_consume = bgrx_inflight_count - (bgrx_phase0_consume ? 4'd1 : 4'd0);
+wire [17:0] bgrx_fetch_words_cfg = frame_words_cfg >> 1;
+wire bgrx_fetch_credit_ok = (bgrx_fetch_word_count < bgrx_fetch_words_cfg);
+wire bgrx_fetch_fire = dma_expand_mode && dma_session_active && frame_rd_data_ready && bgrx_fetch_credit_ok &&
+                       (bgrx_inflight_after_consume < {1'b0, BGRX_PIPE_TARGET});
+wire frame_rd_fetch_en = dma_expand_mode ? bgrx_fetch_fire : bar2_addr_step;
+wire first_pixel_fetch = bgrx_fetch_fire && (bgrx_fetch_word_count == 18'd0);
+
+wire [127:0] bgrx_pair_lo_head = bgrx_pair_lo_fifo[bgrx_fifo_rptr];
+wire [127:0] bgrx_pair_hi_head = bgrx_pair_hi_fifo[bgrx_fifo_rptr];
+wire bgrx_fifo_pop = bgrx_phase0_consume && (bgrx_pair_count != 3'd0);
+wire bgrx_fifo_push = yuv_s3_valid && ((bgrx_pair_count != 3'd4) || bgrx_fifo_pop);
+
+wire bgrx_phase_ready = dma_expand_phase ? bgrx_active_hi_valid : (bgrx_pair_count != 3'd0);
+wire frame_stream_ready_565 = ~dma_session_active | ~mwr_first_beat_seen | frame_rd_data_ready;
+wire frame_stream_ready_bgrx = ~dma_session_active ? 1'b1 : bgrx_phase_ready;
+wire frame_stream_ready = dma_expand_mode ? frame_stream_ready_bgrx : frame_stream_ready_565;
+
 wire [127:0] post_ddr_pattern_data_565 = {8{post_ddr_color_data}};
 wire [127:0] post_ddr_pattern_data_bgrx = {4{bgr565_to_bgrx32(post_ddr_color_data, preproc_en ? 8'h80 : 8'h00)}};
 wire [127:0] post_ddr_pattern_data = dma_expand_mode ? post_ddr_pattern_data_bgrx : post_ddr_pattern_data_565;
-wire [127:0] frame_dma_data = dma_expand_mode
-    ? (dma_expand_phase ? frame_rd_hold_bgrx_hi : frame_rd_data_bgrx_lo)
-    : frame_rd_data;
-wire        frame_stream_ready = ~dma_session_active | ~mwr_first_beat_seen | frame_rd_data_ready;
+wire [127:0] frame_dma_data_expand = dma_expand_phase ? bgrx_active_hi_word : bgrx_pair_lo_head;
+wire [127:0] frame_dma_data = dma_expand_mode ? frame_dma_data_expand : frame_rd_data;
 
 assign axis_slave2_tready_fc = axis_slave2_tready_raw & frame_stream_ready;
+
+always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
+    if (!pclk_div2_core_rst_n) begin
+        yuv_s0_valid <= 1'b0;
+        yuv_s1_valid <= 1'b0;
+        yuv_s2_valid <= 1'b0;
+        yuv_s3_valid <= 1'b0;
+    end else if (frame_done_pulse || dma_session_start) begin
+        yuv_s0_valid <= 1'b0;
+        yuv_s1_valid <= 1'b0;
+        yuv_s2_valid <= 1'b0;
+        yuv_s3_valid <= 1'b0;
+    end else begin
+        yuv_s0_valid <= bgrx_fetch_fire;
+        if (bgrx_fetch_fire) begin
+            yuv_s0_y0 <= s0_y0_src;
+            yuv_s0_y1 <= s0_y1_src;
+            yuv_s0_y2 <= s0_y2_src;
+            yuv_s0_y3 <= s0_y3_src;
+            yuv_s0_y4 <= s0_y4_src;
+            yuv_s0_y5 <= s0_y5_src;
+            yuv_s0_y6 <= s0_y6_src;
+            yuv_s0_y7 <= s0_y7_src;
+
+            yuv_s0_du0 <= $signed({1'b0, s0_u0_src}) - 9'sd128;
+            yuv_s0_dv0 <= $signed({1'b0, s0_v0_src}) - 9'sd128;
+            yuv_s0_du1 <= $signed({1'b0, s0_u1_src}) - 9'sd128;
+            yuv_s0_dv1 <= $signed({1'b0, s0_v1_src}) - 9'sd128;
+            yuv_s0_du2 <= $signed({1'b0, s0_u2_src}) - 9'sd128;
+            yuv_s0_dv2 <= $signed({1'b0, s0_v2_src}) - 9'sd128;
+            yuv_s0_du3 <= $signed({1'b0, s0_u3_src}) - 9'sd128;
+            yuv_s0_dv3 <= $signed({1'b0, s0_v3_src}) - 9'sd128;
+
+            yuv_s0_a0 <= (preproc_en && first_pixel_fetch) ? frame_id : s0_a0_base;
+            yuv_s0_a1 <= s0_a1_base;
+            yuv_s0_a2 <= s0_a2_base;
+            yuv_s0_a3 <= s0_a3_base;
+            yuv_s0_a4 <= s0_a4_base;
+            yuv_s0_a5 <= s0_a5_base;
+            yuv_s0_a6 <= s0_a6_base;
+            yuv_s0_a7 <= s0_a7_base;
+        end
+
+        yuv_s1_valid <= yuv_s0_valid;
+        if (yuv_s0_valid) begin
+            yuv_s1_y0 <= yuv_s0_y0;
+            yuv_s1_y1 <= yuv_s0_y1;
+            yuv_s1_y2 <= yuv_s0_y2;
+            yuv_s1_y3 <= yuv_s0_y3;
+            yuv_s1_y4 <= yuv_s0_y4;
+            yuv_s1_y5 <= yuv_s0_y5;
+            yuv_s1_y6 <= yuv_s0_y6;
+            yuv_s1_y7 <= yuv_s0_y7;
+            yuv_s1_a0 <= yuv_s0_a0;
+            yuv_s1_a1 <= yuv_s0_a1;
+            yuv_s1_a2 <= yuv_s0_a2;
+            yuv_s1_a3 <= yuv_s0_a3;
+            yuv_s1_a4 <= yuv_s0_a4;
+            yuv_s1_a5 <= yuv_s0_a5;
+            yuv_s1_a6 <= yuv_s0_a6;
+            yuv_s1_a7 <= yuv_s0_a7;
+
+            yuv_s1_rv0 <= $signed(yuv_s0_dv0) * YUV_MUL_RV;
+            yuv_s1_gu0 <= $signed(yuv_s0_du0) * YUV_MUL_GU;
+            yuv_s1_gv0 <= $signed(yuv_s0_dv0) * YUV_MUL_GV;
+            yuv_s1_bu0 <= $signed(yuv_s0_du0) * YUV_MUL_BU;
+
+            yuv_s1_rv1 <= $signed(yuv_s0_dv1) * YUV_MUL_RV;
+            yuv_s1_gu1 <= $signed(yuv_s0_du1) * YUV_MUL_GU;
+            yuv_s1_gv1 <= $signed(yuv_s0_dv1) * YUV_MUL_GV;
+            yuv_s1_bu1 <= $signed(yuv_s0_du1) * YUV_MUL_BU;
+
+            yuv_s1_rv2 <= $signed(yuv_s0_dv2) * YUV_MUL_RV;
+            yuv_s1_gu2 <= $signed(yuv_s0_du2) * YUV_MUL_GU;
+            yuv_s1_gv2 <= $signed(yuv_s0_dv2) * YUV_MUL_GV;
+            yuv_s1_bu2 <= $signed(yuv_s0_du2) * YUV_MUL_BU;
+
+            yuv_s1_rv3 <= $signed(yuv_s0_dv3) * YUV_MUL_RV;
+            yuv_s1_gu3 <= $signed(yuv_s0_du3) * YUV_MUL_GU;
+            yuv_s1_gv3 <= $signed(yuv_s0_dv3) * YUV_MUL_GV;
+            yuv_s1_bu3 <= $signed(yuv_s0_du3) * YUV_MUL_BU;
+        end
+
+        yuv_s2_valid <= yuv_s1_valid;
+        if (yuv_s1_valid) begin
+            yuv_s2_r0 <= $signed({3'b000, yuv_s1_y0}) + (yuv_s1_rv0 >>> 8);
+            yuv_s2_g0 <= $signed({3'b000, yuv_s1_y0}) - ((yuv_s1_gu0 + yuv_s1_gv0) >>> 8);
+            yuv_s2_b0 <= $signed({3'b000, yuv_s1_y0}) + (yuv_s1_bu0 >>> 8);
+            yuv_s2_r1 <= $signed({3'b000, yuv_s1_y1}) + (yuv_s1_rv0 >>> 8);
+            yuv_s2_g1 <= $signed({3'b000, yuv_s1_y1}) - ((yuv_s1_gu0 + yuv_s1_gv0) >>> 8);
+            yuv_s2_b1 <= $signed({3'b000, yuv_s1_y1}) + (yuv_s1_bu0 >>> 8);
+
+            yuv_s2_r2 <= $signed({3'b000, yuv_s1_y2}) + (yuv_s1_rv1 >>> 8);
+            yuv_s2_g2 <= $signed({3'b000, yuv_s1_y2}) - ((yuv_s1_gu1 + yuv_s1_gv1) >>> 8);
+            yuv_s2_b2 <= $signed({3'b000, yuv_s1_y2}) + (yuv_s1_bu1 >>> 8);
+            yuv_s2_r3 <= $signed({3'b000, yuv_s1_y3}) + (yuv_s1_rv1 >>> 8);
+            yuv_s2_g3 <= $signed({3'b000, yuv_s1_y3}) - ((yuv_s1_gu1 + yuv_s1_gv1) >>> 8);
+            yuv_s2_b3 <= $signed({3'b000, yuv_s1_y3}) + (yuv_s1_bu1 >>> 8);
+
+            yuv_s2_r4 <= $signed({3'b000, yuv_s1_y4}) + (yuv_s1_rv2 >>> 8);
+            yuv_s2_g4 <= $signed({3'b000, yuv_s1_y4}) - ((yuv_s1_gu2 + yuv_s1_gv2) >>> 8);
+            yuv_s2_b4 <= $signed({3'b000, yuv_s1_y4}) + (yuv_s1_bu2 >>> 8);
+            yuv_s2_r5 <= $signed({3'b000, yuv_s1_y5}) + (yuv_s1_rv2 >>> 8);
+            yuv_s2_g5 <= $signed({3'b000, yuv_s1_y5}) - ((yuv_s1_gu2 + yuv_s1_gv2) >>> 8);
+            yuv_s2_b5 <= $signed({3'b000, yuv_s1_y5}) + (yuv_s1_bu2 >>> 8);
+
+            yuv_s2_r6 <= $signed({3'b000, yuv_s1_y6}) + (yuv_s1_rv3 >>> 8);
+            yuv_s2_g6 <= $signed({3'b000, yuv_s1_y6}) - ((yuv_s1_gu3 + yuv_s1_gv3) >>> 8);
+            yuv_s2_b6 <= $signed({3'b000, yuv_s1_y6}) + (yuv_s1_bu3 >>> 8);
+            yuv_s2_r7 <= $signed({3'b000, yuv_s1_y7}) + (yuv_s1_rv3 >>> 8);
+            yuv_s2_g7 <= $signed({3'b000, yuv_s1_y7}) - ((yuv_s1_gu3 + yuv_s1_gv3) >>> 8);
+            yuv_s2_b7 <= $signed({3'b000, yuv_s1_y7}) + (yuv_s1_bu3 >>> 8);
+
+            yuv_s2_a0 <= yuv_s1_a0;
+            yuv_s2_a1 <= yuv_s1_a1;
+            yuv_s2_a2 <= yuv_s1_a2;
+            yuv_s2_a3 <= yuv_s1_a3;
+            yuv_s2_a4 <= yuv_s1_a4;
+            yuv_s2_a5 <= yuv_s1_a5;
+            yuv_s2_a6 <= yuv_s1_a6;
+            yuv_s2_a7 <= yuv_s1_a7;
+        end
+
+        yuv_s3_valid <= yuv_s2_valid;
+        if (yuv_s2_valid) begin
+            yuv_s3_lo_word <= {
+                {yuv_s2_a3, clip_s11_to_u8(yuv_s2_r3), clip_s11_to_u8(yuv_s2_g3), clip_s11_to_u8(yuv_s2_b3)},
+                {yuv_s2_a2, clip_s11_to_u8(yuv_s2_r2), clip_s11_to_u8(yuv_s2_g2), clip_s11_to_u8(yuv_s2_b2)},
+                {yuv_s2_a1, clip_s11_to_u8(yuv_s2_r1), clip_s11_to_u8(yuv_s2_g1), clip_s11_to_u8(yuv_s2_b1)},
+                {yuv_s2_a0, clip_s11_to_u8(yuv_s2_r0), clip_s11_to_u8(yuv_s2_g0), clip_s11_to_u8(yuv_s2_b0)}
+            };
+            yuv_s3_hi_word <= {
+                {yuv_s2_a7, clip_s11_to_u8(yuv_s2_r7), clip_s11_to_u8(yuv_s2_g7), clip_s11_to_u8(yuv_s2_b7)},
+                {yuv_s2_a6, clip_s11_to_u8(yuv_s2_r6), clip_s11_to_u8(yuv_s2_g6), clip_s11_to_u8(yuv_s2_b6)},
+                {yuv_s2_a5, clip_s11_to_u8(yuv_s2_r5), clip_s11_to_u8(yuv_s2_g5), clip_s11_to_u8(yuv_s2_b5)},
+                {yuv_s2_a4, clip_s11_to_u8(yuv_s2_r4), clip_s11_to_u8(yuv_s2_g4), clip_s11_to_u8(yuv_s2_b4)}
+            };
+        end
+    end
+end
+
+always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
+    if (!pclk_div2_core_rst_n) begin
+        bgrx_fifo_wptr <= 2'd0;
+        bgrx_fifo_rptr <= 2'd0;
+        bgrx_pair_count <= 3'd0;
+        bgrx_active_hi_word <= 128'd0;
+        bgrx_active_hi_valid <= 1'b0;
+    end else if (frame_done_pulse || dma_session_start) begin
+        bgrx_fifo_wptr <= 2'd0;
+        bgrx_fifo_rptr <= 2'd0;
+        bgrx_pair_count <= 3'd0;
+        bgrx_active_hi_word <= 128'd0;
+        bgrx_active_hi_valid <= 1'b0;
+    end else begin
+        if (bgrx_fifo_push) begin
+            bgrx_pair_lo_fifo[bgrx_fifo_wptr] <= yuv_s3_lo_word;
+            bgrx_pair_hi_fifo[bgrx_fifo_wptr] <= yuv_s3_hi_word;
+            bgrx_fifo_wptr <= bgrx_fifo_wptr + 2'd1;
+        end
+
+        if (bgrx_fifo_pop) begin
+            bgrx_active_hi_word <= bgrx_pair_hi_head;
+            bgrx_active_hi_valid <= 1'b1;
+            bgrx_fifo_rptr <= bgrx_fifo_rptr + 2'd1;
+        end else if (bgrx_phase1_consume) begin
+            bgrx_active_hi_valid <= 1'b0;
+        end
+
+        case ({bgrx_fifo_push, bgrx_fifo_pop})
+            2'b10: bgrx_pair_count <= bgrx_pair_count + 3'd1;
+            2'b01: bgrx_pair_count <= bgrx_pair_count - 3'd1;
+            default: bgrx_pair_count <= bgrx_pair_count;
+        endcase
+    end
+end
 
 always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
     if (!pclk_div2_core_rst_n)
@@ -1044,7 +1300,7 @@ always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
         rd_fsync_stretch_cnt <= 6'd0;
         dma_expand_phase <= 1'b0;
         mwr_first_beat_seen <= 1'b0;
-        frame_rd_data_hold <= 128'd0;
+        bgrx_fetch_word_count <= 18'd0;
         frame_id <= 8'd0;
     end else if (frame_done_pulse) begin
         dma_session_active <= 1'b0;
@@ -1052,6 +1308,7 @@ always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
         rd_fsync_stretch_cnt <= 6'd0;
         dma_expand_phase <= 1'b0;
         mwr_first_beat_seen <= 1'b0;
+        bgrx_fetch_word_count <= 18'd0;
     end else begin
         if (dma_session_start) begin
             dma_session_active <= 1'b1;
@@ -1059,6 +1316,7 @@ always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
             rd_fsync_stretch_cnt <= 6'd31;
             dma_expand_phase <= 1'b0;
             mwr_first_beat_seen <= 1'b0;
+            bgrx_fetch_word_count <= 18'd0;
             frame_id <= frame_id + 8'd1;
         end else begin
             if (dma_session_active && bar2_addr_step)
@@ -1076,8 +1334,8 @@ always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
             if (dma_expand_mode && dma_session_active && bar2_addr_step)
                 dma_expand_phase <= ~dma_expand_phase;
 
-            if (frame_rd_fetch_en)
-                frame_rd_data_hold <= frame_rd_data;
+            if (bgrx_fetch_fire)
+                bgrx_fetch_word_count <= bgrx_fetch_word_count + 18'd1;
 
             if (rd_fsync_stretch_cnt != 6'd0)
                 rd_fsync_stretch_cnt <= rd_fsync_stretch_cnt - 6'd1;
