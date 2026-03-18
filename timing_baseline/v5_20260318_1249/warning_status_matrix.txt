@@ -1,0 +1,17 @@
+﻿Warning status matrix (summary-level)
+
+[clock_20k]
+rows_found=48 violated_rows=0
+  violated_summary_entry: NO
+
+[DebugCore_JCLK]
+rows_found=56 violated_rows=0
+  violated_summary_entry: NO
+
+[DebugCore_CAPTURE]
+rows_found=28 violated_rows=0
+  violated_summary_entry: NO
+
+[DeviceMap-2011 nt_sys_clk]
+summary_row: N/A (device mapping warning)
+classification: implementation warning; treat as IP-owned unless it appears in top50 RTL-owned paths
