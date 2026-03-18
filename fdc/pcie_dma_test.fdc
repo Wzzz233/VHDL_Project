@@ -53,11 +53,11 @@ set_false_path -to [get_pins {u_sys_ddr_rstn_sync/sig_async}]
 set_false_path -to [get_pins {u_cmos1_init_done_sync/sig_async}]
 
 # ref_clk <-> pclk_div2 CDC bridge endpoints (point constraints only).
-set_false_path -to [get_pins {u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/u_pcie_apb_mux/u_pcie_apb_cross/o_des_p_addr[10]/opit_0_inv/D}]
-set_false_path -to [get_pins {u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/u_pcie_apb_mux/u_pcie_apb_cross/o_des_p_addr[11]/opit_0_inv/D}]
-set_false_path -to [get_pins {u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_PCIE_HARD_CTRL/tx_rst_done_sync/sig_async_ff/opit_0_inv_srl/D}]
-set_false_path -to [get_pins {u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_HSSTLP_PCIE_SOFT_PHY/phy_rstn_sync/sig_async_ff/opit_0_inv_srl/RS}]
-set_false_path -to [get_pins {u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_HSSTLP_PCIE_SOFT_PHY/hsst_pciex4_rst/hsst_rx_rst_mcrsw/genblk1[1].hsst_rst4mcrsw_rx_init/word_align_multi_sw_sync/sig_async_ff/opit_0_inv_srl/D}]
+# Note: constrain synchronizer async inputs only (RTL-visible pins), and
+# avoid mapping-specific primitive pins (opit_*/D, */RS) to keep import robust.
+set_false_path -to [get_pins {*/tx_rst_done_sync/sig_async}]
+set_false_path -to [get_pins {*/phy_rstn_sync/sig_async}]
+set_false_path -to [get_pins {*/word_align_multi_sw_sync/sig_async}]
 
 # Local synchronizers in ref_clk domain.
 set_false_path -to [get_pins {u_ref_smlh_linkup_sync/sig_async}]
