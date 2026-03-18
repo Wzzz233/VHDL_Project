@@ -1091,7 +1091,7 @@ fram_buf #(
     .ddr_init_ready     (ddr_init_done),
     
     // Camera input (write to DDR)
-    .vin_clk            (cmos1_pclk_16bit),
+    .vin_clk            (cmos1_pclk),
     .wr_fsync           (cmos1_vsync_16bit),
     .wr_en              (cmos1_href_16bit),
     .wr_data_vld        (cmos1_pix_vld),
