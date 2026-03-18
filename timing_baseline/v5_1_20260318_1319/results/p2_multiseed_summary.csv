@@ -1,0 +1,6 @@
+seed,status,reason,pclk_pclk_wns,ddrphy_ddrphy_wns,pclk_div2_wns,pclk_div2_tns,pclk_div2_fe,ref_to_div2_fe,div2_to_ref_fe,fdc_gate_total,ip_owned_top50_ratio_pct
+101,OK,ok,0.044,-0.07,-2.656,-351.807,275,45,5,0,92.00
+102,OK,ok,0.186,0.014,-2.111,-285.526,239,49,5,0,94.00
+103,OK,ok,-0.07,0.196,-2.47,-282.633,227,41,5,0,92.00
+104,OK,ok,0.126,0.286,-2.33,-333.01,267,50,4,0,92.00
+105,OK,ok,0.119,0.045,-2.548,-333.08,285,45,4,0,90.00

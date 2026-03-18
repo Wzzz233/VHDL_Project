@@ -1,0 +1,158 @@
+Top50 Slow-Max Path Classification
+
+Total top50 paths: 50
+RTL_OWNED: 3
+IP_DDR_PHY: 39
+IP_PCIE_HARD: 8
+IP_OWNED_RATIO: 47/50 (94.00%)
+
+01. slack=-6.979 owner=IP_DDR_PHY group=ddrphy_sysclk class=async timing path
+    start=rstn_1ms[4]/opit_0_inv_AQ_perm/CLK
+    end=u_DDR3/u_ddrphy_top/u_ips2l_ddrphy_rst_clk_phase_adj/cpd_offset_cnt[4]/opit_0_AQ_perm/RS
+02. slack=-6.960 owner=IP_DDR_PHY group=ddrphy_sysclk class=async timing path
+    start=rstn_1ms[4]/opit_0_inv_AQ_perm/CLK
+    end=u_DDR3/u_ddrphy_top/u_ips2l_ddrphy_rst_clk_phase_adj/rst_clk_dps_done_d[0]/opit_0_srl/RS
+03. slack=-6.927 owner=IP_DDR_PHY group=ddrphy_sysclk class=async timing path
+    start=rstn_1ms[4]/opit_0_inv_AQ_perm/CLK
+    end=u_DDR3/u_ddrphy_top/u_ips2l_ddrphy_rst_clk_phase_adj/cpd_offset_cnt[0]/opit_0_L5Q_perm/RS
+04. slack=-5.436 owner=IP_DDR_PHY group=ddr_rst_clk class=async timing path
+    start=rstn_1ms[4]/opit_0_inv_AQ_perm/CLK
+    end=u_DDR3/u_ddrphy_top/u_ddrphy_rst_seq_rstn_sync/sig_async_r1[0]/opit_0_srl/RS
+05. slack=-4.216 owner=IP_DDR_PHY group=ddrphy_sysclk class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_rst_n_rg/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/u_ddrphy_rstn_sync/sig_async_r1[0]/opit_0_inv_srl/RS
+06. slack=-4.135 owner=IP_DDR_PHY group=phy_dq_clk_1 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_dqs_rst/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[1].ddrphy_data_slice/u_ddc_dq/ddc_inst_PHY/RST
+07. slack=-4.057 owner=IP_DDR_PHY group=phy_dq_clk_1 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_dqs_rst/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[1].ddrphy_data_slice/dq_loop[7].u_iobuf_dq/opit_1/OSR_IOLHR
+08. slack=-3.973 owner=IP_DDR_PHY group=phy_dq_clk_1 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_dqs_rst/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[1].ddrphy_data_slice/dq_loop[6].u_iobuf_dq/opit_1/OSR_IOLHR
+09. slack=-3.762 owner=IP_DDR_PHY group=phy_dq_clk_1 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_training_ctrl/ddrphy_dqs_training_rstn/opit_0_inv_L5Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[1].ddrphy_data_slice/u_ddc_dq/ddc_inst_PHY/RST_TRAINING_N
+10. slack=-3.695 owner=IP_DDR_PHY group=ddrphy_sysclk class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_dll_update_ctrl/dll_update_n/opit_0_inv_L6Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/u_dll_update_n_sync/sig_async_r1[0]/opit_0_inv_srl/D
+11. slack=-3.691 owner=IP_DDR_PHY group=phy_dq_sysclk_1 class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[0].ddrphy_data_slice/ddrphy_wdata_path_adj/phy_wrdata_en_r[2]/opit_0_inv_L6QQ_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[0].ddrphy_data_slice/u_tserdes0_dqs/oserdes_inst/TS_CTRL[3]
+12. slack=-3.676 owner=IP_DDR_PHY group=phy_dq_clk_0 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_dqs_rst/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_ca_group[2].u_ddc_ca/ddc_inst/RST
+13. slack=-3.670 owner=IP_DDR_PHY group=phy_dq_sysclk_1 class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[0].ddrphy_data_slice/ddrphy_wdata_path_adj/phy_wrdata_en_r[2]/opit_0_inv_L6QQ_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[0].ddrphy_data_slice/u_tserdes0_dqs/oserdes_inst/TS_CTRL[2]
+14. slack=-3.665 owner=IP_DDR_PHY group=phy_dq_sysclk_1 class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[0].ddrphy_data_slice/ddrphy_wdata_path_adj/phy_wrdata_en_r[2]/opit_0_inv_L6QQ_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[0].ddrphy_data_slice/u_tserdes0_dqs/oserdes_inst/TS_CTRL[7]
+15. slack=-3.590 owner=IP_DDR_PHY group=phy_dq_clk_0 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_iol_rst/opit_0_inv_L5Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_ca_group[2].u_tserdes_ca1/oserdes_inst/TSR
+16. slack=-3.568 owner=IP_DDR_PHY group=ddrphy_sysclk class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/training_error_latch/opit_0_inv_L6Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/u_ips2l_ddrphy_rst_clk_phase_adj/rst_clk_adj_start_d[0]/opit_0_srl/D
+17. slack=-3.471 owner=IP_DDR_PHY group=phy_dq_clk_1 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_training_ctrl/ddrphy_dqs_training_rstn/opit_0_inv_L5Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[0].ddrphy_data_slice/u_ddc_dq/ddc_inst_PHY/RST_TRAINING_N
+18. slack=-3.463 owner=IP_DDR_PHY group=phy_dq_sysclk_0 class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_dfi/phy_addr_d[3]/opit_0_inv_L6QL5Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_mem_addr_0[3].u_outbuft_addr0/opit_1/TX_DATA[3]
+19. slack=-3.443 owner=IP_DDR_PHY group=phy_dq_sysclk_0 class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[0].ddrphy_data_slice/ddrphy_dqs_rddata_align/this_group_ca_dly/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_mem_addr_0[1].u_outbuft_addr0/opit_1/TX_DATA[5]
+20. slack=-3.440 owner=IP_DDR_PHY group=phy_dq_sysclk_0 class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[0].ddrphy_data_slice/ddrphy_dqs_rddata_align/this_group_ca_dly/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_mem_addr_0[2].u_outbuft_addr0/opit_1/TX_DATA[6]
+21. slack=-3.396 owner=IP_DDR_PHY group=phy_dq_clk_0 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_dqs_rst/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/u_outbuft_csn/opit_1/OSR_IOLHR
+22. slack=-3.201 owner=IP_DDR_PHY group=ddrphy_sysclk class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_dll_update_ctrl/dll_freeze_cnt[18]/opit_0_inv_AQ_perm/CLK
+    end=u_DDR3/u_ddrphy_top/u_dll_freeze_sync/sig_async_r1[0]/opit_0_inv_srl/D
+23. slack=-3.199 owner=IP_DDR_PHY group=ddrphy_sysclk class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/logic_rstn/opit_0_inv_L6QL5Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/u_dll_rst_sync/sig_async_r1[0]/opit_0_inv_srl/RS
+24. slack=-3.069 owner=IP_DDR_PHY group=phy_dq_clk_0 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_training_ctrl/ddrphy_dqs_training_rstn/opit_0_inv_L5Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_ca_group[2].u_ddc_ca/ddc_inst/RST_TRAINING_N
+25. slack=-2.926 owner=IP_DDR_PHY group=phy_dq_sysclk_1 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_dqs_rst/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[1].ddrphy_data_slice/dq_loop[6].u_iobuf_dq/opit_1/ISR_IOLHR
+26. slack=-2.908 owner=IP_DDR_PHY group=phy_dq_sysclk_1 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_dqs_rst/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[1].ddrphy_data_slice/dq_loop[7].u_iobuf_dq/opit_1/ISR_IOLHR
+27. slack=-2.855 owner=IP_DDR_PHY group=phy_dq_sysclk_1 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_dqs_rst/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[1].ddrphy_data_slice/dq_loop[4].u_iobuf_dq/opit_1/ISR_IOLHR
+28. slack=-2.722 owner=IP_DDR_PHY group=phy_dq_clk_0 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_training_ctrl/ddrphy_dqs_training_rstn/opit_0_inv_L5Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_ca_group[0].u_ddc_ca/ddc_inst/RST_TRAINING_N
+29. slack=-2.679 owner=IP_DDR_PHY group=ddrphy_sysclk class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_cpd_ctrl/gpll_dps_en/opit_0_inv_L6QL5Q1_perm/CLK
+    end=u_DDR3/u_ddrphy_top/u_ddrphy_cpd_rstn_sync/sig_async_r1[0]/opit_0_inv_srl/RS
+30. slack=-2.644 owner=IP_DDR_PHY group=phy_dq_clk_0 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_training_ctrl/ddrphy_dqs_training_rstn/opit_0_inv_L5Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_ca_group[1].u_ddc_ca/ddc_inst/RST_TRAINING_N
+31. slack=-2.548 owner=IP_DDR_PHY group=phy_dq_sysclk_0 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_iol_rst/opit_0_inv_L5Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_ca_group[2].u_tserdes_ca1/oserdes_inst/TSR
+32. slack=-2.336 owner=IP_DDR_PHY group=phy_dq_sysclk_0 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_iol_rst/opit_0_inv_L5Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_ca_group[0].u_tserdes_ca0/oserdes_inst/TSR
+33. slack=-2.326 owner=IP_DDR_PHY group=phy_dq_sysclk_0 class=async timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_iol_rst/opit_0_inv_L5Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_ca_group[2].u_tserdes_ca0/oserdes_inst/TSR
+34. slack=-2.184 owner=RTL_OWNED group=pclk_div2 class=sequential timing path
+    start=u_fram_buf/rd_buf/rd_fram_buf/U_ipm2l_dpram_rd_fram_buf/ADDR_LOOP[0].DATA_LOOP[0].U_GTP_DRM36K_E1/gopdrm_36k_inv/CLKB[0]
+    end=u_ips2l_pcie_dma/u_ips2l_pcie_dma_tx_top/u_ips2l_pcie_dma_tx_mwr_rd_ctrl/u_ips2l_pcie_dma_mwr_rd_ctrl/data_in_pipe_data[76]/opit_0_inv_L6Q_perm/I4
+35. slack=-2.152 owner=RTL_OWNED group=pclk_div2 class=sequential timing path
+    start=u_fram_buf/rd_buf/rd_fram_buf/U_ipm2l_dpram_rd_fram_buf/ADDR_LOOP[0].DATA_LOOP[0].U_GTP_DRM36K_E1/gopdrm_36k_inv/CLKB[0]
+    end=u_ips2l_pcie_dma/u_ips2l_pcie_dma_tx_top/u_ips2l_pcie_dma_tx_mwr_rd_ctrl/u_ips2l_pcie_dma_mwr_rd_ctrl/data_in_pipe_data[111]/opit_0_inv_L6Q_perm/I4
+36. slack=-2.124 owner=RTL_OWNED group=pclk_div2 class=sequential timing path
+    start=u_fram_buf/rd_buf/rd_fram_buf/U_ipm2l_dpram_rd_fram_buf/ADDR_LOOP[0].DATA_LOOP[0].U_GTP_DRM36K_E1/gopdrm_36k_inv/CLKB[0]
+    end=u_ips2l_pcie_dma/u_ips2l_pcie_dma_tx_top/u_ips2l_pcie_dma_tx_mwr_rd_ctrl/u_ips2l_pcie_dma_mwr_rd_ctrl/data_in_pipe_data[79]/opit_0_inv_L6Q_perm/I5
+37. slack=-1.828 owner=IP_DDR_PHY group=ddr_rst_clk class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/u_ddrphy_cpd/cpd_inst/CLK_PHY
+    end=u_DDR3/u_ddrphy_top/ddrphy_cpd_ctrl/cpd_up_d[0]/opit_0_inv_srl/D
+38. slack=-1.800 owner=IP_PCIE_HARD group=ref_clk class=async timing path
+    start=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_PCIE_HARD_CTRL/u_gtp_pcie/gateop/PCLK_DIV2
+    end=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/u_core_rstn_sync/sig_async_ff/opit_0_inv_srl/RS
+39. slack=-1.590 owner=IP_PCIE_HARD group=ref_clk class=sequential timing path
+    start=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_HSSTLP_PCIE_SOFT_PHY/x2.GTP_HSST_2LANE_TOP/U_GTP_HSSTLP_WRAPPER/CHANNEL1_ENABLE.U_GTP_HSSTLP_LANE1/gophsst/P_RX_CLK_FR_CORE
+    end=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_HSSTLP_PCIE_SOFT_PHY/hsst_pciex4_rst/hsst_rx_rst_mcrsw/genblk1[1].hsst_rst4mcrsw_rx_init/word_align_multi_sw_sync/sig_async_ff/opit_0_inv_srl/D
+40. slack=-1.446 owner=IP_PCIE_HARD group=ref_clk class=sequential timing path
+    start=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_HSSTLP_PCIE_SOFT_PHY/x2.GTP_HSST_2LANE_TOP/U_GTP_HSSTLP_WRAPPER/CHANNEL0_ENABLE.U_GTP_HSSTLP_LANE0/gophsst/P_RX_CLK_FR_CORE
+    end=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_HSSTLP_PCIE_SOFT_PHY/hsst_pciex4_rst/hsst_rx_rst_mcrsw/genblk1[0].hsst_rst4mcrsw_rx_init/word_align_multi_sw_sync/sig_async_ff/opit_0_inv_srl/D
+41. slack=-1.421 owner=IP_DDR_PHY group=ddr_rst_clk class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/u_ips2l_ddrphy_rst_clk_phase_adj/rst_clk_adj_done/opit_0_L6QQ_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/rst_clk_adj_done_d1/opit_0_inv_srl/D
+42. slack=-1.401 owner=IP_DDR_PHY group=ddr_rst_clk class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/ddrphy_calib_top/ddrphy_main_ctrl/calib_done/opit_0_inv_L6Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_reset_ctrl/ddrphy_calib_done_d[0]/opit_0_inv_srl/D
+43. slack=-1.388 owner=IP_DDR_PHY group=ddr_rst_clk class=sequential timing path
+    start=u_DDR3/u_ddrphy_top/u_ips2l_ddrphy_cpd_lock/ddrphy_cpd_lock/opit_0_inv_L6Q_perm/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_cpd_ctrl/cpd_lock_d[0]/opit_0_inv_srl/D
+44. slack=-1.307 owner=IP_PCIE_HARD group=ref_clk class=sequential timing path
+    start=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_PCIE_HARD_CTRL/u_gtp_pcie/gateop/PCLK_DIV2
+    end=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_HSSTLP_PCIE_SOFT_PHY/hsst_pciex4_rst/rate_multi_sw_sync/sig_async_ff/opit_0_inv_srl/D
+45. slack=-1.228 owner=IP_PCIE_HARD group=ref_clk class=async timing path
+    start=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_PCIE_HARD_CTRL/u_gtp_pcie/gateop/PCLK_DIV2
+    end=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_HSSTLP_PCIE_SOFT_PHY/phy_rstn_sync/sig_async_ff/opit_0_inv_srl/RS
+46. slack=-0.410 owner=IP_PCIE_HARD group=pclk_div2 class=sequential timing path
+    start=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_HSSTLP_PCIE_SOFT_PHY/hsst_pciex4_rst/hsst_rx_rst_mcrsw/rx_rst_fsm_multi_sw_lane/rate_done/opit_0_inv_L6Q_LUT6DQL5Q_perm/CLK
+    end=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/U_IPS2L_HSSTLP_PCIE_SOFT_PHY/hsst_pciex4_sync_rate_done/sig_async_ff/opit_0_inv_srl/D
+47. slack=-0.318 owner=IP_PCIE_HARD group=pclk_div2 class=sequential timing path
+    start=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/u_pcie_apb_mux/u_pcie_apb_cross/src_p_strb[1]/opit_0_inv_L6QL5Q_perm/CLK
+    end=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/u_pcie_apb_mux/u_pcie_apb_cross/o_des_p_strb[0]/opit_0_inv/D
+48. slack=-0.290 owner=IP_PCIE_HARD group=pclk_div2 class=sequential timing path
+    start=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/u_pcie_apb_mux/u_pcie_apb_cross/src_p_strb[1]/opit_0_inv_L6QL5Q_perm/CLK
+    end=u_ips2l_pcie_wrap/U_IPS2L_PCIE_TOP/u_pcie_apb_mux/u_pcie_apb_cross/o_des_p_strb[1]/opit_0_inv/D
+49. slack=-0.201 owner=IP_DDR_PHY group=ddrphy_sysclk class=sequential timing path
+    start=u_DDR3/u_ips_ddrc_top/mcdq_dfi/mux_dfi_cke[0]/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[1].ddrphy_data_slice/ddrphy_data_slice_dqs_gate_cal/ddrphy_dqs_gate_coarse_cal/dqs_gate_ctrl_pos[3]/opit_0_inv_L6Q_perm/I5
+50. slack=-0.200 owner=IP_DDR_PHY group=ddrphy_sysclk class=sequential timing path
+    start=u_DDR3/u_ips_ddrc_top/mcdq_dfi/mux_dfi_cke[0]/opit_0_inv/CLK
+    end=u_DDR3/u_ddrphy_top/ddrphy_slice_top/i_dqs_group[1].ddrphy_data_slice/ddrphy_data_slice_dqs_gate_cal/ddrphy_dqs_gate_coarse_cal/dqs_gate_ctrl_pos[2]/opit_0_inv_L6Q_perm/I2
