@@ -49,8 +49,15 @@ set_input_delay -clock [get_clocks {cmos1_pclk}] -min 0.5 [get_ports {cmos1_data
 # 1) Only constrain first-stage synchronizer D pins.
 # 2) A structural synchronizer must exist before applying false_path.
 # 3) Do not false-path functional datapaths.
-set_false_path -to [get_pins {u_sys_ddr_rstn_sync/sig_async_ff/D}]
-set_false_path -to [get_pins {u_cmos1_init_done_sync/sig_async_ff/D}]
+set _fp_sys_ddr_sync [get_pins -quiet {u_sys_ddr_rstn_sync/sig_async}]
+if {[llength $_fp_sys_ddr_sync] > 0} {
+    set_false_path -to $_fp_sys_ddr_sync
+}
+
+set _fp_cmos_init_sync [get_pins -quiet {u_cmos1_init_done_sync/sig_async}]
+if {[llength $_fp_cmos_init_sync] > 0} {
+    set_false_path -to $_fp_cmos_init_sync
+}
 ###==== END "set_false_path"
 
 ###==== BEGIN Attributes - (Populated from tab in SCOPE, do not edit)
