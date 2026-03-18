@@ -146,6 +146,10 @@ reg		[22:0]	ref_led_cnt;
 reg		[26:0]	pclk_led_cnt;		
 wire			smlh_link_up; 	
 wire			rdlh_link_up/*synthesis PAP_MARK_DEBUG="1"*/; 	
+wire			smlh_link_up_ref;
+wire			rdlh_link_up_ref;
+wire			smlh_link_up_pclk;
+wire			rdlh_link_up_pclk;
 
 // Uart to APB 32bits
 wire			uart_p_sel;			
@@ -264,12 +268,40 @@ hsst_rst_sync_v1_0  u_sys_perst_rstn_sync (
     .sig_synced			(sys_perst_rst_n)
 );
 
+hsst_rst_sync_v1_0  u_ref_smlh_linkup_sync (
+    .clk				(ref_clk),
+    .rst_n				(sync_perst_n),
+    .sig_async			(smlh_link_up),
+    .sig_synced			(smlh_link_up_ref)
+);
+
+hsst_rst_sync_v1_0  u_ref_rdlh_linkup_sync (
+    .clk				(ref_clk),
+    .rst_n				(sync_perst_n),
+    .sig_async			(rdlh_link_up),
+    .sig_synced			(rdlh_link_up_ref)
+);
+
+hsst_rst_sync_v1_0  u_pclk_smlh_linkup_sync (
+    .clk				(pclk),
+    .rst_n				(s_pclk_rstn),
+    .sig_async			(smlh_link_up),
+    .sig_synced			(smlh_link_up_pclk)
+);
+
+hsst_rst_sync_v1_0  u_pclk_rdlh_linkup_sync (
+    .clk				(pclk),
+    .rst_n				(s_pclk_rstn),
+    .sig_async			(rdlh_link_up),
+    .sig_synced			(rdlh_link_up_pclk)
+);
+
 // Clk led
 always @(posedge ref_clk or negedge sync_perst_n) begin
 	if (!sync_perst_n) begin
 		ref_led_cnt <= 23'd0;
 		ref_led <= 1'b1;
-	end else if (smlh_link_up & rdlh_link_up) begin
+	end else if (smlh_link_up_ref & rdlh_link_up_ref) begin
 		ref_led_cnt <= ref_led_cnt + 23'd1;
 		if(&ref_led_cnt)
 			ref_led <= ~ref_led;
@@ -280,7 +312,7 @@ always @(posedge pclk or negedge s_pclk_rstn) begin
 	if (!s_pclk_rstn) begin
 		pclk_led_cnt <= 27'd0;
 		pclk_led <= 1'b1;
-	end else if (smlh_link_up & rdlh_link_up) begin
+	end else if (smlh_link_up_pclk & rdlh_link_up_pclk) begin
 		pclk_led_cnt <= pclk_led_cnt + 27'd1;
 		if(&pclk_led_cnt)
 			pclk_led <= ~pclk_led;
