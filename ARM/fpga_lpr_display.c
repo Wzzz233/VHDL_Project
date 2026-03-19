@@ -4477,6 +4477,41 @@ static bool plate_box_pass_rules_relaxed(const struct det_box *b, int frame_w, i
     return true;
 }
 
+static bool plate_box_pass_rules_obb(const struct det_box *b, int frame_w, int frame_h)
+{
+    int bw;
+    int bh;
+    int cy;
+    float aspect;
+    float area;
+    float min_area = (float)frame_w * (float)frame_h * 0.00018f;
+    float tilt;
+
+    if (!b)
+        return false;
+    bw = b->x2 - b->x1 + 1;
+    bh = b->y2 - b->y1 + 1;
+    cy = (b->y1 + b->y2) / 2;
+    if (bw <= 0 || bh <= 0)
+        return false;
+    if (bw < 16 || bh < 6)
+        return false;
+    aspect = (float)bw / (float)bh;
+    if (aspect < 1.2f || aspect > 13.5f)
+        return false;
+    area = (float)bw * (float)bh;
+    if (area < min_area)
+        return false;
+    if (cy < (int)(0.01f * (float)frame_h) || cy > (int)(0.99f * (float)frame_h))
+        return false;
+    if (b->has_obb) {
+        tilt = plate_abs_tilt_deg(b);
+        if (tilt > 82.0f)
+            return false;
+    }
+    return true;
+}
+
 static bool has_iou_match(const struct det_box *cur, const struct det_box *hist, int hist_count, float iou_thr)
 {
     int i;
@@ -4492,13 +4527,28 @@ static void temporal_confirm_and_update(struct app_ctx *ctx,
                                         struct det_box *confirmed, int *confirmed_count)
 {
     int i;
+    float iou_thr_hist1 = 0.35f;
+    float iou_thr_hist2 = 0.30f;
+    float direct_keep_thr = 0.55f;
     *confirmed_count = 0;
+    if (ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
+        iou_thr_hist1 = 0.30f;
+        iou_thr_hist2 = 0.22f;
+        direct_keep_thr = fmaxf(0.55f, ctx->opt.min_plate_conf + 0.08f);
+    }
     if (ctx->plate_hist1_count > 0 && ctx->plate_hist2_count > 0) {
         for (i = 0; i < filtered_count && *confirmed_count < MAX_DETS; i++) {
-            if (has_iou_match(&filtered[i], ctx->plate_hist1, ctx->plate_hist1_count, 0.35f) &&
-                has_iou_match(&filtered[i], ctx->plate_hist2, ctx->plate_hist2_count, 0.30f)) {
+            if (has_iou_match(&filtered[i], ctx->plate_hist1, ctx->plate_hist1_count, iou_thr_hist1) &&
+                has_iou_match(&filtered[i], ctx->plate_hist2, ctx->plate_hist2_count, iou_thr_hist2)) {
                 confirmed[(*confirmed_count)++] = filtered[i];
             }
+        }
+    }
+    if (*confirmed_count == 0 &&
+        ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
+        for (i = 0; i < filtered_count && *confirmed_count < MAX_DETS; i++) {
+            if (filtered[i].conf >= direct_keep_thr)
+                confirmed[(*confirmed_count)++] = filtered[i];
         }
     }
     memcpy(ctx->plate_hist2, ctx->plate_hist1, sizeof(ctx->plate_hist1));
@@ -5141,6 +5191,20 @@ static void *infer_thread_main(void *arg)
             if (run_detect_on_rgb(ctx, &ctx->plate_model, det_src_rgb, (int)ctx->frame_width, (int)ctx->frame_height,
                                   plate_thr, algo_rgb, plate_in, raw_plates, &raw_plate_count, &plate_diag) < 0)
                 raw_plate_count = 0;
+            if (raw_plate_count <= 0 &&
+                ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+                ctx->opt.det_resize_mode == DET_RESIZE_LETTERBOX) {
+                int saved_mode = ctx->opt.det_resize_mode;
+                fprintf(stderr,
+                        "[plate-fallback] frame=%" PRIu64 " retry=stretch reason=raw_empty\n",
+                        seq);
+                ctx->opt.det_resize_mode = DET_RESIZE_STRETCH;
+                if (run_detect_on_rgb(ctx, &ctx->plate_model, det_src_rgb, (int)ctx->frame_width, (int)ctx->frame_height,
+                                      plate_thr, algo_rgb, plate_in, raw_plates, &raw_plate_count, &plate_diag) < 0) {
+                    raw_plate_count = 0;
+                }
+                ctx->opt.det_resize_mode = saved_mode;
+            }
         }
         if (raw_plate_count > 0) {
             ctx->gate_plate_raw_positive_frames++;
@@ -5157,9 +5221,32 @@ static void *infer_thread_main(void *arg)
             ped_events = update_ped_tracks_nn(ctx, persons, person_count, light_red, seq,
                                               tracked_persons, &tracked_person_count);
 
-        for (i = 0; i < raw_plate_count; i++) {
-            if (plate_box_pass_rules(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height))
+        for (i = 0; i < raw_plate_count && filtered_plate_count < MAX_DETS; i++) {
+            bool keep = plate_box_pass_rules(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height);
+            if (!keep && ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
+                keep = plate_box_pass_rules_obb(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height) ||
+                       plate_box_pass_rules_relaxed(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height);
+            }
+            if (keep)
                 filtered_plates[filtered_plate_count++] = raw_plates[i];
+        }
+        if (filtered_plate_count == 0 &&
+            raw_plate_count > 0 &&
+            ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
+            int best_i = 0;
+            float best_conf = raw_plates[0].conf;
+            for (i = 1; i < raw_plate_count; i++) {
+                if (raw_plates[i].conf > best_conf) {
+                    best_conf = raw_plates[i].conf;
+                    best_i = i;
+                }
+            }
+            if (best_conf >= fmaxf(0.50f, ctx->opt.min_plate_conf)) {
+                filtered_plates[filtered_plate_count++] = raw_plates[best_i];
+                fprintf(stderr,
+                        "[plate-fallback] frame=%" PRIu64 " keep=top1 conf=%.3f reason=filtered_empty\n",
+                        seq, best_conf);
+            }
         }
         if (ctx->opt.fpga_a_mask && a_roi_valid) {
             int roi_count = filter_boxes_by_roi(filtered_plates, filtered_plate_count, &a_roi,
