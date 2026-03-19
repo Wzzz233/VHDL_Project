@@ -52,6 +52,8 @@
 #define DMA_CMD_FRAME_MODE        (1U << 31)
 #define DMA_CMD_FRAME_DWORDS_MASK 0x00FFFFFFU
 
+#define FPGA_DMA_MAX_RING_BUFFERS 8U
+
 /* Maximum DMA transfer size per chunk in DWORDs.
  * cmd_reg[9:0] encodes (length - 1); 0x3FF encodes 1024 DW.
  * The RTL uses 10-bit length where value 0 represents 1024 DW. */
@@ -97,7 +99,7 @@ struct fpga_info {
 /**
  * struct dma_transfer - DMA transfer parameters
  * @size: Number of bytes to transfer
- * @offset: Offset in FPGA DDR3 memory to read from (for future use)
+ * @offset: DMA ring buffer index for frame destination (0-based)
  * @flags: Transfer flags (reserved for future use)
  * @result: Result code (0=success, negative=error)
  */
@@ -111,9 +113,9 @@ struct dma_transfer {
 
 /**
  * struct buffer_map - Buffer mapping for mmap
- * @index: Buffer index (0 for single buffer)
- * @size: Buffer size
- * @offset: Offset for mmap (returned by driver)
+ * @index: DMA ring buffer index (0-based)
+ * @size: Per-buffer mapping size
+ * @offset: mmap offset for this buffer (returned by driver)
  */
 struct buffer_map {
     __u32 index;

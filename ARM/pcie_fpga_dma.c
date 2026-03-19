@@ -48,6 +48,7 @@ static bool dma_verbose = false;   /* verbose transfer logs */
 static int dma_pixel_format = FPGA_PIXEL_FORMAT_BGRX8888;
 static int dma_allow_poll_fallback = 0;
 static int dma_irq_timeout_retry_poll = 1;
+static int dma_ring_buffers = 3;
 
 module_param(major_num, int, 0);
 MODULE_PARM_DESC(major_num, "Major device number (0=dynamic)");
@@ -71,6 +72,8 @@ module_param(dma_allow_poll_fallback, int, 0644);
 MODULE_PARM_DESC(dma_allow_poll_fallback, "Allow legacy polling fallback when MSI setup fails (0=strict IRQ, 1=allow polling)");
 module_param(dma_irq_timeout_retry_poll, int, 0644);
 MODULE_PARM_DESC(dma_irq_timeout_retry_poll, "Retry once with polling path on IRQ timeout (0=disabled, 1=enabled)");
+module_param(dma_ring_buffers, int, 0644);
+MODULE_PARM_DESC(dma_ring_buffers, "Number of DMA frame ring buffers (1..8)");
 
 /* Per-device structure */
 struct fpga_dma_dev {
@@ -84,9 +87,10 @@ struct fpga_dma_dev {
     resource_size_t bar0_size;
     resource_size_t bar1_size;
 
-    /* DMA buffer */
-    void *dma_buf;
-    dma_addr_t dma_handle;
+    /* DMA ring buffers */
+    void *dma_bufs[FPGA_DMA_MAX_RING_BUFFERS];
+    dma_addr_t dma_handles[FPGA_DMA_MAX_RING_BUFFERS];
+    u32 dma_buf_count;
     size_t dma_buf_size;
     struct mutex dma_lock;
 
@@ -160,6 +164,21 @@ static size_t fpga_dma_default_frame_size(const struct fpga_info *info)
     return (size_t)info->frame_stride * (size_t)info->frame_height;
 }
 
+static void fpga_dma_free_ring_buffers(struct fpga_dma_dev *dev)
+{
+    u32 i;
+
+    for (i = 0; i < dev->dma_buf_count; i++) {
+        if (!dev->dma_bufs[i])
+            continue;
+        dma_free_coherent(&dev->pdev->dev, dev->dma_buf_size,
+                          dev->dma_bufs[i], dev->dma_handles[i]);
+        dev->dma_bufs[i] = NULL;
+        dev->dma_handles[i] = (dma_addr_t)0;
+    }
+    dev->dma_buf_count = 0;
+}
+
 /**
  * fpga_dma_read_reg - Read a 32-bit register from BAR1
  */
@@ -196,20 +215,23 @@ static irqreturn_t fpga_dma_irq_handler(int irq, void *data)
     return IRQ_HANDLED;
 }
 
-static int fpga_dma_perform_transfer_polling(struct fpga_dma_dev *dev, size_t size)
+static int fpga_dma_perform_transfer_polling(struct fpga_dma_dev *dev,
+                                             size_t size,
+                                             dma_addr_t dma_handle,
+                                             void *dma_buf)
 {
     u32 cmd_reg;
     int ret = 0;
     size_t remaining = size;
     size_t chunk_size;
-    dma_addr_t current_addr = dev->dma_handle;
+    dma_addr_t current_addr = dma_handle;
     int chunk_num = 0;
 
     if (dma_verbose) {
         dev_info(dev->dev, "=== DMA MWR Transfer Start (poll fallback) ===\n");
         dev_info(dev->dev, "  Total size: %zu bytes\n", size);
-        dev_info(dev->dev, "  DMA handle (bus addr): 0x%llx\n", (u64)dev->dma_handle);
-        dev_info(dev->dev, "  DMA buf (virt): %px\n", dev->dma_buf);
+        dev_info(dev->dev, "  DMA handle (bus addr): 0x%llx\n", (u64)dma_handle);
+        dev_info(dev->dev, "  DMA buf (virt): %px\n", dma_buf);
         dev_info(dev->dev, "  BAR1 base (virt): %px\n", dev->bar1);
     }
 
@@ -257,9 +279,9 @@ static int fpga_dma_perform_transfer_polling(struct fpga_dma_dev *dev, size_t si
                      chunk_size, length_in_dwords);
         }
 
-        buf_offset = (size_t)(current_addr - dev->dma_handle);
+        buf_offset = (size_t)(current_addr - dma_handle);
 
-        chunk_tail0 = (u32 *)((u8 *)dev->dma_buf + buf_offset + chunk_size - sizeof(u32));
+        chunk_tail0 = (u32 *)((u8 *)dma_buf + buf_offset + chunk_size - sizeof(u32));
         WRITE_ONCE(*chunk_tail0, tail_sentinel0);
         if (chunk_size >= 8) {
             chunk_tail1 = (u32 *)((u8 *)chunk_tail0 - sizeof(u32));
@@ -322,7 +344,9 @@ static int fpga_dma_perform_transfer_polling(struct fpga_dma_dev *dev, size_t si
     return ret;
 }
 
-static int fpga_dma_perform_transfer_irq(struct fpga_dma_dev *dev, size_t size)
+static int fpga_dma_perform_transfer_irq(struct fpga_dma_dev *dev,
+                                         size_t size,
+                                         dma_addr_t dma_handle)
 {
     u32 total_dwords;
     u32 cmd_reg;
@@ -341,8 +365,8 @@ static int fpga_dma_perform_transfer_irq(struct fpga_dma_dev *dev, size_t size)
     reinit_completion(&dev->dma_done);
 
     /* Fixed write order: BAR1+0x120 -> BAR1+0x110 -> BAR1+0x100. */
-    fpga_dma_write_reg(dev, BAR1_DMA_H_ADDR, upper_32_bits(dev->dma_handle));
-    fpga_dma_write_reg(dev, BAR1_DMA_L_ADDR, lower_32_bits(dev->dma_handle));
+    fpga_dma_write_reg(dev, BAR1_DMA_H_ADDR, upper_32_bits(dma_handle));
+    fpga_dma_write_reg(dev, BAR1_DMA_L_ADDR, lower_32_bits(dma_handle));
     cmd_reg = DMA_CMD_FRAME_MODE | (total_dwords & DMA_CMD_FRAME_DWORDS_MASK);
     fpga_dma_write_reg(dev, BAR1_DMA_CMD_REG, cmd_reg);
     fpga_dma_flush_posted_writes(dev);
@@ -360,19 +384,22 @@ static int fpga_dma_perform_transfer_irq(struct fpga_dma_dev *dev, size_t size)
 /**
  * fpga_dma_perform_transfer - Perform a DMA read from FPGA
  */
-static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev, size_t size)
+static int fpga_dma_perform_transfer(struct fpga_dma_dev *dev,
+                                     size_t size,
+                                     dma_addr_t dma_handle,
+                                     void *dma_buf)
 {
     if (dev->irq_enabled) {
-        int ret = fpga_dma_perform_transfer_irq(dev, size);
+        int ret = fpga_dma_perform_transfer_irq(dev, size, dma_handle);
 
         if (ret == -ETIMEDOUT && dma_irq_timeout_retry_poll) {
             dev_warn(dev->dev, "IRQ timeout, retrying DMA transfer with polling path\n");
-            ret = fpga_dma_perform_transfer_polling(dev, size);
+            ret = fpga_dma_perform_transfer_polling(dev, size, dma_handle, dma_buf);
         }
         return ret;
     }
     if (dev->use_poll_fallback)
-        return fpga_dma_perform_transfer_polling(dev, size);
+        return fpga_dma_perform_transfer_polling(dev, size, dma_handle, dma_buf);
 
     dev_err(dev->dev, "DMA requested but neither IRQ nor fallback path is available\n");
     return -EIO;
@@ -430,6 +457,9 @@ static long fpga_dma_ioctl(struct file *file, unsigned int cmd, unsigned long ar
         struct dma_transfer transfer;
         size_t size;
         size_t default_size;
+        u32 buf_index;
+        dma_addr_t dma_handle;
+        void *dma_buf;
 
         if (copy_from_user(&transfer, argp, sizeof(transfer))) {
             ret = -EFAULT;
@@ -441,6 +471,14 @@ static long fpga_dma_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 
         /* Use default frame size if not specified */
         size = transfer.size > 0 ? transfer.size : default_size;
+        buf_index = transfer.offset;
+
+        if (buf_index >= dev->dma_buf_count) {
+            dev_err(dev->dev, "Invalid DMA ring index %u (count=%u)\n",
+                    buf_index, dev->dma_buf_count);
+            ret = -EINVAL;
+            break;
+        }
 
         if (size > dev->dma_buf_size) {
             dev_err(dev->dev, "Requested size %zu exceeds buffer size %zu\n",
@@ -449,16 +487,24 @@ static long fpga_dma_ioctl(struct file *file, unsigned int cmd, unsigned long ar
             break;
         }
 
+        dma_handle = dev->dma_handles[buf_index];
+        dma_buf = dev->dma_bufs[buf_index];
+        if (!dma_buf || dma_handle == (dma_addr_t)0) {
+            dev_err(dev->dev, "DMA ring slot %u is not initialized\n", buf_index);
+            ret = -EIO;
+            break;
+        }
+
         /* Perform DMA transfer */
         mutex_lock(&dev->dma_lock);
-        ret = fpga_dma_perform_transfer(dev, size);
+        ret = fpga_dma_perform_transfer(dev, size, dma_handle, dma_buf);
         mutex_unlock(&dev->dma_lock);
 
         if (!ret) {
             /* Copy DMA buffer data to userspace */
             if (transfer.user_buf) {
                 if (copy_to_user((void __user *)(unsigned long)transfer.user_buf,
-                                 dev->dma_buf, size)) {
+                                 dma_buf, size)) {
                     ret = -EFAULT;
                     break;
                 }
@@ -478,13 +524,13 @@ static long fpga_dma_ioctl(struct file *file, unsigned int cmd, unsigned long ar
             break;
         }
 
-        if (map.index != 0) {
+        if (map.index >= dev->dma_buf_count) {
             ret = -EINVAL;
             break;
         }
 
         map.size = dev->dma_buf_size;
-        map.offset = 0;  /* Offset for mmap */
+        map.offset = (u64)map.index * (u64)dev->dma_buf_size;
 
         if (copy_to_user(argp, &map, sizeof(map)))
             ret = -EFAULT;
@@ -507,9 +553,29 @@ static int fpga_dma_mmap(struct file *file, struct vm_area_struct *vma)
 {
     struct fpga_dma_dev *dev = file->private_data;
     size_t size = vma->vm_end - vma->vm_start;
+    u64 mmap_offset_bytes = ((u64)vma->vm_pgoff << PAGE_SHIFT);
+    u64 buf_size = (u64)dev->dma_buf_size;
+    u32 buf_index;
+    void *dma_buf;
+    dma_addr_t dma_handle;
+    unsigned long saved_vm_pgoff;
     int ret;
 
-    dev_dbg(dev->dev, "mmap requested: size=%zu\n", size);
+    if (buf_size == 0)
+        return -EINVAL;
+
+    if (mmap_offset_bytes % buf_size) {
+        dev_err(dev->dev, "mmap offset 0x%llx is not aligned to buffer size 0x%llx\n",
+                mmap_offset_bytes, buf_size);
+        return -EINVAL;
+    }
+
+    buf_index = (u32)(mmap_offset_bytes / buf_size);
+    if (buf_index >= dev->dma_buf_count) {
+        dev_err(dev->dev, "mmap ring index %u out of range (count=%u)\n",
+                buf_index, dev->dma_buf_count);
+        return -EINVAL;
+    }
 
     if (size > dev->dma_buf_size) {
         dev_err(dev->dev, "mmap size %zu exceeds DMA buffer size %zu\n",
@@ -517,8 +583,21 @@ static int fpga_dma_mmap(struct file *file, struct vm_area_struct *vma)
         return -EINVAL;
     }
 
+    dma_buf = dev->dma_bufs[buf_index];
+    dma_handle = dev->dma_handles[buf_index];
+    if (!dma_buf || dma_handle == (dma_addr_t)0) {
+        dev_err(dev->dev, "mmap ring slot %u is not initialized\n", buf_index);
+        return -EIO;
+    }
+
+    dev_dbg(dev->dev, "mmap requested: idx=%u size=%zu offset=0x%llx\n",
+            buf_index, size, mmap_offset_bytes);
+
     /* Map coherent DMA memory with the DMA API helper to avoid wrong PFN mapping. */
-    ret = dma_mmap_coherent(&dev->pdev->dev, vma, dev->dma_buf, dev->dma_handle, size);
+    saved_vm_pgoff = vma->vm_pgoff;
+    vma->vm_pgoff = 0;
+    ret = dma_mmap_coherent(&dev->pdev->dev, vma, dma_buf, dma_handle, size);
+    vma->vm_pgoff = saved_vm_pgoff;
     if (ret) {
         dev_err(dev->dev, "dma_mmap_coherent failed: %d\n", ret);
         return ret;
@@ -533,6 +612,8 @@ static int fpga_dma_mmap(struct file *file, struct vm_area_struct *vma)
 static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
     struct fpga_dma_dev *dev;
+    int requested_ring_buffers;
+    u32 i;
     int ret;
     u16 pcie_cmd;
 
@@ -611,18 +692,34 @@ static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     dev_info(&pdev->dev, "BAR1 mapped at %p, size=%pa\n",
              dev->bar1, &dev->bar1_size);
 
+    requested_ring_buffers = dma_ring_buffers;
+    if (requested_ring_buffers < 1)
+        requested_ring_buffers = 1;
+    if (requested_ring_buffers > FPGA_DMA_MAX_RING_BUFFERS)
+        requested_ring_buffers = FPGA_DMA_MAX_RING_BUFFERS;
+
     /* Allocate enough space for the largest supported frame format. */
     dev->dma_buf_size = PAGE_ALIGN((size_t)FPGA_FRAME_MAX_SIZE);
-    dev->dma_buf = dma_alloc_coherent(&pdev->dev, dev->dma_buf_size,
-                                      &dev->dma_handle, GFP_KERNEL);
-    if (!dev->dma_buf) {
-        dev_err(&pdev->dev, "Cannot allocate DMA buffer\n");
-        ret = -ENOMEM;
-        goto err_iounmap_bar1;
+    dev->dma_buf_count = 0;
+    for (i = 0; i < (u32)requested_ring_buffers; i++) {
+        dev->dma_bufs[i] = dma_alloc_coherent(&pdev->dev, dev->dma_buf_size,
+                                              &dev->dma_handles[i], GFP_KERNEL);
+        if (!dev->dma_bufs[i]) {
+            if (i == 0) {
+                dev_err(&pdev->dev, "Cannot allocate DMA ring buffers\n");
+                ret = -ENOMEM;
+                goto err_iounmap_bar1;
+            }
+            dev_warn(&pdev->dev,
+                     "DMA ring allocation stopped at %u/%d buffers\n",
+                     i, requested_ring_buffers);
+            break;
+        }
+        dev->dma_buf_count++;
     }
 
-    dev_info(&pdev->dev, "DMA buffer allocated: virt=%p phys=%pad size=%zu\n",
-             dev->dma_buf, &dev->dma_handle, dev->dma_buf_size);
+    dev_info(&pdev->dev, "DMA ring allocated: buffers=%u size=%zu bytes each\n",
+             dev->dma_buf_count, dev->dma_buf_size);
 
     ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
     if (ret < 0) {
@@ -727,7 +824,7 @@ err_free_irq:
         dev->irq_vector = -1;
     }
 err_free_dma:
-    dma_free_coherent(&pdev->dev, dev->dma_buf_size, dev->dma_buf, dev->dma_handle);
+    fpga_dma_free_ring_buffers(dev);
 err_iounmap_bar1:
     pci_iounmap(pdev, dev->bar1);
 err_release_bar1:
@@ -763,8 +860,8 @@ static void fpga_dma_remove(struct pci_dev *pdev)
         dev->irq_vector = -1;
     }
 
-    /* Free DMA buffer */
-    dma_free_coherent(&pdev->dev, dev->dma_buf_size, dev->dma_buf, dev->dma_handle);
+    /* Free DMA ring buffers */
+    fpga_dma_free_ring_buffers(dev);
 
     /* Unmap and release BARs */
     pci_iounmap(pdev, dev->bar1);
