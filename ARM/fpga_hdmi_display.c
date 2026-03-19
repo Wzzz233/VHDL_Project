@@ -50,6 +50,11 @@ enum io_mode {
     IO_MODE_COPY,
 };
 
+enum mmap_mode {
+    MMAP_MODE_STAGED = 0,
+    MMAP_MODE_ZERO_COPY,
+};
+
 struct options {
     const char *device_path;
     const char *drm_card_path;
@@ -62,7 +67,9 @@ struct options {
     int copy_buffers;
     int queue_depth;
     enum io_mode io_mode;
+    enum mmap_mode mmap_mode;
     bool swap16;
+    bool display_sync;
 };
 
 struct frame_slot {
@@ -162,7 +169,9 @@ static void print_usage(const char *prog)
             "  --copy-buffers <num>    Copy ring size (default: %d, range: %d..%d)\n"
             "  --queue-depth <num>     appsrc max frame queue (default: %d)\n"
             "  --io-mode <mode>        mmap|copy (default: mmap)\n"
+            "  --mmap-mode <mode>      staged|zero-copy (default: staged)\n"
             "  --swap16 <0|1>          Swap bytes in each 16-bit pixel (default: 1)\n"
+            "  --display-sync <0|1>    kmssink sync to display clock (default: 1)\n"
             "  --help                  Show this message\n",
             prog,
             DEFAULT_DEVICE,
@@ -191,6 +200,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"queue-depth", required_argument, NULL, 10},
         {"io-mode", required_argument, NULL, 11},
         {"swap16", required_argument, NULL, 12},
+        {"mmap-mode", required_argument, NULL, 13},
+        {"display-sync", required_argument, NULL, 14},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -208,7 +219,9 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->copy_buffers = DEFAULT_COPY_BUFFERS;
     opt->queue_depth = DEFAULT_QUEUE_DEPTH;
     opt->io_mode = IO_MODE_MMAP;
+    opt->mmap_mode = MMAP_MODE_STAGED;
     opt->swap16 = true;
+    opt->display_sync = true;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
         switch (c) {
@@ -289,6 +302,28 @@ static int parse_options(int argc, char **argv, struct options *opt)
                 opt->swap16 = false;
             } else {
                 fprintf(stderr, "Invalid --swap16: %s (use 0|1)\n", optarg);
+                return -1;
+            }
+            break;
+        case 13:
+            if (strcmp(optarg, "staged") == 0) {
+                opt->mmap_mode = MMAP_MODE_STAGED;
+            } else if (strcmp(optarg, "zero-copy") == 0) {
+                opt->mmap_mode = MMAP_MODE_ZERO_COPY;
+            } else {
+                fprintf(stderr, "Invalid --mmap-mode: %s\n", optarg);
+                return -1;
+            }
+            break;
+        case 14:
+            if (strcmp(optarg, "1") == 0 || strcasecmp(optarg, "on") == 0 ||
+                strcasecmp(optarg, "true") == 0) {
+                opt->display_sync = true;
+            } else if (strcmp(optarg, "0") == 0 || strcasecmp(optarg, "off") == 0 ||
+                       strcasecmp(optarg, "false") == 0) {
+                opt->display_sync = false;
+            } else {
+                fprintf(stderr, "Invalid --display-sync: %s (use 0|1)\n", optarg);
                 return -1;
             }
             break;
@@ -521,6 +556,13 @@ static const char *pixel_format_name(uint32_t pixel_format)
     }
 }
 
+static const char *active_mmap_mode_name(const struct app_ctx *ctx)
+{
+    if (ctx->opt.io_mode != IO_MODE_MMAP)
+        return "n/a";
+    return ctx->zero_copy_mode ? "zero-copy" : "staged";
+}
+
 static int init_fpga_dma(struct app_ctx *ctx)
 {
     struct fpga_info info;
@@ -572,7 +614,17 @@ static int init_fpga_dma(struct app_ctx *ctx)
     ctx->display_frame_size = ctx->source_is_bgrx
         ? ctx->frame_size
         : ((size_t)ctx->frame_width * ctx->frame_height * 4U);
-    ctx->zero_copy_mode = ctx->source_is_bgrx && (ctx->opt.io_mode == IO_MODE_MMAP);
+    if (ctx->opt.io_mode != IO_MODE_MMAP && ctx->opt.mmap_mode == MMAP_MODE_ZERO_COPY)
+        fprintf(stderr, "Note: --mmap-mode is ignored when --io-mode=copy\n");
+    if (ctx->opt.io_mode == IO_MODE_MMAP &&
+        ctx->opt.mmap_mode == MMAP_MODE_ZERO_COPY &&
+        !ctx->source_is_bgrx) {
+        fprintf(stderr,
+                "Note: --mmap-mode=zero-copy requires BGRX source, falling back to staged\n");
+    }
+    ctx->zero_copy_mode = ctx->source_is_bgrx &&
+        (ctx->opt.io_mode == IO_MODE_MMAP) &&
+        (ctx->opt.mmap_mode == MMAP_MODE_ZERO_COPY);
 
     if (ctx->opt.io_mode == IO_MODE_MMAP) {
         struct buffer_map map;
@@ -608,7 +660,7 @@ static int init_fpga_dma(struct app_ctx *ctx)
         fprintf(stderr, "Note: --pixel-order/--swap16 are ignored for BGRX source frames\n");
 
     fprintf(stderr,
-            "FPGA DMA ready: %ux%u fmt=%s bpp=%u stride=%u frame=%zu bytes (io-mode=%s zero-copy=%s)\n",
+            "FPGA DMA ready: %ux%u fmt=%s bpp=%u stride=%u frame=%zu bytes (io-mode=%s mmap-mode=%s zero-copy=%s)\n",
             ctx->frame_width,
             ctx->frame_height,
             pixel_format_name(ctx->pixel_format),
@@ -616,6 +668,7 @@ static int init_fpga_dma(struct app_ctx *ctx)
             ctx->frame_stride,
             ctx->frame_size,
             (ctx->opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy",
+            active_mmap_mode_name(ctx),
             ctx->zero_copy_mode ? "on" : "off");
     return 0;
 }
@@ -626,7 +679,15 @@ static int init_copy_slots(struct app_ctx *ctx)
 
     if (ctx->zero_copy_mode)
         ctx->slot_count = 1;
-    else
+    else if (ctx->opt.io_mode == IO_MODE_MMAP) {
+        ctx->slot_count = ctx->opt.copy_buffers;
+        if (ctx->slot_count < 3) {
+            fprintf(stderr,
+                    "Note: mmap staged mode needs at least 3 buffers for stable 60fps, forcing copy_buffers=3\n");
+            ctx->slot_count = 3;
+            ctx->opt.copy_buffers = 3;
+        }
+    } else
         ctx->slot_count = ctx->opt.copy_buffers;
 
     ctx->slots = calloc((size_t)ctx->slot_count, sizeof(*ctx->slots));
@@ -996,7 +1057,7 @@ static int build_pipeline(struct app_ctx *ctx)
                  "leaky", 2,  /* downstream */
                  NULL);
 
-    g_object_set(ctx->sink, "sync", FALSE, NULL);
+    g_object_set(ctx->sink, "sync", ctx->opt.display_sync ? TRUE : FALSE, NULL);
     if (ctx->opt.connector_id >= 0)
         g_object_set(ctx->sink, "connector-id", ctx->opt.connector_id, NULL);
 
@@ -1018,8 +1079,8 @@ static int build_pipeline(struct app_ctx *ctx)
     }
 
     fprintf(stderr,
-            "Pipeline started: appsrc(format=%s,block=false) -> queue(leaky=downstream,1) -> kmssink (copy_buffers=%d queue_depth=%d)\n",
-            fmt, ctx->opt.copy_buffers, ctx->opt.queue_depth);
+            "Pipeline started: appsrc(format=%s,block=false) -> queue(leaky=downstream,1) -> kmssink(sync=%s) (copy_buffers=%d queue_depth=%d)\n",
+            fmt, ctx->opt.display_sync ? "on" : "off", ctx->opt.copy_buffers, ctx->opt.queue_depth);
     print_pad_caps("appsrc:src", ctx->appsrc, "src");
     print_pad_caps("kmssink:sink", ctx->sink, "sink");
     return 0;
@@ -1108,11 +1169,13 @@ int main(int argc, char **argv)
         goto out;
 
     fprintf(stderr,
-            "Start display loop: fps=%d src_fmt=%s io-mode=%s zero-copy=%s pixel-order=%s swap16=%s timeout=%dms copy_buffers=%d queue_depth=%d\n",
+            "Start display loop: fps=%d src_fmt=%s io-mode=%s mmap-mode=%s zero-copy=%s display-sync=%s pixel-order=%s swap16=%s timeout=%dms copy_buffers=%d queue_depth=%d\n",
             ctx.opt.fps,
             pixel_format_name(ctx.pixel_format),
             (ctx.opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy",
+            active_mmap_mode_name(&ctx),
             ctx.zero_copy_mode ? "on" : "off",
+            ctx.opt.display_sync ? "on" : "off",
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
             ctx.opt.swap16 ? "on" : "off",
             ctx.opt.timeout_ms,

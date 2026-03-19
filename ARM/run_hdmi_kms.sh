@@ -4,15 +4,17 @@ set -euo pipefail
 DEVICE="/dev/fpga_dma0"
 DRM_CARD="/dev/dri/card0"
 INPUT_DEV=""
-FPS="15"
+FPS="60"
 PIXEL_ORDER="bgr565"
 CONNECTOR_ID=""
 TIMEOUT_MS="5000"
 STATS_INTERVAL="1"
-COPY_BUFFERS="2"
+COPY_BUFFERS="3"
 QUEUE_DEPTH="1"
 IO_MODE="mmap"
+MMAP_MODE="staged"
 SWAP16="1"
+DISPLAY_SYNC="1"
 
 usage() {
   cat <<EOF
@@ -27,8 +29,10 @@ Usage: $0 [options]
   --stats-interval <sec>  Stats interval (default: ${STATS_INTERVAL})
   --copy-buffers <num>    Copy ring size (default: ${COPY_BUFFERS})
   --queue-depth <num>     appsrc queue depth (default: ${QUEUE_DEPTH})
-  --io-mode <mode>        mmap|copy (default: ${IO_MODE}, mmap enables zero-copy when FPGA outputs BGRX)
+  --io-mode <mode>        mmap|copy (default: ${IO_MODE})
+  --mmap-mode <mode>      staged|zero-copy (default: ${MMAP_MODE})
   --swap16 <0|1>          Swap bytes in each 16-bit pixel (default: ${SWAP16})
+  --display-sync <0|1>    kmssink sync to display clock (default: ${DISPLAY_SYNC})
   -h, --help              Show this help
 EOF
 }
@@ -46,7 +50,9 @@ while [[ $# -gt 0 ]]; do
     --copy-buffers) COPY_BUFFERS="$2"; shift 2 ;;
     --queue-depth) QUEUE_DEPTH="$2"; shift 2 ;;
     --io-mode) IO_MODE="$2"; shift 2 ;;
+    --mmap-mode) MMAP_MODE="$2"; shift 2 ;;
     --swap16) SWAP16="$2"; shift 2 ;;
+    --display-sync) DISPLAY_SYNC="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "Unknown option: $1" >&2
@@ -94,7 +100,9 @@ CMD=(./fpga_hdmi_display
   --copy-buffers "$COPY_BUFFERS"
   --queue-depth "$QUEUE_DEPTH"
   --io-mode "$IO_MODE"
-  --swap16 "$SWAP16")
+  --mmap-mode "$MMAP_MODE"
+  --swap16 "$SWAP16"
+  --display-sync "$DISPLAY_SYNC")
 
 if [[ -n "$CONNECTOR_ID" ]]; then
   CMD+=(--connector-id "$CONNECTOR_ID")
