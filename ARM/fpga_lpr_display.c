@@ -429,8 +429,8 @@ static void resize_rgb888_nn(const uint8_t *src, int sw, int sh, uint8_t *dst, i
 static void resize_rgb888_bilinear(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh);
 static void resize_rgb888_with_kernel(const uint8_t *src, int sw, int sh,
                                       uint8_t *dst, int dw, int dh, int kernel);
-static void resize_rgb888_nn_letterbox(const uint8_t *src, int sw, int sh,
-                                       uint8_t *dst, int dw, int dh, uint8_t pad);
+static void __attribute__((unused)) resize_rgb888_nn_letterbox(const uint8_t *src, int sw, int sh,
+                                                               uint8_t *dst, int dw, int dh, uint8_t pad);
 static void resize_rgb888_letterbox_kernel(const uint8_t *src, int sw, int sh,
                                            uint8_t *dst, int dw, int dh, uint8_t pad,
                                            int kernel, struct letterbox_meta *meta);
@@ -441,6 +441,7 @@ static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
                                          const uint8_t *crop_rgb, int crop_w, int crop_h,
                                          float *occ_ratio_out);
 static bool append_utf8_token(char *dst, size_t dst_len, const char *token);
+static void copy_cstr_trunc(char *dst, size_t dst_len, const char *src);
 static int utf8_token_len(const char *s);
 static uint32_t utf8_token_codepoint(const char *tok);
 static int split_utf8_tokens(const char *s, char tokens[][MAX_UTF8_TOKEN_BYTES], int max_tokens);
@@ -1096,6 +1097,20 @@ static bool append_utf8_token(char *dst, size_t dst_len, const char *token)
     return true;
 }
 
+static void copy_cstr_trunc(char *dst, size_t dst_len, const char *src)
+{
+    size_t n;
+    if (!dst || dst_len == 0)
+        return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    n = strnlen(src, dst_len - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 static int utf8_token_len(const char *s)
 {
     unsigned char c0, c1, c2, c3;
@@ -1309,9 +1324,7 @@ static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, 
     if (!ctx || !box || !text || text_len == 0 || !conf)
         return;
 
-    raw_text[0] = '\0';
-    strncpy(raw_text, text, sizeof(raw_text) - 1);
-    raw_text[sizeof(raw_text) - 1] = '\0';
+    copy_cstr_trunc(raw_text, sizeof(raw_text), text);
 
     tr_idx = find_or_create_ocr_track(ctx, box);
     if (tr_idx < 0)
@@ -1328,8 +1341,7 @@ static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, 
         char toks[MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
         int tok_n;
 
-        strncpy(tr->hist[pos].text, raw_text, sizeof(tr->hist[pos].text) - 1);
-        tr->hist[pos].text[sizeof(tr->hist[pos].text) - 1] = '\0';
+        copy_cstr_trunc(tr->hist[pos].text, sizeof(tr->hist[pos].text), raw_text);
         tr->hist[pos].conf = fmaxf(0.0f, fminf(1.0f, *conf));
         tr->hist[pos].frame_seq = frame_seq;
         tr->hist_next = (tr->hist_next + 1) % OCR_TRACK_HIST;
@@ -1339,12 +1351,10 @@ static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, 
         tok_n = split_utf8_tokens(raw_text, toks, MAX_PLATE_TOKENS);
         if (tok_n > 0 && utf8_token_is_cjk(toks[0])) {
             if (tr->province_tok[0] == '\0' || strcmp(tr->province_tok, toks[0]) == 0) {
-                strncpy(tr->province_tok, toks[0], sizeof(tr->province_tok) - 1);
-                tr->province_tok[sizeof(tr->province_tok) - 1] = '\0';
+                copy_cstr_trunc(tr->province_tok, sizeof(tr->province_tok), toks[0]);
                 tr->province_score = fminf(4.0f, tr->province_score + tr->hist[pos].conf);
             } else if (tr->hist[pos].conf >= tr->province_score * 0.80f) {
-                strncpy(tr->province_tok, toks[0], sizeof(tr->province_tok) - 1);
-                tr->province_tok[sizeof(tr->province_tok) - 1] = '\0';
+                copy_cstr_trunc(tr->province_tok, sizeof(tr->province_tok), toks[0]);
                 tr->province_score = tr->hist[pos].conf;
             }
         }
@@ -1415,8 +1425,7 @@ static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, 
                 }
             }
             if (j == cand_n && cand_n < OCR_TRACK_HIST) {
-                strncpy(cand_tok[cand_n], tok, MAX_UTF8_TOKEN_BYTES - 1);
-                cand_tok[cand_n][MAX_UTF8_TOKEN_BYTES - 1] = '\0';
+                copy_cstr_trunc(cand_tok[cand_n], MAX_UTF8_TOKEN_BYTES, tok);
                 cand_w[cand_n] = w;
                 cand_n++;
             }
@@ -1442,13 +1451,11 @@ static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, 
     first_tok[0] = '\0';
     smooth_first[0] = '\0';
     if (split_utf8_tokens(raw_text, sample_tokens[0], MAX_PLATE_TOKENS) > 0) {
-        strncpy(first_tok, sample_tokens[0][0], sizeof(first_tok) - 1);
-        first_tok[sizeof(first_tok) - 1] = '\0';
+        copy_cstr_trunc(first_tok, sizeof(first_tok), sample_tokens[0][0]);
         raw_first_cjk = utf8_token_is_cjk(first_tok);
     }
     if (split_utf8_tokens(smooth, sample_tokens[1], MAX_PLATE_TOKENS) > 0) {
-        strncpy(smooth_first, sample_tokens[1][0], sizeof(smooth_first) - 1);
-        smooth_first[sizeof(smooth_first) - 1] = '\0';
+        copy_cstr_trunc(smooth_first, sizeof(smooth_first), sample_tokens[1][0]);
         smooth_first_cjk = utf8_token_is_cjk(smooth_first);
     }
 
@@ -1471,8 +1478,7 @@ static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, 
     if (strcmp(raw_text, smooth) != 0) {
         if (smooth_conf >= (*conf * 0.90f) || (!raw_first_cjk && smooth_first_cjk)) {
             float old_conf = *conf;
-            strncpy(text, smooth, text_len - 1);
-            text[text_len - 1] = '\0';
+            copy_cstr_trunc(text, text_len, smooth);
             *conf = fmaxf(old_conf * 0.90f, smooth_conf);
             fprintf(stderr,
                     "[ocr-smooth] frame=%" PRIu64 " raw=(%.2f,%s) smooth=(%.2f,%s)\n",
@@ -2492,8 +2498,8 @@ static void resize_rgb888_with_kernel(const uint8_t *src, int sw, int sh,
         resize_rgb888_nn(src, sw, sh, dst, dw, dh);
 }
 
-static void resize_rgb888_nn_letterbox(const uint8_t *src, int sw, int sh,
-                                       uint8_t *dst, int dw, int dh, uint8_t pad)
+static void __attribute__((unused)) resize_rgb888_nn_letterbox(const uint8_t *src, int sw, int sh,
+                                                               uint8_t *dst, int dw, int dh, uint8_t pad)
 {
     int scaled_w, scaled_h;
     int off_x, off_y;
