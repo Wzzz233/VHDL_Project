@@ -3945,6 +3945,32 @@ static bool infer_obb_output_views(const struct yolo_model *m, const rknn_output
     int ones_count = 0;
     uint32_t i;
 
+    /*
+     * Prefer the exported middecode contract directly:
+     *   out[0] = decoded ltrb distances
+     *   out[1] = class logits
+     *   out[2] = decoded angle scalar
+     *
+     * This avoids misclassifying single-class logits as angle when both tails
+     * are 1x8400 tensors.
+     */
+    if (m->io_num.n_output >= 3) {
+        struct tensor_cn_view tv0;
+        struct tensor_cn_view tv1;
+        struct tensor_cn_view tv2;
+        if (build_tensor_cn_view(&m->output_attrs[0], (const float *)outs[0].buf, &tv0) &&
+            build_tensor_cn_view(&m->output_attrs[1], (const float *)outs[1].buf, &tv1) &&
+            build_tensor_cn_view(&m->output_attrs[2], (const float *)outs[2].buf, &tv2) &&
+            tv0.c == 4 && tv0.n == OBB_POINT_COUNT &&
+            tv1.c >= 1 && tv1.n == OBB_POINT_COUNT &&
+            tv2.c == 1 && tv2.n == OBB_POINT_COUNT) {
+            *dist_view = tv0;
+            *cls_view = tv1;
+            *angle_view = tv2;
+            return true;
+        }
+    }
+
     for (i = 0; i < m->io_num.n_output; i++) {
         struct tensor_cn_view tv;
         if (!build_tensor_cn_view(&m->output_attrs[i], (const float *)outs[i].buf, &tv))
