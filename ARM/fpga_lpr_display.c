@@ -53,6 +53,10 @@
 #define OCR_CROP_WIDTH 150
 #define OCR_CROP_HEIGHT 50
 #define OBB_POINT_COUNT 8400
+#define OCR_TRACK_MAX 24
+#define OCR_TRACK_HIST 8
+#define MAX_UTF8_TOKEN_BYTES 8
+#define MAX_PLATE_TOKENS 16
 
 #define COLOR_YELLOW_565 0xFFE0
 #define COLOR_CYAN_565 0x07FF
@@ -278,6 +282,24 @@ struct letterbox_meta {
     bool valid;
 };
 
+struct ocr_track_sample {
+    char text[64];
+    float conf;
+    uint64_t frame_seq;
+};
+
+struct ocr_track {
+    bool used;
+    int ttl;
+    uint64_t last_seq;
+    struct det_box box;
+    struct ocr_track_sample hist[OCR_TRACK_HIST];
+    int hist_count;
+    int hist_next;
+    char province_tok[MAX_UTF8_TOKEN_BYTES];
+    float province_score;
+};
+
 struct yolo_model {
     const char *name;
     const char *path;
@@ -386,6 +408,9 @@ struct app_ctx {
     int ped_track_count;
     int ped_next_track_id;
     int ped_red_streak;
+
+    struct ocr_track ocr_tracks[OCR_TRACK_MAX];
+    uint64_t ocr_track_age_seq;
 };
 
 struct slot_ticket {
@@ -416,6 +441,16 @@ static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
                                          const uint8_t *crop_rgb, int crop_w, int crop_h,
                                          float *occ_ratio_out);
 static bool append_utf8_token(char *dst, size_t dst_len, const char *token);
+static int utf8_token_len(const char *s);
+static uint32_t utf8_token_codepoint(const char *tok);
+static int split_utf8_tokens(const char *s, char tokens[][MAX_UTF8_TOKEN_BYTES], int max_tokens);
+static bool utf8_token_is_cjk(const char *tok);
+static bool utf8_token_is_ascii_alnum(const char *tok);
+static const char *province_token_ascii(const char *tok);
+static void age_ocr_tracks(struct app_ctx *ctx, uint64_t frame_seq);
+static int find_or_create_ocr_track(struct app_ctx *ctx, const struct det_box *box);
+static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, uint64_t frame_seq,
+                                char *text, size_t text_len, float *conf);
 static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src_w, int src_h,
                             float conf_thr, struct det_box *out, int *out_count,
                             struct detect_decode_diag *diag);
@@ -1059,6 +1094,391 @@ static bool append_utf8_token(char *dst, size_t dst_len, const char *token)
     memcpy(dst + cur, token, tok_len);
     dst[cur + tok_len] = '\0';
     return true;
+}
+
+static int utf8_token_len(const char *s)
+{
+    unsigned char c0, c1, c2, c3;
+    if (!s || s[0] == '\0')
+        return 0;
+    c0 = (unsigned char)s[0];
+    if (c0 < 0x80)
+        return 1;
+    if ((c0 & 0xE0U) == 0xC0U) {
+        c1 = (unsigned char)s[1];
+        return ((c1 & 0xC0U) == 0x80U) ? 2 : 1;
+    }
+    if ((c0 & 0xF0U) == 0xE0U) {
+        c1 = (unsigned char)s[1];
+        c2 = (unsigned char)s[2];
+        if ((c1 & 0xC0U) == 0x80U && (c2 & 0xC0U) == 0x80U)
+            return 3;
+        return 1;
+    }
+    if ((c0 & 0xF8U) == 0xF0U) {
+        c1 = (unsigned char)s[1];
+        c2 = (unsigned char)s[2];
+        c3 = (unsigned char)s[3];
+        if ((c1 & 0xC0U) == 0x80U && (c2 & 0xC0U) == 0x80U && (c3 & 0xC0U) == 0x80U)
+            return 4;
+        return 1;
+    }
+    return 1;
+}
+
+static uint32_t utf8_token_codepoint(const char *tok)
+{
+    int len;
+    const unsigned char *p = (const unsigned char *)tok;
+    if (!tok || tok[0] == '\0')
+        return 0;
+    len = utf8_token_len(tok);
+    if (len == 1)
+        return (uint32_t)p[0];
+    if (len == 2)
+        return (uint32_t)(((p[0] & 0x1FU) << 6) | (p[1] & 0x3FU));
+    if (len == 3)
+        return (uint32_t)(((p[0] & 0x0FU) << 12) | ((p[1] & 0x3FU) << 6) | (p[2] & 0x3FU));
+    if (len == 4)
+        return (uint32_t)(((p[0] & 0x07U) << 18) | ((p[1] & 0x3FU) << 12) |
+                          ((p[2] & 0x3FU) << 6) | (p[3] & 0x3FU));
+    return 0;
+}
+
+static int split_utf8_tokens(const char *s, char tokens[][MAX_UTF8_TOKEN_BYTES], int max_tokens)
+{
+    int n = 0;
+    const char *p = s;
+    if (!s || !tokens || max_tokens <= 0)
+        return 0;
+    while (p[0] != '\0' && n < max_tokens) {
+        int len = utf8_token_len(p);
+        int cp_len = len;
+        if (cp_len < 1)
+            break;
+        if (len >= MAX_UTF8_TOKEN_BYTES)
+            len = MAX_UTF8_TOKEN_BYTES - 1;
+        memcpy(tokens[n], p, (size_t)len);
+        tokens[n][len] = '\0';
+        n++;
+        p += cp_len;
+    }
+    return n;
+}
+
+static bool utf8_token_is_cjk(const char *tok)
+{
+    uint32_t cp = utf8_token_codepoint(tok);
+    return (cp >= 0x4E00U && cp <= 0x9FFFU);
+}
+
+static bool utf8_token_is_ascii_alnum(const char *tok)
+{
+    return tok && tok[0] != '\0' && tok[1] == '\0' && isalnum((unsigned char)tok[0]);
+}
+
+static const char *province_token_ascii(const char *tok)
+{
+    uint32_t cp = utf8_token_codepoint(tok);
+    switch (cp) {
+    case 0x4EACU: return "BJ";
+    case 0x6D25U: return "TJ";
+    case 0x6CAAU: return "SH";
+    case 0x6E1DU: return "CQ";
+    case 0x5180U: return "HE";
+    case 0x664BU: return "SX";
+    case 0x8499U: return "NM";
+    case 0x8FBDU: return "LN";
+    case 0x5409U: return "JL";
+    case 0x9ED1U: return "HL";
+    case 0x82CFU: return "JS";
+    case 0x6D59U: return "ZJ";
+    case 0x7696U: return "AH";
+    case 0x95FDU: return "FJ";
+    case 0x8D63U: return "JX";
+    case 0x9C81U: return "SD";
+    case 0x8C6BU: return "HA";
+    case 0x9102U: return "HB";
+    case 0x6E58U: return "HN";
+    case 0x7CA4U: return "GD";
+    case 0x6842U: return "GX";
+    case 0x743CU: return "HI";
+    case 0x5DDDU: return "SC";
+    case 0x8D35U: return "GZ";
+    case 0x4E91U: return "YN";
+    case 0x85CFU: return "XZ";
+    case 0x9655U: return "SN";
+    case 0x7518U: return "GS";
+    case 0x9752U: return "QH";
+    case 0x5B81U: return "NX";
+    case 0x65B0U: return "XJ";
+    case 0x6E2FU: return "HK";
+    case 0x6FB3U: return "MO";
+    case 0x53F0U: return "TW";
+    case 0x8B66U: return "J";
+    case 0x6302U: return "G";
+    case 0x9886U: return "L";
+    case 0x4F7FU: return "S";
+    default: return NULL;
+    }
+}
+
+static void age_ocr_tracks(struct app_ctx *ctx, uint64_t frame_seq)
+{
+    int i;
+    if (!ctx || ctx->ocr_track_age_seq == frame_seq)
+        return;
+    for (i = 0; i < OCR_TRACK_MAX; i++) {
+        struct ocr_track *tr = &ctx->ocr_tracks[i];
+        if (!tr->used)
+            continue;
+        tr->ttl--;
+        tr->province_score *= 0.97f;
+        if (tr->ttl <= 0)
+            memset(tr, 0, sizeof(*tr));
+    }
+    ctx->ocr_track_age_seq = frame_seq;
+}
+
+static int find_or_create_ocr_track(struct app_ctx *ctx, const struct det_box *box)
+{
+    int i;
+    int best_idx = -1;
+    float best_iou = 0.0f;
+    int free_idx = -1;
+    int replace_idx = -1;
+    int min_ttl = 1 << 30;
+
+    if (!ctx || !box)
+        return -1;
+
+    for (i = 0; i < OCR_TRACK_MAX; i++) {
+        struct ocr_track *tr = &ctx->ocr_tracks[i];
+        float iou;
+        if (!tr->used) {
+            if (free_idx < 0)
+                free_idx = i;
+            continue;
+        }
+        iou = box_iou(box, &tr->box);
+        if (iou > best_iou) {
+            best_iou = iou;
+            best_idx = i;
+        }
+        if (tr->ttl < min_ttl) {
+            min_ttl = tr->ttl;
+            replace_idx = i;
+        }
+    }
+    if (best_idx >= 0 && best_iou >= 0.25f)
+        return best_idx;
+
+    if (free_idx >= 0)
+        best_idx = free_idx;
+    else
+        best_idx = replace_idx;
+
+    if (best_idx >= 0)
+        memset(&ctx->ocr_tracks[best_idx], 0, sizeof(ctx->ocr_tracks[best_idx]));
+    return best_idx;
+}
+
+static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, uint64_t frame_seq,
+                                char *text, size_t text_len, float *conf)
+{
+    struct ocr_track *tr;
+    char raw_text[64];
+    char smooth[64];
+    int tr_idx;
+    int i, k;
+    int sample_count = 0;
+    float sample_w[OCR_TRACK_HIST];
+    int sample_lens[OCR_TRACK_HIST];
+    char sample_tokens[OCR_TRACK_HIST][MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
+    float len_vote[MAX_PLATE_TOKENS + 1];
+    int target_len = 0;
+    float target_w = -1.0f;
+    float smooth_ratio_sum = 0.0f;
+    int smooth_ratio_n = 0;
+    float smooth_conf;
+    char first_tok[MAX_UTF8_TOKEN_BYTES];
+    char smooth_first[MAX_UTF8_TOKEN_BYTES];
+    bool raw_first_cjk = false;
+    bool smooth_first_cjk = false;
+
+    if (!ctx || !box || !text || text_len == 0 || !conf)
+        return;
+
+    raw_text[0] = '\0';
+    strncpy(raw_text, text, sizeof(raw_text) - 1);
+    raw_text[sizeof(raw_text) - 1] = '\0';
+
+    tr_idx = find_or_create_ocr_track(ctx, box);
+    if (tr_idx < 0)
+        return;
+    tr = &ctx->ocr_tracks[tr_idx];
+
+    tr->used = true;
+    tr->ttl = 10;
+    tr->last_seq = frame_seq;
+    tr->box = *box;
+
+    if (raw_text[0] != '\0') {
+        int pos = tr->hist_next;
+        char toks[MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
+        int tok_n;
+
+        strncpy(tr->hist[pos].text, raw_text, sizeof(tr->hist[pos].text) - 1);
+        tr->hist[pos].text[sizeof(tr->hist[pos].text) - 1] = '\0';
+        tr->hist[pos].conf = fmaxf(0.0f, fminf(1.0f, *conf));
+        tr->hist[pos].frame_seq = frame_seq;
+        tr->hist_next = (tr->hist_next + 1) % OCR_TRACK_HIST;
+        if (tr->hist_count < OCR_TRACK_HIST)
+            tr->hist_count++;
+
+        tok_n = split_utf8_tokens(raw_text, toks, MAX_PLATE_TOKENS);
+        if (tok_n > 0 && utf8_token_is_cjk(toks[0])) {
+            if (tr->province_tok[0] == '\0' || strcmp(tr->province_tok, toks[0]) == 0) {
+                strncpy(tr->province_tok, toks[0], sizeof(tr->province_tok) - 1);
+                tr->province_tok[sizeof(tr->province_tok) - 1] = '\0';
+                tr->province_score = fminf(4.0f, tr->province_score + tr->hist[pos].conf);
+            } else if (tr->hist[pos].conf >= tr->province_score * 0.80f) {
+                strncpy(tr->province_tok, toks[0], sizeof(tr->province_tok) - 1);
+                tr->province_tok[sizeof(tr->province_tok) - 1] = '\0';
+                tr->province_score = tr->hist[pos].conf;
+            }
+        }
+    }
+
+    if (tr->hist_count < 2)
+        return;
+
+    memset(len_vote, 0, sizeof(len_vote));
+    for (k = 0; k < tr->hist_count && sample_count < OCR_TRACK_HIST; k++) {
+        int idx = (tr->hist_next - 1 - k + OCR_TRACK_HIST) % OCR_TRACK_HIST;
+        float recency = 1.0f - 0.08f * (float)k;
+        int n;
+        if (tr->hist[idx].text[0] == '\0')
+            continue;
+        if (recency < 0.45f)
+            recency = 0.45f;
+        sample_w[sample_count] = tr->hist[idx].conf * recency;
+        n = split_utf8_tokens(tr->hist[idx].text, sample_tokens[sample_count], MAX_PLATE_TOKENS);
+        sample_lens[sample_count] = n;
+        if (n > 0 && n <= MAX_PLATE_TOKENS)
+            len_vote[n] += sample_w[sample_count];
+        sample_count++;
+    }
+    if (sample_count == 0)
+        return;
+
+    for (i = 1; i <= MAX_PLATE_TOKENS; i++) {
+        if (len_vote[i] > target_w) {
+            target_w = len_vote[i];
+            target_len = i;
+        }
+    }
+    if (target_len <= 0)
+        return;
+
+    smooth[0] = '\0';
+    for (i = 0; i < target_len; i++) {
+        char cand_tok[OCR_TRACK_HIST][MAX_UTF8_TOKEN_BYTES];
+        float cand_w[OCR_TRACK_HIST];
+        int cand_n = 0;
+        float pos_total_w = 0.0f;
+        float pos_best_w = -1.0f;
+        int best_j = -1;
+
+        memset(cand_w, 0, sizeof(cand_w));
+        for (k = 0; k < sample_count; k++) {
+            const char *tok;
+            float w;
+            int j;
+            if (sample_lens[k] <= i)
+                continue;
+            tok = sample_tokens[k][i];
+            w = sample_w[k];
+            if (i == 0) {
+                if (utf8_token_is_cjk(tok))
+                    w *= 1.25f;
+                else if (utf8_token_is_ascii_alnum(tok))
+                    w *= 0.75f;
+            } else if (utf8_token_is_cjk(tok)) {
+                w *= 0.90f;
+            }
+            pos_total_w += w;
+            for (j = 0; j < cand_n; j++) {
+                if (strcmp(cand_tok[j], tok) == 0) {
+                    cand_w[j] += w;
+                    break;
+                }
+            }
+            if (j == cand_n && cand_n < OCR_TRACK_HIST) {
+                strncpy(cand_tok[cand_n], tok, MAX_UTF8_TOKEN_BYTES - 1);
+                cand_tok[cand_n][MAX_UTF8_TOKEN_BYTES - 1] = '\0';
+                cand_w[cand_n] = w;
+                cand_n++;
+            }
+        }
+        if (cand_n == 0)
+            break;
+        for (k = 0; k < cand_n; k++) {
+            if (cand_w[k] > pos_best_w) {
+                pos_best_w = cand_w[k];
+                best_j = k;
+            }
+        }
+        if (best_j < 0 || !append_utf8_token(smooth, sizeof(smooth), cand_tok[best_j]))
+            break;
+        if (pos_total_w > 1e-6f) {
+            smooth_ratio_sum += pos_best_w / pos_total_w;
+            smooth_ratio_n++;
+        }
+    }
+    if (smooth[0] == '\0')
+        return;
+
+    first_tok[0] = '\0';
+    smooth_first[0] = '\0';
+    if (split_utf8_tokens(raw_text, sample_tokens[0], MAX_PLATE_TOKENS) > 0) {
+        strncpy(first_tok, sample_tokens[0][0], sizeof(first_tok) - 1);
+        first_tok[sizeof(first_tok) - 1] = '\0';
+        raw_first_cjk = utf8_token_is_cjk(first_tok);
+    }
+    if (split_utf8_tokens(smooth, sample_tokens[1], MAX_PLATE_TOKENS) > 0) {
+        strncpy(smooth_first, sample_tokens[1][0], sizeof(smooth_first) - 1);
+        smooth_first[sizeof(smooth_first) - 1] = '\0';
+        smooth_first_cjk = utf8_token_is_cjk(smooth_first);
+    }
+
+    if (!smooth_first_cjk && tr->province_tok[0] != '\0' && tr->province_score >= 1.2f) {
+        char toks[MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
+        int n = split_utf8_tokens(smooth, toks, MAX_PLATE_TOKENS);
+        if (n > 0) {
+            int p;
+            smooth[0] = '\0';
+            append_utf8_token(smooth, sizeof(smooth), tr->province_tok);
+            for (p = 1; p < n; p++)
+                append_utf8_token(smooth, sizeof(smooth), toks[p]);
+            smooth_first_cjk = true;
+        }
+    }
+
+    smooth_conf = (smooth_ratio_n > 0) ? (smooth_ratio_sum / (float)smooth_ratio_n) : *conf;
+    smooth_conf = fmaxf(0.0f, fminf(1.0f, smooth_conf));
+
+    if (strcmp(raw_text, smooth) != 0) {
+        if (smooth_conf >= (*conf * 0.90f) || (!raw_first_cjk && smooth_first_cjk)) {
+            float old_conf = *conf;
+            strncpy(text, smooth, text_len - 1);
+            text[text_len - 1] = '\0';
+            *conf = fmaxf(old_conf * 0.90f, smooth_conf);
+            fprintf(stderr,
+                    "[ocr-smooth] frame=%" PRIu64 " raw=(%.2f,%s) smooth=(%.2f,%s)\n",
+                    frame_seq, old_conf, raw_text, *conf, text);
+        }
+    }
 }
 
 static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
@@ -5070,20 +5490,41 @@ static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t t
 static void build_overlay_ascii_text(const struct plate_det *pd, char *out, size_t out_len)
 {
     size_t i = 0;
-    const char *s = pd->ocr_text;
+    char toks[MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
+    int tok_n = 0;
+    int t;
+
     if (out_len == 0)
         return;
-    while (s && *s && i + 1 < out_len) {
-        unsigned char ch = (unsigned char)*s++;
-        if ((ch >= '0' && ch <= '9') ||
-            (ch >= 'A' && ch <= 'Z') ||
-            (ch >= 'a' && ch <= 'z') ||
-            ch == '-') {
+    out[0] = '\0';
+
+    tok_n = split_utf8_tokens(pd->ocr_text, toks, MAX_PLATE_TOKENS);
+    for (t = 0; t < tok_n && i + 1 < out_len; t++) {
+        const char *tok = toks[t];
+        const char *alias = province_token_ascii(tok);
+        if (tok[0] == '\0')
+            continue;
+
+        if (tok[1] == '\0') {
+            unsigned char ch = (unsigned char)tok[0];
+            if (ch == '.' || ch == '-' || ch == '_') {
+                out[i++] = '-';
+                continue;
+            }
             if (ch >= 'a' && ch <= 'z')
                 ch = (unsigned char)(ch - 'a' + 'A');
-            out[i++] = (char)ch;
+            if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z')) {
+                out[i++] = (char)ch;
+                continue;
+            }
+        }
+        if (alias && alias[0] != '\0') {
+            int j;
+            for (j = 0; alias[j] != '\0' && i + 1 < out_len; j++)
+                out[i++] = alias[j];
         }
     }
+
     if (i == 0) {
         const char *fb = "UNK";
         if (pd->type == PLATE_TYPE_COMMON_BLUE) fb = "BLUE";
@@ -5163,6 +5604,8 @@ static void *infer_thread_main(void *arg)
         seq = ctx->infer_frame_seq;
         ctx->infer_has_new = false;
         pthread_mutex_unlock(&ctx->infer_lock);
+
+        age_ocr_tracks(ctx, seq);
 
         t0 = mono_us();
         if (ctx->src_is_bgrx) {
@@ -5426,6 +5869,9 @@ static void *infer_thread_main(void *arg)
                         pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2,
                         odiag.t_size, odiag.c_size, odiag.blank_idx, odiag.blank_top1_ratio,
                         pd.ocr_text);
+            }
+            if (pd.ocr_text[0] != '\0') {
+                ocr_temporal_smooth(ctx, &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf);
             }
             if (pd.ocr_text[0] != '\0')
                 ocr_nonempty_count++;
