@@ -4477,6 +4477,19 @@ static bool plate_box_pass_rules_relaxed(const struct det_box *b, int frame_w, i
     return true;
 }
 
+static float plate_abs_tilt_deg(const struct det_box *b)
+{
+    float deg;
+    if (!b || !b->has_obb)
+        return 0.0f;
+    deg = fabsf(b->angle) * (180.0f / (float)M_PI);
+    while (deg > 180.0f)
+        deg -= 180.0f;
+    if (deg > 90.0f)
+        deg = 180.0f - deg;
+    return deg;
+}
+
 static bool plate_box_pass_rules_obb(const struct det_box *b, int frame_w, int frame_h)
 {
     int bw;
