@@ -1556,6 +1556,7 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     rknn_output outs[4];
     uint8_t *ocr_in = NULL;
     const rknn_tensor_attr *out_attr;
+    uint32_t decode_output_idx = 0;
     int t_size, c_size, t_stride, c_stride;
     int ret = -1;
     uint32_t i;
@@ -1589,7 +1590,9 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     if (ret < 0)
         goto out;
 
-    out_attr = &m->output_attrs[0];
+    if (m->io_num.n_output >= 2)
+        decode_output_idx = 1; /* 临时 green8 测试模式：多头时优先取 green8 head */
+    out_attr = &m->output_attrs[decode_output_idx];
     if (!build_ocr_layout(out_attr, &t_size, &c_size, &t_stride, &c_stride)) {
         ret = -1;
         goto out_release;
@@ -1606,9 +1609,14 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
                     "[ocr] WARN key/output mismatch: keys=%d c_size=%d (expected N or N+1)\n",
                     ctx->ocr_key_count, c_size);
         }
+        fprintf(stderr,
+                "[ocr] decode_output_idx=%u/%u%s\n",
+                decode_output_idx,
+                m->io_num.n_output,
+                (m->io_num.n_output >= 2) ? " (temporary green8 head test mode)" : "");
         ctx->ocr_keysize_warned = true;
     }
-    ret = ctc_decode_logits((const float *)outs[0].buf, t_size, c_size, t_stride, c_stride,
+    ret = ctc_decode_logits((const float *)outs[decode_output_idx].buf, t_size, c_size, t_stride, c_stride,
                             ctx, text, text_len, conf_out, diag);
     if (diag)
         diag->in_occ_ratio = occ_ratio;
