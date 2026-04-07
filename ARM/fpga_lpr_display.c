@@ -4928,18 +4928,19 @@ static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src
     return 0;
 }
 
-static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int h, const struct det_box *b)
+static enum plate_color classify_plate_color_region_rgb(const uint8_t *rgb, int w, int h,
+                                                        int x1, int y1, int x2, int y2)
 {
-    int x1 = b->x1 + (b->x2 - b->x1) / 6;
-    int x2 = b->x2 - (b->x2 - b->x1) / 6;
-    int y1 = b->y1 + (b->y2 - b->y1) / 6;
-    int y2 = b->y2 - (b->y2 - b->y1) / 6;
     int x, y;
     int total = 0, blue_cnt = 0, green_cnt = 0, yellow_cnt = 0;
+    if (!rgb || w <= 0 || h <= 0)
+        return PLATE_COLOR_UNKNOWN;
     if (x1 < 0) x1 = 0;
     if (y1 < 0) y1 = 0;
     if (x2 >= w) x2 = w - 1;
     if (y2 >= h) y2 = h - 1;
+    if (x2 < x1 || y2 < y1)
+        return PLATE_COLOR_UNKNOWN;
     for (y = y1; y <= y2; y++) {
         for (x = x1; x <= x2; x++) {
             const uint8_t *p = rgb + (y * w + x) * 3;
@@ -4972,6 +4973,38 @@ static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int 
     if ((float)yellow_cnt / (float)total >= 0.18f)
         return PLATE_COLOR_YELLOW;
     return PLATE_COLOR_UNKNOWN;
+}
+
+static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int h, const struct det_box *b)
+{
+    int x1;
+    int x2;
+    int y1;
+    int y2;
+
+    if (!b)
+        return PLATE_COLOR_UNKNOWN;
+    x1 = b->x1 + (b->x2 - b->x1) / 6;
+    x2 = b->x2 - (b->x2 - b->x1) / 6;
+    y1 = b->y1 + (b->y2 - b->y1) / 6;
+    y2 = b->y2 - (b->y2 - b->y1) / 6;
+    return classify_plate_color_region_rgb(rgb, w, h, x1, y1, x2, y2);
+}
+
+static enum plate_color classify_plate_color_crop_rgb(const uint8_t *crop_rgb, int w, int h)
+{
+    int x1;
+    int x2;
+    int y1;
+    int y2;
+
+    if (!crop_rgb || w <= 0 || h <= 0)
+        return PLATE_COLOR_UNKNOWN;
+    x1 = w / 10;
+    x2 = w - 1 - w / 10;
+    y1 = h / 10;
+    y2 = h - 1 - h / 10;
+    return classify_plate_color_region_rgb(crop_rgb, w, h, x1, y1, x2, y2);
 }
 
 static int find_parent_car(const struct det_box *plate, const struct det_box *cars, int car_count)
@@ -5560,7 +5593,7 @@ static int run_offline_once(struct app_ctx *ctx)
     }
 
     pd.box = box;
-    pd.color = classify_plate_color_rgb(rgb, w, h, &pd.box);
+    pd.color = PLATE_COLOR_UNKNOWN;
     if (!prepare_plate_crop_rgb888(ctx, rgb, w, h, &pd.box,
                                    plate_crop, w, h, &pd.crop_box, &crop_w, &crop_h,
                                    &occ_ratio, &used_obb_warp))
@@ -5609,6 +5642,9 @@ static int run_offline_once(struct app_ctx *ctx)
             }
         }
     }
+    pd.color = classify_plate_color_crop_rgb(plate_crop, crop_w, crop_h);
+    if (pd.color == PLATE_COLOR_UNKNOWN)
+        pd.color = classify_plate_color_rgb(rgb, w, h, &pd.crop_box);
     pd.ocr_in_occ_ratio = occ_ratio;
     fprintf(stderr, "[crop-geom] box=[%d,%d,%d,%d] crop=[%d,%d,%d,%d] iou=%.3f\n",
             pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2,
@@ -6037,7 +6073,7 @@ static void *infer_thread_main(void *arg)
             if (!ctx->opt.plate_only && ctx->opt.plate_on_car_only && parent < 0)
                 continue;
             pd.parent_car = parent;
-            pd.color = classify_plate_color_rgb(rgb_full, (int)ctx->frame_width, (int)ctx->frame_height, &pd.box);
+            pd.color = PLATE_COLOR_UNKNOWN;
             if (!prepare_plate_crop_rgb888(ctx, rgb_full, (int)ctx->frame_width, (int)ctx->frame_height,
                                            &pd.box, plate_crop, (int)ctx->frame_width, (int)ctx->frame_height,
                                            &pd.crop_box, &crop_w, &crop_h, &occ_ratio, &used_obb_warp))
@@ -6089,6 +6125,11 @@ static void *infer_thread_main(void *arg)
                                 seq, old_occ, mode_tag, occ_ratio);
                     }
                 }
+            }
+            pd.color = classify_plate_color_crop_rgb(plate_crop, crop_w, crop_h);
+            if (pd.color == PLATE_COLOR_UNKNOWN) {
+                pd.color = classify_plate_color_rgb(rgb_full, (int)ctx->frame_width,
+                                                    (int)ctx->frame_height, &pd.crop_box);
             }
             pd.ocr_in_occ_ratio = occ_ratio;
             fprintf(stderr,
@@ -6147,7 +6188,13 @@ static void *infer_thread_main(void *arg)
                         pd.ocr_text);
             }
             if (pd.ocr_text[0] != '\0') {
-                ocr_temporal_smooth(ctx, &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf);
+                if (pd.ocr_in_occ_ratio >= 0.70f) {
+                    ocr_temporal_smooth(ctx, &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf);
+                } else {
+                    fprintf(stderr,
+                            "[ocr-smooth] frame=%" PRIu64 " skip=1 reason=low-occ occ=%.3f conf=%.2f text=%s\n",
+                            seq, pd.ocr_in_occ_ratio, pd.ocr_conf, pd.ocr_text);
+                }
             }
             if (pd.ocr_text[0] != '\0')
                 ocr_nonempty_count++;
