@@ -53,10 +53,6 @@
 #define OCR_CROP_WIDTH 150
 #define OCR_CROP_HEIGHT 50
 #define OBB_POINT_COUNT 8400
-#define OCR_TRACK_MAX 24
-#define OCR_TRACK_HIST 8
-#define MAX_UTF8_TOKEN_BYTES 8
-#define MAX_PLATE_TOKENS 16
 
 #define COLOR_YELLOW_565 0xFFE0
 #define COLOR_CYAN_565 0x07FF
@@ -282,24 +278,6 @@ struct letterbox_meta {
     bool valid;
 };
 
-struct ocr_track_sample {
-    char text[64];
-    float conf;
-    uint64_t frame_seq;
-};
-
-struct ocr_track {
-    bool used;
-    int ttl;
-    uint64_t last_seq;
-    struct det_box box;
-    struct ocr_track_sample hist[OCR_TRACK_HIST];
-    int hist_count;
-    int hist_next;
-    char province_tok[MAX_UTF8_TOKEN_BYTES];
-    float province_score;
-};
-
 struct yolo_model {
     const char *name;
     const char *path;
@@ -408,9 +386,6 @@ struct app_ctx {
     int ped_track_count;
     int ped_next_track_id;
     int ped_red_streak;
-
-    struct ocr_track ocr_tracks[OCR_TRACK_MAX];
-    uint64_t ocr_track_age_seq;
 };
 
 struct slot_ticket {
@@ -429,8 +404,8 @@ static void resize_rgb888_nn(const uint8_t *src, int sw, int sh, uint8_t *dst, i
 static void resize_rgb888_bilinear(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh);
 static void resize_rgb888_with_kernel(const uint8_t *src, int sw, int sh,
                                       uint8_t *dst, int dw, int dh, int kernel);
-static void __attribute__((unused)) resize_rgb888_nn_letterbox(const uint8_t *src, int sw, int sh,
-                                                               uint8_t *dst, int dw, int dh, uint8_t pad);
+static void resize_rgb888_nn_letterbox(const uint8_t *src, int sw, int sh,
+                                       uint8_t *dst, int dw, int dh, uint8_t pad);
 static void resize_rgb888_letterbox_kernel(const uint8_t *src, int sw, int sh,
                                            uint8_t *dst, int dw, int dh, uint8_t pad,
                                            int kernel, struct letterbox_meta *meta);
@@ -441,17 +416,6 @@ static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
                                          const uint8_t *crop_rgb, int crop_w, int crop_h,
                                          float *occ_ratio_out);
 static bool append_utf8_token(char *dst, size_t dst_len, const char *token);
-static void copy_cstr_trunc(char *dst, size_t dst_len, const char *src);
-static int utf8_token_len(const char *s);
-static uint32_t utf8_token_codepoint(const char *tok);
-static int split_utf8_tokens(const char *s, char tokens[][MAX_UTF8_TOKEN_BYTES], int max_tokens);
-static bool utf8_token_is_cjk(const char *tok);
-static bool utf8_token_is_ascii_alnum(const char *tok);
-static const char *province_token_ascii(const char *tok);
-static void age_ocr_tracks(struct app_ctx *ctx, uint64_t frame_seq);
-static int find_or_create_ocr_track(struct app_ctx *ctx, const struct det_box *box);
-static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, uint64_t frame_seq,
-                                char *text, size_t text_len, float *conf);
 static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src_w, int src_h,
                             float conf_thr, struct det_box *out, int *out_count,
                             struct detect_decode_diag *diag);
@@ -1097,396 +1061,6 @@ static bool append_utf8_token(char *dst, size_t dst_len, const char *token)
     return true;
 }
 
-static void copy_cstr_trunc(char *dst, size_t dst_len, const char *src)
-{
-    size_t n;
-    if (!dst || dst_len == 0)
-        return;
-    if (!src) {
-        dst[0] = '\0';
-        return;
-    }
-    n = strnlen(src, dst_len - 1);
-    memcpy(dst, src, n);
-    dst[n] = '\0';
-}
-
-static int utf8_token_len(const char *s)
-{
-    unsigned char c0, c1, c2, c3;
-    if (!s || s[0] == '\0')
-        return 0;
-    c0 = (unsigned char)s[0];
-    if (c0 < 0x80)
-        return 1;
-    if ((c0 & 0xE0U) == 0xC0U) {
-        c1 = (unsigned char)s[1];
-        return ((c1 & 0xC0U) == 0x80U) ? 2 : 1;
-    }
-    if ((c0 & 0xF0U) == 0xE0U) {
-        c1 = (unsigned char)s[1];
-        c2 = (unsigned char)s[2];
-        if ((c1 & 0xC0U) == 0x80U && (c2 & 0xC0U) == 0x80U)
-            return 3;
-        return 1;
-    }
-    if ((c0 & 0xF8U) == 0xF0U) {
-        c1 = (unsigned char)s[1];
-        c2 = (unsigned char)s[2];
-        c3 = (unsigned char)s[3];
-        if ((c1 & 0xC0U) == 0x80U && (c2 & 0xC0U) == 0x80U && (c3 & 0xC0U) == 0x80U)
-            return 4;
-        return 1;
-    }
-    return 1;
-}
-
-static uint32_t utf8_token_codepoint(const char *tok)
-{
-    int len;
-    const unsigned char *p = (const unsigned char *)tok;
-    if (!tok || tok[0] == '\0')
-        return 0;
-    len = utf8_token_len(tok);
-    if (len == 1)
-        return (uint32_t)p[0];
-    if (len == 2)
-        return (uint32_t)(((p[0] & 0x1FU) << 6) | (p[1] & 0x3FU));
-    if (len == 3)
-        return (uint32_t)(((p[0] & 0x0FU) << 12) | ((p[1] & 0x3FU) << 6) | (p[2] & 0x3FU));
-    if (len == 4)
-        return (uint32_t)(((p[0] & 0x07U) << 18) | ((p[1] & 0x3FU) << 12) |
-                          ((p[2] & 0x3FU) << 6) | (p[3] & 0x3FU));
-    return 0;
-}
-
-static int split_utf8_tokens(const char *s, char tokens[][MAX_UTF8_TOKEN_BYTES], int max_tokens)
-{
-    int n = 0;
-    const char *p = s;
-    if (!s || !tokens || max_tokens <= 0)
-        return 0;
-    while (p[0] != '\0' && n < max_tokens) {
-        int len = utf8_token_len(p);
-        int cp_len = len;
-        if (cp_len < 1)
-            break;
-        if (len >= MAX_UTF8_TOKEN_BYTES)
-            len = MAX_UTF8_TOKEN_BYTES - 1;
-        memcpy(tokens[n], p, (size_t)len);
-        tokens[n][len] = '\0';
-        n++;
-        p += cp_len;
-    }
-    return n;
-}
-
-static bool utf8_token_is_cjk(const char *tok)
-{
-    uint32_t cp = utf8_token_codepoint(tok);
-    return (cp >= 0x4E00U && cp <= 0x9FFFU);
-}
-
-static bool utf8_token_is_ascii_alnum(const char *tok)
-{
-    return tok && tok[0] != '\0' && tok[1] == '\0' && isalnum((unsigned char)tok[0]);
-}
-
-static const char *province_token_ascii(const char *tok)
-{
-    uint32_t cp = utf8_token_codepoint(tok);
-    switch (cp) {
-    case 0x4EACU: return "BJ";
-    case 0x6D25U: return "TJ";
-    case 0x6CAAU: return "SH";
-    case 0x6E1DU: return "CQ";
-    case 0x5180U: return "HE";
-    case 0x664BU: return "SX";
-    case 0x8499U: return "NM";
-    case 0x8FBDU: return "LN";
-    case 0x5409U: return "JL";
-    case 0x9ED1U: return "HL";
-    case 0x82CFU: return "JS";
-    case 0x6D59U: return "ZJ";
-    case 0x7696U: return "AH";
-    case 0x95FDU: return "FJ";
-    case 0x8D63U: return "JX";
-    case 0x9C81U: return "SD";
-    case 0x8C6BU: return "HA";
-    case 0x9102U: return "HB";
-    case 0x6E58U: return "HN";
-    case 0x7CA4U: return "GD";
-    case 0x6842U: return "GX";
-    case 0x743CU: return "HI";
-    case 0x5DDDU: return "SC";
-    case 0x8D35U: return "GZ";
-    case 0x4E91U: return "YN";
-    case 0x85CFU: return "XZ";
-    case 0x9655U: return "SN";
-    case 0x7518U: return "GS";
-    case 0x9752U: return "QH";
-    case 0x5B81U: return "NX";
-    case 0x65B0U: return "XJ";
-    case 0x6E2FU: return "HK";
-    case 0x6FB3U: return "MO";
-    case 0x53F0U: return "TW";
-    case 0x8B66U: return "J";
-    case 0x6302U: return "G";
-    case 0x9886U: return "L";
-    case 0x4F7FU: return "S";
-    default: return NULL;
-    }
-}
-
-static void age_ocr_tracks(struct app_ctx *ctx, uint64_t frame_seq)
-{
-    int i;
-    if (!ctx || ctx->ocr_track_age_seq == frame_seq)
-        return;
-    for (i = 0; i < OCR_TRACK_MAX; i++) {
-        struct ocr_track *tr = &ctx->ocr_tracks[i];
-        if (!tr->used)
-            continue;
-        tr->ttl--;
-        tr->province_score *= 0.97f;
-        if (tr->ttl <= 0)
-            memset(tr, 0, sizeof(*tr));
-    }
-    ctx->ocr_track_age_seq = frame_seq;
-}
-
-static int find_or_create_ocr_track(struct app_ctx *ctx, const struct det_box *box)
-{
-    int i;
-    int best_idx = -1;
-    float best_iou = 0.0f;
-    int free_idx = -1;
-    int replace_idx = -1;
-    int min_ttl = 1 << 30;
-
-    if (!ctx || !box)
-        return -1;
-
-    for (i = 0; i < OCR_TRACK_MAX; i++) {
-        struct ocr_track *tr = &ctx->ocr_tracks[i];
-        float iou;
-        if (!tr->used) {
-            if (free_idx < 0)
-                free_idx = i;
-            continue;
-        }
-        iou = box_iou(box, &tr->box);
-        if (iou > best_iou) {
-            best_iou = iou;
-            best_idx = i;
-        }
-        if (tr->ttl < min_ttl) {
-            min_ttl = tr->ttl;
-            replace_idx = i;
-        }
-    }
-    if (best_idx >= 0 && best_iou >= 0.25f)
-        return best_idx;
-
-    if (free_idx >= 0)
-        best_idx = free_idx;
-    else
-        best_idx = replace_idx;
-
-    if (best_idx >= 0)
-        memset(&ctx->ocr_tracks[best_idx], 0, sizeof(ctx->ocr_tracks[best_idx]));
-    return best_idx;
-}
-
-static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, uint64_t frame_seq,
-                                char *text, size_t text_len, float *conf)
-{
-    struct ocr_track *tr;
-    char raw_text[64];
-    char smooth[64];
-    int tr_idx;
-    int i, k;
-    int sample_count = 0;
-    float sample_w[OCR_TRACK_HIST];
-    int sample_lens[OCR_TRACK_HIST];
-    char sample_tokens[OCR_TRACK_HIST][MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
-    float len_vote[MAX_PLATE_TOKENS + 1];
-    int target_len = 0;
-    float target_w = -1.0f;
-    float smooth_ratio_sum = 0.0f;
-    int smooth_ratio_n = 0;
-    float smooth_conf;
-    char first_tok[MAX_UTF8_TOKEN_BYTES];
-    char smooth_first[MAX_UTF8_TOKEN_BYTES];
-    bool raw_first_cjk = false;
-    bool smooth_first_cjk = false;
-
-    if (!ctx || !box || !text || text_len == 0 || !conf)
-        return;
-
-    copy_cstr_trunc(raw_text, sizeof(raw_text), text);
-
-    tr_idx = find_or_create_ocr_track(ctx, box);
-    if (tr_idx < 0)
-        return;
-    tr = &ctx->ocr_tracks[tr_idx];
-
-    tr->used = true;
-    tr->ttl = 10;
-    tr->last_seq = frame_seq;
-    tr->box = *box;
-
-    if (raw_text[0] != '\0') {
-        int pos = tr->hist_next;
-        char toks[MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
-        int tok_n;
-
-        copy_cstr_trunc(tr->hist[pos].text, sizeof(tr->hist[pos].text), raw_text);
-        tr->hist[pos].conf = fmaxf(0.0f, fminf(1.0f, *conf));
-        tr->hist[pos].frame_seq = frame_seq;
-        tr->hist_next = (tr->hist_next + 1) % OCR_TRACK_HIST;
-        if (tr->hist_count < OCR_TRACK_HIST)
-            tr->hist_count++;
-
-        tok_n = split_utf8_tokens(raw_text, toks, MAX_PLATE_TOKENS);
-        if (tok_n > 0 && utf8_token_is_cjk(toks[0])) {
-            if (tr->province_tok[0] == '\0' || strcmp(tr->province_tok, toks[0]) == 0) {
-                copy_cstr_trunc(tr->province_tok, sizeof(tr->province_tok), toks[0]);
-                tr->province_score = fminf(4.0f, tr->province_score + tr->hist[pos].conf);
-            } else if (tr->hist[pos].conf >= tr->province_score * 0.80f) {
-                copy_cstr_trunc(tr->province_tok, sizeof(tr->province_tok), toks[0]);
-                tr->province_score = tr->hist[pos].conf;
-            }
-        }
-    }
-
-    if (tr->hist_count < 2)
-        return;
-
-    memset(len_vote, 0, sizeof(len_vote));
-    for (k = 0; k < tr->hist_count && sample_count < OCR_TRACK_HIST; k++) {
-        int idx = (tr->hist_next - 1 - k + OCR_TRACK_HIST) % OCR_TRACK_HIST;
-        float recency = 1.0f - 0.08f * (float)k;
-        int n;
-        if (tr->hist[idx].text[0] == '\0')
-            continue;
-        if (recency < 0.45f)
-            recency = 0.45f;
-        sample_w[sample_count] = tr->hist[idx].conf * recency;
-        n = split_utf8_tokens(tr->hist[idx].text, sample_tokens[sample_count], MAX_PLATE_TOKENS);
-        sample_lens[sample_count] = n;
-        if (n > 0 && n <= MAX_PLATE_TOKENS)
-            len_vote[n] += sample_w[sample_count];
-        sample_count++;
-    }
-    if (sample_count == 0)
-        return;
-
-    for (i = 1; i <= MAX_PLATE_TOKENS; i++) {
-        if (len_vote[i] > target_w) {
-            target_w = len_vote[i];
-            target_len = i;
-        }
-    }
-    if (target_len <= 0)
-        return;
-
-    smooth[0] = '\0';
-    for (i = 0; i < target_len; i++) {
-        char cand_tok[OCR_TRACK_HIST][MAX_UTF8_TOKEN_BYTES];
-        float cand_w[OCR_TRACK_HIST];
-        int cand_n = 0;
-        float pos_total_w = 0.0f;
-        float pos_best_w = -1.0f;
-        int best_j = -1;
-
-        memset(cand_w, 0, sizeof(cand_w));
-        for (k = 0; k < sample_count; k++) {
-            const char *tok;
-            float w;
-            int j;
-            if (sample_lens[k] <= i)
-                continue;
-            tok = sample_tokens[k][i];
-            w = sample_w[k];
-            if (i == 0) {
-                if (utf8_token_is_cjk(tok))
-                    w *= 1.25f;
-                else if (utf8_token_is_ascii_alnum(tok))
-                    w *= 0.75f;
-            } else if (utf8_token_is_cjk(tok)) {
-                w *= 0.90f;
-            }
-            pos_total_w += w;
-            for (j = 0; j < cand_n; j++) {
-                if (strcmp(cand_tok[j], tok) == 0) {
-                    cand_w[j] += w;
-                    break;
-                }
-            }
-            if (j == cand_n && cand_n < OCR_TRACK_HIST) {
-                copy_cstr_trunc(cand_tok[cand_n], MAX_UTF8_TOKEN_BYTES, tok);
-                cand_w[cand_n] = w;
-                cand_n++;
-            }
-        }
-        if (cand_n == 0)
-            break;
-        for (k = 0; k < cand_n; k++) {
-            if (cand_w[k] > pos_best_w) {
-                pos_best_w = cand_w[k];
-                best_j = k;
-            }
-        }
-        if (best_j < 0 || !append_utf8_token(smooth, sizeof(smooth), cand_tok[best_j]))
-            break;
-        if (pos_total_w > 1e-6f) {
-            smooth_ratio_sum += pos_best_w / pos_total_w;
-            smooth_ratio_n++;
-        }
-    }
-    if (smooth[0] == '\0')
-        return;
-
-    first_tok[0] = '\0';
-    smooth_first[0] = '\0';
-    if (split_utf8_tokens(raw_text, sample_tokens[0], MAX_PLATE_TOKENS) > 0) {
-        copy_cstr_trunc(first_tok, sizeof(first_tok), sample_tokens[0][0]);
-        raw_first_cjk = utf8_token_is_cjk(first_tok);
-    }
-    if (split_utf8_tokens(smooth, sample_tokens[1], MAX_PLATE_TOKENS) > 0) {
-        copy_cstr_trunc(smooth_first, sizeof(smooth_first), sample_tokens[1][0]);
-        smooth_first_cjk = utf8_token_is_cjk(smooth_first);
-    }
-
-    if (!smooth_first_cjk && tr->province_tok[0] != '\0' && tr->province_score >= 1.2f) {
-        char toks[MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
-        int n = split_utf8_tokens(smooth, toks, MAX_PLATE_TOKENS);
-        if (n > 0) {
-            int p;
-            smooth[0] = '\0';
-            append_utf8_token(smooth, sizeof(smooth), tr->province_tok);
-            for (p = 1; p < n; p++)
-                append_utf8_token(smooth, sizeof(smooth), toks[p]);
-            smooth_first_cjk = true;
-        }
-    }
-
-    smooth_conf = (smooth_ratio_n > 0) ? (smooth_ratio_sum / (float)smooth_ratio_n) : *conf;
-    smooth_conf = fmaxf(0.0f, fminf(1.0f, smooth_conf));
-
-    if (strcmp(raw_text, smooth) != 0) {
-        if (smooth_conf >= (*conf * 0.90f) || (!raw_first_cjk && smooth_first_cjk)) {
-            float old_conf = *conf;
-            copy_cstr_trunc(text, text_len, smooth);
-            *conf = fmaxf(old_conf * 0.90f, smooth_conf);
-            fprintf(stderr,
-                    "[ocr-smooth] frame=%" PRIu64 " raw=(%.2f,%s) smooth=(%.2f,%s)\n",
-                    frame_seq, old_conf, raw_text, *conf, text);
-        }
-    }
-}
-
 static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
                                          const uint8_t *crop_rgb, int crop_w, int crop_h,
                                          float *occ_ratio_out)
@@ -1556,7 +1130,6 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     rknn_output outs[4];
     uint8_t *ocr_in = NULL;
     const rknn_tensor_attr *out_attr;
-    uint32_t decode_output_idx = 0;
     int t_size, c_size, t_stride, c_stride;
     int ret = -1;
     uint32_t i;
@@ -1590,9 +1163,7 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     if (ret < 0)
         goto out;
 
-    if (m->io_num.n_output >= 2)
-        decode_output_idx = 1; /* 临时 green8 测试模式：多头时优先取 green8 head */
-    out_attr = &m->output_attrs[decode_output_idx];
+    out_attr = &m->output_attrs[0];
     if (!build_ocr_layout(out_attr, &t_size, &c_size, &t_stride, &c_stride)) {
         ret = -1;
         goto out_release;
@@ -1609,14 +1180,9 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
                     "[ocr] WARN key/output mismatch: keys=%d c_size=%d (expected N or N+1)\n",
                     ctx->ocr_key_count, c_size);
         }
-        fprintf(stderr,
-                "[ocr] decode_output_idx=%u/%u%s\n",
-                decode_output_idx,
-                m->io_num.n_output,
-                (m->io_num.n_output >= 2) ? " (temporary green8 head test mode)" : "");
         ctx->ocr_keysize_warned = true;
     }
-    ret = ctc_decode_logits((const float *)outs[decode_output_idx].buf, t_size, c_size, t_stride, c_stride,
+    ret = ctc_decode_logits((const float *)outs[0].buf, t_size, c_size, t_stride, c_stride,
                             ctx, text, text_len, conf_out, diag);
     if (diag)
         diag->in_occ_ratio = occ_ratio;
@@ -2506,8 +2072,8 @@ static void resize_rgb888_with_kernel(const uint8_t *src, int sw, int sh,
         resize_rgb888_nn(src, sw, sh, dst, dw, dh);
 }
 
-static void __attribute__((unused)) resize_rgb888_nn_letterbox(const uint8_t *src, int sw, int sh,
-                                                               uint8_t *dst, int dw, int dh, uint8_t pad)
+static void resize_rgb888_nn_letterbox(const uint8_t *src, int sw, int sh,
+                                       uint8_t *dst, int dw, int dh, uint8_t pad)
 {
     int scaled_w, scaled_h;
     int off_x, off_y;
@@ -4911,54 +4477,6 @@ static bool plate_box_pass_rules_relaxed(const struct det_box *b, int frame_w, i
     return true;
 }
 
-static float plate_abs_tilt_deg(const struct det_box *b)
-{
-    float deg;
-    if (!b || !b->has_obb)
-        return 0.0f;
-    deg = fabsf(b->angle) * (180.0f / (float)M_PI);
-    while (deg > 180.0f)
-        deg -= 180.0f;
-    if (deg > 90.0f)
-        deg = 180.0f - deg;
-    return deg;
-}
-
-static bool plate_box_pass_rules_obb(const struct det_box *b, int frame_w, int frame_h)
-{
-    int bw;
-    int bh;
-    int cy;
-    float aspect;
-    float area;
-    float min_area = (float)frame_w * (float)frame_h * 0.00018f;
-    float tilt;
-
-    if (!b)
-        return false;
-    bw = b->x2 - b->x1 + 1;
-    bh = b->y2 - b->y1 + 1;
-    cy = (b->y1 + b->y2) / 2;
-    if (bw <= 0 || bh <= 0)
-        return false;
-    if (bw < 16 || bh < 6)
-        return false;
-    aspect = (float)bw / (float)bh;
-    if (aspect < 1.2f || aspect > 13.5f)
-        return false;
-    area = (float)bw * (float)bh;
-    if (area < min_area)
-        return false;
-    if (cy < (int)(0.01f * (float)frame_h) || cy > (int)(0.99f * (float)frame_h))
-        return false;
-    if (b->has_obb) {
-        tilt = plate_abs_tilt_deg(b);
-        if (tilt > 82.0f)
-            return false;
-    }
-    return true;
-}
-
 static bool has_iou_match(const struct det_box *cur, const struct det_box *hist, int hist_count, float iou_thr)
 {
     int i;
@@ -4974,28 +4492,13 @@ static void temporal_confirm_and_update(struct app_ctx *ctx,
                                         struct det_box *confirmed, int *confirmed_count)
 {
     int i;
-    float iou_thr_hist1 = 0.35f;
-    float iou_thr_hist2 = 0.30f;
-    float direct_keep_thr = 0.55f;
     *confirmed_count = 0;
-    if (ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
-        iou_thr_hist1 = 0.30f;
-        iou_thr_hist2 = 0.22f;
-        direct_keep_thr = fmaxf(0.55f, ctx->opt.min_plate_conf + 0.08f);
-    }
     if (ctx->plate_hist1_count > 0 && ctx->plate_hist2_count > 0) {
         for (i = 0; i < filtered_count && *confirmed_count < MAX_DETS; i++) {
-            if (has_iou_match(&filtered[i], ctx->plate_hist1, ctx->plate_hist1_count, iou_thr_hist1) &&
-                has_iou_match(&filtered[i], ctx->plate_hist2, ctx->plate_hist2_count, iou_thr_hist2)) {
+            if (has_iou_match(&filtered[i], ctx->plate_hist1, ctx->plate_hist1_count, 0.35f) &&
+                has_iou_match(&filtered[i], ctx->plate_hist2, ctx->plate_hist2_count, 0.30f)) {
                 confirmed[(*confirmed_count)++] = filtered[i];
             }
-        }
-    }
-    if (*confirmed_count == 0 &&
-        ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
-        for (i = 0; i < filtered_count && *confirmed_count < MAX_DETS; i++) {
-            if (filtered[i].conf >= direct_keep_thr)
-                confirmed[(*confirmed_count)++] = filtered[i];
         }
     }
     memcpy(ctx->plate_hist2, ctx->plate_hist1, sizeof(ctx->plate_hist1));
@@ -5504,41 +5007,20 @@ static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t t
 static void build_overlay_ascii_text(const struct plate_det *pd, char *out, size_t out_len)
 {
     size_t i = 0;
-    char toks[MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
-    int tok_n = 0;
-    int t;
-
+    const char *s = pd->ocr_text;
     if (out_len == 0)
         return;
-    out[0] = '\0';
-
-    tok_n = split_utf8_tokens(pd->ocr_text, toks, MAX_PLATE_TOKENS);
-    for (t = 0; t < tok_n && i + 1 < out_len; t++) {
-        const char *tok = toks[t];
-        const char *alias = province_token_ascii(tok);
-        if (tok[0] == '\0')
-            continue;
-
-        if (tok[1] == '\0') {
-            unsigned char ch = (unsigned char)tok[0];
-            if (ch == '.' || ch == '-' || ch == '_') {
-                out[i++] = '-';
-                continue;
-            }
+    while (s && *s && i + 1 < out_len) {
+        unsigned char ch = (unsigned char)*s++;
+        if ((ch >= '0' && ch <= '9') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= 'a' && ch <= 'z') ||
+            ch == '-') {
             if (ch >= 'a' && ch <= 'z')
                 ch = (unsigned char)(ch - 'a' + 'A');
-            if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z')) {
-                out[i++] = (char)ch;
-                continue;
-            }
-        }
-        if (alias && alias[0] != '\0') {
-            int j;
-            for (j = 0; alias[j] != '\0' && i + 1 < out_len; j++)
-                out[i++] = alias[j];
+            out[i++] = (char)ch;
         }
     }
-
     if (i == 0) {
         const char *fb = "UNK";
         if (pd->type == PLATE_TYPE_COMMON_BLUE) fb = "BLUE";
@@ -5619,8 +5101,6 @@ static void *infer_thread_main(void *arg)
         ctx->infer_has_new = false;
         pthread_mutex_unlock(&ctx->infer_lock);
 
-        age_ocr_tracks(ctx, seq);
-
         t0 = mono_us();
         if (ctx->src_is_bgrx) {
             bgrx8888_to_rgb888_and_a(raw_local, (int)ctx->frame_width, (int)ctx->frame_height, rgb_full, a_map);
@@ -5661,20 +5141,6 @@ static void *infer_thread_main(void *arg)
             if (run_detect_on_rgb(ctx, &ctx->plate_model, det_src_rgb, (int)ctx->frame_width, (int)ctx->frame_height,
                                   plate_thr, algo_rgb, plate_in, raw_plates, &raw_plate_count, &plate_diag) < 0)
                 raw_plate_count = 0;
-            if (raw_plate_count <= 0 &&
-                ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
-                ctx->opt.det_resize_mode == DET_RESIZE_LETTERBOX) {
-                int saved_mode = ctx->opt.det_resize_mode;
-                fprintf(stderr,
-                        "[plate-fallback] frame=%" PRIu64 " retry=stretch reason=raw_empty\n",
-                        seq);
-                ctx->opt.det_resize_mode = DET_RESIZE_STRETCH;
-                if (run_detect_on_rgb(ctx, &ctx->plate_model, det_src_rgb, (int)ctx->frame_width, (int)ctx->frame_height,
-                                      plate_thr, algo_rgb, plate_in, raw_plates, &raw_plate_count, &plate_diag) < 0) {
-                    raw_plate_count = 0;
-                }
-                ctx->opt.det_resize_mode = saved_mode;
-            }
         }
         if (raw_plate_count > 0) {
             ctx->gate_plate_raw_positive_frames++;
@@ -5691,32 +5157,9 @@ static void *infer_thread_main(void *arg)
             ped_events = update_ped_tracks_nn(ctx, persons, person_count, light_red, seq,
                                               tracked_persons, &tracked_person_count);
 
-        for (i = 0; i < raw_plate_count && filtered_plate_count < MAX_DETS; i++) {
-            bool keep = plate_box_pass_rules(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height);
-            if (!keep && ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
-                keep = plate_box_pass_rules_obb(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height) ||
-                       plate_box_pass_rules_relaxed(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height);
-            }
-            if (keep)
+        for (i = 0; i < raw_plate_count; i++) {
+            if (plate_box_pass_rules(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height))
                 filtered_plates[filtered_plate_count++] = raw_plates[i];
-        }
-        if (filtered_plate_count == 0 &&
-            raw_plate_count > 0 &&
-            ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
-            int best_i = 0;
-            float best_conf = raw_plates[0].conf;
-            for (i = 1; i < raw_plate_count; i++) {
-                if (raw_plates[i].conf > best_conf) {
-                    best_conf = raw_plates[i].conf;
-                    best_i = i;
-                }
-            }
-            if (best_conf >= fmaxf(0.50f, ctx->opt.min_plate_conf)) {
-                filtered_plates[filtered_plate_count++] = raw_plates[best_i];
-                fprintf(stderr,
-                        "[plate-fallback] frame=%" PRIu64 " keep=top1 conf=%.3f reason=filtered_empty\n",
-                        seq, best_conf);
-            }
         }
         if (ctx->opt.fpga_a_mask && a_roi_valid) {
             int roi_count = filter_boxes_by_roi(filtered_plates, filtered_plate_count, &a_roi,
@@ -5883,9 +5326,6 @@ static void *infer_thread_main(void *arg)
                         pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2,
                         odiag.t_size, odiag.c_size, odiag.blank_idx, odiag.blank_top1_ratio,
                         pd.ocr_text);
-            }
-            if (pd.ocr_text[0] != '\0') {
-                ocr_temporal_smooth(ctx, &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf);
             }
             if (pd.ocr_text[0] != '\0')
                 ocr_nonempty_count++;
