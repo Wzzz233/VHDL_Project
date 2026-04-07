@@ -3423,6 +3423,108 @@ static void order_quad_points(const float in[8], float out[8])
     out[6] = in[bl * 2 + 0]; out[7] = in[bl * 2 + 1];
 }
 
+static void clip_quad_to_image(const float in[8], int img_w, int img_h, float out[8])
+{
+    int i;
+    float tmp[8];
+    if (!in || !out || img_w <= 0 || img_h <= 0)
+        return;
+    for (i = 0; i < 4; i++) {
+        float x = in[i * 2 + 0];
+        float y = in[i * 2 + 1];
+        if (x < 0.0f) x = 0.0f;
+        if (y < 0.0f) y = 0.0f;
+        if (x > (float)(img_w - 1)) x = (float)(img_w - 1);
+        if (y > (float)(img_h - 1)) y = (float)(img_h - 1);
+        tmp[i * 2 + 0] = x;
+        tmp[i * 2 + 1] = y;
+    }
+    order_quad_points(tmp, out);
+}
+
+static void calc_warp_padding_ratio(const float quad[8], float *pad_w, float *pad_h)
+{
+    float w_top, w_bottom, h_left, h_right;
+    float w_ref, h_ref, skew_w, skew_h, skew;
+    if (!quad || !pad_w || !pad_h)
+        return;
+    w_top = hypotf(quad[2] - quad[0], quad[3] - quad[1]);
+    w_bottom = hypotf(quad[4] - quad[6], quad[5] - quad[7]);
+    h_left = hypotf(quad[6] - quad[0], quad[7] - quad[1]);
+    h_right = hypotf(quad[4] - quad[2], quad[5] - quad[3]);
+    w_ref = fmaxf(fmaxf(w_top, w_bottom), 1.0f);
+    h_ref = fmaxf(fmaxf(h_left, h_right), 1.0f);
+    skew_w = fabsf(w_top - w_bottom) / w_ref;
+    skew_h = fabsf(h_left - h_right) / h_ref;
+    skew = fmaxf(skew_w, skew_h);
+    *pad_w = 0.08f + 0.10f * skew;
+    *pad_h = 0.16f + 0.20f * skew;
+    if (*pad_w < 0.08f) *pad_w = 0.08f;
+    if (*pad_w > 0.28f) *pad_w = 0.28f;
+    if (*pad_h < 0.16f) *pad_h = 0.16f;
+    if (*pad_h > 0.42f) *pad_h = 0.42f;
+}
+
+static void expand_quad_for_ocr(const float quad_in[8], int img_w, int img_h,
+                                float pad_w_ratio, float pad_h_ratio, float out[8])
+{
+    float q[8];
+    float center_x, center_y;
+    float ux, uy, vx, vy;
+    float norm;
+    float w_top, w_bottom, h_left, h_right;
+    float half_w, half_h;
+
+    if (!quad_in || !out)
+        return;
+
+    order_quad_points(quad_in, q);
+    center_x = 0.25f * (q[0] + q[2] + q[4] + q[6]);
+    center_y = 0.25f * (q[1] + q[3] + q[5] + q[7]);
+
+    ux = (q[2] - q[0]) + (q[4] - q[6]);
+    uy = (q[3] - q[1]) + (q[5] - q[7]);
+    norm = hypotf(ux, uy);
+    if (norm < 1e-6f) {
+        ux = 1.0f;
+        uy = 0.0f;
+    } else {
+        ux /= norm;
+        uy /= norm;
+    }
+
+    vx = (q[6] - q[0]) + (q[4] - q[2]);
+    vy = (q[7] - q[1]) + (q[5] - q[3]);
+    norm = hypotf(vx, vy);
+    if (norm < 1e-6f) {
+        vx = 0.0f;
+        vy = 1.0f;
+    } else {
+        vx /= norm;
+        vy /= norm;
+    }
+
+    w_top = hypotf(q[2] - q[0], q[3] - q[1]);
+    w_bottom = hypotf(q[4] - q[6], q[5] - q[7]);
+    h_left = hypotf(q[6] - q[0], q[7] - q[1]);
+    h_right = hypotf(q[4] - q[2], q[5] - q[3]);
+
+    half_w = 0.25f * (w_top + w_bottom) * (1.0f + pad_w_ratio);
+    half_h = 0.25f * (h_left + h_right) * (1.0f + pad_h_ratio);
+    if (half_w < 1.0f) half_w = 1.0f;
+    if (half_h < 1.0f) half_h = 1.0f;
+
+    out[0] = center_x - ux * half_w - vx * half_h;
+    out[1] = center_y - uy * half_w - vy * half_h;
+    out[2] = center_x + ux * half_w - vx * half_h;
+    out[3] = center_y + uy * half_w - vy * half_h;
+    out[4] = center_x + ux * half_w + vx * half_h;
+    out[5] = center_y + uy * half_w + vy * half_h;
+    out[6] = center_x - ux * half_w + vx * half_h;
+    out[7] = center_y - uy * half_w + vy * half_h;
+    clip_quad_to_image(out, img_w, img_h, out);
+}
+
 static void bbox_from_quad(const float quad[8], int img_w, int img_h, struct det_box *box)
 {
     int i;
@@ -3581,6 +3683,7 @@ static void bilinear_sample_rgb888(const uint8_t *rgb, int img_w, int img_h,
 
 static bool warp_quad_to_rect_rgb888(const uint8_t *rgb, int img_w, int img_h, const float quad_in[8],
                                      uint8_t *dst, int dst_cap_w, int dst_cap_h,
+                                     float extra_pad_ratio, float used_quad[8],
                                      int *out_w, int *out_h)
 {
     float quad[8];
@@ -3591,13 +3694,21 @@ static bool warp_quad_to_rect_rgb888(const uint8_t *rgb, int img_w, int img_h, c
     float w_bottom;
     float h_left;
     float h_right;
+    float pad_w;
+    float pad_h;
     int dw;
     int dh;
     int y;
     int x;
     if (!rgb || !quad_in || !dst || !out_w || !out_h)
         return false;
-    order_quad_points(quad_in, quad);
+    clip_quad_to_image(quad_in, img_w, img_h, quad);
+    calc_warp_padding_ratio(quad, &pad_w, &pad_h);
+    if (extra_pad_ratio > 0.0f) {
+        pad_w += extra_pad_ratio;
+        pad_h += extra_pad_ratio;
+    }
+    expand_quad_for_ocr(quad, img_w, img_h, pad_w, pad_h, quad);
     w_top = hypotf(quad[2] - quad[0], quad[3] - quad[1]);
     w_bottom = hypotf(quad[4] - quad[6], quad[5] - quad[7]);
     h_left = hypotf(quad[6] - quad[0], quad[7] - quad[1]);
@@ -3644,8 +3755,162 @@ static bool warp_quad_to_rect_rgb888(const uint8_t *rgb, int img_w, int img_h, c
             q[2] = pix[2];
         }
     }
+    if (used_quad)
+        memcpy(used_quad, quad, sizeof(quad));
     *out_w = dw;
     *out_h = dh;
+    return true;
+}
+
+static bool warp_plate_box_with_pad_rgb888(const struct app_ctx *ctx,
+                                           const uint8_t *rgb, int img_w, int img_h,
+                                           const struct det_box *plate_box,
+                                           uint8_t *crop_buf, int crop_cap_w, int crop_cap_h,
+                                           float extra_pad_ratio,
+                                           struct det_box *crop_box, int *crop_w, int *crop_h,
+                                           float *occ_ratio)
+{
+    float ordered[8];
+    float used_quad[8];
+    if (!ctx || !rgb || !plate_box || !crop_buf || !crop_box || !crop_w || !crop_h || !occ_ratio)
+        return false;
+    if (!plate_box->has_obb)
+        return false;
+    order_quad_points(plate_box->quad, ordered);
+    if (!warp_quad_to_rect_rgb888(rgb, img_w, img_h, ordered,
+                                  crop_buf, crop_cap_w, crop_cap_h,
+                                  extra_pad_ratio, used_quad,
+                                  crop_w, crop_h))
+        return false;
+    bbox_from_quad(used_quad, img_w, img_h, crop_box);
+    *occ_ratio = estimate_ocr_occ_ratio(ctx, *crop_w, *crop_h);
+    return true;
+}
+
+static bool apply_obb_warp_quality_gate(const struct app_ctx *ctx,
+                                        const uint8_t *rgb, int img_w, int img_h,
+                                        const struct det_box *plate_box,
+                                        uint8_t *crop_buf, int crop_cap_w, int crop_cap_h,
+                                        struct det_box *crop_box, int *crop_w, int *crop_h,
+                                        float *occ_ratio, bool *used_obb_warp,
+                                        bool with_frame, uint64_t frame_seq)
+{
+    float warp_occ;
+    int warp_w;
+    int warp_h;
+    const char *fallback_mode = "none";
+
+    if (!ctx || !rgb || !plate_box || !crop_buf || !crop_box || !crop_w || !crop_h ||
+        !occ_ratio || !used_obb_warp)
+        return false;
+
+    warp_occ = *occ_ratio;
+    warp_w = *crop_w;
+    warp_h = *crop_h;
+
+    if (*used_obb_warp &&
+        ctx->opt.ocr_min_occ_ratio > 0.0f &&
+        *occ_ratio < ctx->opt.ocr_min_occ_ratio &&
+        ctx->opt.ocr_crop_mode != OCR_CROP_TIGHT &&
+        plate_box->has_obb) {
+        enum {
+            OBB_KEEP_BASE = 0,
+            OBB_USE_DYNPAD,
+            OBB_USE_TIGHT
+        } best_mode = OBB_KEEP_BASE;
+        float best_occ = *occ_ratio;
+        float dyn_occ = 0.0f;
+        struct det_box tight_box;
+        int tight_w = 0;
+        int tight_h = 0;
+        float tight_occ = 0.0f;
+        bool dyn_ok = false;
+        bool tight_ok = false;
+        float old_occ = *occ_ratio;
+
+        dyn_ok = warp_plate_box_with_pad_rgb888(ctx, rgb, img_w, img_h, plate_box,
+                                                crop_buf, crop_cap_w, crop_cap_h,
+                                                0.08f, crop_box, crop_w, crop_h, &dyn_occ);
+        if (dyn_ok && dyn_occ > best_occ) {
+            best_occ = dyn_occ;
+            best_mode = OBB_USE_DYNPAD;
+        }
+
+        compute_expand_crop_box(plate_box, img_w, img_h, 0.08f, 0.16f, &tight_box);
+        tight_w = tight_box.x2 - tight_box.x1 + 1;
+        tight_h = tight_box.y2 - tight_box.y1 + 1;
+        tight_ok = (tight_w > 0 && tight_h > 0 &&
+                    tight_w <= crop_cap_w && tight_h <= crop_cap_h);
+        if (tight_ok) {
+            tight_occ = estimate_ocr_occ_ratio(ctx, tight_w, tight_h);
+            if (tight_occ > best_occ) {
+                best_occ = tight_occ;
+                best_mode = OBB_USE_TIGHT;
+            }
+        }
+
+        if (best_mode == OBB_USE_DYNPAD) {
+            if (!warp_plate_box_with_pad_rgb888(ctx, rgb, img_w, img_h, plate_box,
+                                                crop_buf, crop_cap_w, crop_cap_h,
+                                                0.08f, crop_box, crop_w, crop_h, occ_ratio))
+                return false;
+            *used_obb_warp = true;
+            fallback_mode = "obb-dynpad";
+            if (with_frame) {
+                fprintf(stderr,
+                        "[ocr-recrop] frame=%" PRIu64 " trigger=1 old_occ=%.3f new_mode=%s new_occ=%.3f\n",
+                        frame_seq, old_occ, fallback_mode, *occ_ratio);
+            } else {
+                fprintf(stderr,
+                        "[ocr-recrop] trigger=1 old_occ=%.3f new_mode=%s new_occ=%.3f\n",
+                        old_occ, fallback_mode, *occ_ratio);
+            }
+        } else if (best_mode == OBB_USE_TIGHT) {
+            copy_crop_rgb888(rgb, img_w, &tight_box, crop_buf);
+            *crop_box = tight_box;
+            *crop_w = tight_w;
+            *crop_h = tight_h;
+            *occ_ratio = tight_occ;
+            *used_obb_warp = false;
+            fallback_mode = "obb-fallback-tight";
+            if (with_frame) {
+                fprintf(stderr,
+                        "[ocr-recrop] frame=%" PRIu64 " trigger=1 old_occ=%.3f new_mode=%s new_occ=%.3f\n",
+                        frame_seq, old_occ, fallback_mode, *occ_ratio);
+            } else {
+                fprintf(stderr,
+                        "[ocr-recrop] trigger=1 old_occ=%.3f new_mode=%s new_occ=%.3f\n",
+                        old_occ, fallback_mode, *occ_ratio);
+            }
+        } else {
+            if (!warp_plate_box_with_pad_rgb888(ctx, rgb, img_w, img_h, plate_box,
+                                                crop_buf, crop_cap_w, crop_cap_h,
+                                                0.0f, crop_box, crop_w, crop_h, occ_ratio))
+                return false;
+            *used_obb_warp = true;
+            fallback_mode = "obb-keep";
+            if (with_frame) {
+                fprintf(stderr,
+                        "[ocr-recrop] frame=%" PRIu64 " trigger=0 old_occ=%.3f new_mode=%s reason=not-improved\n",
+                        frame_seq, old_occ, fallback_mode);
+            } else {
+                fprintf(stderr,
+                        "[ocr-recrop] trigger=0 old_occ=%.3f new_mode=%s reason=not-improved\n",
+                        old_occ, fallback_mode);
+            }
+        }
+    }
+
+    if (with_frame) {
+        fprintf(stderr,
+                "[ocr-gate] frame=%" PRIu64 " warp_ok=%d warp_occ=%.3f warp_wxh=%dx%d fallback_mode=%s final_occ=%.3f final_wxh=%dx%d\n",
+                frame_seq, 1, warp_occ, warp_w, warp_h, fallback_mode, *occ_ratio, *crop_w, *crop_h);
+    } else {
+        fprintf(stderr,
+                "[ocr-gate] warp_ok=%d warp_occ=%.3f warp_wxh=%dx%d fallback_mode=%s final_occ=%.3f final_wxh=%dx%d\n",
+                1, warp_occ, warp_w, warp_h, fallback_mode, *occ_ratio, *crop_w, *crop_h);
+    }
+
     return true;
 }
 
@@ -3661,13 +3926,9 @@ static bool prepare_plate_crop_rgb888(const struct app_ctx *ctx,
     *used_obb_warp = false;
 
     if (ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP && plate_box->has_obb) {
-        float ordered[8];
-        order_quad_points(plate_box->quad, ordered);
-        if (warp_quad_to_rect_rgb888(rgb, img_w, img_h, ordered,
-                                     crop_buf, crop_cap_w, crop_cap_h,
-                                     crop_w, crop_h)) {
-            bbox_from_quad(ordered, img_w, img_h, crop_box);
-            *occ_ratio = estimate_ocr_occ_ratio(ctx, *crop_w, *crop_h);
+        if (warp_plate_box_with_pad_rgb888(ctx, rgb, img_w, img_h, plate_box,
+                                           crop_buf, crop_cap_w, crop_cap_h,
+                                           0.0f, crop_box, crop_w, crop_h, occ_ratio)) {
             *used_obb_warp = true;
             return true;
         }
@@ -5218,6 +5479,7 @@ static int run_offline_once(struct app_ctx *ctx)
     const uint8_t *det_src_rgb = NULL;
     float occ_ratio = 0.0f;
     bool used_obb_warp = false;
+    bool obb_gate_applied = false;
 
     if (read_ppm_rgb888(ctx->opt.offline_image_path, &rgb, &w, &h) < 0) {
         fprintf(stderr, "Offline image load failed (need PPM P6): %s\n",
@@ -5324,9 +5586,19 @@ static int run_offline_once(struct app_ctx *ctx)
                                    plate_crop, w, h, &pd.crop_box, &crop_w, &crop_h,
                                    &occ_ratio, &used_obb_warp))
         goto out;
+    if (used_obb_warp) {
+        obb_gate_applied = true;
+        if (!apply_obb_warp_quality_gate(ctx, rgb, w, h, &pd.box,
+                                         plate_crop, w, h,
+                                         &pd.crop_box, &crop_w, &crop_h,
+                                         &occ_ratio, &used_obb_warp,
+                                         false, 0))
+            goto out;
+    }
     if (ctx->opt.ocr_min_occ_ratio > 0.0f &&
         occ_ratio < ctx->opt.ocr_min_occ_ratio &&
         ctx->opt.ocr_crop_mode != OCR_CROP_TIGHT &&
+        !obb_gate_applied &&
         !used_obb_warp) {
         struct det_box recrop_box;
         float old_occ = occ_ratio;
@@ -5772,6 +6044,7 @@ static void *infer_thread_main(void *arg)
             float sharpness = 0.0f;
             float occ_ratio = 0.0f;
             bool used_obb_warp = false;
+            bool obb_gate_applied = false;
             char overlay_txt[32];
             pd.box = stable_plates[i];
             if (ctx->opt.plate_refine) {
@@ -5790,9 +6063,19 @@ static void *infer_thread_main(void *arg)
                                            &pd.box, plate_crop, (int)ctx->frame_width, (int)ctx->frame_height,
                                            &pd.crop_box, &crop_w, &crop_h, &occ_ratio, &used_obb_warp))
                 continue;
+            if (used_obb_warp) {
+                obb_gate_applied = true;
+                if (!apply_obb_warp_quality_gate(ctx, rgb_full, (int)ctx->frame_width, (int)ctx->frame_height, &pd.box,
+                                                 plate_crop, (int)ctx->frame_width, (int)ctx->frame_height,
+                                                 &pd.crop_box, &crop_w, &crop_h,
+                                                 &occ_ratio, &used_obb_warp,
+                                                 true, seq))
+                    continue;
+            }
             if (ctx->opt.ocr_min_occ_ratio > 0.0f &&
                 occ_ratio < ctx->opt.ocr_min_occ_ratio &&
                 ctx->opt.ocr_crop_mode != OCR_CROP_TIGHT &&
+                !obb_gate_applied &&
                 !used_obb_warp) {
                 struct det_box recrop_box;
                 float old_occ = occ_ratio;
