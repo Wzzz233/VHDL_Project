@@ -425,8 +425,6 @@ struct frame_cookie {
 
 static volatile sig_atomic_t g_stop = 0;
 
-struct point2f;
-
 static void resize_rgb888_nn(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh);
 static void resize_rgb888_bilinear(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh);
 static void resize_rgb888_with_kernel(const uint8_t *src, int sw, int sh,
