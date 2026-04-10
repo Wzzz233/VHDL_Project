@@ -352,6 +352,7 @@ static float quad_area8(const float q[8]);
 static void quad_center8(const float q[8], float *cx, float *cy);
 static float quad_edge_len8(const float q[8], int i);
 static bool quad_is_convex8(const float q[8]);
+static void rect_box_to_quad(const struct det_box *box, float quad[8]);
 static void bbox_from_quad_float(const float q[8], int img_w, int img_h,
                                  int *x1, int *y1, int *x2, int *y2);
 static bool decode_refiner_output_layout(const rknn_tensor_attr *a, int *h, int *w, int *c, bool *is_nchw);
@@ -546,7 +547,7 @@ static void print_usage(const char *prog)
             "  --plate-max-det <n>     Plate max detections after NMS (default: 128)\n"
             "  --plate-class-id <n>    Optional class filter for plate model (-1: disabled)\n"
             "  --ocr-channel-order <m> OCR input order: rgb|bgr (default: rgb)\n"
-            "  --ocr-crop-mode <m>     OCR crop mode: fixed|box|tight|box-pad|match|obb_warp (default: fixed)\n"
+            "  --ocr-crop-mode <m>     OCR crop mode: fixed|box|tight|box-pad|match|obb_warp (default: obb_warp)\n"
             "  --ocr-resize-mode <m>   OCR resize: stretch|letterbox (default: stretch)\n"
             "  --ocr-resize-kernel <m> OCR resize kernel: nn|bilinear (default: nn)\n"
             "  --ocr-preproc <m>       OCR crop preproc: none|gray|bin (default: none)\n"
@@ -651,7 +652,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->plate_max_det = MAX_DETS;
     opt->plate_class_id = -1;
     opt->ocr_channel_order = OCR_CH_RGB;
-    opt->ocr_crop_mode = OCR_CROP_FIXED;
+    opt->ocr_crop_mode = OCR_CROP_OBB_WARP;
     opt->ocr_resize_mode = OCR_RESIZE_STRETCH;
     opt->ocr_resize_kernel = OCR_KERNEL_NN;
     opt->ocr_preproc_mode = OCR_PREPROC_NONE;
@@ -3813,6 +3814,16 @@ static bool quad_is_convex8(const float q[8])
     return !(has_pos && has_neg);
 }
 
+static void rect_box_to_quad(const struct det_box *box, float quad[8])
+{
+    if (!box || !quad)
+        return;
+    quad[0] = (float)box->x1; quad[1] = (float)box->y1;
+    quad[2] = (float)box->x2; quad[3] = (float)box->y1;
+    quad[4] = (float)box->x2; quad[5] = (float)box->y2;
+    quad[6] = (float)box->x1; quad[7] = (float)box->y2;
+}
+
 static void bbox_from_quad_float(const float q[8], int img_w, int img_h,
                                  int *x1, int *y1, int *x2, int *y2)
 {
@@ -4105,14 +4116,17 @@ static bool prepare_plate_crop_rgb888(const struct app_ctx *ctx,
                                       struct det_box *crop_box, int *crop_w, int *crop_h,
                                       float *occ_ratio, bool *used_obb_warp)
 {
+    float ordered[8];
+    float refined_quad[8];
     if (!ctx || !rgb || !plate_box || !crop_buf || !crop_box || !crop_w || !crop_h || !occ_ratio || !used_obb_warp)
         return false;
     *used_obb_warp = false;
 
-    if (ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP && plate_box->has_obb) {
-        float ordered[8];
-        float refined_quad[8];
-        order_quad_points(plate_box->quad, ordered);
+    if (ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP) {
+        if (plate_box->has_obb)
+            order_quad_points(plate_box->quad, ordered);
+        else
+            rect_box_to_quad(plate_box, ordered);
         /* Run quad refiner before OBB warp if model is loaded */
         if (ctx->quad_refiner_model.ctx) {
             if (run_quad_refiner(ctx, rgb, img_w, img_h, ordered, refined_quad)) {
