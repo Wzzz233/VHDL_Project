@@ -41,6 +41,7 @@
 #define DEFAULT_STATS_INTERVAL 1
 #define DEFAULT_COPY_BUFFERS 2
 #define DEFAULT_QUEUE_DEPTH 1
+#define DEFAULT_QUAD_REFINER_MODEL "stage1_r18_gt_best.rknn"
 #define MIN_COPY_BUFFERS 2
 #define MAX_COPY_BUFFERS 6
 
@@ -512,7 +513,7 @@ static void print_usage(const char *prog)
             "  --plate-model <path>    Plate RKNN model path (required)\n"
             "  --ocr-model <path>      OCR RKNN model path (required)\n"
             "  --ocr-keys <path>       OCR keys file path (required)\n"
-            "  --quad-refiner-model <path> Optional quad refiner RKNN model path\n"
+            "  --quad-refiner-model <path|off> Quad refiner RKNN path; default: " DEFAULT_QUAD_REFINER_MODEL " ; pass off to disable\n"
             "  --labels <path>         Labels file path (required for live camera mode)\n"
             "  --pred-log <path>       Prediction CSV output path (optional)\n"
             "  --offline-image <path>  One-shot offline infer on PPM(P6) image and exit\n"
@@ -622,6 +623,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
     memset(opt, 0, sizeof(*opt));
     opt->device_path = DEFAULT_DEVICE;
     opt->drm_card_path = DEFAULT_DRM_CARD;
+    opt->quad_refiner_model_path = DEFAULT_QUAD_REFINER_MODEL;
     opt->connector_id = -1;
     opt->fps = DEFAULT_FPS;
     opt->pixel_order = PIXEL_ORDER_BGR565;
@@ -670,7 +672,12 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 4: opt->plate_model_path = optarg; break;
         case 5: opt->ocr_model_path = optarg; break;
         case 6: opt->ocr_keys_path = optarg; break;
-        case 50: opt->quad_refiner_model_path = optarg; break;
+        case 50:
+            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
+                opt->quad_refiner_model_path = NULL;
+            else
+                opt->quad_refiner_model_path = optarg;
+            break;
         case 7: opt->labels_path = optarg; break;
         case 8: opt->pred_log_path = optarg; break;
         case 36: opt->offline_image_path = optarg; break;

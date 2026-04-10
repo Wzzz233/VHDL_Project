@@ -1,0 +1,13 @@
+Baseline quad refiner artifact placeholder.
+
+Expected runtime filename: stage1_r18_gt_best.rknn
+Default driver behavior in fpga_lpr_display.c now tries to load this file automatically.
+To disable refiner explicitly, run with:
+  --quad-refiner-model off
+
+Why this placeholder exists:
+- The baseline refiner has been wired into the ARM pipeline by default.
+- Local RKNN conversion is currently blocked by rknn-toolkit2 v2.3.2 internal ONNXRuntime fold_constant bug
+  (Conv ShapeInferenceError: Attribute dilations has incorrect size) even though the exported ONNX passes standalone onnxruntime.
+- Once a machine/board with a compatible RKNN conversion path is used, replace this placeholder with the real
+  stage1_r18_gt_best.rknn artifact at the same path.
