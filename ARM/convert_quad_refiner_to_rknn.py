@@ -1,7 +1,7 @@
 from rknn.api import RKNN
 
-onnx_path = '/home/wzzz/VHDL_Project/ARM/stage1_r18_gt_best_rknn_ready.onnx'
-out_path = '/home/wzzz/VHDL_Project/ARM/stage1_r18_gt_best_rknn.rknn'
+onnx_path = '/home/wzzz/VHDL_Project/ARM/stage1_r18_gt_best_sim.onnx'
+out_path = '/home/wzzz/VHDL_Project/ARM/stage1_r18_gt_best.rknn'
 
 trials = [
     ('nchw', ['image'], [[3, 128, 256]]),
