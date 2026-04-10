@@ -3892,14 +3892,24 @@ static bool run_quad_refiner(const struct app_ctx *ctx,
     size_t input_size;
     int i, c;
     int ret = -1;
+    const char *reject_reason = "unknown";
+    float reject_metric = 0.0f;
+    float reject_limit = 0.0f;
+    float gate_area_ratio = 0.0f;
+    float gate_center_shift = 0.0f;
+    float gate_center_shift_limit = 0.0f;
+    float gate_max_corner_shift = 0.0f;
+    float gate_corner_shift_limit = 0.0f;
+    float gate_edge_ratio_sanity = 0.0f;
+    float gate_edge_ratio_limit = 0.0f;
     const float pad_x_ratio = 0.20f;
     const float pad_y_ratio = 0.25f;
     const float min_corner_conf = 0.20f;
-    const float min_area_ratio = 0.65f;
-    const float max_area_ratio = 1.45f;
-    const float max_center_shift_ratio = 0.20f;
-    const float max_corner_shift_ratio = 0.18f;
-    const float max_edge_ratio_ratio = 2.2f;
+    const float min_area_ratio = 0.50f;
+    const float max_area_ratio = 1.80f;
+    const float max_center_shift_ratio = 0.30f;
+    const float max_corner_shift_ratio = 0.28f;
+    const float max_edge_ratio_ratio = 3.0f;
 
     if (!ctx || !rgb || !coarse_quad || !refined_quad_out || !m->ctx)
         return false;
@@ -4077,21 +4087,64 @@ static bool run_quad_refiner(const struct app_ctx *ctx,
             if (ratio > edge_ratio_sanity) edge_ratio_sanity = ratio;
             if ((1.0f / ratio) > edge_ratio_sanity) edge_ratio_sanity = 1.0f / ratio;
         }
+        gate_area_ratio = area_ratio;
+        gate_center_shift = center_shift;
+        gate_center_shift_limit = max_center_shift_ratio * patch_diag;
+        gate_max_corner_shift = max_corner_shift;
+        gate_corner_shift_limit = max_corner_shift_ratio * patch_diag;
+        gate_edge_ratio_sanity = edge_ratio_sanity;
+        gate_edge_ratio_limit = max_edge_ratio_ratio;
         if (corner_conf[0] < min_corner_conf || corner_conf[1] < min_corner_conf ||
-            corner_conf[2] < min_corner_conf || corner_conf[3] < min_corner_conf)
+            corner_conf[2] < min_corner_conf || corner_conf[3] < min_corner_conf) {
+            float min_conf_seen = corner_conf[0];
+            if (corner_conf[1] < min_conf_seen) min_conf_seen = corner_conf[1];
+            if (corner_conf[2] < min_conf_seen) min_conf_seen = corner_conf[2];
+            if (corner_conf[3] < min_conf_seen) min_conf_seen = corner_conf[3];
+            reject_reason = "low_corner_conf";
+            reject_metric = min_conf_seen;
+            reject_limit = min_corner_conf;
             goto out_release;
-        if (!quad_is_convex8(refined_quad_out))
+        }
+        if (!quad_is_convex8(refined_quad_out)) {
+            reject_reason = "non_convex";
             goto out_release;
-        if (area_ratio < min_area_ratio || area_ratio > max_area_ratio)
+        }
+        if (area_ratio < min_area_ratio) {
+            reject_reason = "area_ratio_low";
+            reject_metric = area_ratio;
+            reject_limit = min_area_ratio;
             goto out_release;
-        if (center_shift > max_center_shift_ratio * patch_diag)
+        }
+        if (area_ratio > max_area_ratio) {
+            reject_reason = "area_ratio_high";
+            reject_metric = area_ratio;
+            reject_limit = max_area_ratio;
             goto out_release;
-        if (max_corner_shift > max_corner_shift_ratio * patch_diag)
+        }
+        if (center_shift > max_center_shift_ratio * patch_diag) {
+            reject_reason = "center_shift";
+            reject_metric = center_shift;
+            reject_limit = max_center_shift_ratio * patch_diag;
             goto out_release;
-        if (edge_ratio_sanity > max_edge_ratio_ratio)
+        }
+        if (max_corner_shift > max_corner_shift_ratio * patch_diag) {
+            reject_reason = "corner_shift";
+            reject_metric = max_corner_shift;
+            reject_limit = max_corner_shift_ratio * patch_diag;
             goto out_release;
-        if (refined_area < 4.0f)
+        }
+        if (edge_ratio_sanity > max_edge_ratio_ratio) {
+            reject_reason = "edge_ratio";
+            reject_metric = edge_ratio_sanity;
+            reject_limit = max_edge_ratio_ratio;
             goto out_release;
+        }
+        if (refined_area < 4.0f) {
+            reject_reason = "refined_area";
+            reject_metric = refined_area;
+            reject_limit = 4.0f;
+            goto out_release;
+        }
     }
 
     ret = 0;
@@ -4102,11 +4155,18 @@ out:
     free(input_buf);
     free(heatmaps);
     if (ret == 0) {
-        fprintf(stderr, "[quad_refiner] gate ACCEPT conf=[%.3f %.3f %.3f %.3f]\n",
-                corner_conf[0], corner_conf[1], corner_conf[2], corner_conf[3]);
+        fprintf(stderr,
+                "[quad_refiner] gate ACCEPT conf=[%.3f %.3f %.3f %.3f] area_ratio=%.3f center_shift=%.3f/%.3f corner_shift=%.3f/%.3f edge_ratio=%.3f/%.3f\n",
+                corner_conf[0], corner_conf[1], corner_conf[2], corner_conf[3],
+                gate_area_ratio,
+                gate_center_shift, gate_center_shift_limit,
+                gate_max_corner_shift, gate_corner_shift_limit,
+                gate_edge_ratio_sanity, gate_edge_ratio_limit);
         return true;
     }
-    fprintf(stderr, "[quad_refiner] gate REJECT/FAIL conf=[%.3f %.3f %.3f %.3f]\n",
+    fprintf(stderr,
+            "[quad_refiner] gate REJECT/FAIL reason=%s metric=%.3f limit=%.3f conf=[%.3f %.3f %.3f %.3f]\n",
+            reject_reason, reject_metric, reject_limit,
             corner_conf[0], corner_conf[1], corner_conf[2], corner_conf[3]);
     return false;
 }
