@@ -145,6 +145,7 @@ struct options {
     const char *plate_model_path;
     const char *ocr_model_path;
     const char *ocr_keys_path;
+    const char *quad_refiner_model_path;
     const char *labels_path;
     const char *pred_log_path;
     const char *offline_image_path;
@@ -329,6 +330,31 @@ struct ocr_model {
     uint32_t in_c;
 };
 
+struct quad_refiner_model {
+    const char *name;
+    const char *path;
+    rknn_context ctx;
+    rknn_input_output_num io_num;
+    rknn_tensor_attr input_attr;
+    rknn_tensor_attr output_attrs[4];
+    uint32_t in_w;
+    uint32_t in_h;
+    uint32_t in_c;
+};
+
+static bool run_quad_refiner(const struct app_ctx *ctx,
+                              const uint8_t *rgb, int img_w, int img_h,
+                              const float coarse_quad[8],
+                              float refined_quad_out[8]);
+
+static float quad_area8(const float q[8]);
+static void quad_center8(const float q[8], float *cx, float *cy);
+static float quad_edge_len8(const float q[8], int i);
+static bool quad_is_convex8(const float q[8]);
+static void bbox_from_quad_float(const float q[8], int img_w, int img_h,
+                                 int *x1, int *y1, int *x2, int *y2);
+static bool decode_refiner_output_layout(const rknn_tensor_attr *a, int *h, int *w, int *c, bool *is_nchw);
+
 struct app_ctx {
     struct options opt;
     int dev_fd;
@@ -380,6 +406,7 @@ struct app_ctx {
     struct yolo_model veh_model;
     struct yolo_model plate_model;
     struct ocr_model ocr_model;
+    struct quad_refiner_model quad_refiner_model;
     char ocr_keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
     int ocr_key_count;
     int ocr_blank_index;
@@ -441,6 +468,8 @@ static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
                                          const uint8_t *crop_rgb, int crop_w, int crop_h,
                                          float *occ_ratio_out);
 static bool append_utf8_token(char *dst, size_t dst_len, const char *token);
+static int rknn_quad_refiner_model_load(struct quad_refiner_model *m, const char *name, const char *path);
+static void rknn_quad_refiner_model_release(struct quad_refiner_model *m);
 static void copy_cstr_trunc(char *dst, size_t dst_len, const char *src);
 static int utf8_token_len(const char *s);
 static uint32_t utf8_token_codepoint(const char *tok);
@@ -483,6 +512,7 @@ static void print_usage(const char *prog)
             "  --plate-model <path>    Plate RKNN model path (required)\n"
             "  --ocr-model <path>      OCR RKNN model path (required)\n"
             "  --ocr-keys <path>       OCR keys file path (required)\n"
+            "  --quad-refiner-model <path> Optional quad refiner RKNN model path\n"
             "  --labels <path>         Labels file path (required for live camera mode)\n"
             "  --pred-log <path>       Prediction CSV output path (optional)\n"
             "  --offline-image <path>  One-shot offline infer on PPM(P6) image and exit\n"
@@ -540,6 +570,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"plate-model", required_argument, NULL, 4},
         {"ocr-model", required_argument, NULL, 5},
         {"ocr-keys", required_argument, NULL, 6},
+        {"quad-refiner-model", required_argument, NULL, 50},
         {"labels", required_argument, NULL, 7},
         {"pred-log", required_argument, NULL, 8},
         {"offline-image", required_argument, NULL, 36},
@@ -639,6 +670,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 4: opt->plate_model_path = optarg; break;
         case 5: opt->ocr_model_path = optarg; break;
         case 6: opt->ocr_keys_path = optarg; break;
+        case 50: opt->quad_refiner_model_path = optarg; break;
         case 7: opt->labels_path = optarg; break;
         case 8: opt->pred_log_path = optarg; break;
         case 36: opt->offline_image_path = optarg; break;
@@ -957,6 +989,82 @@ static int rknn_ocr_model_load(struct ocr_model *m, const char *name, const char
 }
 
 static void rknn_ocr_model_release(struct ocr_model *m)
+{
+    if (m->ctx)
+        rknn_destroy(m->ctx);
+    memset(m, 0, sizeof(*m));
+}
+
+static int rknn_quad_refiner_model_load(struct quad_refiner_model *m, const char *name, const char *path)
+{
+    FILE *fp;
+    long sz;
+    void *data;
+    uint32_t i;
+    memset(m, 0, sizeof(*m));
+    m->name = name;
+    m->path = path;
+
+    if (!path || path[0] == '\0')
+        return 0;
+
+    fp = fopen(path, "rb");
+    if (!fp) return -1;
+    fseek(fp, 0, SEEK_END);
+    sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    data = malloc((size_t)sz);
+    if (!data) { fclose(fp); return -1; }
+    if (fread(data, 1, (size_t)sz, fp) != (size_t)sz) { fclose(fp); free(data); return -1; }
+    fclose(fp);
+
+    if (rknn_init(&m->ctx, data, (uint32_t)sz, 0, NULL) < 0) { free(data); return -1; }
+    free(data);
+    if (rknn_query(m->ctx, RKNN_QUERY_IN_OUT_NUM, &m->io_num, sizeof(m->io_num)) < 0)
+        return -1;
+    if (m->io_num.n_output == 0 || m->io_num.n_output > 4)
+        return -1;
+
+    memset(&m->input_attr, 0, sizeof(m->input_attr));
+    m->input_attr.index = 0;
+    if (rknn_query(m->ctx, RKNN_QUERY_INPUT_ATTR, &m->input_attr, sizeof(m->input_attr)) < 0)
+        return -1;
+    if (m->input_attr.fmt == RKNN_TENSOR_NCHW) {
+        m->in_c = m->input_attr.dims[1];
+        m->in_h = m->input_attr.dims[2];
+        m->in_w = m->input_attr.dims[3];
+    } else {
+        m->in_h = m->input_attr.dims[1];
+        m->in_w = m->input_attr.dims[2];
+        m->in_c = m->input_attr.dims[3];
+    }
+
+    for (i = 0; i < m->io_num.n_output; i++) {
+        memset(&m->output_attrs[i], 0, sizeof(m->output_attrs[i]));
+        m->output_attrs[i].index = i;
+        if (rknn_query(m->ctx, RKNN_QUERY_OUTPUT_ATTR, &m->output_attrs[i], sizeof(m->output_attrs[i])) < 0)
+            return -1;
+    }
+
+    fprintf(stderr, "[%s] loaded input=%ux%ux%u outputs=%u\n",
+            name, m->in_w, m->in_h, m->in_c, m->io_num.n_output);
+    fprintf(stderr, "[%s] input_attr fmt=%d type=%d qnt=%d zp=%d scale=%.6f\n",
+            name,
+            m->input_attr.fmt,
+            m->input_attr.type,
+            m->input_attr.qnt_type,
+            m->input_attr.zp,
+            m->input_attr.scale);
+    for (i = 0; i < m->io_num.n_output; i++) {
+        const rknn_tensor_attr *a = &m->output_attrs[i];
+        fprintf(stderr, "[%s] out[%u] fmt=%d type=%d qnt=%d dims=(%u,%u,%u,%u) n_dims=%u\n",
+                name, i, a->fmt, a->type, a->qnt_type,
+                a->dims[0], a->dims[1], a->dims[2], a->dims[3], a->n_dims);
+    }
+    return 0;
+}
+
+static void rknn_quad_refiner_model_release(struct quad_refiner_model *m)
 {
     if (m->ctx)
         rknn_destroy(m->ctx);
@@ -3649,6 +3757,340 @@ static bool warp_quad_to_rect_rgb888(const uint8_t *rgb, int img_w, int img_h, c
     return true;
 }
 
+static float quad_area8(const float q[8])
+{
+    float s = 0.0f;
+    int i;
+    for (i = 0; i < 4; i++) {
+        int j = (i + 1) % 4;
+        s += q[i * 2 + 0] * q[j * 2 + 1] - q[j * 2 + 0] * q[i * 2 + 1];
+    }
+    return fabsf(s) * 0.5f;
+}
+
+static void quad_center8(const float q[8], float *cx, float *cy)
+{
+    int i;
+    float sx = 0.0f, sy = 0.0f;
+    for (i = 0; i < 4; i++) {
+        sx += q[i * 2 + 0];
+        sy += q[i * 2 + 1];
+    }
+    *cx = sx * 0.25f;
+    *cy = sy * 0.25f;
+}
+
+static float quad_edge_len8(const float q[8], int i)
+{
+    int j = (i + 1) % 4;
+    float dx = q[j * 2 + 0] - q[i * 2 + 0];
+    float dy = q[j * 2 + 1] - q[i * 2 + 1];
+    return hypotf(dx, dy);
+}
+
+static bool quad_is_convex8(const float q[8])
+{
+    int i;
+    bool has_pos = false, has_neg = false;
+    for (i = 0; i < 4; i++) {
+        int i1 = (i + 1) % 4;
+        int i2 = (i + 2) % 4;
+        float ax = q[i1 * 2 + 0] - q[i * 2 + 0];
+        float ay = q[i1 * 2 + 1] - q[i * 2 + 1];
+        float bx = q[i2 * 2 + 0] - q[i1 * 2 + 0];
+        float by = q[i2 * 2 + 1] - q[i1 * 2 + 1];
+        float cross = ax * by - ay * bx;
+        if (cross > 1e-5f) has_pos = true;
+        if (cross < -1e-5f) has_neg = true;
+    }
+    return !(has_pos && has_neg);
+}
+
+static void bbox_from_quad_float(const float q[8], int img_w, int img_h,
+                                 int *x1, int *y1, int *x2, int *y2)
+{
+    float minx = q[0], maxx = q[0], miny = q[1], maxy = q[1];
+    int i;
+    for (i = 1; i < 4; i++) {
+        float x = q[i * 2 + 0];
+        float y = q[i * 2 + 1];
+        if (x < minx) minx = x;
+        if (x > maxx) maxx = x;
+        if (y < miny) miny = y;
+        if (y > maxy) maxy = y;
+    }
+    *x1 = (int)floorf(minx + 1e-6f);
+    *y1 = (int)floorf(miny + 1e-6f);
+    *x2 = (int)ceilf(maxx - 1e-6f);
+    *y2 = (int)ceilf(maxy - 1e-6f);
+    if (*x1 < 0) *x1 = 0;
+    if (*y1 < 0) *y1 = 0;
+    if (*x2 >= img_w) *x2 = img_w - 1;
+    if (*y2 >= img_h) *y2 = img_h - 1;
+}
+
+static bool decode_refiner_output_layout(const rknn_tensor_attr *a, int *h, int *w, int *c, bool *is_nchw)
+{
+    if (!a || !h || !w || !c || !is_nchw)
+        return false;
+    if (a->n_dims != 4)
+        return false;
+    if (a->fmt == RKNN_TENSOR_NCHW) {
+        *is_nchw = true;
+        *c = (int)a->dims[1];
+        *h = (int)a->dims[2];
+        *w = (int)a->dims[3];
+    } else {
+        *is_nchw = false;
+        *h = (int)a->dims[1];
+        *w = (int)a->dims[2];
+        *c = (int)a->dims[3];
+    }
+    return (*h > 0 && *w > 0 && *c > 0);
+}
+
+static bool run_quad_refiner(const struct app_ctx *ctx,
+                              const uint8_t *rgb, int img_w, int img_h,
+                              const float coarse_quad[8],
+                              float refined_quad_out[8])
+{
+    struct quad_refiner_model *m = &ctx->quad_refiner_model;
+    rknn_input in;
+    rknn_output outs[4];
+    float ordered[8];
+    float pred_ordered[8];
+    int patch_x1, patch_y1, patch_x2, patch_y2;
+    int patch_w, patch_h;
+    float *input_buf = NULL;
+    float *heatmaps = NULL;
+    float corner_conf[4] = {0};
+    int ref_w, ref_h;
+    int hm_h, hm_w, hm_c;
+    bool hm_is_nchw = false;
+    float scale_x, scale_y;
+    size_t input_count;
+    size_t input_size;
+    int i, c;
+    int ret = -1;
+    const float pad_x_ratio = 0.20f;
+    const float pad_y_ratio = 0.25f;
+    const float min_corner_conf = 0.20f;
+    const float min_area_ratio = 0.65f;
+    const float max_area_ratio = 1.45f;
+    const float max_center_shift_ratio = 0.20f;
+    const float max_corner_shift_ratio = 0.18f;
+    const float max_edge_ratio_ratio = 2.2f;
+
+    if (!ctx || !rgb || !coarse_quad || !refined_quad_out || !m->ctx)
+        return false;
+
+    order_quad_points(coarse_quad, ordered);
+    bbox_from_quad_float(ordered, img_w, img_h, &patch_x1, &patch_y1, &patch_x2, &patch_y2);
+    {
+        int ex = (int)lroundf((float)(patch_x2 - patch_x1 + 1) * pad_x_ratio);
+        int ey = (int)lroundf((float)(patch_y2 - patch_y1 + 1) * pad_y_ratio);
+        patch_x1 -= ex; patch_x2 += ex;
+        patch_y1 -= ey; patch_y2 += ey;
+        if (patch_x1 < 0) patch_x1 = 0;
+        if (patch_y1 < 0) patch_y1 = 0;
+        if (patch_x2 >= img_w) patch_x2 = img_w - 1;
+        if (patch_y2 >= img_h) patch_y2 = img_h - 1;
+    }
+    patch_w = patch_x2 - patch_x1 + 1;
+    patch_h = patch_y2 - patch_y1 + 1;
+    if (patch_w < 4 || patch_h < 4)
+        return false;
+
+    ref_w = (int)m->in_w;
+    ref_h = (int)m->in_h;
+    if (ref_w <= 1 || ref_h <= 1)
+        return false;
+
+    input_count = (size_t)3 * (size_t)ref_h * (size_t)ref_w;
+    input_size = input_count * sizeof(float);
+    input_buf = (float *)malloc(input_size);
+    if (!input_buf)
+        return false;
+
+    if (m->input_attr.fmt == RKNN_TENSOR_NCHW) {
+        for (int dy = 0; dy < ref_h; dy++) {
+            float sy = (ref_h > 1) ? ((float)dy * (float)(patch_h - 1) / (float)(ref_h - 1)) : 0.0f;
+            for (int dx = 0; dx < ref_w; dx++) {
+                float sx = (ref_w > 1) ? ((float)dx * (float)(patch_w - 1) / (float)(ref_w - 1)) : 0.0f;
+                uint8_t pix[3];
+                bilinear_sample_rgb888(rgb, img_w, img_h, (float)patch_x1 + sx, (float)patch_y1 + sy, pix);
+                for (c = 0; c < 3; c++)
+                    input_buf[((size_t)c * ref_h + (size_t)dy) * ref_w + (size_t)dx] = (float)pix[c] / 255.0f;
+            }
+        }
+    } else {
+        for (int dy = 0; dy < ref_h; dy++) {
+            float sy = (ref_h > 1) ? ((float)dy * (float)(patch_h - 1) / (float)(ref_h - 1)) : 0.0f;
+            for (int dx = 0; dx < ref_w; dx++) {
+                float sx = (ref_w > 1) ? ((float)dx * (float)(patch_w - 1) / (float)(ref_w - 1)) : 0.0f;
+                uint8_t pix[3];
+                bilinear_sample_rgb888(rgb, img_w, img_h, (float)patch_x1 + sx, (float)patch_y1 + sy, pix);
+                for (c = 0; c < 3; c++)
+                    input_buf[((size_t)dy * ref_w + (size_t)dx) * 3 + (size_t)c] = (float)pix[c] / 255.0f;
+            }
+        }
+    }
+
+    memset(&in, 0, sizeof(in));
+    in.index = 0;
+    in.buf = input_buf;
+    in.size = input_size;
+    in.type = RKNN_TENSOR_FLOAT32;
+    in.fmt = m->input_attr.fmt;
+    ret = rknn_inputs_set(m->ctx, 1, &in);
+    if (ret < 0)
+        goto out;
+    ret = rknn_run(m->ctx, NULL);
+    if (ret < 0)
+        goto out;
+
+    memset(outs, 0, sizeof(outs));
+    for (i = 0; i < (int)m->io_num.n_output; i++)
+        outs[i].want_float = 1;
+    ret = rknn_outputs_get(m->ctx, m->io_num.n_output, outs, NULL);
+    if (ret < 0)
+        goto out;
+
+    if (!decode_refiner_output_layout(&m->output_attrs[0], &hm_h, &hm_w, &hm_c, &hm_is_nchw))
+        goto out_release;
+    if (hm_c != 4)
+        goto out_release;
+
+    heatmaps = (float *)malloc((size_t)hm_h * (size_t)hm_w * 4U * sizeof(float));
+    if (!heatmaps)
+        goto out_release;
+
+    {
+        const float *src = (const float *)outs[0].buf;
+        if (hm_is_nchw) {
+            memcpy(heatmaps, src, (size_t)hm_h * (size_t)hm_w * 4U * sizeof(float));
+        } else {
+            for (int y = 0; y < hm_h; y++) {
+                for (int x = 0; x < hm_w; x++) {
+                    for (c = 0; c < 4; c++) {
+                        heatmaps[((size_t)c * hm_h + (size_t)y) * hm_w + (size_t)x] =
+                            src[((size_t)y * hm_w + (size_t)x) * 4U + (size_t)c];
+                    }
+                }
+            }
+        }
+    }
+
+    scale_x = (hm_w > 1 && ref_w > 1) ? (float)(ref_w - 1) / (float)(hm_w - 1) : 0.0f;
+    scale_y = (hm_h > 1 && ref_h > 1) ? (float)(ref_h - 1) / (float)(hm_h - 1) : 0.0f;
+
+    for (c = 0; c < 4; c++) {
+        float *ch = heatmaps + (size_t)c * hm_h * hm_w;
+        float best = -1e30f;
+        int best_idx = 0;
+        int by, bx;
+        float rx, ry;
+        for (i = 0; i < hm_h * hm_w; i++) {
+            float v = ch[i];
+            if (v >= 0.0f) v = 1.0f / (1.0f + expf(-v));
+            else {
+                float ev = expf(v);
+                v = ev / (1.0f + ev);
+            }
+            ch[i] = v;
+            if (v > best) {
+                best = v;
+                best_idx = i;
+            }
+        }
+        corner_conf[c] = best;
+        by = best_idx / hm_w;
+        bx = best_idx % hm_w;
+        {
+            int x0 = (bx > 0) ? bx - 1 : 0;
+            int x1 = (bx + 1 < hm_w) ? bx + 1 : hm_w - 1;
+            int y0 = (by > 0) ? by - 1 : 0;
+            int y1 = (by + 1 < hm_h) ? by + 1 : hm_h - 1;
+            float total = 0.0f, wx = 0.0f, wy = 0.0f;
+            int yy, xx;
+            for (yy = y0; yy <= y1; yy++) {
+                for (xx = x0; xx <= x1; xx++) {
+                    float w = ch[yy * hm_w + xx];
+                    total += w;
+                    wx += w * (float)xx;
+                    wy += w * (float)yy;
+                }
+            }
+            if (total > 1e-6f) {
+                rx = wx / total;
+                ry = wy / total;
+            } else {
+                rx = (float)bx;
+                ry = (float)by;
+            }
+        }
+        pred_ordered[c * 2 + 0] = (rx * scale_x) * ((float)(patch_w - 1) / (float)(ref_w - 1 + 1e-6f)) + (float)patch_x1;
+        pred_ordered[c * 2 + 1] = (ry * scale_y) * ((float)(patch_h - 1) / (float)(ref_h - 1 + 1e-6f)) + (float)patch_y1;
+    }
+
+    order_quad_points(pred_ordered, refined_quad_out);
+
+    {
+        float coarse_area = fmaxf(quad_area8(ordered), 1e-6f);
+        float refined_area = quad_area8(refined_quad_out);
+        float area_ratio = refined_area / coarse_area;
+        float coarse_cx, coarse_cy, refined_cx, refined_cy;
+        float center_shift;
+        float max_corner_shift = 0.0f;
+        float edge_ratio_sanity = 1.0f;
+        float patch_diag = hypotf((float)ref_w, (float)ref_h);
+        quad_center8(ordered, &coarse_cx, &coarse_cy);
+        quad_center8(refined_quad_out, &refined_cx, &refined_cy);
+        center_shift = hypotf(refined_cx - coarse_cx, refined_cy - coarse_cy);
+        for (i = 0; i < 4; i++) {
+            float shift = hypotf(refined_quad_out[i * 2 + 0] - ordered[i * 2 + 0],
+                                 refined_quad_out[i * 2 + 1] - ordered[i * 2 + 1]);
+            float ce = fmaxf(quad_edge_len8(ordered, i), 1e-6f);
+            float re = fmaxf(quad_edge_len8(refined_quad_out, i), 1e-6f);
+            float ratio = re / ce;
+            if (shift > max_corner_shift) max_corner_shift = shift;
+            if (ratio > edge_ratio_sanity) edge_ratio_sanity = ratio;
+            if ((1.0f / ratio) > edge_ratio_sanity) edge_ratio_sanity = 1.0f / ratio;
+        }
+        if (corner_conf[0] < min_corner_conf || corner_conf[1] < min_corner_conf ||
+            corner_conf[2] < min_corner_conf || corner_conf[3] < min_corner_conf)
+            goto out_release;
+        if (!quad_is_convex8(refined_quad_out))
+            goto out_release;
+        if (area_ratio < min_area_ratio || area_ratio > max_area_ratio)
+            goto out_release;
+        if (center_shift > max_center_shift_ratio * patch_diag)
+            goto out_release;
+        if (max_corner_shift > max_corner_shift_ratio * patch_diag)
+            goto out_release;
+        if (edge_ratio_sanity > max_edge_ratio_ratio)
+            goto out_release;
+        if (refined_area < 4.0f)
+            goto out_release;
+    }
+
+    ret = 0;
+out_release:
+    if (m->ctx)
+        rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+out:
+    free(input_buf);
+    free(heatmaps);
+    if (ret == 0) {
+        fprintf(stderr, "[quad_refiner] gate ACCEPT conf=[%.3f %.3f %.3f %.3f]\n",
+                corner_conf[0], corner_conf[1], corner_conf[2], corner_conf[3]);
+        return true;
+    }
+    fprintf(stderr, "[quad_refiner] gate REJECT/FAIL conf=[%.3f %.3f %.3f %.3f]\n",
+            corner_conf[0], corner_conf[1], corner_conf[2], corner_conf[3]);
+    return false;
+}
+
 static bool prepare_plate_crop_rgb888(const struct app_ctx *ctx,
                                       const uint8_t *rgb, int img_w, int img_h,
                                       const struct det_box *plate_box,
@@ -3662,7 +4104,15 @@ static bool prepare_plate_crop_rgb888(const struct app_ctx *ctx,
 
     if (ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP && plate_box->has_obb) {
         float ordered[8];
+        float refined_quad[8];
         order_quad_points(plate_box->quad, ordered);
+        /* Run quad refiner before OBB warp if model is loaded */
+        if (ctx->quad_refiner_model.ctx) {
+            if (run_quad_refiner(ctx, rgb, img_w, img_h, ordered, refined_quad)) {
+                /* Gate accepted: replace ordered quad with refined quad */
+                memcpy(ordered, refined_quad, sizeof(float) * 8);
+            }
+        }
         if (warp_quad_to_rect_rgb888(rgb, img_w, img_h, ordered,
                                      crop_buf, crop_cap_w, crop_cap_h,
                                      crop_w, crop_h)) {
@@ -6043,6 +6493,7 @@ static void cleanup(struct app_ctx *ctx)
     rknn_model_release(&ctx->veh_model);
     rknn_model_release(&ctx->plate_model);
     rknn_ocr_model_release(&ctx->ocr_model);
+    rknn_quad_refiner_model_release(&ctx->quad_refiner_model);
 
     if (ctx->pred_log_fp) {
         fclose(ctx->pred_log_fp);
@@ -6164,6 +6615,8 @@ int main(int argc, char **argv)
     ctx.plate_model.class_filter = ctx.opt.plate_class_id;
     if (rknn_ocr_model_load(&ctx.ocr_model, "ocr", ctx.opt.ocr_model_path) < 0)
         goto out;
+    if (rknn_quad_refiner_model_load(&ctx.quad_refiner_model, "quad_refiner", ctx.opt.quad_refiner_model_path) < 0)
+        goto out;
 
     if (ctx.opt.pred_log_path && ctx.opt.pred_log_path[0] != '\0') {
         ctx.pred_log_fp = fopen(ctx.opt.pred_log_path, "w");
@@ -6192,7 +6645,7 @@ int main(int argc, char **argv)
                 "Start OFFLINE OCR: image=%s roi=%s auto_det=%d min_plate=%.2f det_resize=%s plate_refine=%d "
                 "plate_det=%s nms_iou=%.2f max_det=%d cls_filter=%d "
                 "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_kernel=%s ocr_pp=%s min_h=%d min_sharp=%.2f min_occ=%.2f "
-                "crop_src=fullres_raw det_src=%s\n",
+                "crop_src=fullres_raw det_src=%s quad_refiner=%s\n",
                 ctx.opt.offline_image_path,
                 (ctx.opt.offline_roi_arg && ctx.opt.offline_roi_arg[0]) ? ctx.opt.offline_roi_arg : "<none>",
                 ctx.opt.offline_detect_plate,
@@ -6211,7 +6664,8 @@ int main(int argc, char **argv)
                 ctx.opt.ocr_min_plate_h,
                 ctx.opt.ocr_min_sharpness,
                 ctx.opt.ocr_min_occ_ratio,
-                ctx.opt.sw_preproc ? "preproc" : "raw");
+                ctx.opt.sw_preproc ? "preproc" : "raw",
+                ctx.opt.quad_refiner_model_path ? ctx.opt.quad_refiner_model_path : "<off>");
         if (run_offline_once(&ctx) < 0)
             goto out;
         ret = 0;
@@ -6231,7 +6685,7 @@ int main(int argc, char **argv)
             "sw_preproc=%d fpga_a_mask=%d ped_event=%d det_resize=%s plate_refine=%d "
             "plate_det=%s nms_iou=%.2f max_det=%d cls_filter=%d "
             "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_kernel=%s ocr_pp=%s min_h=%d min_sharp=%.2f min_occ=%.2f show_crop=%d "
-            "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d pred_log=%s\n",
+            "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d pred_log=%s quad_refiner=%s\n",
             ctx.opt.fps,
             ctx.src_is_bgrx ? "bgrx8888" : "bgr565",
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
@@ -6260,7 +6714,8 @@ int main(int argc, char **argv)
             ctx.opt.ocr_ctc_diag,
             ctx.opt.ocr_crop_dump_dir ? ctx.opt.ocr_crop_dump_dir : "<off>",
             ctx.opt.ocr_crop_dump_max,
-            ctx.opt.pred_log_path ? ctx.opt.pred_log_path : "<off>");
+            ctx.opt.pred_log_path ? ctx.opt.pred_log_path : "<off>",
+            ctx.opt.quad_refiner_model_path ? ctx.opt.quad_refiner_model_path : "<off>");
 
     ctx.last_stats_us = mono_us();
 
