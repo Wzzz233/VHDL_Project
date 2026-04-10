@@ -343,6 +343,8 @@ struct quad_refiner_model {
     uint32_t in_c;
 };
 
+struct app_ctx;
+
 static bool run_quad_refiner(const struct app_ctx *ctx,
                               const uint8_t *rgb, int img_w, int img_h,
                               const float coarse_quad[8],
@@ -3872,7 +3874,7 @@ static bool run_quad_refiner(const struct app_ctx *ctx,
                               const float coarse_quad[8],
                               float refined_quad_out[8])
 {
-    struct quad_refiner_model *m = &ctx->quad_refiner_model;
+    const struct quad_refiner_model *m = &ctx->quad_refiner_model;
     rknn_input in;
     rknn_output outs[4];
     float ordered[8];

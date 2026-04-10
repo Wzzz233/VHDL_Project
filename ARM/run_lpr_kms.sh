@@ -7,6 +7,7 @@ VEH_MODEL=""
 PLATE_MODEL=""
 OCR_MODEL=""
 OCR_KEYS=""
+QUAD_REFINER_MODEL=""
 LABELS=""
 PRED_LOG=""
 CONNECTOR_ID=""
@@ -60,6 +61,7 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --plate-model <path>       Plate RKNN model (required)
   --ocr-model <path>         OCR RKNN model (required)
   --ocr-keys <path>          OCR keys txt (required)
+  --quad-refiner-model <path|off> Quad refiner RKNN path; pass off to disable
   --labels <path>            Labels file (required for live camera mode)
   --pred-log <path>          Prediction CSV output path (optional)
   --offline-image <path>     Run one-shot offline on image (jpg/png/ppm), no camera path
@@ -114,6 +116,7 @@ while [[ $# -gt 0 ]]; do
     --plate-model) PLATE_MODEL="$2"; shift 2 ;;
     --ocr-model) OCR_MODEL="$2"; shift 2 ;;
     --ocr-keys) OCR_KEYS="$2"; shift 2 ;;
+    --quad-refiner-model) QUAD_REFINER_MODEL="$2"; shift 2 ;;
     --labels) LABELS="$2"; shift 2 ;;
     --pred-log) PRED_LOG="$2"; shift 2 ;;
     --offline-image) OFFLINE_IMAGE="$2"; shift 2 ;;
@@ -292,7 +295,9 @@ fi
 if [[ -n "$OCR_CROP_DUMP_DIR" ]]; then
   CMD+=(--ocr-crop-dump-dir "$OCR_CROP_DUMP_DIR")
 fi
-
+if [[ -n "$QUAD_REFINER_MODEL" ]]; then
+  CMD+=(--quad-refiner-model "$QUAD_REFINER_MODEL")
+fi
 if [[ -n "$CONNECTOR_ID" ]]; then
   CMD+=(--connector-id "$CONNECTOR_ID")
 fi
