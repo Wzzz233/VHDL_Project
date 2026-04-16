@@ -33,6 +33,7 @@
 #include <rknn_api.h>
 
 #include "pcie_fpga_dma.h"
+#include "ocr_decode.h"
 
 #define DEFAULT_DEVICE "/dev/" FPGA_DMA_DEV_NAME
 #define DEFAULT_DRM_CARD "/dev/dri/card0"
@@ -1126,71 +1127,29 @@ static bool build_ocr_layout(const rknn_tensor_attr *a, int *t_size, int *c_size
 }
 
 static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_stride, int c_stride,
-                             struct app_ctx *ctx, char *text, size_t text_len, float *conf_out,
+                             struct app_ctx *ctx, enum ocr_decode_family family,
+                             char *text, size_t text_len, float *conf_out,
                              struct ocr_diag *diag)
 {
-    int t;
-    int prev = -1;
-    int emitted = 0;
-    float conf_sum = 0.0f;
-    int blank_idx = ctx->ocr_blank_index;
-    int blank_top1_count = 0;
+    const char *keys[MAX_OCR_KEYS];
+    struct ocr_decode_diag decode_diag;
+    int i;
+    int ret;
 
-    if (text_len == 0)
+    if (!ctx || !buf || !text || text_len == 0)
         return -1;
-    text[0] = '\0';
-
-    if (blank_idx < 0 || blank_idx >= c_size) {
-        if (c_size == ctx->ocr_key_count + 1)
-            blank_idx = ctx->ocr_key_count;
-        else
-            blank_idx = c_size - 1;
-    }
-
-    for (t = 0; t < t_size; t++) {
-        int c;
-        int best_c = 0;
-        float best_logit = -1e30f;
-        float max_logit = -1e30f;
-        float exp_sum = 0.0f;
-        const float *row = buf + (size_t)t * (size_t)t_stride;
-
-        for (c = 0; c < c_size; c++) {
-            float v = row[(size_t)c * (size_t)c_stride];
-            if (v > best_logit) {
-                best_logit = v;
-                best_c = c;
-            }
-            if (v > max_logit)
-                max_logit = v;
-        }
-        for (c = 0; c < c_size; c++) {
-            float v = row[(size_t)c * (size_t)c_stride];
-            exp_sum += expf(v - max_logit);
-        }
-        if (best_c == blank_idx)
-            blank_top1_count++;
-        if (best_c == blank_idx || best_c == prev) {
-            prev = best_c;
-            continue;
-        }
-        if (best_c >= 0 && best_c < ctx->ocr_key_count) {
-            float prob = 0.0f;
-            exp_sum = (exp_sum > 1e-8f) ? exp_sum : 1e-8f;
-            prob = expf(best_logit - max_logit) / exp_sum;
-            if (append_utf8_token(text, text_len, ctx->ocr_keys[best_c])) {
-                emitted++;
-                conf_sum += prob;
-            }
-        }
-        prev = best_c;
-    }
-    *conf_out = (emitted > 0) ? (conf_sum / (float)emitted) : 0.0f;
+    for (i = 0; i < ctx->ocr_key_count && i < MAX_OCR_KEYS; i++)
+        keys[i] = ctx->ocr_keys[i];
+    ret = ocr_decode_logits(buf, t_size, c_size, t_stride, c_stride,
+                            keys, ctx->ocr_key_count, ctx->ocr_blank_index,
+                            family, text, text_len, conf_out, &decode_diag);
+    if (ret < 0)
+        return ret;
     if (diag) {
-        diag->t_size = t_size;
-        diag->c_size = c_size;
-        diag->blank_idx = blank_idx;
-        diag->blank_top1_ratio = (t_size > 0) ? ((float)blank_top1_count / (float)t_size) : 0.0f;
+        diag->t_size = decode_diag.t_size;
+        diag->c_size = decode_diag.c_size;
+        diag->blank_idx = decode_diag.blank_idx;
+        diag->blank_top1_ratio = decode_diag.blank_top1_ratio;
     }
     return 0;
 }
@@ -1665,7 +1624,18 @@ static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
     return ocr_in;
 }
 
+static enum ocr_decode_family select_decode_family(uint32_t decode_output_idx,
+                                                  enum plate_color plate_color)
+{
+    if (decode_output_idx == 1)
+        return OCR_DECODE_FAMILY_GREEN8;
+    if (plate_color == PLATE_COLOR_GREEN)
+        return OCR_DECODE_FAMILY_GREEN8;
+    return OCR_DECODE_FAMILY_NONE;
+}
+
 static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_w, int crop_h,
+                         enum plate_color plate_color,
                          char *text, size_t text_len, float *conf_out,
                          struct ocr_diag *diag, uint8_t **model_input_out)
 {
@@ -1734,8 +1704,11 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
                 (m->io_num.n_output >= 2) ? " (temporary green8 head test mode)" : "");
         ctx->ocr_keysize_warned = true;
     }
-    ret = ctc_decode_logits((const float *)outs[decode_output_idx].buf, t_size, c_size, t_stride, c_stride,
-                            ctx, text, text_len, conf_out, diag);
+    {
+        enum ocr_decode_family family = select_decode_family(decode_output_idx, plate_color);
+        ret = ctc_decode_logits((const float *)outs[decode_output_idx].buf, t_size, c_size, t_stride, c_stride,
+                                ctx, family, text, text_len, conf_out, diag);
+    }
     if (diag)
         diag->in_occ_ratio = occ_ratio;
     fprintf(stderr, "[ocrin] resize_mode=%s kernel=%s in_occ_ratio=%.3f\n",
@@ -5913,11 +5886,11 @@ static int run_offline_once(struct app_ctx *ctx)
                     sharp, ctx->opt.ocr_min_sharpness);
         } else {
             if (ctx->ocr_crop_index_fp && ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max)
-                ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h,
+                ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
                                     pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
                                     &odiag, &ocr_input_dump);
             else
-                ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h,
+                ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
                                     pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
                                     &odiag, NULL);
             if (ret < 0) {
@@ -6395,7 +6368,7 @@ static void *infer_thread_main(void *arg)
                             seq, sharpness, ctx->opt.ocr_min_sharpness,
                             pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2);
                 } else {
-                    if (run_model_ocr(ctx, plate_crop, crop_w, crop_h,
+                    if (run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
                                       pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
                                       &odiag, ocr_input_out) < 0) {
                         snprintf(pd.ocr_text, sizeof(pd.ocr_text), "UNK");
