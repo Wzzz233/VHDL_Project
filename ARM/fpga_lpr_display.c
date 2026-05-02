@@ -3975,10 +3975,14 @@ static bool run_quad_refiner(const struct app_ctx *ctx,
     int patch_w, patch_h;
     float *input_buf = NULL;
     float *heatmaps = NULL;
+    float *offsets_buf = NULL;
     float corner_conf[4] = {0};
     int ref_w, ref_h;
     int hm_h, hm_w, hm_c;
+    int off_h = 0, off_w = 0, off_c = 0;
     bool hm_is_nchw = false;
+    bool off_is_nchw = false;
+    bool has_offset = false;
     float scale_x, scale_y;
     size_t input_count;
     size_t input_size;
@@ -4106,10 +4110,7 @@ static bool run_quad_refiner(const struct app_ctx *ctx,
     scale_x = (hm_w > 1 && ref_w > 1) ? (float)(ref_w - 1) / (float)(hm_w - 1) : 0.0f;
     scale_y = (hm_h > 1 && ref_h > 1) ? (float)(ref_h - 1) / (float)(hm_h - 1) : 0.0f;
 
-    bool has_offset = (m->io_num.n_output >= 3);
-    float *offsets_buf = NULL;
-    int off_h = 0, off_w = 0, off_c = 0;
-    bool off_is_nchw = false;
+    has_offset = (m->io_num.n_output >= 3);
     if (has_offset) {
         if (decode_refiner_output_layout(&m->output_attrs[2], &off_h, &off_w, &off_c, &off_is_nchw) && off_c == 8) {
             offsets_buf = (float *)malloc((size_t)off_h * (size_t)off_w * 8U * sizeof(float));
