@@ -1151,7 +1151,7 @@ static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_str
     for (i = 0; i < ctx->ocr_key_count && i < MAX_OCR_KEYS; i++)
         keys[i] = ctx->ocr_keys[i];
     ret = ocr_decode_logits(buf, t_size, c_size, t_stride, c_stride,
-                            keys, ctx->ocr_key_count, ctx->ocr_blank_index,
+                            keys, i, ctx->ocr_blank_index,
                             family, text, text_len, conf_out, &decode_diag);
     if (ret < 0)
         return ret;
@@ -4155,7 +4155,12 @@ static bool run_quad_refiner(const struct app_ctx *ctx,
         corner_conf[c] = best;
         by = best_idx / hm_w;
         bx = best_idx % hm_w;
-        {
+        if (offsets_buf && bx < off_w && by < off_h) {
+            size_t dx_idx = ((size_t)c * 2U * (size_t)off_h + (size_t)by) * (size_t)off_w + (size_t)bx;
+            size_t dy_idx = (((size_t)c * 2U + 1U) * (size_t)off_h + (size_t)by) * (size_t)off_w + (size_t)bx;
+            rx = (float)bx + offsets_buf[dx_idx];
+            ry = (float)by + offsets_buf[dy_idx];
+        } else {
             int x0 = (bx > 0) ? bx - 1 : 0;
             int x1 = (bx + 1 < hm_w) ? bx + 1 : hm_w - 1;
             int y0 = (by > 0) ? by - 1 : 0;
@@ -4176,12 +4181,6 @@ static bool run_quad_refiner(const struct app_ctx *ctx,
             } else {
                 rx = (float)bx;
                 ry = (float)by;
-            }
-            /* Apply offset refinement if available */
-            if (offsets_buf && bx < off_w && by < off_h) {
-                float *off_ch = offsets_buf + (size_t)c * 2 * off_h * off_w;
-                rx += off_ch[(size_t)by * off_w + (size_t)bx];  /* dx */
-                ry += off_ch[(size_t)(c * 2 + 1) * off_h * off_w + (size_t)by * off_w + (size_t)bx];  /* dy */
             }
         }
         pred_ordered[c * 2 + 0] = (rx * scale_x) * ((float)(patch_w - 1) / (float)(ref_w - 1 + 1e-6f)) + (float)patch_x1;

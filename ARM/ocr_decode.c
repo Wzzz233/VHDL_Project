@@ -107,13 +107,17 @@ static bool token_is_alnum(const char *token)
 
 static bool family_prefix_valid(enum ocr_decode_family family,
                                 const int *token_ids, int token_count,
-                                const char *const *keys)
+                                const char *const *keys, int key_count)
 {
     int i;
     if (family == OCR_DECODE_FAMILY_NONE)
         return true;
     if (token_count == 0)
         return true;
+    for (i = 0; i < token_count; i++) {
+        if (token_ids[i] < 0 || token_ids[i] >= key_count)
+            return false;
+    }
     if (!token_is_province(keys[token_ids[0]]))
         return false;
     if (token_count >= 2 && !token_is_alpha(keys[token_ids[1]]))
@@ -141,9 +145,9 @@ static bool family_prefix_valid(enum ocr_decode_family family,
 
 static bool family_full_valid(enum ocr_decode_family family,
                               const int *token_ids, int token_count,
-                              const char *const *keys)
+                              const char *const *keys, int key_count)
 {
-    if (!family_prefix_valid(family, token_ids, token_count, keys))
+    if (!family_prefix_valid(family, token_ids, token_count, keys, key_count))
         return false;
     if (family == OCR_DECODE_FAMILY_GREEN8)
         return token_count == 8;
@@ -258,8 +262,8 @@ static int constrained_decode(const float *buf, int t_size, int c_size, int t_st
     int beam_count = 1;
     int t;
 
-    (void)key_count;
-    if (c_size > (int)(sizeof(log_probs) / sizeof(log_probs[0])))
+    if (c_size > (int)(sizeof(log_probs) / sizeof(log_probs[0])) ||
+        key_count <= 0 || blank_idx < 0 || blank_idx >= c_size)
         return -1;
     memset(beams, 0, sizeof(beams));
     beams[0].pb = 0.0;
@@ -319,7 +323,7 @@ static int constrained_decode(const float *buf, int t_size, int c_size, int t_st
                 if (beams[b].token_count > 0)
                     memcpy(new_ids, beams[b].token_ids, (size_t)beams[b].token_count * sizeof(int));
                 new_ids[new_count - 1] = c;
-                if (!family_prefix_valid(family, new_ids, new_count, keys))
+                if (!family_prefix_valid(family, new_ids, new_count, keys, key_count))
                     continue;
                 state_idx = beam_state_upsert(next_beams, &next_count, new_ids, new_count, keys);
                 if (state_idx < 0)
@@ -347,14 +351,14 @@ static int constrained_decode(const float *buf, int t_size, int c_size, int t_st
     }
 
     for (int i = 0; i < beam_count; i++) {
-        if (!family_full_valid(family, beams[i].token_ids, beams[i].token_count, keys))
+        if (!family_full_valid(family, beams[i].token_ids, beams[i].token_count, keys, key_count))
             continue;
         strncpy(text, beams[i].text, text_len - 1);
         text[text_len - 1] = '\0';
         return 0;
     }
     for (int i = 0; i < beam_count; i++) {
-        if (!family_prefix_valid(family, beams[i].token_ids, beams[i].token_count, keys))
+        if (!family_prefix_valid(family, beams[i].token_ids, beams[i].token_count, keys, key_count))
             continue;
         strncpy(text, beams[i].text, text_len - 1);
         text[text_len - 1] = '\0';
