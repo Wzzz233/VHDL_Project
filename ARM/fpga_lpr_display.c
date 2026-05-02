@@ -112,6 +112,7 @@ enum ocr_crop_mode {
     OCR_CROP_BOX_PAD,
     OCR_CROP_MATCH,
     OCR_CROP_OBB_WARP,
+    OCR_CROP_OBB_PIECEWISE,
 };
 
 enum detector_type {
@@ -358,6 +359,10 @@ static bool quad_is_convex8(const float q[8]);
 static void rect_box_to_quad(const struct det_box *box, float quad[8]);
 static void bbox_from_quad_float(const float q[8], int img_w, int img_h,
                                  int *x1, int *y1, int *x2, int *y2);
+static bool warp_quad_to_rect_piecewise_rgb888(const uint8_t *rgb, int img_w, int img_h,
+                                               const float quad_in[8], uint8_t *dst,
+                                               int dst_cap_w, int dst_cap_h,
+                                               int *out_w, int *out_h);
 static bool decode_refiner_output_layout(const rknn_tensor_attr *a, int *h, int *w, int *c, bool *is_nchw);
 
 struct app_ctx {
@@ -492,6 +497,9 @@ static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src
 static void dump_ocr_pair(struct app_ctx *ctx, uint64_t frame_id, const struct plate_det *pd,
                           const uint8_t *crop_rgb, int crop_w, int crop_h,
                           const uint8_t *ocr_in, int ocr_w, int ocr_h);
+static void dump_ocr_ab_variant(const struct app_ctx *ctx, uint64_t frame_id, int sample_id,
+                                const char *tag, const float quad[8],
+                                const uint8_t *crop_rgb, int crop_w, int crop_h);
 static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t ts_us,
                                const struct plate_det *pd);
 static const char *detector_type_str(int mode);
@@ -550,7 +558,7 @@ static void print_usage(const char *prog)
             "  --plate-max-det <n>     Plate max detections after NMS (default: 128)\n"
             "  --plate-class-id <n>    Optional class filter for plate model (-1: disabled)\n"
             "  --ocr-channel-order <m> OCR input order: rgb|bgr (default: rgb)\n"
-            "  --ocr-crop-mode <m>     OCR crop mode: fixed|box|tight|box-pad|match|obb_warp (default: obb_warp)\n"
+            "  --ocr-crop-mode <m>     OCR crop mode: fixed|box|tight|box-pad|match|obb_warp|obb_piecewise (default: obb_warp)\n"
             "  --ocr-resize-mode <m>   OCR resize: stretch|letterbox (default: stretch)\n"
             "  --ocr-resize-kernel <m> OCR resize kernel: nn|bilinear (default: nn)\n"
             "  --ocr-preproc <m>       OCR crop preproc: none|gray|bin (default: none)\n"
@@ -755,6 +763,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
                 opt->ocr_crop_mode = OCR_CROP_MATCH;
             else if (strcmp(optarg, "obb_warp") == 0 || strcmp(optarg, "obb-warp") == 0)
                 opt->ocr_crop_mode = OCR_CROP_OBB_WARP;
+            else if (strcmp(optarg, "obb_piecewise") == 0 || strcmp(optarg, "obb-piecewise") == 0)
+                opt->ocr_crop_mode = OCR_CROP_OBB_PIECEWISE;
             else
                 return -1;
             break;
@@ -3385,7 +3395,8 @@ static void compute_ocr_crop_box(const struct app_ctx *ctx, const struct det_box
                                  struct det_box *crop)
 {
     if (ctx->opt.ocr_crop_mode == OCR_CROP_MATCH ||
-        ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP) {
+        ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP ||
+        ctx->opt.ocr_crop_mode == OCR_CROP_OBB_PIECEWISE) {
         *crop = *src;
         clamp_box(crop, (int)ctx->frame_width, (int)ctx->frame_height);
         return;
@@ -3494,24 +3505,71 @@ static void copy_crop_rgb888(const uint8_t *rgb, int img_w, const struct det_box
 
 static void order_quad_points(const float in[8], float out[8])
 {
-    int i;
-    int tl = 0, tr = 0, br = 0, bl = 0;
-    float min_sum = 1e30f, max_sum = -1e30f;
-    float min_diff = 1e30f, max_diff = -1e30f;
+    struct quad_pt {
+        float x;
+        float y;
+        float a;
+    } pts[4];
+    int idx[4] = {0, 1, 2, 3};
+    int i, j;
+    float cx = 0.0f, cy = 0.0f;
+    float area;
+
+    if (!in || !out)
+        return;
+
     for (i = 0; i < 4; i++) {
-        float x = in[i * 2 + 0];
-        float y = in[i * 2 + 1];
-        float sum = x + y;
-        float diff = y - x;
-        if (sum < min_sum) { min_sum = sum; tl = i; }
-        if (sum > max_sum) { max_sum = sum; br = i; }
-        if (diff < min_diff) { min_diff = diff; tr = i; }
-        if (diff > max_diff) { max_diff = diff; bl = i; }
+        pts[i].x = in[i * 2 + 0];
+        pts[i].y = in[i * 2 + 1];
+        cx += pts[i].x;
+        cy += pts[i].y;
     }
-    out[0] = in[tl * 2 + 0]; out[1] = in[tl * 2 + 1];
-    out[2] = in[tr * 2 + 0]; out[3] = in[tr * 2 + 1];
-    out[4] = in[br * 2 + 0]; out[5] = in[br * 2 + 1];
-    out[6] = in[bl * 2 + 0]; out[7] = in[bl * 2 + 1];
+    cx *= 0.25f;
+    cy *= 0.25f;
+    for (i = 0; i < 4; i++)
+        pts[i].a = atan2f(pts[i].y - cy, pts[i].x - cx);
+
+    for (i = 0; i < 3; i++) {
+        for (j = i + 1; j < 4; j++) {
+            if (pts[idx[j]].a < pts[idx[i]].a) {
+                int t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+            }
+        }
+    }
+
+    {
+        int top_edge = 0;
+        float best_y = 0.5f * (pts[idx[0]].y + pts[idx[1]].y);
+        int pos;
+        for (i = 1; i < 4; i++) {
+            float edge_y = 0.5f * (pts[idx[i]].y + pts[idx[(i + 1) & 3]].y);
+            if (edge_y < best_y) {
+                best_y = edge_y;
+                top_edge = i;
+            }
+        }
+        if (pts[idx[top_edge]].x <= pts[idx[(top_edge + 1) & 3]].x) {
+            for (i = 0; i < 4; i++) {
+                pos = idx[(top_edge + i) & 3];
+                out[i * 2 + 0] = pts[pos].x;
+                out[i * 2 + 1] = pts[pos].y;
+            }
+        } else {
+            for (i = 0; i < 4; i++) {
+                pos = idx[(top_edge + 1 - i + 4) & 3];
+                out[i * 2 + 0] = pts[pos].x;
+                out[i * 2 + 1] = pts[pos].y;
+            }
+        }
+    }
+
+    area = quad_area8(out);
+    if (area < 4.0f || !quad_is_convex8(out)) {
+        /* Degenerate OBB/refiner output: preserve input order rather than risk
+         * sum/diff corner duplication or a folded homography.
+         */
+        memcpy(out, in, sizeof(float) * 8U);
+    }
 }
 
 static void bbox_from_quad(const float quad[8], int img_w, int img_h, struct det_box *box)
@@ -3702,10 +3760,10 @@ static bool warp_quad_to_rect_rgb888(const uint8_t *rgb, int img_w, int img_h, c
     if (dw <= 0 || dh <= 0)
         return false;
 
-    dst_quad[0] = 0.0f;         dst_quad[1] = 0.0f;
-    dst_quad[2] = (float)dw - 1.0f; dst_quad[3] = 0.0f;
-    dst_quad[4] = (float)dw - 1.0f; dst_quad[5] = (float)dh - 1.0f;
-    dst_quad[6] = 0.0f;         dst_quad[7] = (float)dh - 1.0f;
+    dst_quad[0] = 0.0f;              dst_quad[1] = 0.0f;
+    dst_quad[2] = (float)dw - 1.0f;  dst_quad[3] = 0.0f;
+    dst_quad[4] = (float)dw - 1.0f;  dst_quad[5] = (float)dh - 1.0f;
+    dst_quad[6] = 0.0f;              dst_quad[7] = (float)dh - 1.0f;
     if (!get_homography_4pt(quad, dst_quad, h))
         return false;
     if (!invert_homography(h, inv_h))
@@ -3735,6 +3793,67 @@ static bool warp_quad_to_rect_rgb888(const uint8_t *rgb, int img_w, int img_h, c
             q[2] = pix[2];
         }
     }
+    *out_w = dw;
+    *out_h = dh;
+    return true;
+}
+
+static bool warp_quad_to_rect_piecewise_rgb888(const uint8_t *rgb, int img_w, int img_h,
+                                               const float quad_in[8], uint8_t *dst,
+                                               int dst_cap_w, int dst_cap_h,
+                                               int *out_w, int *out_h)
+{
+    float quad[8];
+    float top_w;
+    float bottom_w;
+    float left_h;
+    float right_h;
+    int dw;
+    int dh;
+    int x;
+    int y;
+
+    if (!rgb || !quad_in || !dst || !out_w || !out_h)
+        return false;
+
+    order_quad_points(quad_in, quad);
+    top_w = hypotf(quad[2] - quad[0], quad[3] - quad[1]);
+    bottom_w = hypotf(quad[4] - quad[6], quad[5] - quad[7]);
+    left_h = hypotf(quad[6] - quad[0], quad[7] - quad[1]);
+    right_h = hypotf(quad[4] - quad[2], quad[5] - quad[3]);
+    dw = (int)(fmaxf(top_w, bottom_w) + 0.5f);
+    dh = (int)(fmaxf(left_h, right_h) + 0.5f);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    if (dw > dst_cap_w) dw = dst_cap_w;
+    if (dh > dst_cap_h) dh = dst_cap_h;
+    if (dw <= 0 || dh <= 0)
+        return false;
+
+    for (y = 0; y < dh; y++) {
+        float ty = (dh > 1) ? ((float)y / (float)(dh - 1)) : 0.0f;
+        float lx = quad[0] + (quad[6] - quad[0]) * ty;
+        float ly = quad[1] + (quad[7] - quad[1]) * ty;
+        float rx = quad[2] + (quad[4] - quad[2]) * ty;
+        float ry = quad[3] + (quad[5] - quad[3]) * ty;
+        for (x = 0; x < dw; x++) {
+            float tx = (dw > 1) ? ((float)x / (float)(dw - 1)) : 0.0f;
+            float sx = lx + (rx - lx) * tx;
+            float sy = ly + (ry - ly) * tx;
+            uint8_t pix[3];
+            uint8_t *q;
+            if (sx < 0.0f) sx = 0.0f;
+            if (sy < 0.0f) sy = 0.0f;
+            if (sx > (float)(img_w - 1)) sx = (float)(img_w - 1);
+            if (sy > (float)(img_h - 1)) sy = (float)(img_h - 1);
+            bilinear_sample_rgb888(rgb, img_w, img_h, sx, sy, pix);
+            q = dst + ((size_t)y * (size_t)dw + (size_t)x) * 3U;
+            q[0] = pix[0];
+            q[1] = pix[1];
+            q[2] = pix[2];
+        }
+    }
+
     *out_w = dw;
     *out_h = dh;
     return true;
@@ -3987,6 +4106,33 @@ static bool run_quad_refiner(const struct app_ctx *ctx,
     scale_x = (hm_w > 1 && ref_w > 1) ? (float)(ref_w - 1) / (float)(hm_w - 1) : 0.0f;
     scale_y = (hm_h > 1 && ref_h > 1) ? (float)(ref_h - 1) / (float)(hm_h - 1) : 0.0f;
 
+    bool has_offset = (m->io_num.n_output >= 3);
+    float *offsets_buf = NULL;
+    int off_h = 0, off_w = 0, off_c = 0;
+    bool off_is_nchw = false;
+    if (has_offset) {
+        if (decode_refiner_output_layout(&m->output_attrs[2], &off_h, &off_w, &off_c, &off_is_nchw) && off_c == 8) {
+            offsets_buf = (float *)malloc((size_t)off_h * (size_t)off_w * 8U * sizeof(float));
+            if (offsets_buf) {
+                const float *src = (const float *)outs[2].buf;
+                if (off_is_nchw) {
+                    memcpy(offsets_buf, src, (size_t)off_h * (size_t)off_w * 8U * sizeof(float));
+                } else {
+                    for (int y = 0; y < off_h; y++) {
+                        for (int x = 0; x < off_w; x++) {
+                            for (int ch = 0; ch < 8; ch++) {
+                                offsets_buf[((size_t)ch * off_h + (size_t)y) * off_w + (size_t)x] =
+                                    src[((size_t)y * off_w + (size_t)x) * 8U + (size_t)ch];
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            has_offset = false;
+        }
+    }
+
     for (c = 0; c < 4; c++) {
         float *ch = heatmaps + (size_t)c * hm_h * hm_w;
         float best = -1e30f;
@@ -4030,6 +4176,12 @@ static bool run_quad_refiner(const struct app_ctx *ctx,
             } else {
                 rx = (float)bx;
                 ry = (float)by;
+            }
+            /* Apply offset refinement if available */
+            if (offsets_buf && bx < off_w && by < off_h) {
+                float *off_ch = offsets_buf + (size_t)c * 2 * off_h * off_w;
+                rx += off_ch[(size_t)by * off_w + (size_t)bx];  /* dx */
+                ry += off_ch[(size_t)(c * 2 + 1) * off_h * off_w + (size_t)by * off_w + (size_t)bx];  /* dy */
             }
         }
         pred_ordered[c * 2 + 0] = (rx * scale_x) * ((float)(patch_w - 1) / (float)(ref_w - 1 + 1e-6f)) + (float)patch_x1;
@@ -4125,6 +4277,8 @@ out_release:
     if (m->ctx)
         rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
 out:
+    if (offsets_buf)
+        free(offsets_buf);
     free(input_buf);
     free(heatmaps);
     if (ret == 0) {
@@ -4149,32 +4303,75 @@ static bool prepare_plate_crop_rgb888(const struct app_ctx *ctx,
                                       const struct det_box *plate_box,
                                       uint8_t *crop_buf, int crop_cap_w, int crop_cap_h,
                                       struct det_box *crop_box, int *crop_w, int *crop_h,
-                                      float *occ_ratio, bool *used_obb_warp)
+                                      float *occ_ratio, bool *used_obb_warp,
+                                      uint64_t frame_id)
 {
     float ordered[8];
+    float coarse_ordered[8];
     float refined_quad[8];
+    bool have_refined = false;
     if (!ctx || !rgb || !plate_box || !crop_buf || !crop_box || !crop_w || !crop_h || !occ_ratio || !used_obb_warp)
         return false;
     *used_obb_warp = false;
 
-    if (ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP) {
+    if (ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP ||
+        ctx->opt.ocr_crop_mode == OCR_CROP_OBB_PIECEWISE) {
+        bool use_piecewise = (ctx->opt.ocr_crop_mode == OCR_CROP_OBB_PIECEWISE);
+        bool warp_ok;
         if (plate_box->has_obb)
             order_quad_points(plate_box->quad, ordered);
         else
             rect_box_to_quad(plate_box, ordered);
+        memcpy(coarse_ordered, ordered, sizeof(coarse_ordered));
         /* Run quad refiner before OBB warp if model is loaded */
         if (ctx->quad_refiner_model.ctx) {
             if (run_quad_refiner(ctx, rgb, img_w, img_h, ordered, refined_quad)) {
                 /* Gate accepted: replace ordered quad with refined quad */
                 memcpy(ordered, refined_quad, sizeof(float) * 8);
+                have_refined = true;
             }
         }
-        if (warp_quad_to_rect_rgb888(rgb, img_w, img_h, ordered,
+        warp_ok = use_piecewise ?
+            warp_quad_to_rect_piecewise_rgb888(rgb, img_w, img_h, ordered,
+                                               crop_buf, crop_cap_w, crop_cap_h,
+                                               crop_w, crop_h) :
+            warp_quad_to_rect_rgb888(rgb, img_w, img_h, ordered,
                                      crop_buf, crop_cap_w, crop_cap_h,
-                                     crop_w, crop_h)) {
+                                     crop_w, crop_h);
+        if (warp_ok) {
             bbox_from_quad(ordered, img_w, img_h, crop_box);
             *occ_ratio = estimate_ocr_occ_ratio(ctx, *crop_w, *crop_h);
             *used_obb_warp = true;
+            if (ctx->ocr_crop_index_fp && ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
+                uint8_t *coarse_crop = malloc((size_t)crop_cap_w * (size_t)crop_cap_h * 3U);
+                int coarse_w = 0, coarse_h = 0;
+                int sample_id = ctx->ocr_crop_dumped;
+                if (coarse_crop) {
+                    bool coarse_ok = use_piecewise ?
+                        warp_quad_to_rect_piecewise_rgb888(rgb, img_w, img_h, coarse_ordered,
+                                                           coarse_crop, crop_cap_w, crop_cap_h,
+                                                           &coarse_w, &coarse_h) :
+                        warp_quad_to_rect_rgb888(rgb, img_w, img_h, coarse_ordered,
+                                                 coarse_crop, crop_cap_w, crop_cap_h,
+                                                 &coarse_w, &coarse_h);
+                    if (coarse_ok) {
+                        dump_ocr_ab_variant(ctx, frame_id, sample_id, "coarse", coarse_ordered,
+                                            coarse_crop, coarse_w, coarse_h);
+                    }
+                    free(coarse_crop);
+                }
+                if (have_refined) {
+                    dump_ocr_ab_variant(ctx, frame_id, sample_id, "refined", ordered,
+                                        crop_buf, *crop_w, *crop_h);
+                    fprintf(stderr,
+                            "[ocr-ab] frame=%" PRIu64 " sample=%d mode=%s dump=coarse/refined refiner=accepted\n",
+                            frame_id, sample_id, use_piecewise ? "piecewise" : "homography");
+                } else {
+                    fprintf(stderr,
+                            "[ocr-ab] frame=%" PRIu64 " sample=%d mode=%s dump=coarse refiner=not_accepted\n",
+                            frame_id, sample_id, use_piecewise ? "piecewise" : "homography");
+                }
+            }
             return true;
         }
     }
@@ -5344,6 +5541,7 @@ static const char *ocr_crop_mode_str(int mode)
     if (mode == OCR_CROP_BOX_PAD) return "box-pad";
     if (mode == OCR_CROP_MATCH) return "match";
     if (mode == OCR_CROP_OBB_WARP) return "obb_warp";
+    if (mode == OCR_CROP_OBB_PIECEWISE) return "obb_piecewise";
     return "fixed";
 }
 
@@ -5828,7 +6026,7 @@ static int run_offline_once(struct app_ctx *ctx)
     pd.color = classify_plate_color_rgb(rgb, w, h, &pd.box);
     if (!prepare_plate_crop_rgb888(ctx, rgb, w, h, &pd.box,
                                    plate_crop, w, h, &pd.crop_box, &crop_w, &crop_h,
-                                   &occ_ratio, &used_obb_warp))
+                                   &occ_ratio, &used_obb_warp, 0))
         goto out;
     if (ctx->opt.ocr_min_occ_ratio > 0.0f &&
         occ_ratio < ctx->opt.ocr_min_occ_ratio &&
@@ -5985,6 +6183,41 @@ static void dump_ocr_pair(struct app_ctx *ctx, uint64_t frame_id, const struct p
             safe_text, pd->ocr_conf, pd->ocr_blank_top1, pd->ocr_in_occ_ratio, crop_path, in_path);
     fflush(ctx->ocr_crop_index_fp);
     ctx->ocr_crop_dumped++;
+}
+
+static void dump_ocr_ab_variant(const struct app_ctx *ctx, uint64_t frame_id, int sample_id,
+                                const char *tag, const float quad[8],
+                                const uint8_t *crop_rgb, int crop_w, int crop_h)
+{
+    char crop_path[640];
+    char meta_path[640];
+    FILE *fp;
+    const char *dir;
+    int i;
+
+    if (!ctx || !ctx->opt.ocr_crop_dump_dir || ctx->opt.ocr_crop_dump_dir[0] == '\0' ||
+        !tag || !quad || !crop_rgb || crop_w <= 0 || crop_h <= 0)
+        return;
+
+    dir = ctx->opt.ocr_crop_dump_dir;
+    snprintf(crop_path, sizeof(crop_path), "%s/%s_%04d_f%06" PRIu64 ".ppm",
+             dir, tag, sample_id, frame_id);
+    snprintf(meta_path, sizeof(meta_path), "%s/%s_%04d_f%06" PRIu64 ".quad.txt",
+             dir, tag, sample_id, frame_id);
+
+    if (write_ppm_rgb888(crop_path, crop_rgb, crop_w, crop_h) < 0)
+        return;
+
+    fp = fopen(meta_path, "w");
+    if (!fp)
+        return;
+    fprintf(fp, "tag=%s\nframe_id=%" PRIu64 "\nsample_id=%d\ncrop_w=%d\ncrop_h=%d\nquad=",
+            tag, frame_id, sample_id, crop_w, crop_h);
+    for (i = 0; i < 4; i++) {
+        fprintf(fp, "%s%.3f,%.3f", (i == 0) ? "" : ";", quad[i * 2 + 0], quad[i * 2 + 1]);
+    }
+    fprintf(fp, "\n");
+    fclose(fp);
 }
 
 static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t ts_us,
@@ -6294,7 +6527,7 @@ static void *infer_thread_main(void *arg)
             pd.color = classify_plate_color_rgb(rgb_full, (int)ctx->frame_width, (int)ctx->frame_height, &pd.box);
             if (!prepare_plate_crop_rgb888(ctx, rgb_full, (int)ctx->frame_width, (int)ctx->frame_height,
                                            &pd.box, plate_crop, (int)ctx->frame_width, (int)ctx->frame_height,
-                                           &pd.crop_box, &crop_w, &crop_h, &occ_ratio, &used_obb_warp))
+                                           &pd.crop_box, &crop_w, &crop_h, &occ_ratio, &used_obb_warp, seq))
                 continue;
             if (ctx->opt.ocr_min_occ_ratio > 0.0f &&
                 occ_ratio < ctx->opt.ocr_min_occ_ratio &&
@@ -6615,9 +6848,10 @@ int main(int argc, char **argv)
         goto out;
     }
     if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
-        ctx.opt.ocr_crop_mode != OCR_CROP_OBB_WARP) {
+        ctx.opt.ocr_crop_mode != OCR_CROP_OBB_WARP &&
+        ctx.opt.ocr_crop_mode != OCR_CROP_OBB_PIECEWISE) {
         fprintf(stderr,
-                "[cfg] detector=yolov8_obb_rknn requires ocr-crop-mode=obb_warp, force switching\n");
+                "[cfg] detector=yolov8_obb_rknn requires ocr-crop-mode=obb_warp|obb_piecewise, force switching\n");
         ctx.opt.ocr_crop_mode = OCR_CROP_OBB_WARP;
     }
     if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
