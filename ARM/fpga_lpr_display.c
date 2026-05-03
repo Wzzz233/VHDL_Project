@@ -5317,7 +5317,6 @@ static int decode_yolov8_pose_outputs(const struct yolo_model *m, const rknn_out
                                       float conf_thr, int src_w, int src_h,
                                       struct det_box *out, int *out_count)
 {
-    static struct obb_anchor_cache anchor_cache = {0};
     struct tensor_cn_view pose_view;
     struct det_box cand[MAX_DETS * 4];
     const int pre_nms_cap = MAX_DETS * 4;
@@ -5329,35 +5328,41 @@ static int decode_yolov8_pose_outputs(const struct yolo_model *m, const rknn_out
         return -1;
     if (m->class_filter > 0)
         return 0;
-    if (!build_obb_anchor_cache(&anchor_cache))
-        return -1;
     if (!infer_pose_output_view(m, outs, &pose_view))
         return -1;
 
     for (i = 0; i < OBB_POINT_COUNT; i++) {
-        float anchor_x = anchor_cache.x[i];
-        float anchor_y = anchor_cache.y[i];
-        float stride = anchor_cache.stride[i];
-        float l = tensor_cn_read(&pose_view, 0, i);
-        float t = tensor_cn_read(&pose_view, 1, i);
-        float r = tensor_cn_read(&pose_view, 2, i);
-        float b = tensor_cn_read(&pose_view, 3, i);
-        float score = sigmoidf_local(tensor_cn_read(&pose_view, 4, i));
+        float cx = tensor_cn_read(&pose_view, 0, i);
+        float cy = tensor_cn_read(&pose_view, 1, i);
+        float bw = tensor_cn_read(&pose_view, 2, i);
+        float bh = tensor_cn_read(&pose_view, 3, i);
+        float score = tensor_cn_read(&pose_view, 4, i);
         float ordered[8];
         struct det_box det;
         int k;
         bool valid = true;
 
-        if (!(l >= 0.0f && t >= 0.0f && r >= 0.0f && b >= 0.0f))
+        /*
+         * ONNX export already bakes in Ultralytics pose decoding:
+         *   output[0:4]  = xywh in detector-input pixels
+         *   output[4]    = sigmoid(cls)
+         *   output[5:17] = decoded keypoints in detector-input pixels, flattened as
+         *                  [x0,y0,v0,x1,y1,v1,x2,y2,v2,x3,y3,v3]
+         *
+         * Do not run dist2bbox or anchor-relative keypoint decoding again here.
+         */
+        if (!isfinite(cx) || !isfinite(cy) || !isfinite(bw) || !isfinite(bh) || !isfinite(score))
             continue;
+        if (score < 0.0f || score > 1.0f)
+            score = sigmoidf_local(score);
         if (score < conf_thr)
             continue;
 
         memset(&det, 0, sizeof(det));
-        det.cx = (anchor_x + 0.5f * (r - l)) * stride;
-        det.cy = (anchor_y + 0.5f * (b - t)) * stride;
-        det.w = (l + r) * stride;
-        det.h = (t + b) * stride;
+        det.cx = cx;
+        det.cy = cy;
+        det.w = bw;
+        det.h = bh;
         det.conf = score;
         det.cls = 0;
         det.has_obb = 1;
@@ -5372,8 +5377,8 @@ static int decode_yolov8_pose_outputs(const struct yolo_model *m, const rknn_out
                 valid = false;
                 break;
             }
-            det.quad[k * 2 + 0] = (anchor_x + kx) * stride;
-            det.quad[k * 2 + 1] = (anchor_y + ky) * stride;
+            det.quad[k * 2 + 0] = kx;
+            det.quad[k * 2 + 1] = ky;
         }
         if (!valid)
             continue;
@@ -7041,6 +7046,13 @@ int main(int argc, char **argv)
                 "[cfg] detector=%s keeps OCR contract, force ocr-resize-kernel=nn\n",
                 detector_type_str(ctx.opt.plate_detector_type));
         ctx.opt.ocr_resize_kernel = OCR_KERNEL_NN;
+    }
+    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_POSE_RKNN &&
+        ctx.opt.quad_refiner_model_path) {
+        fprintf(stderr,
+                "[cfg] detector=%s uses direct keypoints, disable quad-refiner\n",
+                detector_type_str(ctx.opt.plate_detector_type));
+        ctx.opt.quad_refiner_model_path = NULL;
     }
     offline_mode = (ctx.opt.offline_image_path && ctx.opt.offline_image_path[0] != '\0');
 
