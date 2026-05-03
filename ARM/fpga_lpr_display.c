@@ -55,6 +55,9 @@
 #define OCR_CROP_WIDTH 150
 #define OCR_CROP_HEIGHT 50
 #define OBB_POINT_COUNT 8400
+#define POSE_KPT_COUNT 4
+#define POSE_KPT_DIMS 3
+#define POSE_OUTPUT_CHANNELS (4 + 1 + POSE_KPT_COUNT * POSE_KPT_DIMS)
 #define OCR_TRACK_MAX 24
 #define OCR_TRACK_HIST 8
 #define MAX_UTF8_TOKEN_BYTES 8
@@ -118,6 +121,7 @@ enum ocr_crop_mode {
 enum detector_type {
     DETECTOR_YOLOV5 = 0,
     DETECTOR_YOLOV8_OBB_RKNN,
+    DETECTOR_YOLOV8_POSE_RKNN,
 };
 
 enum ocr_resize_mode {
@@ -553,7 +557,7 @@ static void print_usage(const char *prog)
             "  --stopline-ratio <v>    Stopline Y ratio [0,1] (default: 0.55)\n"
             "  --det-resize-mode <m>   Detect resize: stretch|letterbox (default: letterbox)\n"
             "  --plate-refine <0|1>    Enable local high-res plate refine (default: 1)\n"
-            "  --plate-detector-type <m> Plate detector: yolov5|yolov8_obb_rknn (default: yolov5)\n"
+            "  --plate-detector-type <m> Plate detector: yolov5|yolov8_obb_rknn|yolov8_pose_rknn (default: yolov5)\n"
             "  --plate-nms-iou <v>     Plate NMS IoU threshold (default: 0.45)\n"
             "  --plate-max-det <n>     Plate max detections after NMS (default: 128)\n"
             "  --plate-class-id <n>    Optional class filter for plate model (-1: disabled)\n"
@@ -736,6 +740,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
                 opt->plate_detector_type = DETECTOR_YOLOV5;
             else if (strcmp(optarg, "yolov8_obb_rknn") == 0)
                 opt->plate_detector_type = DETECTOR_YOLOV8_OBB_RKNN;
+            else if (strcmp(optarg, "yolov8_pose_rknn") == 0)
+                opt->plate_detector_type = DETECTOR_YOLOV8_POSE_RKNN;
             else
                 return -1;
             break;
@@ -2200,16 +2206,21 @@ static int det_conf_cmp(const void *pa, const void *pb)
 
 static void nms_inplace(struct det_box *dets, int *count, float iou_thr)
 {
-    bool removed[MAX_DETS];
+    bool removed[MAX_DETS * 4];
+    int n = *count;
     int i;
     int j;
     int out = 0;
+    if (n < 0)
+        n = 0;
+    if (n > (int)(sizeof(removed) / sizeof(removed[0])))
+        n = (int)(sizeof(removed) / sizeof(removed[0]));
     memset(removed, 0, sizeof(removed));
-    qsort(dets, (size_t)(*count), sizeof(dets[0]), det_conf_cmp);
-    for (i = 0; i < *count; i++) {
+    qsort(dets, (size_t)n, sizeof(dets[0]), det_conf_cmp);
+    for (i = 0; i < n; i++) {
         if (removed[i]) continue;
         dets[out++] = dets[i];
-        for (j = i + 1; j < *count; j++) {
+        for (j = i + 1; j < n; j++) {
             if (removed[j] || dets[i].cls != dets[j].cls)
                 continue;
             if (box_iou(&dets[i], &dets[j]) > iou_thr)
@@ -5038,6 +5049,12 @@ struct obb_anchor_cache {
     float stride[OBB_POINT_COUNT];
 };
 
+static bool detector_type_uses_quad(int mode)
+{
+    return mode == DETECTOR_YOLOV8_OBB_RKNN ||
+           mode == DETECTOR_YOLOV8_POSE_RKNN;
+}
+
 static bool build_obb_anchor_cache(struct obb_anchor_cache *cache)
 {
     static const int strides[3] = {8, 16, 32};
@@ -5166,6 +5183,26 @@ static bool infer_obb_output_views(const struct yolo_model *m, const rknn_output
            angle_view->n == OBB_POINT_COUNT;
 }
 
+static bool infer_pose_output_view(const struct yolo_model *m, const rknn_output *outs,
+                                   struct tensor_cn_view *pose_view)
+{
+    uint32_t i;
+
+    if (!m || !outs || !pose_view)
+        return false;
+
+    for (i = 0; i < m->io_num.n_output; i++) {
+        struct tensor_cn_view tv;
+        if (!build_tensor_cn_view(&m->output_attrs[i], (const float *)outs[i].buf, &tv))
+            continue;
+        if (tv.n == OBB_POINT_COUNT && tv.c == POSE_OUTPUT_CHANNELS) {
+            *pose_view = tv;
+            return true;
+        }
+    }
+    return false;
+}
+
 static int decode_yolov8_obb_outputs(const struct yolo_model *m, const rknn_output *outs,
                                      float conf_thr, int src_w, int src_h,
                                      struct det_box *out, int *out_count)
@@ -5276,6 +5313,105 @@ static int decode_yolov8_obb_outputs(const struct yolo_model *m, const rknn_outp
     return 0;
 }
 
+static int decode_yolov8_pose_outputs(const struct yolo_model *m, const rknn_output *outs,
+                                      float conf_thr, int src_w, int src_h,
+                                      struct det_box *out, int *out_count)
+{
+    static struct obb_anchor_cache anchor_cache = {0};
+    struct tensor_cn_view pose_view;
+    struct det_box cand[MAX_DETS * 4];
+    const int pre_nms_cap = MAX_DETS * 4;
+    int count = 0;
+    int i;
+
+    *out_count = 0;
+    if (m->in_w != ALGO_STREAM_SIZE || m->in_h != ALGO_STREAM_SIZE)
+        return -1;
+    if (m->class_filter > 0)
+        return 0;
+    if (!build_obb_anchor_cache(&anchor_cache))
+        return -1;
+    if (!infer_pose_output_view(m, outs, &pose_view))
+        return -1;
+
+    for (i = 0; i < OBB_POINT_COUNT; i++) {
+        float anchor_x = anchor_cache.x[i];
+        float anchor_y = anchor_cache.y[i];
+        float stride = anchor_cache.stride[i];
+        float l = tensor_cn_read(&pose_view, 0, i);
+        float t = tensor_cn_read(&pose_view, 1, i);
+        float r = tensor_cn_read(&pose_view, 2, i);
+        float b = tensor_cn_read(&pose_view, 3, i);
+        float score = sigmoidf_local(tensor_cn_read(&pose_view, 4, i));
+        float ordered[8];
+        struct det_box det;
+        int k;
+        bool valid = true;
+
+        if (!(l >= 0.0f && t >= 0.0f && r >= 0.0f && b >= 0.0f))
+            continue;
+        if (score < conf_thr)
+            continue;
+
+        memset(&det, 0, sizeof(det));
+        det.cx = (anchor_x + 0.5f * (r - l)) * stride;
+        det.cy = (anchor_y + 0.5f * (b - t)) * stride;
+        det.w = (l + r) * stride;
+        det.h = (t + b) * stride;
+        det.conf = score;
+        det.cls = 0;
+        det.has_obb = 1;
+        if (det.w < 2.0f || det.h < 2.0f)
+            continue;
+
+        for (k = 0; k < POSE_KPT_COUNT; k++) {
+            float kx = tensor_cn_read(&pose_view, 5 + k * POSE_KPT_DIMS + 0, i);
+            float ky = tensor_cn_read(&pose_view, 5 + k * POSE_KPT_DIMS + 1, i);
+            float kv = tensor_cn_read(&pose_view, 5 + k * POSE_KPT_DIMS + 2, i);
+            if (!isfinite(kx) || !isfinite(ky) || !isfinite(kv)) {
+                valid = false;
+                break;
+            }
+            det.quad[k * 2 + 0] = (anchor_x + kx) * stride;
+            det.quad[k * 2 + 1] = (anchor_y + ky) * stride;
+        }
+        if (!valid)
+            continue;
+
+        order_quad_points(det.quad, ordered);
+        memcpy(det.quad, ordered, sizeof(ordered));
+        if (quad_area8(det.quad) < 4.0f || !quad_is_convex8(det.quad))
+            continue;
+
+        bbox_from_quad_float(det.quad, src_w, src_h, &det.x1, &det.y1, &det.x2, &det.y2);
+        clamp_box(&det, src_w, src_h);
+
+        if (count < pre_nms_cap) {
+            cand[count++] = det;
+        } else {
+            int min_i = 0;
+            float min_conf = cand[0].conf;
+            for (k = 1; k < pre_nms_cap; k++) {
+                if (cand[k].conf < min_conf) {
+                    min_conf = cand[k].conf;
+                    min_i = k;
+                }
+            }
+            if (det.conf > min_conf)
+                cand[min_i] = det;
+        }
+    }
+
+    nms_inplace(cand, &count, m->nms_iou_thr);
+    if (m->max_det > 0 && count > m->max_det)
+        count = m->max_det;
+    if (count > MAX_DETS)
+        count = MAX_DETS;
+    memcpy(out, cand, (size_t)count * sizeof(out[0]));
+    *out_count = count;
+    return 0;
+}
+
 static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src_w, int src_h,
                             float conf_thr, struct det_box *out, int *out_count,
                             struct detect_decode_diag *diag)
@@ -5312,6 +5448,22 @@ static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src
 
     if (m->detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
         ret = decode_yolov8_obb_outputs(m, outs, conf_thr, src_w, src_h, out, out_count);
+        if (ret < 0) {
+            *out_count = 0;
+            rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+            return ret;
+        }
+        if (diag) {
+            diag->rows_raw = 0;
+            diag->heads_raw = *out_count;
+            diag->rows_keep = 0;
+            diag->heads_keep = *out_count;
+            diag->mode = (*out_count > 0) ? PLATE_DECODE_OBB : PLATE_DECODE_NONE;
+        }
+        rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+        return 0;
+    } else if (m->detector_type == DETECTOR_YOLOV8_POSE_RKNN) {
+        ret = decode_yolov8_pose_outputs(m, outs, conf_thr, src_w, src_h, out, out_count);
         if (ret < 0) {
             *out_count = 0;
             rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
@@ -5526,6 +5678,8 @@ static const char *detector_type_str(int mode)
 {
     if (mode == DETECTOR_YOLOV8_OBB_RKNN)
         return "yolov8_obb_rknn";
+    if (mode == DETECTOR_YOLOV8_POSE_RKNN)
+        return "yolov8_pose_rknn";
     return "yolov5";
 }
 
@@ -5663,6 +5817,20 @@ static bool plate_box_pass_rules_obb(const struct det_box *b, int frame_w, int f
     return true;
 }
 
+static bool plate_box_pass_rules_for_detector(int detector_type, const struct det_box *b,
+                                              int frame_w, int frame_h)
+{
+    if (plate_box_pass_rules(b, frame_w, frame_h))
+        return true;
+    if (detector_type_uses_quad(detector_type)) {
+        if (plate_box_pass_rules_obb(b, frame_w, frame_h))
+            return true;
+        if (plate_box_pass_rules_relaxed(b, frame_w, frame_h))
+            return true;
+    }
+    return false;
+}
+
 static bool has_iou_match(const struct det_box *cur, const struct det_box *hist, int hist_count, float iou_thr)
 {
     int i;
@@ -5682,7 +5850,7 @@ static void temporal_confirm_and_update(struct app_ctx *ctx,
     float iou_thr_hist2 = 0.30f;
     float direct_keep_thr = 0.55f;
     *confirmed_count = 0;
-    if (ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
+    if (detector_type_uses_quad(ctx->opt.plate_detector_type)) {
         iou_thr_hist1 = 0.30f;
         iou_thr_hist2 = 0.22f;
         direct_keep_thr = fmaxf(0.55f, ctx->opt.min_plate_conf + 0.08f);
@@ -5696,7 +5864,7 @@ static void temporal_confirm_and_update(struct app_ctx *ctx,
         }
     }
     if (*confirmed_count == 0 &&
-        ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
+        detector_type_uses_quad(ctx->opt.plate_detector_type)) {
         for (i = 0; i < filtered_count && *confirmed_count < MAX_DETS; i++) {
             if (filtered[i].conf >= direct_keep_thr)
                 confirmed[(*confirmed_count)++] = filtered[i];
@@ -5971,7 +6139,7 @@ static int run_offline_once(struct app_ctx *ctx)
             goto out;
         }
         for (i = 0; i < det_count && valid_count < MAX_DETS; i++) {
-            if (plate_box_pass_rules(&dets[i], w, h))
+            if (plate_box_pass_rules_for_detector(ctx->opt.plate_detector_type, &dets[i], w, h))
                 valid[valid_count++] = dets[i];
         }
         if (valid_count <= 0) {
@@ -5994,8 +6162,7 @@ static int run_offline_once(struct app_ctx *ctx)
                 }
                 ctx->opt.det_resize_mode = saved_mode;
                 for (i = 0; i < det_count && valid_count < MAX_DETS; i++) {
-                    if (plate_box_pass_rules(&dets[i], w, h) ||
-                        plate_box_pass_rules_relaxed(&dets[i], w, h))
+                    if (plate_box_pass_rules_for_detector(ctx->opt.plate_detector_type, &dets[i], w, h))
                         valid[valid_count++] = dets[i];
                 }
                 if (valid_count > 0)
@@ -6014,7 +6181,7 @@ static int run_offline_once(struct app_ctx *ctx)
         if (ctx->opt.plate_refine) {
             struct det_box refined = box;
             if (refine_plate_box_local(ctx, det_src_rgb, w, h, &box, algo_rgb, plate_in, &refined) &&
-                plate_box_pass_rules(&refined, w, h))
+                plate_box_pass_rules_for_detector(ctx->opt.plate_detector_type, &refined, w, h))
                 box = refined;
         }
     } else {
@@ -6401,7 +6568,7 @@ static void *infer_thread_main(void *arg)
                                   plate_thr, algo_rgb, plate_in, raw_plates, &raw_plate_count, &plate_diag) < 0)
                 raw_plate_count = 0;
             if (raw_plate_count <= 0 &&
-                ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+                detector_type_uses_quad(ctx->opt.plate_detector_type) &&
                 ctx->opt.det_resize_mode == DET_RESIZE_LETTERBOX) {
                 int saved_mode = ctx->opt.det_resize_mode;
                 fprintf(stderr,
@@ -6431,17 +6598,16 @@ static void *infer_thread_main(void *arg)
                                               tracked_persons, &tracked_person_count);
 
         for (i = 0; i < raw_plate_count && filtered_plate_count < MAX_DETS; i++) {
-            bool keep = plate_box_pass_rules(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height);
-            if (!keep && ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
-                keep = plate_box_pass_rules_obb(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height) ||
-                       plate_box_pass_rules_relaxed(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height);
-            }
+            bool keep = plate_box_pass_rules_for_detector(ctx->opt.plate_detector_type,
+                                                          &raw_plates[i],
+                                                          (int)ctx->frame_width,
+                                                          (int)ctx->frame_height);
             if (keep)
                 filtered_plates[filtered_plate_count++] = raw_plates[i];
         }
         if (filtered_plate_count == 0 &&
             raw_plate_count > 0 &&
-            ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
+            detector_type_uses_quad(ctx->opt.plate_detector_type)) {
             int best_i = 0;
             float best_conf = raw_plates[0].conf;
             for (i = 1; i < raw_plate_count; i++) {
@@ -6847,29 +7013,33 @@ int main(int argc, char **argv)
         print_usage(argv[0]);
         goto out;
     }
-    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+    if (detector_type_uses_quad(ctx.opt.plate_detector_type) &&
         ctx.opt.ocr_crop_mode != OCR_CROP_OBB_WARP &&
         ctx.opt.ocr_crop_mode != OCR_CROP_OBB_PIECEWISE) {
         fprintf(stderr,
-                "[cfg] detector=yolov8_obb_rknn requires ocr-crop-mode=obb_warp|obb_piecewise, force switching\n");
+                "[cfg] detector=%s requires ocr-crop-mode=obb_warp|obb_piecewise, force switching\n",
+                detector_type_str(ctx.opt.plate_detector_type));
         ctx.opt.ocr_crop_mode = OCR_CROP_OBB_WARP;
     }
-    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+    if (detector_type_uses_quad(ctx.opt.plate_detector_type) &&
         ctx.opt.ocr_channel_order != OCR_CH_BGR) {
         fprintf(stderr,
-                "[cfg] detector=yolov8_obb_rknn keeps OCR contract, force ocr-channel-order=bgr\n");
+                "[cfg] detector=%s keeps OCR contract, force ocr-channel-order=bgr\n",
+                detector_type_str(ctx.opt.plate_detector_type));
         ctx.opt.ocr_channel_order = OCR_CH_BGR;
     }
-    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+    if (detector_type_uses_quad(ctx.opt.plate_detector_type) &&
         ctx.opt.ocr_resize_mode != OCR_RESIZE_LETTERBOX) {
         fprintf(stderr,
-                "[cfg] detector=yolov8_obb_rknn keeps OCR contract, force ocr-resize-mode=letterbox\n");
+                "[cfg] detector=%s keeps OCR contract, force ocr-resize-mode=letterbox\n",
+                detector_type_str(ctx.opt.plate_detector_type));
         ctx.opt.ocr_resize_mode = OCR_RESIZE_LETTERBOX;
     }
-    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+    if (detector_type_uses_quad(ctx.opt.plate_detector_type) &&
         ctx.opt.ocr_resize_kernel != OCR_KERNEL_NN) {
         fprintf(stderr,
-                "[cfg] detector=yolov8_obb_rknn keeps OCR contract, force ocr-resize-kernel=nn\n");
+                "[cfg] detector=%s keeps OCR contract, force ocr-resize-kernel=nn\n",
+                detector_type_str(ctx.opt.plate_detector_type));
         ctx.opt.ocr_resize_kernel = OCR_KERNEL_NN;
     }
     offline_mode = (ctx.opt.offline_image_path && ctx.opt.offline_image_path[0] != '\0');

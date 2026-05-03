@@ -89,7 +89,7 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --stopline-ratio <v>       Stopline Y ratio [0,1] (default: ${STOPLINE_RATIO})
   --det-resize-mode <m>      Detect resize: stretch|letterbox (default: ${DET_RESIZE_MODE})
   --plate-refine <0|1>       Enable local high-res plate refine (default: ${PLATE_REFINE})
-  --plate-detector-type <m>  Plate detector: yolov5|yolov8_obb_rknn (default: ${PLATE_DETECTOR_TYPE})
+  --plate-detector-type <m>  Plate detector: yolov5|yolov8_obb_rknn|yolov8_pose_rknn (default: ${PLATE_DETECTOR_TYPE})
   --plate-nms-iou <v>        Plate NMS IoU threshold (default: ${PLATE_NMS_IOU})
   --plate-max-det <n>        Plate max detections after NMS (default: ${PLATE_MAX_DET})
   --plate-class-id <n>       Optional class filter for plate model (-1 disables, default: ${PLATE_CLASS_ID})
