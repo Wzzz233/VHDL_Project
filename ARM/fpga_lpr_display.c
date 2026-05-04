@@ -151,6 +151,8 @@ struct options {
     const char *veh_model_path;
     const char *plate_model_path;
     const char *ocr_model_path;
+    const char *ocr_blue_model_path;
+    const char *ocr_green_model_path;
     const char *ocr_keys_path;
     const char *quad_refiner_model_path;
     const char *labels_path;
@@ -420,6 +422,7 @@ struct app_ctx {
     struct yolo_model veh_model;
     struct yolo_model plate_model;
     struct ocr_model ocr_model;
+    struct ocr_model ocr_green_model;
     struct quad_refiner_model quad_refiner_model;
     char ocr_keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
     int ocr_key_count;
@@ -479,6 +482,7 @@ static void ocr_preprocess_rgb888(uint8_t *rgb, int w, int h, int mode);
 static float box_iou(const struct det_box *a, const struct det_box *b);
 static float laplacian_variance_rgb888(const uint8_t *rgb, int w, int h);
 static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
+                                         const struct ocr_model *m,
                                          const uint8_t *crop_rgb, int crop_w, int crop_h,
                                          float *occ_ratio_out);
 static bool append_utf8_token(char *dst, size_t dst_len, const char *token);
@@ -527,7 +531,9 @@ static void print_usage(const char *prog)
             "  --drm-card <path>       DRM card (default: %s)\n"
             "  --veh-model <path>      Vehicle RKNN model path (required for live camera mode)\n"
             "  --plate-model <path>    Plate RKNN model path (required)\n"
-            "  --ocr-model <path>      OCR RKNN model path (required)\n"
+            "  --ocr-model <path>      Legacy single OCR RKNN model path\n"
+            "  --ocr-blue-model <path> Blue/non-green OCR expert RKNN path\n"
+            "  --ocr-green-model <path> Green OCR expert RKNN path\n"
             "  --ocr-keys <path>       OCR keys file path (required)\n"
             "  --quad-refiner-model <path|off> Quad refiner RKNN path; default: " DEFAULT_QUAD_REFINER_MODEL " ; pass off to disable\n"
             "  --labels <path>         Labels file path (required for live camera mode)\n"
@@ -586,6 +592,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"veh-model", required_argument, NULL, 3},
         {"plate-model", required_argument, NULL, 4},
         {"ocr-model", required_argument, NULL, 5},
+        {"ocr-blue-model", required_argument, NULL, 51},
+        {"ocr-green-model", required_argument, NULL, 52},
         {"ocr-keys", required_argument, NULL, 6},
         {"quad-refiner-model", required_argument, NULL, 50},
         {"labels", required_argument, NULL, 7},
@@ -687,6 +695,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 3: opt->veh_model_path = optarg; break;
         case 4: opt->plate_model_path = optarg; break;
         case 5: opt->ocr_model_path = optarg; break;
+        case 51: opt->ocr_blue_model_path = optarg; break;
+        case 52: opt->ocr_green_model_path = optarg; break;
         case 6: opt->ocr_keys_path = optarg; break;
         case 50:
             if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
@@ -815,6 +825,11 @@ static int parse_options(int argc, char **argv, struct options *opt)
         }
     }
 
+    if (!opt->ocr_blue_model_path)
+        opt->ocr_blue_model_path = opt->ocr_model_path;
+    if (!opt->ocr_green_model_path)
+        opt->ocr_green_model_path = opt->ocr_model_path;
+
     if (opt->fps <= 0 || opt->timeout_ms <= 0 || opt->stats_interval <= 0)
         return -1;
     if (opt->copy_buffers < MIN_COPY_BUFFERS || opt->copy_buffers > MAX_COPY_BUFFERS)
@@ -846,11 +861,11 @@ static int parse_options(int argc, char **argv, struct options *opt)
     if (opt->ocr_crop_dump_max < 0 || opt->ocr_crop_dump_max > 100000)
         return -1;
     if (opt->offline_image_path && opt->offline_image_path[0] != '\0') {
-        if (!opt->plate_model_path || !opt->ocr_model_path || !opt->ocr_keys_path)
+        if (!opt->plate_model_path || !opt->ocr_blue_model_path || !opt->ocr_green_model_path || !opt->ocr_keys_path)
             return -1;
     } else {
         if (!opt->veh_model_path || !opt->plate_model_path ||
-            !opt->ocr_model_path || !opt->ocr_keys_path || !opt->labels_path)
+            !opt->ocr_blue_model_path || !opt->ocr_green_model_path || !opt->ocr_keys_path || !opt->labels_path)
             return -1;
     }
     return 0;
@@ -1020,6 +1035,14 @@ static void rknn_ocr_model_release(struct ocr_model *m)
     if (m->ctx)
         rknn_destroy(m->ctx);
     memset(m, 0, sizeof(*m));
+}
+
+static bool ocr_model_input_compatible(const struct ocr_model *a, const struct ocr_model *b)
+{
+    return a && b &&
+           a->in_w == b->in_w &&
+           a->in_h == b->in_h &&
+           a->in_c == b->in_c;
 }
 
 static int rknn_quad_refiner_model_load(struct quad_refiner_model *m, const char *name, const char *path)
@@ -1581,14 +1604,17 @@ static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, 
 }
 
 static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
+                                         const struct ocr_model *m,
                                          const uint8_t *crop_rgb, int crop_w, int crop_h,
                                          float *occ_ratio_out)
 {
-    const struct ocr_model *m = &ctx->ocr_model;
     uint8_t *crop_work = NULL;
     uint8_t *ocr_in = NULL;
     struct letterbox_meta lb;
     float occ = 1.0f;
+
+    if (!m || !m->ctx)
+        return NULL;
 
     if (occ_ratio_out)
         *occ_ratio_out = 0.0f;
@@ -1640,12 +1666,31 @@ static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
     return ocr_in;
 }
 
-static enum ocr_decode_family select_decode_family(uint32_t decode_output_idx,
-                                                  enum plate_color plate_color)
+static const struct ocr_model *select_ocr_model(const struct app_ctx *ctx,
+                                                enum plate_color plate_color,
+                                                const char **expert_name)
 {
-    if (decode_output_idx == 1)
-        return OCR_DECODE_FAMILY_GREEN8;
-    if (plate_color == PLATE_COLOR_GREEN)
+    if (plate_color == PLATE_COLOR_GREEN && ctx->ocr_green_model.ctx) {
+        if (expert_name)
+            *expert_name = "green";
+        return &ctx->ocr_green_model;
+    }
+    if (expert_name)
+        *expert_name = (plate_color == PLATE_COLOR_GREEN) ? "green-fallback-blue" : "blue";
+    return &ctx->ocr_model;
+}
+
+static uint32_t select_ocr_output_idx(const struct ocr_model *m, const char *expert_name)
+{
+    if (expert_name && strcmp(expert_name, "green") == 0 && m->io_num.n_output >= 2)
+        return 1;
+    return 0;
+}
+
+static enum ocr_decode_family select_decode_family(const char *expert_name,
+                                                   enum plate_color plate_color)
+{
+    if ((expert_name && strcmp(expert_name, "green") == 0) || plate_color == PLATE_COLOR_GREEN)
         return OCR_DECODE_FAMILY_GREEN8;
     return OCR_DECODE_FAMILY_NONE;
 }
@@ -1655,7 +1700,8 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
                          char *text, size_t text_len, float *conf_out,
                          struct ocr_diag *diag, uint8_t **model_input_out)
 {
-    struct ocr_model *m = &ctx->ocr_model;
+    const char *expert_name = NULL;
+    const struct ocr_model *m = select_ocr_model(ctx, plate_color, &expert_name);
     rknn_input in;
     rknn_output outs[4];
     uint8_t *ocr_in = NULL;
@@ -1669,7 +1715,7 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     if (diag)
         memset(diag, 0, sizeof(*diag));
 
-    ocr_in = prepare_ocr_input_rgb888(ctx, crop_rgb, crop_w, crop_h, &occ_ratio);
+    ocr_in = prepare_ocr_input_rgb888(ctx, m, crop_rgb, crop_w, crop_h, &occ_ratio);
     if (!ocr_in) {
         return -1;
     }
@@ -1694,8 +1740,7 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     if (ret < 0)
         goto out;
 
-    if (m->io_num.n_output >= 2)
-        decode_output_idx = 1; /* 临时 green8 测试模式：多头时优先取 green8 head */
+    decode_output_idx = select_ocr_output_idx(m, expert_name);
     out_attr = &m->output_attrs[decode_output_idx];
     if (!build_ocr_layout(out_attr, &t_size, &c_size, &t_stride, &c_stride)) {
         ret = -1;
@@ -1714,20 +1759,22 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
                     ctx->ocr_key_count, c_size);
         }
         fprintf(stderr,
-                "[ocr] decode_output_idx=%u/%u%s\n",
+                "[ocr] expert=%s model=%s decode_output_idx=%u/%u\n",
+                expert_name ? expert_name : "unknown",
+                m->name ? m->name : "ocr",
                 decode_output_idx,
-                m->io_num.n_output,
-                (m->io_num.n_output >= 2) ? " (temporary green8 head test mode)" : "");
+                m->io_num.n_output);
         ctx->ocr_keysize_warned = true;
     }
     {
-        enum ocr_decode_family family = select_decode_family(decode_output_idx, plate_color);
+        enum ocr_decode_family family = select_decode_family(expert_name, plate_color);
         ret = ctc_decode_logits((const float *)outs[decode_output_idx].buf, t_size, c_size, t_stride, c_stride,
                                 ctx, family, text, text_len, conf_out, diag);
     }
     if (diag)
         diag->in_occ_ratio = occ_ratio;
-    fprintf(stderr, "[ocrin] resize_mode=%s kernel=%s in_occ_ratio=%.3f\n",
+    fprintf(stderr, "[ocrin] expert=%s resize_mode=%s kernel=%s in_occ_ratio=%.3f\n",
+            expert_name ? expert_name : "unknown",
             (ctx->opt.ocr_resize_mode == OCR_RESIZE_LETTERBOX) ? "letterbox" : "stretch",
             (ctx->opt.ocr_resize_kernel == OCR_KERNEL_BILINEAR) ? "bilinear" : "nn",
             occ_ratio);
@@ -6291,11 +6338,13 @@ static int run_offline_once(struct app_ctx *ctx)
     log_prediction_row(ctx, 0, ts_us, &pd);
     if (!ocr_input_dump && ctx->ocr_crop_index_fp &&
         ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
-        ocr_input_dump = prepare_ocr_input_rgb888(ctx, plate_crop, crop_w, crop_h, NULL);
+        const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
+        ocr_input_dump = prepare_ocr_input_rgb888(ctx, dump_model, plate_crop, crop_w, crop_h, NULL);
     }
     if (ocr_input_dump) {
+        const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
         dump_ocr_pair(ctx, 0, &pd, plate_crop, crop_w, crop_h,
-                      ocr_input_dump, (int)ctx->ocr_model.in_w, (int)ctx->ocr_model.in_h);
+                      ocr_input_dump, (int)dump_model->in_w, (int)dump_model->in_h);
         free(ocr_input_dump);
         ocr_input_dump = NULL;
     }
@@ -6805,11 +6854,13 @@ static void *infer_thread_main(void *arg)
                 overlay_nonempty_count++;
             if (!ocr_input_dump && ctx->ocr_crop_index_fp &&
                 ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
-                ocr_input_dump = prepare_ocr_input_rgb888(ctx, plate_crop, crop_w, crop_h, NULL);
+                const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
+                ocr_input_dump = prepare_ocr_input_rgb888(ctx, dump_model, plate_crop, crop_w, crop_h, NULL);
             }
             if (ocr_input_dump) {
+                const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
                 dump_ocr_pair(ctx, seq, &pd, plate_crop, crop_w, crop_h,
-                              ocr_input_dump, (int)ctx->ocr_model.in_w, (int)ctx->ocr_model.in_h);
+                              ocr_input_dump, (int)dump_model->in_w, (int)dump_model->in_h);
                 free(ocr_input_dump);
                 ocr_input_dump = NULL;
             }
@@ -6953,6 +7004,7 @@ static void cleanup(struct app_ctx *ctx)
     rknn_model_release(&ctx->veh_model);
     rknn_model_release(&ctx->plate_model);
     rknn_ocr_model_release(&ctx->ocr_model);
+    rknn_ocr_model_release(&ctx->ocr_green_model);
     rknn_quad_refiner_model_release(&ctx->quad_refiner_model);
 
     if (ctx->pred_log_fp) {
@@ -7085,8 +7137,19 @@ int main(int argc, char **argv)
     ctx.plate_model.nms_iou_thr = ctx.opt.plate_nms_iou;
     ctx.plate_model.max_det = ctx.opt.plate_max_det;
     ctx.plate_model.class_filter = ctx.opt.plate_class_id;
-    if (rknn_ocr_model_load(&ctx.ocr_model, "ocr", ctx.opt.ocr_model_path) < 0)
+    if (rknn_ocr_model_load(&ctx.ocr_model, "ocr_blue", ctx.opt.ocr_blue_model_path) < 0)
         goto out;
+    if (rknn_ocr_model_load(&ctx.ocr_green_model, "ocr_green", ctx.opt.ocr_green_model_path) < 0)
+        goto out;
+    if (!ocr_model_input_compatible(&ctx.ocr_model, &ctx.ocr_green_model)) {
+        fprintf(stderr,
+                "[ocr] FATAL blue/green input shape mismatch: blue=%ux%ux%u green=%ux%ux%u\n",
+                ctx.ocr_model.in_w, ctx.ocr_model.in_h, ctx.ocr_model.in_c,
+                ctx.ocr_green_model.in_w, ctx.ocr_green_model.in_h, ctx.ocr_green_model.in_c);
+        goto out;
+    }
+    fprintf(stderr, "[ocr] expert routing enabled: blue=%s green=%s\n",
+            ctx.opt.ocr_blue_model_path, ctx.opt.ocr_green_model_path);
     if (rknn_quad_refiner_model_load(&ctx.quad_refiner_model, "quad_refiner", ctx.opt.quad_refiner_model_path) < 0)
         goto out;
 

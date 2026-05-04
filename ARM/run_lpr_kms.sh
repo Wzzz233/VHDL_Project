@@ -6,6 +6,8 @@ DRM_CARD="/dev/dri/card0"
 VEH_MODEL=""
 PLATE_MODEL=""
 OCR_MODEL=""
+OCR_BLUE_MODEL=""
+OCR_GREEN_MODEL=""
 OCR_KEYS=""
 QUAD_REFINER_MODEL=""
 LABELS=""
@@ -54,12 +56,14 @@ OFFLINE_DETECT_PLATE="1"
 
 usage() {
   cat <<EOF
-Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr-keys <path> [options]
+Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-blue-model <path> --ocr-green-model <path> --ocr-keys <path> [options]
   --device <path>            FPGA device (default: ${DEVICE})
   --drm-card <path>          DRM card (default: ${DRM_CARD})
   --veh-model <path>         Vehicle RKNN model (required for live camera mode)
   --plate-model <path>       Plate RKNN model (required)
-  --ocr-model <path>         OCR RKNN model (required)
+  --ocr-model <path>         Legacy single OCR RKNN model
+  --ocr-blue-model <path>    Blue/non-green OCR expert RKNN model
+  --ocr-green-model <path>   Green OCR expert RKNN model
   --ocr-keys <path>          OCR keys txt (required)
   --quad-refiner-model <path|off> Quad refiner RKNN path; pass off to disable
   --labels <path>            Labels file (required for live camera mode)
@@ -115,6 +119,8 @@ while [[ $# -gt 0 ]]; do
     --veh-model) VEH_MODEL="$2"; shift 2 ;;
     --plate-model) PLATE_MODEL="$2"; shift 2 ;;
     --ocr-model) OCR_MODEL="$2"; shift 2 ;;
+    --ocr-blue-model) OCR_BLUE_MODEL="$2"; shift 2 ;;
+    --ocr-green-model) OCR_GREEN_MODEL="$2"; shift 2 ;;
     --ocr-keys) OCR_KEYS="$2"; shift 2 ;;
     --quad-refiner-model) QUAD_REFINER_MODEL="$2"; shift 2 ;;
     --labels) LABELS="$2"; shift 2 ;;
@@ -170,15 +176,22 @@ if [[ -n "$OFFLINE_IMAGE" ]]; then
   OFFLINE_MODE=1
 fi
 
+if [[ -z "$OCR_BLUE_MODEL" ]]; then
+  OCR_BLUE_MODEL="$OCR_MODEL"
+fi
+if [[ -z "$OCR_GREEN_MODEL" ]]; then
+  OCR_GREEN_MODEL="$OCR_MODEL"
+fi
+
 if [[ "$OFFLINE_MODE" == "1" ]]; then
-  if [[ -z "$PLATE_MODEL" || -z "$OCR_MODEL" || -z "$OCR_KEYS" ]]; then
-    echo "Offline mode requires: --plate-model --ocr-model --ocr-keys" >&2
+  if [[ -z "$PLATE_MODEL" || -z "$OCR_BLUE_MODEL" || -z "$OCR_GREEN_MODEL" || -z "$OCR_KEYS" ]]; then
+    echo "Offline mode requires: --plate-model --ocr-blue-model --ocr-green-model --ocr-keys" >&2
     usage
     exit 1
   fi
 else
-  if [[ -z "$VEH_MODEL" || -z "$PLATE_MODEL" || -z "$OCR_MODEL" || -z "$OCR_KEYS" || -z "$LABELS" ]]; then
-    echo "Missing required args: --veh-model --plate-model --ocr-model --ocr-keys --labels" >&2
+  if [[ -z "$VEH_MODEL" || -z "$PLATE_MODEL" || -z "$OCR_BLUE_MODEL" || -z "$OCR_GREEN_MODEL" || -z "$OCR_KEYS" || -z "$LABELS" ]]; then
+    echo "Missing required args: --veh-model --plate-model --ocr-blue-model --ocr-green-model --ocr-keys --labels" >&2
     usage
     exit 1
   fi
@@ -212,7 +225,7 @@ if [[ "$OFFLINE_MODE" == "0" ]]; then
 fi
 
 if [[ "$OFFLINE_MODE" == "1" ]]; then
-  if [[ ! -f "$OFFLINE_IMAGE" || ! -f "$PLATE_MODEL" || ! -f "$OCR_MODEL" || ! -f "$OCR_KEYS" ]]; then
+  if [[ ! -f "$OFFLINE_IMAGE" || ! -f "$PLATE_MODEL" || ! -f "$OCR_BLUE_MODEL" || ! -f "$OCR_GREEN_MODEL" || ! -f "$OCR_KEYS" ]]; then
     echo "Offline image/model/keys file not found" >&2
     exit 3
   fi
@@ -227,7 +240,7 @@ if [[ "$OFFLINE_MODE" == "1" ]]; then
     ffmpeg -loglevel error -y -i "$OFFLINE_IMAGE" -frames:v 1 "$OFFLINE_INPUT"
   fi
 else
-  if [[ ! -f "$VEH_MODEL" || ! -f "$PLATE_MODEL" || ! -f "$OCR_MODEL" || ! -f "$OCR_KEYS" || ! -f "$LABELS" ]]; then
+  if [[ ! -f "$VEH_MODEL" || ! -f "$PLATE_MODEL" || ! -f "$OCR_BLUE_MODEL" || ! -f "$OCR_GREEN_MODEL" || ! -f "$OCR_KEYS" || ! -f "$LABELS" ]]; then
     echo "Model/keys/label file not found" >&2
     exit 3
   fi
@@ -235,7 +248,8 @@ fi
 
 CMD=(./fpga_lpr_display
   --plate-model "$PLATE_MODEL"
-  --ocr-model "$OCR_MODEL"
+  --ocr-blue-model "$OCR_BLUE_MODEL"
+  --ocr-green-model "$OCR_GREEN_MODEL"
   --ocr-keys "$OCR_KEYS"
   --min-plate-conf "$MIN_PLATE_CONF"
   --plate-detector-type "$PLATE_DETECTOR_TYPE"
