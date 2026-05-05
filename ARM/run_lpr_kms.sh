@@ -3,7 +3,7 @@ set -euo pipefail
 
 DEVICE="/dev/fpga_dma0"
 DRM_CARD="/dev/dri/card0"
-VEH_MODEL=""
+PED_MODEL=""
 PLATE_MODEL=""
 OCR_MODEL=""
 OCR_BLUE_MODEL=""
@@ -34,7 +34,7 @@ RED_RATIO_THR="0.002"
 STOPLINE_RATIO="0.55"
 DET_RESIZE_MODE="letterbox"
 PLATE_REFINE="1"
-PLATE_DETECTOR_TYPE="yolov5"
+PLATE_DETECTOR_TYPE="yolov8_obb_rknn"
 PLATE_NMS_IOU="0.45"
 PLATE_MAX_DET="128"
 PLATE_CLASS_ID="-1"
@@ -59,7 +59,7 @@ usage() {
 Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-blue-model <path> --ocr-green-model <path> --ocr-keys <path> [options]
   --device <path>            FPGA device (default: ${DEVICE})
   --drm-card <path>          DRM card (default: ${DRM_CARD})
-  --veh-model <path>         Vehicle RKNN model (required for live camera mode)
+  --ped-model <path>         Pedestrian YOLOv8 detection RKNN model (optional)
   --plate-model <path>       Plate RKNN model (required)
   --ocr-model <path>         Legacy single OCR RKNN model
   --ocr-blue-model <path>    Blue/non-green OCR expert RKNN model
@@ -93,7 +93,7 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-blue-model <path> 
   --stopline-ratio <v>       Stopline Y ratio [0,1] (default: ${STOPLINE_RATIO})
   --det-resize-mode <m>      Detect resize: stretch|letterbox (default: ${DET_RESIZE_MODE})
   --plate-refine <0|1>       Enable local high-res plate refine (default: ${PLATE_REFINE})
-  --plate-detector-type <m>  Plate detector: yolov5|yolov8_obb_rknn|yolov8_pose_rknn (default: ${PLATE_DETECTOR_TYPE})
+  --plate-detector-type <m>  Plate detector: yolov8_obb_rknn|yolov8_pose_rknn (default: ${PLATE_DETECTOR_TYPE})
   --plate-nms-iou <v>        Plate NMS IoU threshold (default: ${PLATE_NMS_IOU})
   --plate-max-det <n>        Plate max detections after NMS (default: ${PLATE_MAX_DET})
   --plate-class-id <n>       Optional class filter for plate model (-1 disables, default: ${PLATE_CLASS_ID})
@@ -116,7 +116,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --device) DEVICE="$2"; shift 2 ;;
     --drm-card) DRM_CARD="$2"; shift 2 ;;
-    --veh-model) VEH_MODEL="$2"; shift 2 ;;
+    --ped-model) PED_MODEL="$2"; shift 2 ;;
     --plate-model) PLATE_MODEL="$2"; shift 2 ;;
     --ocr-model) OCR_MODEL="$2"; shift 2 ;;
     --ocr-blue-model) OCR_BLUE_MODEL="$2"; shift 2 ;;
@@ -190,8 +190,8 @@ if [[ "$OFFLINE_MODE" == "1" ]]; then
     exit 1
   fi
 else
-  if [[ -z "$VEH_MODEL" || -z "$PLATE_MODEL" || -z "$OCR_BLUE_MODEL" || -z "$OCR_GREEN_MODEL" || -z "$OCR_KEYS" || -z "$LABELS" ]]; then
-    echo "Missing required args: --veh-model --plate-model --ocr-blue-model --ocr-green-model --ocr-keys --labels" >&2
+  if [[ -z "$PLATE_MODEL" || -z "$OCR_BLUE_MODEL" || -z "$OCR_GREEN_MODEL" || -z "$OCR_KEYS" || -z "$LABELS" ]]; then
+    echo "Missing required args: --plate-model --ocr-blue-model --ocr-green-model --ocr-keys --labels" >&2
     usage
     exit 1
   fi
@@ -240,7 +240,7 @@ if [[ "$OFFLINE_MODE" == "1" ]]; then
     ffmpeg -loglevel error -y -i "$OFFLINE_IMAGE" -frames:v 1 "$OFFLINE_INPUT"
   fi
 else
-  if [[ ! -f "$VEH_MODEL" || ! -f "$PLATE_MODEL" || ! -f "$OCR_BLUE_MODEL" || ! -f "$OCR_GREEN_MODEL" || ! -f "$OCR_KEYS" || ! -f "$LABELS" ]]; then
+  if [[ ! -f "$PLATE_MODEL" || ! -f "$OCR_BLUE_MODEL" || ! -f "$OCR_GREEN_MODEL" || ! -f "$OCR_KEYS" || ! -f "$LABELS" ]]; then
     echo "Model/keys/label file not found" >&2
     exit 3
   fi
@@ -272,7 +272,6 @@ if [[ "$OFFLINE_MODE" == "0" ]]; then
   CMD+=(
     --device "$DEVICE"
     --drm-card "$DRM_CARD"
-    --veh-model "$VEH_MODEL"
     --labels "$LABELS"
     --fps "$FPS"
     --pixel-order "$PIXEL_ORDER"
@@ -311,6 +310,9 @@ if [[ -n "$OCR_CROP_DUMP_DIR" ]]; then
 fi
 if [[ -n "$QUAD_REFINER_MODEL" ]]; then
   CMD+=(--quad-refiner-model "$QUAD_REFINER_MODEL")
+fi
+if [[ -n "$PED_MODEL" ]]; then
+  CMD+=(--ped-model "$PED_MODEL")
 fi
 if [[ -n "$CONNECTOR_ID" ]]; then
   CMD+=(--connector-id "$CONNECTOR_ID")
