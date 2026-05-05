@@ -8,6 +8,10 @@ PLATE_MODEL=""
 OCR_MODEL=""
 OCR_BLUE_MODEL=""
 OCR_GREEN_MODEL=""
+OCR_YELLOW_MODEL=""
+OCR_YELLOW_KEYS=""
+OCR_SPECIAL_MODEL=""
+OCR_SPECIAL_KEYS=""
 OCR_KEYS=""
 QUAD_REFINER_MODEL=""
 LABELS=""
@@ -64,6 +68,10 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-blue-model <path> 
   --ocr-model <path>         Legacy single OCR RKNN model
   --ocr-blue-model <path>    Blue/non-green OCR expert RKNN model
   --ocr-green-model <path>   Green OCR expert RKNN model
+  --ocr-yellow-model <path>  Yellow OCR expert RKNN model (optional)
+  --ocr-yellow-keys <path>   Yellow OCR keys txt (optional)
+  --ocr-special-model <path> Special-plate OCR expert RKNN model (optional)
+  --ocr-special-keys <path>  Special-plate OCR keys txt (optional)
   --ocr-keys <path>          OCR keys txt (required)
   --quad-refiner-model <path|off> Quad refiner RKNN path; pass off to disable
   --labels <path>            Labels file (required for live camera mode)
@@ -121,6 +129,10 @@ while [[ $# -gt 0 ]]; do
     --ocr-model) OCR_MODEL="$2"; shift 2 ;;
     --ocr-blue-model) OCR_BLUE_MODEL="$2"; shift 2 ;;
     --ocr-green-model) OCR_GREEN_MODEL="$2"; shift 2 ;;
+    --ocr-yellow-model) OCR_YELLOW_MODEL="$2"; shift 2 ;;
+    --ocr-yellow-keys) OCR_YELLOW_KEYS="$2"; shift 2 ;;
+    --ocr-special-model) OCR_SPECIAL_MODEL="$2"; shift 2 ;;
+    --ocr-special-keys) OCR_SPECIAL_KEYS="$2"; shift 2 ;;
     --ocr-keys) OCR_KEYS="$2"; shift 2 ;;
     --quad-refiner-model) QUAD_REFINER_MODEL="$2"; shift 2 ;;
     --labels) LABELS="$2"; shift 2 ;;
@@ -181,6 +193,12 @@ if [[ -z "$OCR_BLUE_MODEL" ]]; then
 fi
 if [[ -z "$OCR_GREEN_MODEL" ]]; then
   OCR_GREEN_MODEL="$OCR_MODEL"
+fi
+if [[ -z "$OCR_YELLOW_MODEL" ]]; then
+  OCR_YELLOW_MODEL="$OCR_BLUE_MODEL"
+fi
+if [[ -z "$OCR_SPECIAL_MODEL" ]]; then
+  OCR_SPECIAL_MODEL="$OCR_BLUE_MODEL"
 fi
 
 if [[ "$OFFLINE_MODE" == "1" ]]; then
@@ -250,6 +268,8 @@ CMD=(./fpga_lpr_display
   --plate-model "$PLATE_MODEL"
   --ocr-blue-model "$OCR_BLUE_MODEL"
   --ocr-green-model "$OCR_GREEN_MODEL"
+  --ocr-yellow-model "$OCR_YELLOW_MODEL"
+  --ocr-special-model "$OCR_SPECIAL_MODEL"
   --ocr-keys "$OCR_KEYS"
   --min-plate-conf "$MIN_PLATE_CONF"
   --plate-detector-type "$PLATE_DETECTOR_TYPE"
@@ -267,6 +287,13 @@ CMD=(./fpga_lpr_display
   --ocr-min-occ-ratio "$OCR_MIN_OCC_RATIO"
   --ocr-ctc-diag "$OCR_CTC_DIAG"
   --ocr-crop-dump-max "$OCR_CROP_DUMP_MAX")
+
+if [[ -n "$OCR_YELLOW_KEYS" ]]; then
+  CMD+=(--ocr-yellow-keys "$OCR_YELLOW_KEYS")
+fi
+if [[ -n "$OCR_SPECIAL_KEYS" ]]; then
+  CMD+=(--ocr-special-keys "$OCR_SPECIAL_KEYS")
+fi
 
 if [[ "$OFFLINE_MODE" == "0" ]]; then
   CMD+=(
