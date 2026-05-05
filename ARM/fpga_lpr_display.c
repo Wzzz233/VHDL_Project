@@ -1826,12 +1826,11 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
             ctx->ocr_key_count = m->key_count;
             effective_key_count = m->key_count;
         }
-        if (ctx->ocr_blank_index < 0 || ctx->ocr_blank_index >= c_size) {
-            if (c_size == effective_key_count + 1)
-                ctx->ocr_blank_index = effective_key_count;
-            else
-                ctx->ocr_blank_index = c_size - 1;
-        }
+        /* Always recalculate blank index for the current model */
+        if (c_size == effective_key_count + 1)
+            ctx->ocr_blank_index = effective_key_count;
+        else
+            ctx->ocr_blank_index = c_size - 1;
         if (!ctx->ocr_keysize_warned) {
             if (!(c_size == effective_key_count || c_size == (effective_key_count + 1))) {
                 fprintf(stderr, "[ocr] WARN: model=%s c_size=%d key_count=%d\n",
@@ -5297,7 +5296,7 @@ static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int 
     int y1 = b->y1 + (b->y2 - b->y1) / 6;
     int y2 = b->y2 - (b->y2 - b->y1) / 6;
     int x, y;
-    int total = 0, blue_cnt = 0, green_cnt = 0, yellow_cnt = 0;
+    int total = 0, blue_cnt = 0, green_cnt = 0, yellow_cnt = 0, dark_cnt = 0;
     if (x1 < 0) x1 = 0;
     if (y1 < 0) y1 = 0;
     if (x2 >= w) x2 = w - 1;
@@ -5314,6 +5313,7 @@ static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int 
             float h_deg = 0.0f;
             float s = (mx == 0.0f) ? 0.0f : (d / mx);
             float v = mx;
+            if (v < 0.20f) dark_cnt++;
             if (d > 1e-6f) {
                 if (mx == r) h_deg = 60.0f * fmodf((g - bch) / d, 6.0f);
                 else if (mx == g) h_deg = 60.0f * (((bch - r) / d) + 2.0f);
@@ -5323,7 +5323,7 @@ static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int 
             total++;
             if (h_deg >= 190.0f && h_deg <= 260.0f && s > 0.23f && v > 0.16f) blue_cnt++;
             else if (h_deg >= 75.0f && h_deg <= 155.0f && s > 0.20f && v > 0.16f) green_cnt++;
-            else if (h_deg >= 15.0f && h_deg <= 55.0f && s > 0.20f && v > 0.16f) yellow_cnt++;
+            else if (h_deg >= 15.0f && h_deg <= 55.0f && s > 0.15f && v > 0.16f) yellow_cnt++;
         }
     }
     if (total == 0) return PLATE_COLOR_UNKNOWN;
@@ -5331,7 +5331,8 @@ static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int 
         return PLATE_COLOR_BLUE;
     if ((float)green_cnt / (float)total >= 0.20f && green_cnt > blue_cnt + (int)(0.05f * total))
         return PLATE_COLOR_GREEN;
-    if ((float)yellow_cnt / (float)total >= 0.18f)
+    if ((float)yellow_cnt / (float)total >= 0.18f &&
+        (float)dark_cnt / (float)total < 0.50f)
         return PLATE_COLOR_YELLOW;
     return PLATE_COLOR_UNKNOWN;
 }
