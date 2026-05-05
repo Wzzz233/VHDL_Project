@@ -5043,7 +5043,6 @@ static int decode_yolov8_det_output(const struct yolo_model *m, const rknn_outpu
                                      float conf_thr, int src_w, int src_h,
                                      struct det_box *out, int *out_count)
 {
-    static struct obb_anchor_cache anchor_cache = {0};
     struct det_box cand[MAX_DETS * 4];
     const int pre_nms_cap = MAX_DETS * 4;
     const float *buf;
@@ -5051,14 +5050,15 @@ static int decode_yolov8_det_output(const struct yolo_model *m, const rknn_outpu
     int i;
 
     *out_count = 0;
-    if (m->in_w != ALGO_STREAM_SIZE || m->in_h != ALGO_STREAM_SIZE)
-        return -1;
-    if (!build_obb_anchor_cache(&anchor_cache))
-        return -1;
-    /* expect single output tensor [1,5,8400] -> flat [5,8400] after want_float */
     if (m->io_num.n_output != 1)
         return -1;
 
+    /* output tensor [1,5,8400] -> flat [5,8400] via want_float=1
+     * rows: 0=cx, 1=cy, 2=w, 3=h (pixel coords, 0-640)
+     *       4=confidence (sigmoided, ultralytics Detect.forward includes cls.sigmoid())
+     * stride multiplication (* self.strides) is in the ONNX graph,
+     * NOT needed here (unlike OBB/Pose where board must decode stride).
+     */
     buf = (const float *)outs[0].buf;
     for (i = 0; i < OBB_POINT_COUNT; i++) {
         float cx = buf[0 * OBB_POINT_COUNT + i];
@@ -5066,21 +5066,15 @@ static int decode_yolov8_det_output(const struct yolo_model *m, const rknn_outpu
         float w  = buf[2 * OBB_POINT_COUNT + i];
         float h  = buf[3 * OBB_POINT_COUNT + i];
         float score = buf[4 * OBB_POINT_COUNT + i];
-        float stride = anchor_cache.stride[i];
         struct det_box det;
 
-        score = 1.0f / (1.0f + expf(-score));
+        /* score is already sigmoided by the ONNX graph */
         if (score < conf_thr)
             continue;
         if (w <= 0.0f || h <= 0.0f)
             continue;
 
-        /* grid-space decode: value is offset from grid cell centre */
-        cx = (anchor_cache.x[i] + cx) * stride;
-        cy = (anchor_cache.y[i] + cy) * stride;
-        w = w * stride;
-        h = h * stride;
-
+        /* cx,cy,w,h are already in 640x640 pixel space */
         memset(&det, 0, sizeof(det));
         det.cx = cx;
         det.cy = cy;
