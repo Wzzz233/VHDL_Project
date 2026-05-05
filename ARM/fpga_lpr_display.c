@@ -5043,29 +5043,32 @@ static int decode_yolov8_det_output(const struct yolo_model *m, const rknn_outpu
                                      float conf_thr, int src_w, int src_h,
                                      struct det_box *out, int *out_count)
 {
+    struct tensor_cn_view det_view;
     struct det_box cand[MAX_DETS * 4];
     const int pre_nms_cap = MAX_DETS * 4;
-    const float *buf;
     int count = 0;
     int i;
 
     *out_count = 0;
     if (m->io_num.n_output != 1)
         return -1;
+    if (!build_tensor_cn_view(&m->output_attrs[0], (const float *)outs[0].buf, &det_view))
+        return -1;
+    if (det_view.c != 5 || det_view.n != OBB_POINT_COUNT)
+        return -1;
 
-    /* output tensor [1,5,8400] -> flat [5,8400] via want_float=1
+    /* output tensor [1,5,8400] (NCHW or NHWC)
      * rows: 0=cx, 1=cy, 2=w, 3=h (pixel coords, 0-640)
      *       4=confidence (sigmoided, ultralytics Detect.forward includes cls.sigmoid())
      * stride multiplication (* self.strides) is in the ONNX graph,
      * NOT needed here (unlike OBB/Pose where board must decode stride).
      */
-    buf = (const float *)outs[0].buf;
     for (i = 0; i < OBB_POINT_COUNT; i++) {
-        float cx = buf[0 * OBB_POINT_COUNT + i];
-        float cy = buf[1 * OBB_POINT_COUNT + i];
-        float w  = buf[2 * OBB_POINT_COUNT + i];
-        float h  = buf[3 * OBB_POINT_COUNT + i];
-        float score = buf[4 * OBB_POINT_COUNT + i];
+        float cx = tensor_cn_read(&det_view, 0, i);
+        float cy = tensor_cn_read(&det_view, 1, i);
+        float w  = tensor_cn_read(&det_view, 2, i);
+        float h  = tensor_cn_read(&det_view, 3, i);
+        float score = tensor_cn_read(&det_view, 4, i);
         struct det_box det;
 
         /* score is already sigmoided by the ONNX graph */
