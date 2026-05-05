@@ -153,6 +153,10 @@ struct options {
     const char *ocr_model_path;
     const char *ocr_blue_model_path;
     const char *ocr_green_model_path;
+    const char *ocr_yellow_model_path;
+    const char *ocr_yellow_keys_path;
+    const char *ocr_special_model_path;
+    const char *ocr_special_keys_path;
     const char *ocr_keys_path;
     const char *quad_refiner_model_path;
     const char *labels_path;
@@ -337,6 +341,8 @@ struct ocr_model {
     uint32_t in_w;
     uint32_t in_h;
     uint32_t in_c;
+    char keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
+    int key_count;
 };
 
 struct quad_refiner_model {
@@ -423,6 +429,8 @@ struct app_ctx {
     struct yolo_model plate_model;
     struct ocr_model ocr_model;
     struct ocr_model ocr_green_model;
+    struct ocr_model ocr_yellow_model;
+    struct ocr_model ocr_special_model;
     struct quad_refiner_model quad_refiner_model;
     char ocr_keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
     int ocr_key_count;
@@ -532,9 +540,13 @@ static void print_usage(const char *prog)
             "  --veh-model <path>      Vehicle RKNN model path (required for live camera mode)\n"
             "  --plate-model <path>    Plate RKNN model path (required)\n"
             "  --ocr-model <path>      Legacy single OCR RKNN model path\n"
-            "  --ocr-blue-model <path> Blue/non-green OCR expert RKNN path\n"
-            "  --ocr-green-model <path> Green OCR expert RKNN path\n"
-            "  --ocr-keys <path>       OCR keys file path (required)\n"
+            "  --ocr-blue-model <path> Blue/non-green OCR expert RKNN path\\n"
+            "  --ocr-green-model <path> Green OCR expert RKNN path\\n"
+            "  --ocr-yellow-model <path> Yellow OCR expert RKNN path\n"
+            "  --ocr-yellow-keys <path> Yellow OCR keys file path\n"
+            "  --ocr-special-model <path> Special-plate OCR expert RKNN path\n"
+            "  --ocr-special-keys <path> Special-plate OCR keys file path\n"
+            "  --ocr-keys <path>       Default OCR keys file path (required)\\n"
             "  --quad-refiner-model <path|off> Quad refiner RKNN path; default: " DEFAULT_QUAD_REFINER_MODEL " ; pass off to disable\n"
             "  --labels <path>         Labels file path (required for live camera mode)\n"
             "  --pred-log <path>       Prediction CSV output path (optional)\n"
@@ -595,6 +607,10 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"ocr-model", required_argument, NULL, 5},
         {"ocr-blue-model", required_argument, NULL, 51},
         {"ocr-green-model", required_argument, NULL, 52},
+        {"ocr-yellow-model", required_argument, NULL, 53},
+        {"ocr-yellow-keys", required_argument, NULL, 54},
+        {"ocr-special-model", required_argument, NULL, 55},
+        {"ocr-special-keys", required_argument, NULL, 56},
         {"ocr-keys", required_argument, NULL, 6},
         {"quad-refiner-model", required_argument, NULL, 50},
         {"labels", required_argument, NULL, 7},
@@ -698,6 +714,10 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 5: opt->ocr_model_path = optarg; break;
         case 51: opt->ocr_blue_model_path = optarg; break;
         case 52: opt->ocr_green_model_path = optarg; break;
+        case 53: opt->ocr_yellow_model_path = optarg; break;
+        case 54: opt->ocr_yellow_keys_path = optarg; break;
+        case 55: opt->ocr_special_model_path = optarg; break;
+        case 56: opt->ocr_special_keys_path = optarg; break;
         case 6: opt->ocr_keys_path = optarg; break;
         case 50:
             if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
@@ -828,6 +848,10 @@ static int parse_options(int argc, char **argv, struct options *opt)
         opt->ocr_blue_model_path = opt->ocr_model_path;
     if (!opt->ocr_green_model_path)
         opt->ocr_green_model_path = opt->ocr_model_path;
+    if (!opt->ocr_yellow_model_path)
+        opt->ocr_yellow_model_path = opt->ocr_blue_model_path;
+    if (!opt->ocr_special_model_path)
+        opt->ocr_special_model_path = opt->ocr_blue_model_path;
 
     if (opt->fps <= 0 || opt->timeout_ms <= 0 || opt->stats_interval <= 0)
         return -1;
@@ -966,6 +990,41 @@ static int load_ocr_keys(struct app_ctx *ctx, const char *path)
     ctx->ocr_key_count = idx;
     ctx->ocr_blank_index = idx;
     fprintf(stderr, "[ocr] loaded %d keys from %s\n", ctx->ocr_key_count, path);
+    return 0;
+}
+
+static int load_ocr_model_keys(struct ocr_model *m, const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    char line[256];
+    int idx = 0;
+    if (!fp) {
+        fprintf(stderr, "Open OCR model keys failed for %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    while (fgets(line, sizeof(line), fp) && idx < MAX_OCR_KEYS) {
+        char *nl = strchr(line, '\n');
+        char *src = line;
+        size_t n;
+        if (nl) *nl = '\0';
+        nl = strchr(line, '\r');
+        if (nl) *nl = '\0';
+        if (src[0] == '\0' || src[0] == '#')
+            continue;
+        if (idx == 0 &&
+            (unsigned char)src[0] == 0xEF &&
+            (unsigned char)src[1] == 0xBB &&
+            (unsigned char)src[2] == 0xBF) {
+            src += 3;
+        }
+        n = strnlen(src, MAX_OCR_KEY_LEN - 1);
+        memcpy(m->keys[idx], src, n);
+        m->keys[idx][n] = '\0';
+        idx++;
+    }
+    fclose(fp);
+    m->key_count = idx;
+    fprintf(stderr, "[ocr] loaded %d keys for model %s from %s\n", m->key_count, m->name, path);
     return 0;
 }
 
@@ -1674,6 +1733,16 @@ static const struct ocr_model *select_ocr_model(const struct app_ctx *ctx,
             *expert_name = "green";
         return &ctx->ocr_green_model;
     }
+    if (plate_color == PLATE_COLOR_YELLOW && ctx->ocr_yellow_model.ctx) {
+        if (expert_name)
+            *expert_name = "yellow";
+        return &ctx->ocr_yellow_model;
+    }
+    if (plate_color == PLATE_COLOR_UNKNOWN && ctx->ocr_special_model.ctx) {
+        if (expert_name)
+            *expert_name = "special";
+        return &ctx->ocr_special_model;
+    }
     if (expert_name)
         *expert_name = (plate_color == PLATE_COLOR_GREEN) ? "green-fallback-blue" : "blue";
     return &ctx->ocr_model;
@@ -1745,25 +1814,40 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
         ret = -1;
         goto out_release;
     }
-    if (ctx->ocr_blank_index < 0 || ctx->ocr_blank_index >= c_size) {
-        if (c_size == ctx->ocr_key_count + 1)
-            ctx->ocr_blank_index = ctx->ocr_key_count;
-        else
-            ctx->ocr_blank_index = c_size - 1;
-    }
-    if (!ctx->ocr_keysize_warned) {
-        if (!(c_size == ctx->ocr_key_count || c_size == (ctx->ocr_key_count + 1))) {
-            fprintf(stderr,
-                    "[ocr] WARN key/output mismatch: keys=%d c_size=%d (expected N or N+1)\n",
-                    ctx->ocr_key_count, c_size);
+    /* Use per-model keys if model has its own, otherwise fall back to global */
+    {
+        int effective_key_count = (m->key_count > 0) ? m->key_count : ctx->ocr_key_count;
+        /* Temporarily override ctx keys with model keys if available */
+        int saved_key_count = ctx->ocr_key_count;
+        if (m->key_count > 0) {
+            int ki;
+            for (ki = 0; ki < m->key_count && ki < MAX_OCR_KEYS; ki++)
+                memcpy(ctx->ocr_keys[ki], m->keys[ki], MAX_OCR_KEY_LEN);
+            ctx->ocr_key_count = m->key_count;
+            effective_key_count = m->key_count;
         }
-        fprintf(stderr,
-                "[ocr] expert=%s model=%s decode_output_idx=%u/%u\n",
-                expert_name ? expert_name : "unknown",
-                m->name ? m->name : "ocr",
-                decode_output_idx,
-                m->io_num.n_output);
-        ctx->ocr_keysize_warned = true;
+        if (ctx->ocr_blank_index < 0 || ctx->ocr_blank_index >= c_size) {
+            if (c_size == effective_key_count + 1)
+                ctx->ocr_blank_index = effective_key_count;
+            else
+                ctx->ocr_blank_index = c_size - 1;
+        }
+        if (!ctx->ocr_keysize_warned) {
+            if (!(c_size == effective_key_count || c_size == (effective_key_count + 1))) {
+                fprintf(stderr, "[ocr] WARN: model=%s c_size=%d key_count=%d\n",
+                        expert_name ? expert_name : "?",
+                        c_size, effective_key_count);
+            }
+            fprintf(stderr,
+                    "[ocr] expert=%s model=%s decode_output_idx=%u/%u\n",
+                    expert_name ? expert_name : "unknown",
+                    m->name ? m->name : "ocr",
+                    decode_output_idx,
+                    m->io_num.n_output);
+            ctx->ocr_keysize_warned = true;
+        }
+        /* Restore global key count after decode (keys buffer is reused) */
+        ctx->ocr_key_count = saved_key_count;
     }
     {
         enum ocr_decode_family family = select_decode_family(expert_name, plate_color);
@@ -6602,7 +6686,6 @@ static void print_stats(struct app_ctx *ctx)
     ctx->last_stats_infer = r.infer_frames_total;
     ctx->last_stats_us = now;
 }
-
 static void cleanup(struct app_ctx *ctx)
 {
     int i;
@@ -6617,6 +6700,8 @@ static void cleanup(struct app_ctx *ctx)
     rknn_model_release(&ctx->plate_model);
     rknn_ocr_model_release(&ctx->ocr_model);
     rknn_ocr_model_release(&ctx->ocr_green_model);
+    rknn_ocr_model_release(&ctx->ocr_yellow_model);
+    rknn_ocr_model_release(&ctx->ocr_special_model);
     rknn_quad_refiner_model_release(&ctx->quad_refiner_model);
 
     if (ctx->pred_log_fp) {
@@ -6753,6 +6838,18 @@ int main(int argc, char **argv)
         goto out;
     if (rknn_ocr_model_load(&ctx.ocr_green_model, "ocr_green", ctx.opt.ocr_green_model_path) < 0)
         goto out;
+    if (strcmp(ctx.opt.ocr_yellow_model_path, ctx.opt.ocr_blue_model_path) != 0) {
+        if (rknn_ocr_model_load(&ctx.ocr_yellow_model, "ocr_yellow", ctx.opt.ocr_yellow_model_path) < 0)
+            goto out;
+        if (ctx.opt.ocr_yellow_keys_path && ctx.opt.ocr_yellow_keys_path[0])
+            load_ocr_model_keys(&ctx.ocr_yellow_model, ctx.opt.ocr_yellow_keys_path);
+    }
+    if (strcmp(ctx.opt.ocr_special_model_path, ctx.opt.ocr_blue_model_path) != 0) {
+        if (rknn_ocr_model_load(&ctx.ocr_special_model, "ocr_special", ctx.opt.ocr_special_model_path) < 0)
+            goto out;
+        if (ctx.opt.ocr_special_keys_path && ctx.opt.ocr_special_keys_path[0])
+            load_ocr_model_keys(&ctx.ocr_special_model, ctx.opt.ocr_special_keys_path);
+    }
     if (!ocr_model_input_compatible(&ctx.ocr_model, &ctx.ocr_green_model)) {
         fprintf(stderr,
                 "[ocr] FATAL blue/green input shape mismatch: blue=%ux%ux%u green=%ux%ux%u\n",
