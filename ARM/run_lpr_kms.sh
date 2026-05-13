@@ -13,6 +13,9 @@ OCR_YELLOW_KEYS=""
 OCR_SPECIAL_MODEL=""
 OCR_SPECIAL_KEYS=""
 OCR_KEYS=""
+GREEN_FIRSTCHAR_MODEL=""
+GREEN_FIRSTCHAR_MIN_VOTES="5"
+GREEN_FIRSTCHAR_MIN_SHARE="0.60"
 QUAD_REFINER_MODEL=""
 LABELS=""
 PRED_LOG=""
@@ -73,6 +76,9 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-blue-model <path> 
   --ocr-special-model <path> Special-plate OCR expert RKNN model (optional)
   --ocr-special-keys <path>  Special-plate OCR keys txt (optional)
   --ocr-keys <path>          OCR keys txt (required)
+  --green-firstchar-model <path|off> Green first-character RKNN sidecar (default: off)
+  --green-firstchar-min-votes <n> Min same-province votes before replacement (default: ${GREEN_FIRSTCHAR_MIN_VOTES})
+  --green-firstchar-min-share <v> Min vote share before replacement (default: ${GREEN_FIRSTCHAR_MIN_SHARE})
   --quad-refiner-model <path|off> Quad refiner RKNN path; pass off to disable
   --labels <path>            Labels file (required for live camera mode)
   --pred-log <path>          Prediction CSV output path (optional)
@@ -134,6 +140,9 @@ while [[ $# -gt 0 ]]; do
     --ocr-special-model) OCR_SPECIAL_MODEL="$2"; shift 2 ;;
     --ocr-special-keys) OCR_SPECIAL_KEYS="$2"; shift 2 ;;
     --ocr-keys) OCR_KEYS="$2"; shift 2 ;;
+    --green-firstchar-model) GREEN_FIRSTCHAR_MODEL="$2"; shift 2 ;;
+    --green-firstchar-min-votes) GREEN_FIRSTCHAR_MIN_VOTES="$2"; shift 2 ;;
+    --green-firstchar-min-share) GREEN_FIRSTCHAR_MIN_SHARE="$2"; shift 2 ;;
     --quad-refiner-model) QUAD_REFINER_MODEL="$2"; shift 2 ;;
     --labels) LABELS="$2"; shift 2 ;;
     --pred-log) PRED_LOG="$2"; shift 2 ;;
@@ -293,6 +302,12 @@ if [[ -n "$OCR_YELLOW_KEYS" ]]; then
 fi
 if [[ -n "$OCR_SPECIAL_KEYS" ]]; then
   CMD+=(--ocr-special-keys "$OCR_SPECIAL_KEYS")
+fi
+if [[ -n "$GREEN_FIRSTCHAR_MODEL" && "$GREEN_FIRSTCHAR_MODEL" != "off" ]]; then
+  CMD+=(
+    --green-firstchar-model "$GREEN_FIRSTCHAR_MODEL"
+    --green-firstchar-min-votes "$GREEN_FIRSTCHAR_MIN_VOTES"
+    --green-firstchar-min-share "$GREEN_FIRSTCHAR_MIN_SHARE")
 fi
 
 if [[ "$OFFLINE_MODE" == "0" ]]; then

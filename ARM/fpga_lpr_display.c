@@ -62,6 +62,9 @@
 #define POSE_OUTPUT_CHANNELS (4 + 1 + POSE_KPT_COUNT * POSE_KPT_DIMS)
 #define OCR_TRACK_MAX 24
 #define OCR_TRACK_HIST 8
+#define FIRSTCHAR_TRACK_HIST 8
+#define GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES 5
+#define GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE 0.60f
 #define MAX_UTF8_TOKEN_BYTES 8
 #define MAX_PLATE_TOKENS 16
 
@@ -160,6 +163,7 @@ struct options {
     const char *ocr_special_model_path;
     const char *ocr_special_keys_path;
     const char *ocr_keys_path;
+    const char *green_firstchar_model_path;
     const char *quad_refiner_model_path;
     const char *labels_path;
     const char *pred_log_path;
@@ -202,6 +206,8 @@ struct options {
     int ocr_ctc_diag;
     int ocr_crop_dump_max;
     const char *ocr_crop_dump_dir;
+    int green_firstchar_min_votes;
+    float green_firstchar_min_share;
     int offline_detect_plate;
     bool swap16;
 };
@@ -314,6 +320,10 @@ struct ocr_track {
     int hist_next;
     char province_tok[MAX_UTF8_TOKEN_BYTES];
     float province_score;
+    char fc_tok[FIRSTCHAR_TRACK_HIST][MAX_UTF8_TOKEN_BYTES];
+    float fc_conf[FIRSTCHAR_TRACK_HIST];
+    int fc_count;
+    int fc_next;
 };
 
 struct yolo_model {
@@ -354,6 +364,18 @@ struct quad_refiner_model {
     rknn_input_output_num io_num;
     rknn_tensor_attr input_attr;
     rknn_tensor_attr output_attrs[4];
+    uint32_t in_w;
+    uint32_t in_h;
+    uint32_t in_c;
+};
+
+struct firstchar_model {
+    const char *name;
+    const char *path;
+    rknn_context ctx;
+    rknn_input_output_num io_num;
+    rknn_tensor_attr input_attr;
+    rknn_tensor_attr output_attr;
     uint32_t in_w;
     uint32_t in_h;
     uint32_t in_c;
@@ -433,6 +455,7 @@ struct app_ctx {
     struct ocr_model ocr_green_model;
     struct ocr_model ocr_yellow_model;
     struct ocr_model ocr_special_model;
+    struct firstchar_model green_firstchar_model;
     struct quad_refiner_model quad_refiner_model;
     char ocr_keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
     int ocr_key_count;
@@ -479,6 +502,15 @@ struct frame_cookie {
 
 static volatile sig_atomic_t g_stop = 0;
 
+static const char *const g_province_chars[] = {
+    "京", "津", "冀", "晋", "蒙", "辽", "吉", "黑",
+    "沪", "苏", "浙", "皖", "闽", "赣", "鲁", "豫",
+    "鄂", "湘", "粤", "桂", "琼", "川", "贵", "云",
+    "藏", "陕", "甘", "青", "宁", "新", "渝",
+};
+
+#define GREEN_FIRSTCHAR_CLASS_COUNT ((int)(sizeof(g_province_chars) / sizeof(g_province_chars[0])))
+
 static void resize_rgb888_nn(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh);
 static void resize_rgb888_bilinear(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh);
 static void resize_rgb888_with_kernel(const uint8_t *src, int sw, int sh,
@@ -498,6 +530,11 @@ static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
 static bool append_utf8_token(char *dst, size_t dst_len, const char *token);
 static int rknn_quad_refiner_model_load(struct quad_refiner_model *m, const char *name, const char *path);
 static void rknn_quad_refiner_model_release(struct quad_refiner_model *m);
+static int rknn_firstchar_model_load(struct firstchar_model *m, const char *name, const char *path);
+static void rknn_firstchar_model_release(struct firstchar_model *m);
+static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
+                                        const struct det_box *box, uint64_t frame_seq,
+                                        char *text, size_t text_len);
 static void copy_cstr_trunc(char *dst, size_t dst_len, const char *src);
 static int utf8_token_len(const char *s);
 static uint32_t utf8_token_codepoint(const char *tok);
@@ -550,6 +587,9 @@ static void print_usage(const char *prog)
             "  --ocr-special-model <path> Special-plate OCR expert RKNN path\n"
             "  --ocr-special-keys <path> Special-plate OCR keys file path\n"
             "  --ocr-keys <path>       Default OCR keys file path (required)\n"
+            "  --green-firstchar-model <path|off> Green province sidecar RKNN path (default: off)\n"
+            "  --green-firstchar-min-votes <n> Min same-province votes before replacement (default: %d)\n"
+            "  --green-firstchar-min-share <v> Min vote share before replacement (default: %.2f)\n"
             "  --quad-refiner-model <path|off> Quad refiner RKNN path; default: " DEFAULT_QUAD_REFINER_MODEL " ; pass off to disable\n"
             "  --labels <path>         Labels file path (required for live camera mode)\n"
             "  --pred-log <path>       Prediction CSV output path (optional)\n"
@@ -595,7 +635,9 @@ static void print_usage(const char *prog)
             "  --ocr-crop-dump-dir <p> Dump OCR crops+inputs to directory (default: off)\n"
             "  --ocr-crop-dump-max <n> Max dumped OCR samples (default: 20)\n"
             "  --help                  Show this help\n",
-            prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD, DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
+            prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD,
+            GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES, GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE,
+            DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
             DEFAULT_STATS_INTERVAL, DEFAULT_COPY_BUFFERS, DEFAULT_QUEUE_DEPTH);
 }
 
@@ -615,6 +657,9 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"ocr-special-model", required_argument, NULL, 55},
         {"ocr-special-keys", required_argument, NULL, 56},
         {"ocr-keys", required_argument, NULL, 6},
+        {"green-firstchar-model", required_argument, NULL, 57},
+        {"green-firstchar-min-votes", required_argument, NULL, 58},
+        {"green-firstchar-min-share", required_argument, NULL, 59},
         {"quad-refiner-model", required_argument, NULL, 50},
         {"labels", required_argument, NULL, 7},
         {"pred-log", required_argument, NULL, 8},
@@ -706,6 +751,9 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->ocr_ctc_diag = 0;
     opt->ocr_crop_dump_max = 20;
     opt->ocr_crop_dump_dir = NULL;
+    opt->green_firstchar_model_path = NULL;
+    opt->green_firstchar_min_votes = GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES;
+    opt->green_firstchar_min_share = GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE;
     opt->offline_detect_plate = 1;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
@@ -722,6 +770,14 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 55: opt->ocr_special_model_path = optarg; break;
         case 56: opt->ocr_special_keys_path = optarg; break;
         case 6: opt->ocr_keys_path = optarg; break;
+        case 57:
+            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
+                opt->green_firstchar_model_path = NULL;
+            else
+                opt->green_firstchar_model_path = optarg;
+            break;
+        case 58: opt->green_firstchar_min_votes = atoi(optarg); break;
+        case 59: opt->green_firstchar_min_share = (float)atof(optarg); break;
         case 50:
             if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
                 opt->quad_refiner_model_path = NULL;
@@ -885,6 +941,10 @@ static int parse_options(int argc, char **argv, struct options *opt)
     if (opt->ocr_min_occ_ratio < 0.0f || opt->ocr_min_occ_ratio > 1.0f)
         return -1;
     if (opt->ocr_crop_dump_max < 0 || opt->ocr_crop_dump_max > 100000)
+        return -1;
+    if (opt->green_firstchar_min_votes < 1 || opt->green_firstchar_min_votes > FIRSTCHAR_TRACK_HIST)
+        return -1;
+    if (opt->green_firstchar_min_share < 0.0f || opt->green_firstchar_min_share > 1.0f)
         return -1;
     if (opt->offline_image_path && opt->offline_image_path[0] != '\0') {
         if (!opt->plate_model_path || !opt->ocr_blue_model_path || !opt->ocr_green_model_path || !opt->ocr_keys_path)
@@ -1176,6 +1236,104 @@ static int rknn_quad_refiner_model_load(struct quad_refiner_model *m, const char
 }
 
 static void rknn_quad_refiner_model_release(struct quad_refiner_model *m)
+{
+    if (m->ctx)
+        rknn_destroy(m->ctx);
+    memset(m, 0, sizeof(*m));
+}
+
+static int rknn_firstchar_model_load(struct firstchar_model *m, const char *name, const char *path)
+{
+    FILE *fp;
+    long sz;
+    void *data;
+    uint32_t i;
+
+    memset(m, 0, sizeof(*m));
+    m->name = name;
+    m->path = path;
+
+    if (!path || path[0] == '\0')
+        return 0;
+
+    fp = fopen(path, "rb");
+    if (!fp)
+        return -1;
+    fseek(fp, 0, SEEK_END);
+    sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    data = malloc((size_t)sz);
+    if (!data) {
+        fclose(fp);
+        return -1;
+    }
+    if (fread(data, 1, (size_t)sz, fp) != (size_t)sz) {
+        fclose(fp);
+        free(data);
+        return -1;
+    }
+    fclose(fp);
+
+    if (rknn_init(&m->ctx, data, (uint32_t)sz, 0, NULL) < 0) {
+        free(data);
+        return -1;
+    }
+    free(data);
+    if (rknn_query(m->ctx, RKNN_QUERY_IN_OUT_NUM, &m->io_num, sizeof(m->io_num)) < 0)
+        return -1;
+    if (m->io_num.n_output != 1)
+        return -1;
+
+    memset(&m->input_attr, 0, sizeof(m->input_attr));
+    m->input_attr.index = 0;
+    if (rknn_query(m->ctx, RKNN_QUERY_INPUT_ATTR, &m->input_attr, sizeof(m->input_attr)) < 0)
+        return -1;
+    if (m->input_attr.fmt == RKNN_TENSOR_NCHW) {
+        m->in_c = m->input_attr.dims[1];
+        m->in_h = m->input_attr.dims[2];
+        m->in_w = m->input_attr.dims[3];
+    } else {
+        m->in_h = m->input_attr.dims[1];
+        m->in_w = m->input_attr.dims[2];
+        m->in_c = m->input_attr.dims[3];
+    }
+    if (m->in_c != 1 && m->in_c != 3)
+        return -1;
+
+    memset(&m->output_attr, 0, sizeof(m->output_attr));
+    m->output_attr.index = 0;
+    if (rknn_query(m->ctx, RKNN_QUERY_OUTPUT_ATTR, &m->output_attr, sizeof(m->output_attr)) < 0)
+        return -1;
+
+    fprintf(stderr, "[%s] loaded input=%ux%ux%u outputs=%u\n",
+            name, m->in_w, m->in_h, m->in_c, m->io_num.n_output);
+    fprintf(stderr, "[%s] input_attr fmt=%d type=%d qnt=%d zp=%d scale=%.6f\n",
+            name,
+            m->input_attr.fmt,
+            m->input_attr.type,
+            m->input_attr.qnt_type,
+            m->input_attr.zp,
+            m->input_attr.scale);
+    fprintf(stderr, "[%s] out fmt=%d type=%d qnt=%d dims=(%u,%u,%u,%u) n_dims=%u\n",
+            name,
+            m->output_attr.fmt,
+            m->output_attr.type,
+            m->output_attr.qnt_type,
+            m->output_attr.dims[0],
+            m->output_attr.dims[1],
+            m->output_attr.dims[2],
+            m->output_attr.dims[3],
+            m->output_attr.n_dims);
+    for (i = 0; i < m->output_attr.n_dims; i++) {
+        if (m->output_attr.dims[i] == (uint32_t)GREEN_FIRSTCHAR_CLASS_COUNT)
+            return 0;
+    }
+    fprintf(stderr, "[%s] WARN: output shape does not explicitly expose %d classes\n",
+            name, GREEN_FIRSTCHAR_CLASS_COUNT);
+    return 0;
+}
+
+static void rknn_firstchar_model_release(struct firstchar_model *m)
 {
     if (m->ctx)
         rknn_destroy(m->ctx);
@@ -1662,6 +1820,235 @@ static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, 
                     frame_seq, old_conf, raw_text, *conf, text);
         }
     }
+}
+
+static int firstchar_output_count(const rknn_tensor_attr *a)
+{
+    uint32_t i;
+    uint32_t n = 1;
+    if (!a || a->n_dims == 0)
+        return 0;
+    for (i = 0; i < a->n_dims; i++) {
+        if (a->dims[i] == 0)
+            return 0;
+        n *= a->dims[i];
+    }
+    return (int)n;
+}
+
+static bool replace_first_utf8_token(char *text, size_t text_len, const char *first_tok)
+{
+    char toks[MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
+    char out[64];
+    int n;
+    int i;
+
+    if (!text || text_len == 0 || !first_tok || first_tok[0] == '\0')
+        return false;
+    n = split_utf8_tokens(text, toks, MAX_PLATE_TOKENS);
+    if (n <= 1)
+        return false;
+    out[0] = '\0';
+    if (!append_utf8_token(out, sizeof(out), first_tok))
+        return false;
+    for (i = 1; i < n; i++) {
+        if (!append_utf8_token(out, sizeof(out), toks[i]))
+            return false;
+    }
+    copy_cstr_trunc(text, text_len, out);
+    return true;
+}
+
+static bool run_firstchar_model(const struct firstchar_model *m,
+                                const uint8_t *fc_rgb, int fc_w, int fc_h,
+                                char *tok_out, size_t tok_len, float *conf_out)
+{
+    uint8_t *resized = NULL;
+    uint8_t *input = NULL;
+    rknn_input in;
+    rknn_output out;
+    int ret;
+    int i;
+    int class_count;
+    int best = -1;
+    float best_logit = -INFINITY;
+    float max_logit = -INFINITY;
+    float sum_exp = 0.0f;
+
+    if (!m || !m->ctx || !fc_rgb || !tok_out || tok_len == 0 || !conf_out)
+        return false;
+    tok_out[0] = '\0';
+    *conf_out = 0.0f;
+    if (m->in_w == 0 || m->in_h == 0 || (m->in_c != 1 && m->in_c != 3))
+        return false;
+
+    resized = malloc((size_t)m->in_w * (size_t)m->in_h * 3U);
+    input = malloc((size_t)m->in_w * (size_t)m->in_h * (size_t)m->in_c);
+    if (!resized || !input)
+        goto out_free;
+
+    resize_rgb888_bilinear(fc_rgb, fc_w, fc_h, resized, (int)m->in_w, (int)m->in_h);
+    if (m->in_c == 1) {
+        size_t pix = (size_t)m->in_w * (size_t)m->in_h;
+        size_t p;
+        for (p = 0; p < pix; p++) {
+            const uint8_t *q = resized + p * 3U;
+            int y = (int)(0.299f * (float)q[0] + 0.587f * (float)q[1] + 0.114f * (float)q[2] + 0.5f);
+            if (y < 0) y = 0;
+            if (y > 255) y = 255;
+            input[p] = (uint8_t)y;
+        }
+    } else {
+        memcpy(input, resized, (size_t)m->in_w * (size_t)m->in_h * 3U);
+    }
+
+    memset(&in, 0, sizeof(in));
+    in.index = 0;
+    in.buf = input;
+    in.size = m->in_w * m->in_h * m->in_c;
+    in.type = RKNN_TENSOR_UINT8;
+    in.fmt = RKNN_TENSOR_NHWC;
+    ret = rknn_inputs_set(m->ctx, 1, &in);
+    if (ret < 0)
+        goto out_free;
+    ret = rknn_run(m->ctx, NULL);
+    if (ret < 0)
+        goto out_free;
+
+    memset(&out, 0, sizeof(out));
+    out.want_float = 1;
+    ret = rknn_outputs_get(m->ctx, 1, &out, NULL);
+    if (ret < 0)
+        goto out_free;
+
+    class_count = firstchar_output_count(&m->output_attr);
+    if (class_count > GREEN_FIRSTCHAR_CLASS_COUNT)
+        class_count = GREEN_FIRSTCHAR_CLASS_COUNT;
+    if (class_count <= 0)
+        class_count = GREEN_FIRSTCHAR_CLASS_COUNT;
+
+    for (i = 0; i < class_count; i++) {
+        float v = ((const float *)out.buf)[i];
+        if (v > best_logit) {
+            best_logit = v;
+            best = i;
+        }
+        if (v > max_logit)
+            max_logit = v;
+    }
+    if (best >= 0 && best < GREEN_FIRSTCHAR_CLASS_COUNT) {
+        for (i = 0; i < class_count; i++)
+            sum_exp += expf(((const float *)out.buf)[i] - max_logit);
+        copy_cstr_trunc(tok_out, tok_len, g_province_chars[best]);
+        *conf_out = (sum_exp > 0.0f) ? expf(best_logit - max_logit) / sum_exp : 0.0f;
+        ret = 0;
+    } else {
+        ret = -1;
+    }
+    rknn_outputs_release(m->ctx, 1, &out);
+
+out_free:
+    free(resized);
+    free(input);
+    return ret == 0;
+}
+
+static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
+                                        const struct det_box *box, uint64_t frame_seq,
+                                        char *text, size_t text_len)
+{
+    struct ocr_track *tr;
+    char pred_tok[MAX_UTF8_TOKEN_BYTES];
+    char stable_tok[MAX_UTF8_TOKEN_BYTES];
+    char old_text[64];
+    float pred_conf = 0.0f;
+    int tr_idx;
+    int i, k;
+    int best_idx = -1;
+    int best_votes = 0;
+    int total_votes = 0;
+    float best_score = -1.0f;
+    char cand_tok[FIRSTCHAR_TRACK_HIST][MAX_UTF8_TOKEN_BYTES];
+    float cand_score[FIRSTCHAR_TRACK_HIST];
+    int cand_votes[FIRSTCHAR_TRACK_HIST];
+    int cand_n = 0;
+    float share;
+
+    if (!ctx || !ctx->green_firstchar_model.ctx || !fc_rgb || !box || !text || text[0] == '\0')
+        return false;
+    if (!run_firstchar_model(&ctx->green_firstchar_model, fc_rgb, fc_w, fc_h,
+                             pred_tok, sizeof(pred_tok), &pred_conf))
+        return false;
+
+    tr_idx = find_or_create_ocr_track(ctx, box);
+    if (tr_idx < 0)
+        return false;
+    tr = &ctx->ocr_tracks[tr_idx];
+    tr->used = true;
+    tr->ttl = 10;
+    tr->last_seq = frame_seq;
+    tr->box = *box;
+
+    copy_cstr_trunc(tr->fc_tok[tr->fc_next], sizeof(tr->fc_tok[tr->fc_next]), pred_tok);
+    tr->fc_conf[tr->fc_next] = fmaxf(0.0f, fminf(1.0f, pred_conf));
+    tr->fc_next = (tr->fc_next + 1) % FIRSTCHAR_TRACK_HIST;
+    if (tr->fc_count < FIRSTCHAR_TRACK_HIST)
+        tr->fc_count++;
+
+    memset(cand_score, 0, sizeof(cand_score));
+    memset(cand_votes, 0, sizeof(cand_votes));
+    for (k = 0; k < tr->fc_count; k++) {
+        int pos = (tr->fc_next - 1 - k + FIRSTCHAR_TRACK_HIST) % FIRSTCHAR_TRACK_HIST;
+        float recency = 1.0f - 0.06f * (float)k;
+        if (recency < 0.58f)
+            recency = 0.58f;
+        if (tr->fc_tok[pos][0] == '\0')
+            continue;
+        total_votes++;
+        for (i = 0; i < cand_n; i++) {
+            if (strcmp(cand_tok[i], tr->fc_tok[pos]) == 0)
+                break;
+        }
+        if (i == cand_n && cand_n < FIRSTCHAR_TRACK_HIST) {
+            copy_cstr_trunc(cand_tok[cand_n], sizeof(cand_tok[cand_n]), tr->fc_tok[pos]);
+            cand_n++;
+        }
+        if (i < cand_n) {
+            cand_votes[i]++;
+            cand_score[i] += tr->fc_conf[pos] * recency;
+        }
+    }
+    for (i = 0; i < cand_n; i++) {
+        if (cand_votes[i] > best_votes ||
+            (cand_votes[i] == best_votes && cand_score[i] > best_score)) {
+            best_idx = i;
+            best_votes = cand_votes[i];
+            best_score = cand_score[i];
+        }
+    }
+    if (best_idx < 0 || total_votes <= 0)
+        return false;
+
+    share = (float)best_votes / (float)total_votes;
+    copy_cstr_trunc(stable_tok, sizeof(stable_tok), cand_tok[best_idx]);
+    if (best_votes < ctx->opt.green_firstchar_min_votes ||
+        share < ctx->opt.green_firstchar_min_share) {
+        fprintf(stderr,
+                "[green-fc] frame=%" PRIu64 " hold pred=%s conf=%.3f top=%s votes=%d/%d share=%.2f text=%s\n",
+                frame_seq, pred_tok, pred_conf, stable_tok, best_votes, total_votes, share, text);
+        return false;
+    }
+
+    copy_cstr_trunc(old_text, sizeof(old_text), text);
+    if (!replace_first_utf8_token(text, text_len, stable_tok))
+        return false;
+    if (strcmp(old_text, text) != 0) {
+        fprintf(stderr,
+                "[green-fc] frame=%" PRIu64 " replace raw=%s fused=%s sidecar=%s votes=%d/%d share=%.2f last=%s conf=%.3f\n",
+                frame_seq, old_text, text, stable_tok, best_votes, total_votes, share, pred_tok, pred_conf);
+        return true;
+    }
+    return false;
 }
 
 static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
@@ -6085,6 +6472,10 @@ static int run_offline_once(struct app_ctx *ctx)
             pd.ocr_in_occ_ratio = odiag.in_occ_ratio;
         }
     }
+    if (pd.color == PLATE_COLOR_GREEN && pd.ocr_text[0] != '\0') {
+        run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
+                                    &pd.box, 0, pd.ocr_text, sizeof(pd.ocr_text));
+    }
     pd.type = classify_plate_type(pd.color, pd.ocr_text);
 
     fprintf(stderr,
@@ -6628,6 +7019,10 @@ static void *infer_thread_main(void *arg)
             if (pd.ocr_text[0] != '\0') {
                 ocr_temporal_smooth(ctx, &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf);
             }
+            if (pd.color == PLATE_COLOR_GREEN && pd.ocr_text[0] != '\0') {
+                run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
+                                            &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text));
+            }
             if (pd.ocr_text[0] != '\0')
                 ocr_nonempty_count++;
             pd.type = classify_plate_type(pd.color, pd.ocr_text);
@@ -6789,6 +7184,7 @@ static void cleanup(struct app_ctx *ctx)
     rknn_ocr_model_release(&ctx->ocr_green_model);
     rknn_ocr_model_release(&ctx->ocr_yellow_model);
     rknn_ocr_model_release(&ctx->ocr_special_model);
+    rknn_firstchar_model_release(&ctx->green_firstchar_model);
     rknn_quad_refiner_model_release(&ctx->quad_refiner_model);
 
     if (ctx->pred_log_fp) {
@@ -6946,6 +7342,16 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "[ocr] expert routing enabled: blue=%s green=%s\n",
             ctx.opt.ocr_blue_model_path, ctx.opt.ocr_green_model_path);
+    if (rknn_firstchar_model_load(&ctx.green_firstchar_model, "green_firstchar",
+                                  ctx.opt.green_firstchar_model_path) < 0)
+        goto out;
+    if (ctx.green_firstchar_model.ctx) {
+        fprintf(stderr,
+                "[ocr] green firstchar sidecar enabled: model=%s min_votes=%d min_share=%.2f\n",
+                ctx.opt.green_firstchar_model_path,
+                ctx.opt.green_firstchar_min_votes,
+                ctx.opt.green_firstchar_min_share);
+    }
     if (rknn_quad_refiner_model_load(&ctx.quad_refiner_model, "quad_refiner", ctx.opt.quad_refiner_model_path) < 0)
         goto out;
 
@@ -6976,7 +7382,7 @@ int main(int argc, char **argv)
                 "Start OFFLINE OCR: image=%s roi=%s auto_det=%d min_plate=%.2f det_resize=%s plate_refine=%d "
                 "plate_det=%s nms_iou=%.2f max_det=%d cls_filter=%d "
                 "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_kernel=%s ocr_pp=%s min_h=%d min_sharp=%.2f min_occ=%.2f "
-                "crop_src=fullres_raw det_src=%s quad_refiner=%s\n",
+                "crop_src=fullres_raw det_src=%s green_firstchar=%s fc_votes=%d fc_share=%.2f quad_refiner=%s\n",
                 ctx.opt.offline_image_path,
                 (ctx.opt.offline_roi_arg && ctx.opt.offline_roi_arg[0]) ? ctx.opt.offline_roi_arg : "<none>",
                 ctx.opt.offline_detect_plate,
@@ -6996,6 +7402,9 @@ int main(int argc, char **argv)
                 ctx.opt.ocr_min_sharpness,
                 ctx.opt.ocr_min_occ_ratio,
                 ctx.opt.sw_preproc ? "preproc" : "raw",
+                ctx.opt.green_firstchar_model_path ? ctx.opt.green_firstchar_model_path : "<off>",
+                ctx.opt.green_firstchar_min_votes,
+                ctx.opt.green_firstchar_min_share,
                 ctx.opt.quad_refiner_model_path ? ctx.opt.quad_refiner_model_path : "<off>");
         if (run_offline_once(&ctx) < 0)
             goto out;
@@ -7016,7 +7425,8 @@ int main(int argc, char **argv)
             "sw_preproc=%d fpga_a_mask=%d ped_event=%d det_resize=%s plate_refine=%d "
             "plate_det=%s nms_iou=%.2f max_det=%d cls_filter=%d "
             "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_kernel=%s ocr_pp=%s min_h=%d min_sharp=%.2f min_occ=%.2f show_crop=%d "
-            "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d pred_log=%s quad_refiner=%s\n",
+            "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d pred_log=%s "
+            "green_firstchar=%s fc_votes=%d fc_share=%.2f quad_refiner=%s\n",
             ctx.opt.fps,
             ctx.src_is_bgrx ? "bgrx8888" : "bgr565",
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
@@ -7046,6 +7456,9 @@ int main(int argc, char **argv)
             ctx.opt.ocr_crop_dump_dir ? ctx.opt.ocr_crop_dump_dir : "<off>",
             ctx.opt.ocr_crop_dump_max,
             ctx.opt.pred_log_path ? ctx.opt.pred_log_path : "<off>",
+            ctx.opt.green_firstchar_model_path ? ctx.opt.green_firstchar_model_path : "<off>",
+            ctx.opt.green_firstchar_min_votes,
+            ctx.opt.green_firstchar_min_share,
             ctx.opt.quad_refiner_model_path ? ctx.opt.quad_refiner_model_path : "<off>");
 
     ctx.last_stats_us = mono_us();
