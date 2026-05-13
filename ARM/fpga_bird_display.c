@@ -422,11 +422,11 @@ static bool build_tensor_view84(const rknn_tensor_attr *a, const float *buf,
     }
     if (k != 2) return false;
 
-    if (dims[0] == BIRD_TOTAL_CHANNELS && dims[1] == BIRD_GRID_POINTS) {
+    if (dims[0] == BIRD_TOTAL_CHANNELS && dims[1] > 0) {
         tv->buf = buf; tv->c = dims[0]; tv->n = dims[1]; tv->c_major = true;
         return true;
     }
-    if (dims[0] == BIRD_GRID_POINTS && dims[1] == BIRD_TOTAL_CHANNELS) {
+    if (dims[1] == BIRD_TOTAL_CHANNELS && dims[0] > 0) {
         tv->buf = buf; tv->c = dims[1]; tv->n = dims[0]; tv->c_major = false;
         return true;
     }
@@ -444,6 +444,7 @@ static int decode_yolov8_det_cls80(const struct yolo_model *m,
                                    const rknn_output *outs,
                                    float conf_thr,
                                    int target_class,   /* -1 = any */
+                                   int in_w, int in_h, /* model input canvas */
                                    struct det_box *out, int *out_count,
                                    float nms_iou, int max_det)
 {
@@ -453,13 +454,14 @@ static int decode_yolov8_det_cls80(const struct yolo_model *m,
     struct tensor_view84 tv;
     if (!build_tensor_view84(&m->output_attrs[0], (const float *)outs[0].buf, &tv))
         return -1;
-    if (tv.c != BIRD_TOTAL_CHANNELS || tv.n != BIRD_GRID_POINTS)
+    if (tv.c != BIRD_TOTAL_CHANNELS || tv.n <= 0)
         return -1;
 
     struct det_box cand[PRE_NMS_CAP];
     int count = 0;
+    const int grid = tv.n;   /* 2100 for 320x320, 8400 for 640x640 */
 
-    for (int i = 0; i < BIRD_GRID_POINTS; i++) {
+    for (int i = 0; i < grid; i++) {
         /* pick max-score class (or just the target class if filtering) */
         float best_score;
         int best_cls;
@@ -504,8 +506,8 @@ static int decode_yolov8_det_cls80(const struct yolo_model *m,
         det.y2 = (int)(cy + h * 0.5f + 0.5f);
         if (det.x1 < 0) det.x1 = 0;
         if (det.y1 < 0) det.y1 = 0;
-        if (det.x2 >= BIRD_INPUT_SIZE) det.x2 = BIRD_INPUT_SIZE - 1;
-        if (det.y2 >= BIRD_INPUT_SIZE) det.y2 = BIRD_INPUT_SIZE - 1;
+        if (det.x2 >= in_w) det.x2 = in_w - 1;
+        if (det.y2 >= in_h) det.y2 = in_h - 1;
         if (det.x2 <= det.x1 || det.y2 <= det.y1)
             continue;
         det.conf = best_score;
@@ -602,9 +604,9 @@ static int rknn_model_load(struct yolo_model *m, const char *name, const char *p
                 i, a->dims[0], a->dims[1], a->dims[2], a->dims[3],
                 a->n_dims, tensor_fmt_name(a->fmt));
     }
-    if (m->in_w != BIRD_INPUT_SIZE || m->in_h != BIRD_INPUT_SIZE) {
-        fprintf(stderr, "[%s] WARN expected %dx%d input, got %ux%u\n",
-                name, BIRD_INPUT_SIZE, BIRD_INPUT_SIZE, m->in_w, m->in_h);
+    if (m->in_w <= 0 || m->in_h <= 0 || m->in_c != 3) {
+        fprintf(stderr, "[%s] WARN invalid input layout %ux%ux%u\n",
+                name, m->in_w, m->in_h, m->in_c);
     }
     return 0;
 }
@@ -985,6 +987,7 @@ static int run_bird_detect(struct app_ctx *ctx, const uint8_t *src_rgb, int src_
     if (ret < 0) return ret;
 
     ret = decode_yolov8_det_cls80(m, outs, conf_thr, ctx->opt.class_id,
+                                  in_w, in_h,
                                   out, out_count, ctx->opt.nms_iou, ctx->opt.max_det);
     rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
 
