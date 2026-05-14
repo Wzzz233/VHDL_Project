@@ -1392,7 +1392,7 @@ static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_str
     const char *keys[MAX_OCR_KEYS];
     struct ocr_decode_diag decode_diag;
     int i;
-    int ret;
+    int ret = -1;
 
     if (!ctx || !buf || !text || text_len == 0)
         return -1;
@@ -1867,7 +1867,7 @@ static bool run_firstchar_model(const struct firstchar_model *m,
     uint8_t *input = NULL;
     rknn_input in;
     rknn_output out;
-    int ret;
+    int ret = -1;
     int i;
     int class_count;
     int best = -1;
@@ -5061,7 +5061,7 @@ static float rows_get_value(const float *buf, bool transposed, int n_rows, int n
     return buf[(size_t)r * (size_t)n_cols + (size_t)c];
 }
 
-static bool rows_coords_mostly_normalized(const float *buf, bool transposed, int n_rows, int n_cols)
+static bool __attribute__((unused)) rows_coords_mostly_normalized(const float *buf, bool transposed, int n_rows, int n_cols)
 {
     int i;
     int sample = (n_rows < 128) ? n_rows : 128;
@@ -5081,7 +5081,7 @@ static bool rows_coords_mostly_normalized(const float *buf, bool transposed, int
     return ((float)in01 / (float)total) >= 0.75f;
 }
 
-static bool rows_classid_like(const float *buf, bool transposed, int n_rows, int n_cols, int class_count)
+static bool __attribute__((unused)) rows_classid_like(const float *buf, bool transposed, int n_rows, int n_cols, int class_count)
 {
     int i;
     int sample = (n_rows < 128) ? n_rows : 128;
