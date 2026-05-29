@@ -586,6 +586,7 @@ static void dump_ocr_ab_variant(const struct app_ctx *ctx, uint64_t frame_id, in
 static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t ts_us,
                                const struct plate_det *pd);
 static const char *detector_type_str(int mode);
+static const char *plate_color_str(enum plate_color c);
 
 static int64_t mono_us(void)
 {
@@ -1486,33 +1487,6 @@ static bool build_ocr_layout(const rknn_tensor_attr *a, int *t_size, int *c_size
     return false;
 }
 
-static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_stride, int c_stride,
-                             struct app_ctx *ctx, enum ocr_decode_family family,
-                             char *text, size_t text_len, float *conf_out,
-                             struct ocr_diag *diag)
-{
-    const char *keys[MAX_OCR_KEYS];
-    struct ocr_decode_diag decode_diag;
-    int i;
-    int ret = -1;
-
-    if (!ctx || !buf || !text || text_len == 0)
-        return -1;
-    for (i = 0; i < ctx->ocr_key_count && i < MAX_OCR_KEYS; i++)
-        keys[i] = ctx->ocr_keys[i];
-    ret = ocr_decode_logits(buf, t_size, c_size, t_stride, c_stride,
-                            keys, i, ctx->ocr_blank_index,
-                            family, text, text_len, conf_out, &decode_diag);
-    if (ret < 0)
-        return ret;
-    if (diag) {
-        diag->t_size = decode_diag.t_size;
-        diag->c_size = decode_diag.c_size;
-        diag->blank_idx = decode_diag.blank_idx;
-        diag->blank_top1_ratio = decode_diag.blank_top1_ratio;
-    }
-    return 0;
-}
 
 static bool append_utf8_token(char *dst, size_t dst_len, const char *token)
 {
@@ -2325,6 +2299,49 @@ static const struct ocr_model *select_ocr_model(const struct app_ctx *ctx,
                                                 int crop_w, int crop_h,
                                                 const char **expert_name)
 {
+    bool special_models_enabled = false;
+
+    if (ctx)
+        special_models_enabled = ctx->ocr_police_model.ctx || ctx->ocr_embassy_model.ctx || ctx->ocr_special_model.ctx;
+
+    if (special_models_enabled) {
+        float white_ratio = 0.0f;
+        float dark_ratio = 0.0f;
+        bool special_candidate;
+        enum lpr_special_route route;
+
+        measure_special_plate_tone(crop_rgb, crop_w, crop_h, &white_ratio, &dark_ratio);
+        special_candidate = (plate_color == PLATE_COLOR_UNKNOWN) ||
+                            lpr_special_tone_candidate(white_ratio, dark_ratio);
+        if (special_candidate) {
+            route = lpr_choose_unknown_plate_route(ctx->ocr_police_model.ctx != 0,
+                                                   ctx->ocr_embassy_model.ctx != 0,
+                                                   ctx->ocr_special_model.ctx != 0,
+                                                   white_ratio, dark_ratio);
+            if (route == LPR_SPECIAL_ROUTE_EMBASSY) {
+                if (expert_name)
+                    *expert_name = "embassy";
+                fprintf(stderr, "[special-route] color=%s expert=embassy white=%.3f dark=%.3f\n",
+                        plate_color_str(plate_color), white_ratio, dark_ratio);
+                return &ctx->ocr_embassy_model;
+            }
+            if (route == LPR_SPECIAL_ROUTE_POLICE) {
+                if (expert_name)
+                    *expert_name = "police";
+                fprintf(stderr, "[special-route] color=%s expert=police white=%.3f dark=%.3f\n",
+                        plate_color_str(plate_color), white_ratio, dark_ratio);
+                return &ctx->ocr_police_model;
+            }
+            if (route == LPR_SPECIAL_ROUTE_SPECIAL) {
+                if (expert_name)
+                    *expert_name = "special";
+                fprintf(stderr, "[special-route] color=%s expert=special white=%.3f dark=%.3f\n",
+                        plate_color_str(plate_color), white_ratio, dark_ratio);
+                return &ctx->ocr_special_model;
+            }
+        }
+    }
+
     if (plate_color == PLATE_COLOR_GREEN && ctx->ocr_green_model.ctx) {
         if (expert_name)
             *expert_name = "green";
@@ -2334,34 +2351,6 @@ static const struct ocr_model *select_ocr_model(const struct app_ctx *ctx,
         if (expert_name)
             *expert_name = "yellow";
         return &ctx->ocr_yellow_model;
-    }
-    if (plate_color == PLATE_COLOR_UNKNOWN) {
-        float white_ratio = 0.0f;
-        float dark_ratio = 0.0f;
-        enum lpr_special_route route;
-        measure_special_plate_tone(crop_rgb, crop_w, crop_h, &white_ratio, &dark_ratio);
-        route = lpr_choose_unknown_plate_route(ctx->ocr_police_model.ctx != 0,
-                                               ctx->ocr_embassy_model.ctx != 0,
-                                               ctx->ocr_special_model.ctx != 0,
-                                               white_ratio, dark_ratio);
-        if (route == LPR_SPECIAL_ROUTE_EMBASSY) {
-            if (expert_name)
-                *expert_name = "embassy";
-            fprintf(stderr, "[special-route] expert=embassy white=%.3f dark=%.3f\n", white_ratio, dark_ratio);
-            return &ctx->ocr_embassy_model;
-        }
-        if (route == LPR_SPECIAL_ROUTE_POLICE) {
-            if (expert_name)
-                *expert_name = "police";
-            fprintf(stderr, "[special-route] expert=police white=%.3f dark=%.3f\n", white_ratio, dark_ratio);
-            return &ctx->ocr_police_model;
-        }
-        if (route == LPR_SPECIAL_ROUTE_SPECIAL) {
-            if (expert_name)
-                *expert_name = "special";
-            fprintf(stderr, "[special-route] expert=special white=%.3f dark=%.3f\n", white_ratio, dark_ratio);
-            return &ctx->ocr_special_model;
-        }
     }
     if (expert_name)
         *expert_name = (plate_color == PLATE_COLOR_GREEN) ? "green-fallback-blue" : "blue";
@@ -2375,10 +2364,9 @@ static uint32_t select_ocr_output_idx(const struct ocr_model *m, const char *exp
     return 0;
 }
 
-static enum ocr_decode_family select_decode_family(const char *expert_name,
-                                                   enum plate_color plate_color)
+static enum ocr_decode_family select_decode_family(const char *expert_name)
 {
-    if ((expert_name && strcmp(expert_name, "green") == 0) || plate_color == PLATE_COLOR_GREEN)
+    if (expert_name && strcmp(expert_name, "green") == 0)
         return OCR_DECODE_FAMILY_GREEN8;
     return OCR_DECODE_FAMILY_NONE;
 }
@@ -2457,7 +2445,7 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     {
         const char *keys[MAX_OCR_KEYS];
         struct ocr_decode_diag decode_diag;
-        enum ocr_decode_family family = select_decode_family(expert_name, plate_color);
+        enum ocr_decode_family family = select_decode_family(expert_name);
         int effective_key_count = (m->key_count > 0) ? m->key_count : ctx->ocr_key_count;
         int blank_index;
         int ki;
@@ -6740,7 +6728,7 @@ static int run_offline_once(struct app_ctx *ctx)
             pd.ocr_in_occ_ratio = odiag.in_occ_ratio;
         }
     }
-    if (pd.color == PLATE_COLOR_GREEN && pd.ocr_text[0] != '\0') {
+    if (pd.color == PLATE_COLOR_GREEN && strcmp(pd.ocr_expert, "green") == 0 && pd.ocr_text[0] != '\0') {
         run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
                                     &pd.box, 0, pd.ocr_text, sizeof(pd.ocr_text));
     }
@@ -7293,7 +7281,7 @@ static void *infer_thread_main(void *arg)
             if (pd.ocr_text[0] != '\0') {
                 ocr_temporal_smooth(ctx, &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf);
             }
-            if (pd.color == PLATE_COLOR_GREEN && pd.ocr_text[0] != '\0') {
+            if (pd.color == PLATE_COLOR_GREEN && strcmp(pd.ocr_expert, "green") == 0 && pd.ocr_text[0] != '\0') {
                 run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
                                             &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text));
             }

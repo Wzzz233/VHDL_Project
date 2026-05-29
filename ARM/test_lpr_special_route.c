@@ -26,6 +26,25 @@ static void test_white_police_routes_to_police(void)
                  LPR_SPECIAL_ROUTE_POLICE);
 }
 
+static void test_green_misclassified_embassy_is_special_candidate(void)
+{
+    if (!lpr_special_tone_candidate(0.278f, 0.292f)) {
+        fprintf(stderr, "[FAIL] green_misclassified_embassy candidate=false\n");
+        exit(1);
+    }
+    expect_route("green_misclassified_embassy",
+                 lpr_choose_unknown_plate_route(true, true, true, 0.278f, 0.292f),
+                 LPR_SPECIAL_ROUTE_SPECIAL);
+}
+
+static void test_normal_colored_plate_not_special_candidate(void)
+{
+    if (lpr_special_tone_candidate(0.08f, 0.12f)) {
+        fprintf(stderr, "[FAIL] normal_colored candidate=true\n");
+        exit(1);
+    }
+}
+
 static void test_ambiguous_uses_special_fallback(void)
 {
     expect_route("ambiguous_special",
@@ -44,6 +63,8 @@ int main(void)
 {
     test_black_embassy_beats_white_text();
     test_white_police_routes_to_police();
+    test_green_misclassified_embassy_is_special_candidate();
+    test_normal_colored_plate_not_special_candidate();
     test_ambiguous_uses_special_fallback();
     test_dark_plate_never_falls_to_police_when_embassy_missing();
     printf("[PASS] test_lpr_special_route\n");
