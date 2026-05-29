@@ -33,6 +33,7 @@
 #include <rknn_api.h>
 
 #include "pcie_fpga_dma.h"
+#include "lpr_special_route.h"
 #include "ocr_decode.h"
 
 #define DEFAULT_DEVICE "/dev/" FPGA_DMA_DEV_NAME
@@ -2337,20 +2338,25 @@ static const struct ocr_model *select_ocr_model(const struct app_ctx *ctx,
     if (plate_color == PLATE_COLOR_UNKNOWN) {
         float white_ratio = 0.0f;
         float dark_ratio = 0.0f;
+        enum lpr_special_route route;
         measure_special_plate_tone(crop_rgb, crop_w, crop_h, &white_ratio, &dark_ratio);
-        if (ctx->ocr_police_model.ctx && white_ratio >= 0.20f && white_ratio >= dark_ratio * 0.60f) {
-            if (expert_name)
-                *expert_name = "police";
-            fprintf(stderr, "[special-route] expert=police white=%.3f dark=%.3f\n", white_ratio, dark_ratio);
-            return &ctx->ocr_police_model;
-        }
-        if (ctx->ocr_embassy_model.ctx && dark_ratio >= 0.40f && dark_ratio > white_ratio) {
+        route = lpr_choose_unknown_plate_route(ctx->ocr_police_model.ctx != 0,
+                                               ctx->ocr_embassy_model.ctx != 0,
+                                               ctx->ocr_special_model.ctx != 0,
+                                               white_ratio, dark_ratio);
+        if (route == LPR_SPECIAL_ROUTE_EMBASSY) {
             if (expert_name)
                 *expert_name = "embassy";
             fprintf(stderr, "[special-route] expert=embassy white=%.3f dark=%.3f\n", white_ratio, dark_ratio);
             return &ctx->ocr_embassy_model;
         }
-        if (ctx->ocr_special_model.ctx) {
+        if (route == LPR_SPECIAL_ROUTE_POLICE) {
+            if (expert_name)
+                *expert_name = "police";
+            fprintf(stderr, "[special-route] expert=police white=%.3f dark=%.3f\n", white_ratio, dark_ratio);
+            return &ctx->ocr_police_model;
+        }
+        if (route == LPR_SPECIAL_ROUTE_SPECIAL) {
             if (expert_name)
                 *expert_name = "special";
             fprintf(stderr, "[special-route] expert=special white=%.3f dark=%.3f\n", white_ratio, dark_ratio);
