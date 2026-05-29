@@ -12,8 +12,16 @@ OCR_YELLOW_MODEL=""
 OCR_YELLOW_KEYS=""
 OCR_SPECIAL_MODEL=""
 OCR_SPECIAL_KEYS=""
+OCR_POLICE_MODEL=""
+OCR_POLICE_KEYS=""
+OCR_EMBASSY_MODEL=""
+OCR_EMBASSY_KEYS=""
 OCR_KEYS=""
 GREEN_FIRSTCHAR_MODEL=""
+POLICE_SIDECAR_MODEL=""
+POLICE_SIDECAR_MIN_VOTES="1"
+POLICE_SIDECAR_MIN_SHARE="0.00"
+POLICE_SIDECAR_MIN_CONF="0.80"
 GREEN_FIRSTCHAR_MIN_VOTES="5"
 GREEN_FIRSTCHAR_MIN_SHARE="0.60"
 QUAD_REFINER_MODEL=""
@@ -73,10 +81,18 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-blue-model <path> 
   --ocr-green-model <path>   Green OCR expert RKNN model
   --ocr-yellow-model <path>  Yellow OCR expert RKNN model (optional)
   --ocr-yellow-keys <path>   Yellow OCR keys txt (optional)
-  --ocr-special-model <path> Special-plate OCR expert RKNN model (optional)
-  --ocr-special-keys <path>  Special-plate OCR keys txt (optional)
+  --ocr-special-model <path> Legacy UNKNOWN fallback OCR expert RKNN model (optional)
+  --ocr-special-keys <path>  Legacy UNKNOWN fallback OCR keys txt (optional)
+  --ocr-police-model <path|off> Police OCR expert RKNN model (optional)
+  --ocr-police-keys <path>   Police OCR keys txt (required with police model)
+  --ocr-embassy-model <path|off> Embassy OCR expert RKNN model (optional)
+  --ocr-embassy-keys <path>  Embassy OCR keys txt (required with embassy model)
   --ocr-keys <path>          OCR keys txt (required)
   --green-firstchar-model <path|off> Green first-character RKNN sidecar (default: off)
+  --police-sidecar-model <path|off> Police province sidecar RKNN (default: off)
+  --police-sidecar-min-votes <n> Min same-province votes before replacement (default: ${POLICE_SIDECAR_MIN_VOTES})
+  --police-sidecar-min-share <v> Min vote share before replacement (default: ${POLICE_SIDECAR_MIN_SHARE})
+  --police-sidecar-min-conf <v> Min single-frame sidecar confidence (default: ${POLICE_SIDECAR_MIN_CONF})
   --green-firstchar-min-votes <n> Min same-province votes before replacement (default: ${GREEN_FIRSTCHAR_MIN_VOTES})
   --green-firstchar-min-share <v> Min vote share before replacement (default: ${GREEN_FIRSTCHAR_MIN_SHARE})
   --quad-refiner-model <path|off> Quad refiner RKNN path; pass off to disable
@@ -139,8 +155,16 @@ while [[ $# -gt 0 ]]; do
     --ocr-yellow-keys) OCR_YELLOW_KEYS="$2"; shift 2 ;;
     --ocr-special-model) OCR_SPECIAL_MODEL="$2"; shift 2 ;;
     --ocr-special-keys) OCR_SPECIAL_KEYS="$2"; shift 2 ;;
+    --ocr-police-model) OCR_POLICE_MODEL="$2"; shift 2 ;;
+    --ocr-police-keys) OCR_POLICE_KEYS="$2"; shift 2 ;;
+    --ocr-embassy-model) OCR_EMBASSY_MODEL="$2"; shift 2 ;;
+    --ocr-embassy-keys) OCR_EMBASSY_KEYS="$2"; shift 2 ;;
     --ocr-keys) OCR_KEYS="$2"; shift 2 ;;
     --green-firstchar-model) GREEN_FIRSTCHAR_MODEL="$2"; shift 2 ;;
+    --police-sidecar-model|--police-firstchar-model) POLICE_SIDECAR_MODEL="$2"; shift 2 ;;
+    --police-sidecar-min-votes) POLICE_SIDECAR_MIN_VOTES="$2"; shift 2 ;;
+    --police-sidecar-min-share) POLICE_SIDECAR_MIN_SHARE="$2"; shift 2 ;;
+    --police-sidecar-min-conf) POLICE_SIDECAR_MIN_CONF="$2"; shift 2 ;;
     --green-firstchar-min-votes) GREEN_FIRSTCHAR_MIN_VOTES="$2"; shift 2 ;;
     --green-firstchar-min-share) GREEN_FIRSTCHAR_MIN_SHARE="$2"; shift 2 ;;
     --quad-refiner-model) QUAD_REFINER_MODEL="$2"; shift 2 ;;
@@ -224,6 +248,15 @@ else
   fi
 fi
 
+if [[ -n "$OCR_POLICE_MODEL" && "$OCR_POLICE_MODEL" != "off" && -z "$OCR_POLICE_KEYS" ]]; then
+  echo "--ocr-police-keys is required when --ocr-police-model is set" >&2
+  exit 1
+fi
+if [[ -n "$OCR_EMBASSY_MODEL" && "$OCR_EMBASSY_MODEL" != "off" && -z "$OCR_EMBASSY_KEYS" ]]; then
+  echo "--ocr-embassy-keys is required when --ocr-embassy-model is set" >&2
+  exit 1
+fi
+
 if [[ ! -x ./fpga_lpr_display ]]; then
   echo "fpga_lpr_display not found. Build first: make lprapp" >&2
   exit 2
@@ -256,6 +289,12 @@ if [[ "$OFFLINE_MODE" == "1" ]]; then
     echo "Offline image/model/keys file not found" >&2
     exit 3
   fi
+  for optional_path in "$OCR_POLICE_MODEL" "$OCR_POLICE_KEYS" "$OCR_EMBASSY_MODEL" "$OCR_EMBASSY_KEYS" "$POLICE_SIDECAR_MODEL"; do
+    if [[ -n "$optional_path" && "$optional_path" != "off" && ! -f "$optional_path" ]]; then
+      echo "Optional police/embassy model or keys file not found: $optional_path" >&2
+      exit 3
+    fi
+  done
   if [[ "$OFFLINE_IMAGE" =~ \.[Pp][Pp][Mm]$ ]]; then
     OFFLINE_INPUT="$OFFLINE_IMAGE"
   else
@@ -271,6 +310,12 @@ else
     echo "Model/keys/label file not found" >&2
     exit 3
   fi
+  for optional_path in "$OCR_POLICE_MODEL" "$OCR_POLICE_KEYS" "$OCR_EMBASSY_MODEL" "$OCR_EMBASSY_KEYS" "$POLICE_SIDECAR_MODEL"; do
+    if [[ -n "$optional_path" && "$optional_path" != "off" && ! -f "$optional_path" ]]; then
+      echo "Optional police/embassy model or keys file not found: $optional_path" >&2
+      exit 3
+    fi
+  done
 fi
 
 CMD=(./fpga_lpr_display
@@ -303,11 +348,30 @@ fi
 if [[ -n "$OCR_SPECIAL_KEYS" ]]; then
   CMD+=(--ocr-special-keys "$OCR_SPECIAL_KEYS")
 fi
+if [[ -n "$OCR_POLICE_MODEL" ]]; then
+  CMD+=(--ocr-police-model "$OCR_POLICE_MODEL")
+fi
+if [[ -n "$OCR_POLICE_KEYS" ]]; then
+  CMD+=(--ocr-police-keys "$OCR_POLICE_KEYS")
+fi
+if [[ -n "$OCR_EMBASSY_MODEL" ]]; then
+  CMD+=(--ocr-embassy-model "$OCR_EMBASSY_MODEL")
+fi
+if [[ -n "$OCR_EMBASSY_KEYS" ]]; then
+  CMD+=(--ocr-embassy-keys "$OCR_EMBASSY_KEYS")
+fi
 if [[ -n "$GREEN_FIRSTCHAR_MODEL" && "$GREEN_FIRSTCHAR_MODEL" != "off" ]]; then
   CMD+=(
     --green-firstchar-model "$GREEN_FIRSTCHAR_MODEL"
     --green-firstchar-min-votes "$GREEN_FIRSTCHAR_MIN_VOTES"
     --green-firstchar-min-share "$GREEN_FIRSTCHAR_MIN_SHARE")
+fi
+if [[ -n "$POLICE_SIDECAR_MODEL" && "$POLICE_SIDECAR_MODEL" != "off" ]]; then
+  CMD+=(
+    --police-sidecar-model "$POLICE_SIDECAR_MODEL"
+    --police-sidecar-min-votes "$POLICE_SIDECAR_MIN_VOTES"
+    --police-sidecar-min-share "$POLICE_SIDECAR_MIN_SHARE"
+    --police-sidecar-min-conf "$POLICE_SIDECAR_MIN_CONF")
 fi
 
 if [[ "$OFFLINE_MODE" == "0" ]]; then

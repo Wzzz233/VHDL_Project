@@ -65,6 +65,9 @@
 #define FIRSTCHAR_TRACK_HIST 8
 #define GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES 5
 #define GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE 0.60f
+#define POLICE_FIRSTCHAR_DEFAULT_MIN_VOTES 1
+#define POLICE_FIRSTCHAR_DEFAULT_MIN_SHARE 0.00f
+#define POLICE_FIRSTCHAR_DEFAULT_MIN_CONF 0.80f
 #define MAX_UTF8_TOKEN_BYTES 8
 #define MAX_PLATE_TOKENS 16
 
@@ -162,8 +165,13 @@ struct options {
     const char *ocr_yellow_keys_path;
     const char *ocr_special_model_path;
     const char *ocr_special_keys_path;
+    const char *ocr_police_model_path;
+    const char *ocr_police_keys_path;
+    const char *ocr_embassy_model_path;
+    const char *ocr_embassy_keys_path;
     const char *ocr_keys_path;
     const char *green_firstchar_model_path;
+    const char *police_sidecar_model_path;
     const char *quad_refiner_model_path;
     const char *labels_path;
     const char *pred_log_path;
@@ -208,6 +216,9 @@ struct options {
     const char *ocr_crop_dump_dir;
     int green_firstchar_min_votes;
     float green_firstchar_min_share;
+    int police_sidecar_min_votes;
+    float police_sidecar_min_share;
+    float police_sidecar_min_conf;
     int offline_detect_plate;
     bool swap16;
 };
@@ -238,6 +249,7 @@ struct plate_det {
     float ocr_conf;
     float ocr_blank_top1;
     float ocr_in_occ_ratio;
+    char ocr_expert[32];
 };
 
 struct frame_slot {
@@ -455,7 +467,10 @@ struct app_ctx {
     struct ocr_model ocr_green_model;
     struct ocr_model ocr_yellow_model;
     struct ocr_model ocr_special_model;
+    struct ocr_model ocr_police_model;
+    struct ocr_model ocr_embassy_model;
     struct firstchar_model green_firstchar_model;
+    struct firstchar_model police_sidecar_model;
     struct quad_refiner_model quad_refiner_model;
     char ocr_keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
     int ocr_key_count;
@@ -509,7 +524,15 @@ static const char *const g_province_chars[] = {
     "藏", "陕", "甘", "青", "宁", "新", "渝",
 };
 
+static const char *const g_police_province_chars[] = {
+    "京", "沪", "津", "渝", "冀", "晋", "蒙", "辽",
+    "吉", "黑", "苏", "浙", "皖", "闽", "赣", "鲁",
+    "豫", "鄂", "湘", "粤", "桂", "琼", "川", "贵",
+    "云", "藏", "陕", "甘", "青", "宁", "新",
+};
+
 #define GREEN_FIRSTCHAR_CLASS_COUNT ((int)(sizeof(g_province_chars) / sizeof(g_province_chars[0])))
+#define POLICE_FIRSTCHAR_CLASS_COUNT ((int)(sizeof(g_police_province_chars) / sizeof(g_police_province_chars[0])))
 
 static void resize_rgb888_nn(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh);
 static void resize_rgb888_bilinear(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh);
@@ -535,6 +558,9 @@ static void rknn_firstchar_model_release(struct firstchar_model *m);
 static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
                                         const struct det_box *box, uint64_t frame_seq,
                                         char *text, size_t text_len);
+static bool run_police_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
+                               const struct det_box *box, uint64_t frame_seq,
+                               char *text, size_t text_len);
 static void copy_cstr_trunc(char *dst, size_t dst_len, const char *src);
 static int utf8_token_len(const char *s);
 static uint32_t utf8_token_codepoint(const char *tok);
@@ -584,12 +610,20 @@ static void print_usage(const char *prog)
             "  --ocr-green-model <path> Green OCR expert RKNN path\n"
             "  --ocr-yellow-model <path> Yellow OCR expert RKNN path\n"
             "  --ocr-yellow-keys <path> Yellow OCR keys file path\n"
-            "  --ocr-special-model <path> Special-plate OCR expert RKNN path\n"
-            "  --ocr-special-keys <path> Special-plate OCR keys file path\n"
+            "  --ocr-special-model <path> Legacy UNKNOWN fallback OCR expert RKNN path\n"
+            "  --ocr-special-keys <path> Legacy UNKNOWN fallback OCR keys file path\n"
+            "  --ocr-police-model <path|off> Police OCR expert RKNN path (UNKNOWN white route)\n"
+            "  --ocr-police-keys <path> Police OCR keys file path (required with police model)\n"
+            "  --ocr-embassy-model <path|off> Embassy OCR expert RKNN path (UNKNOWN dark route)\n"
+            "  --ocr-embassy-keys <path> Embassy OCR keys file path (required with embassy model)\n"
             "  --ocr-keys <path>       Default OCR keys file path (required)\n"
             "  --green-firstchar-model <path|off> Green province sidecar RKNN path (default: off)\n"
             "  --green-firstchar-min-votes <n> Min same-province votes before replacement (default: %d)\n"
             "  --green-firstchar-min-share <v> Min vote share before replacement (default: %.2f)\n"
+            "  --police-sidecar-model <path|off> Police province sidecar RKNN path (default: off)\n"
+            "  --police-sidecar-min-votes <n> Min same-province votes before replacement (default: %d)\n"
+            "  --police-sidecar-min-share <v> Min vote share before replacement (default: %.2f)\n"
+            "  --police-sidecar-min-conf <v> Min single-frame sidecar confidence (default: %.2f)\n"
             "  --quad-refiner-model <path|off> Quad refiner RKNN path; default: " DEFAULT_QUAD_REFINER_MODEL " ; pass off to disable\n"
             "  --labels <path>         Labels file path (required for live camera mode)\n"
             "  --pred-log <path>       Prediction CSV output path (optional)\n"
@@ -637,6 +671,8 @@ static void print_usage(const char *prog)
             "  --help                  Show this help\n",
             prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD,
             GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES, GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE,
+            POLICE_FIRSTCHAR_DEFAULT_MIN_VOTES, POLICE_FIRSTCHAR_DEFAULT_MIN_SHARE,
+            POLICE_FIRSTCHAR_DEFAULT_MIN_CONF,
             DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
             DEFAULT_STATS_INTERVAL, DEFAULT_COPY_BUFFERS, DEFAULT_QUEUE_DEPTH);
 }
@@ -656,10 +692,19 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"ocr-yellow-keys", required_argument, NULL, 54},
         {"ocr-special-model", required_argument, NULL, 55},
         {"ocr-special-keys", required_argument, NULL, 56},
+        {"ocr-police-model", required_argument, NULL, 60},
+        {"ocr-police-keys", required_argument, NULL, 61},
+        {"ocr-embassy-model", required_argument, NULL, 62},
+        {"ocr-embassy-keys", required_argument, NULL, 63},
         {"ocr-keys", required_argument, NULL, 6},
         {"green-firstchar-model", required_argument, NULL, 57},
         {"green-firstchar-min-votes", required_argument, NULL, 58},
         {"green-firstchar-min-share", required_argument, NULL, 59},
+        {"police-sidecar-model", required_argument, NULL, 64},
+        {"police-firstchar-model", required_argument, NULL, 64},
+        {"police-sidecar-min-votes", required_argument, NULL, 65},
+        {"police-sidecar-min-share", required_argument, NULL, 66},
+        {"police-sidecar-min-conf", required_argument, NULL, 67},
         {"quad-refiner-model", required_argument, NULL, 50},
         {"labels", required_argument, NULL, 7},
         {"pred-log", required_argument, NULL, 8},
@@ -754,6 +799,10 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->green_firstchar_model_path = NULL;
     opt->green_firstchar_min_votes = GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES;
     opt->green_firstchar_min_share = GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE;
+    opt->police_sidecar_model_path = NULL;
+    opt->police_sidecar_min_votes = POLICE_FIRSTCHAR_DEFAULT_MIN_VOTES;
+    opt->police_sidecar_min_share = POLICE_FIRSTCHAR_DEFAULT_MIN_SHARE;
+    opt->police_sidecar_min_conf = POLICE_FIRSTCHAR_DEFAULT_MIN_CONF;
     opt->offline_detect_plate = 1;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
@@ -767,8 +816,27 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 52: opt->ocr_green_model_path = optarg; break;
         case 53: opt->ocr_yellow_model_path = optarg; break;
         case 54: opt->ocr_yellow_keys_path = optarg; break;
-        case 55: opt->ocr_special_model_path = optarg; break;
+        case 55:
+            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
+                opt->ocr_special_model_path = opt->ocr_blue_model_path;
+            else
+                opt->ocr_special_model_path = optarg;
+            break;
         case 56: opt->ocr_special_keys_path = optarg; break;
+        case 60:
+            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
+                opt->ocr_police_model_path = NULL;
+            else
+                opt->ocr_police_model_path = optarg;
+            break;
+        case 61: opt->ocr_police_keys_path = optarg; break;
+        case 62:
+            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
+                opt->ocr_embassy_model_path = NULL;
+            else
+                opt->ocr_embassy_model_path = optarg;
+            break;
+        case 63: opt->ocr_embassy_keys_path = optarg; break;
         case 6: opt->ocr_keys_path = optarg; break;
         case 57:
             if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
@@ -778,6 +846,15 @@ static int parse_options(int argc, char **argv, struct options *opt)
             break;
         case 58: opt->green_firstchar_min_votes = atoi(optarg); break;
         case 59: opt->green_firstchar_min_share = (float)atof(optarg); break;
+        case 64:
+            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
+                opt->police_sidecar_model_path = NULL;
+            else
+                opt->police_sidecar_model_path = optarg;
+            break;
+        case 65: opt->police_sidecar_min_votes = atoi(optarg); break;
+        case 66: opt->police_sidecar_min_share = (float)atof(optarg); break;
+        case 67: opt->police_sidecar_min_conf = (float)atof(optarg); break;
         case 50:
             if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
                 opt->quad_refiner_model_path = NULL;
@@ -946,6 +1023,18 @@ static int parse_options(int argc, char **argv, struct options *opt)
         return -1;
     if (opt->green_firstchar_min_share < 0.0f || opt->green_firstchar_min_share > 1.0f)
         return -1;
+    if (opt->police_sidecar_min_votes < 1 || opt->police_sidecar_min_votes > FIRSTCHAR_TRACK_HIST)
+        return -1;
+    if (opt->police_sidecar_min_share < 0.0f || opt->police_sidecar_min_share > 1.0f)
+        return -1;
+    if (opt->police_sidecar_min_conf < 0.0f || opt->police_sidecar_min_conf > 1.0f)
+        return -1;
+    if (opt->ocr_police_model_path && opt->ocr_police_model_path[0] &&
+        (!opt->ocr_police_keys_path || !opt->ocr_police_keys_path[0]))
+        return -1;
+    if (opt->ocr_embassy_model_path && opt->ocr_embassy_model_path[0] &&
+        (!opt->ocr_embassy_keys_path || !opt->ocr_embassy_keys_path[0]))
+        return -1;
     if (opt->offline_image_path && opt->offline_image_path[0] != '\0') {
         if (!opt->plate_model_path || !opt->ocr_blue_model_path || !opt->ocr_green_model_path || !opt->ocr_keys_path)
             return -1;
@@ -1086,6 +1175,10 @@ static int load_ocr_model_keys(struct ocr_model *m, const char *path)
         idx++;
     }
     fclose(fp);
+    if (idx <= 0) {
+        fprintf(stderr, "Open OCR model keys failed for %s: no valid keys\n", path);
+        return -1;
+    }
     m->key_count = idx;
     fprintf(stderr, "[ocr] loaded %d keys for model %s from %s\n", m->key_count, m->name, path);
     return 0;
@@ -1148,6 +1241,14 @@ static int rknn_ocr_model_load(struct ocr_model *m, const char *name, const char
             m->input_attr.qnt_type,
             m->input_attr.zp,
             m->input_attr.scale);
+    for (i = 0; i < m->io_num.n_output; i++) {
+        const rknn_tensor_attr *oa = &m->output_attrs[i];
+        fprintf(stderr,
+                "[%s] output[%u] fmt=%d type=%d qnt=%d dims=(%u,%u,%u,%u) n_dims=%u zp=%d scale=%.6f\n",
+                name, i, oa->fmt, oa->type, oa->qnt_type,
+                oa->dims[0], oa->dims[1], oa->dims[2], oa->dims[3], oa->n_dims,
+                oa->zp, oa->scale);
+    }
     return 0;
 }
 
@@ -1328,7 +1429,7 @@ static int rknn_firstchar_model_load(struct firstchar_model *m, const char *name
         if (m->output_attr.dims[i] == (uint32_t)GREEN_FIRSTCHAR_CLASS_COUNT)
             return 0;
     }
-    fprintf(stderr, "[%s] WARN: output shape does not explicitly expose %d classes\n",
+    fprintf(stderr, "[%s] WARN: output shape does not explicitly expose %d first-char classes\n",
             name, GREEN_FIRSTCHAR_CLASS_COUNT);
     return 0;
 }
@@ -1861,6 +1962,8 @@ static bool replace_first_utf8_token(char *text, size_t text_len, const char *fi
 
 static bool run_firstchar_model(const struct firstchar_model *m,
                                 const uint8_t *fc_rgb, int fc_w, int fc_h,
+                                bool gray_input,
+                                const char *const *class_tokens, int max_class_count,
                                 char *tok_out, size_t tok_len, float *conf_out)
 {
     uint8_t *resized = NULL;
@@ -1875,7 +1978,7 @@ static bool run_firstchar_model(const struct firstchar_model *m,
     float max_logit = -INFINITY;
     float sum_exp = 0.0f;
 
-    if (!m || !m->ctx || !fc_rgb || !tok_out || tok_len == 0 || !conf_out)
+    if (!m || !m->ctx || !fc_rgb || !class_tokens || !tok_out || tok_len == 0 || !conf_out)
         return false;
     tok_out[0] = '\0';
     *conf_out = 0.0f;
@@ -1888,18 +1991,27 @@ static bool run_firstchar_model(const struct firstchar_model *m,
         goto out_free;
 
     resize_rgb888_bilinear(fc_rgb, fc_w, fc_h, resized, (int)m->in_w, (int)m->in_h);
-    if (m->in_c == 1) {
+    {
         size_t pix = (size_t)m->in_w * (size_t)m->in_h;
         size_t p;
         for (p = 0; p < pix; p++) {
             const uint8_t *q = resized + p * 3U;
-            int y = (int)(0.299f * (float)q[0] + 0.587f * (float)q[1] + 0.114f * (float)q[2] + 0.5f);
-            if (y < 0) y = 0;
-            if (y > 255) y = 255;
-            input[p] = (uint8_t)y;
+            uint8_t y = (uint8_t)fmaxf(0.0f, fminf(255.0f,
+                                0.299f * (float)q[0] + 0.587f * (float)q[1] + 0.114f * (float)q[2] + 0.5f));
+            if (m->in_c == 1) {
+                input[p] = y;
+            } else if (gray_input) {
+                uint8_t *dst = input + p * 3U;
+                dst[0] = y;
+                dst[1] = y;
+                dst[2] = y;
+            } else {
+                uint8_t *dst = input + p * 3U;
+                dst[0] = q[0];
+                dst[1] = q[1];
+                dst[2] = q[2];
+            }
         }
-    } else {
-        memcpy(input, resized, (size_t)m->in_w * (size_t)m->in_h * 3U);
     }
 
     memset(&in, 0, sizeof(in));
@@ -1922,10 +2034,10 @@ static bool run_firstchar_model(const struct firstchar_model *m,
         goto out_free;
 
     class_count = firstchar_output_count(&m->output_attr);
-    if (class_count > GREEN_FIRSTCHAR_CLASS_COUNT)
-        class_count = GREEN_FIRSTCHAR_CLASS_COUNT;
+    if (class_count > max_class_count)
+        class_count = max_class_count;
     if (class_count <= 0)
-        class_count = GREEN_FIRSTCHAR_CLASS_COUNT;
+        class_count = max_class_count;
 
     for (i = 0; i < class_count; i++) {
         float v = ((const float *)out.buf)[i];
@@ -1936,10 +2048,10 @@ static bool run_firstchar_model(const struct firstchar_model *m,
         if (v > max_logit)
             max_logit = v;
     }
-    if (best >= 0 && best < GREEN_FIRSTCHAR_CLASS_COUNT) {
+    if (best >= 0 && best < max_class_count) {
         for (i = 0; i < class_count; i++)
             sum_exp += expf(((const float *)out.buf)[i] - max_logit);
-        copy_cstr_trunc(tok_out, tok_len, g_province_chars[best]);
+        copy_cstr_trunc(tok_out, tok_len, class_tokens[best]);
         *conf_out = (sum_exp > 0.0f) ? expf(best_logit - max_logit) / sum_exp : 0.0f;
         ret = 0;
     } else {
@@ -1953,9 +2065,18 @@ out_free:
     return ret == 0;
 }
 
-static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
-                                        const struct det_box *box, uint64_t frame_seq,
-                                        char *text, size_t text_len)
+static bool run_firstchar_sidecar_common(struct app_ctx *ctx,
+                                         const struct firstchar_model *model,
+                                         const char *tag,
+                                         const char *const *class_tokens,
+                                         int class_count,
+                                         bool gray_input,
+                                         int min_votes,
+                                         float min_share,
+                                         float min_conf,
+                                         const uint8_t *fc_rgb, int fc_w, int fc_h,
+                                         const struct det_box *box, uint64_t frame_seq,
+                                         char *text, size_t text_len)
 {
     struct ocr_track *tr;
     char pred_tok[MAX_UTF8_TOKEN_BYTES];
@@ -1974,11 +2095,17 @@ static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_r
     int cand_n = 0;
     float share;
 
-    if (!ctx || !ctx->green_firstchar_model.ctx || !fc_rgb || !box || !text || text[0] == '\0')
+    if (!ctx || !model || !model->ctx || !fc_rgb || !box || !text || text[0] == '\0')
         return false;
-    if (!run_firstchar_model(&ctx->green_firstchar_model, fc_rgb, fc_w, fc_h,
+    if (!run_firstchar_model(model, fc_rgb, fc_w, fc_h, gray_input, class_tokens, class_count,
                              pred_tok, sizeof(pred_tok), &pred_conf))
         return false;
+    if (pred_conf < min_conf) {
+        fprintf(stderr,
+                "[%s] frame=%" PRIu64 " hold pred=%s conf=%.3f min_conf=%.3f text=%s\n",
+                tag, frame_seq, pred_tok, pred_conf, min_conf, text);
+        return false;
+    }
 
     tr_idx = find_or_create_ocr_track(ctx, box);
     if (tr_idx < 0)
@@ -2031,11 +2158,10 @@ static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_r
 
     share = (float)best_votes / (float)total_votes;
     copy_cstr_trunc(stable_tok, sizeof(stable_tok), cand_tok[best_idx]);
-    if (best_votes < ctx->opt.green_firstchar_min_votes ||
-        share < ctx->opt.green_firstchar_min_share) {
+    if (best_votes < min_votes || share < min_share) {
         fprintf(stderr,
-                "[green-fc] frame=%" PRIu64 " hold pred=%s conf=%.3f top=%s votes=%d/%d share=%.2f text=%s\n",
-                frame_seq, pred_tok, pred_conf, stable_tok, best_votes, total_votes, share, text);
+                "[%s] frame=%" PRIu64 " hold pred=%s conf=%.3f top=%s votes=%d/%d share=%.2f text=%s\n",
+                tag, frame_seq, pred_tok, pred_conf, stable_tok, best_votes, total_votes, share, text);
         return false;
     }
 
@@ -2044,11 +2170,35 @@ static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_r
         return false;
     if (strcmp(old_text, text) != 0) {
         fprintf(stderr,
-                "[green-fc] frame=%" PRIu64 " replace raw=%s fused=%s sidecar=%s votes=%d/%d share=%.2f last=%s conf=%.3f\n",
-                frame_seq, old_text, text, stable_tok, best_votes, total_votes, share, pred_tok, pred_conf);
+                "[%s] frame=%" PRIu64 " replace raw=%s fused=%s sidecar=%s votes=%d/%d share=%.2f last=%s conf=%.3f\n",
+                tag, frame_seq, old_text, text, stable_tok, best_votes, total_votes, share, pred_tok, pred_conf);
         return true;
     }
     return false;
+}
+
+static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
+                                        const struct det_box *box, uint64_t frame_seq,
+                                        char *text, size_t text_len)
+{
+    return run_firstchar_sidecar_common(ctx, &ctx->green_firstchar_model, "green-fc",
+                                        g_province_chars, GREEN_FIRSTCHAR_CLASS_COUNT, false,
+                                        ctx->opt.green_firstchar_min_votes,
+                                        ctx->opt.green_firstchar_min_share,
+                                        0.0f,
+                                        fc_rgb, fc_w, fc_h, box, frame_seq, text, text_len);
+}
+
+static bool run_police_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
+                               const struct det_box *box, uint64_t frame_seq,
+                               char *text, size_t text_len)
+{
+    return run_firstchar_sidecar_common(ctx, &ctx->police_sidecar_model, "police-fc",
+                                        g_police_province_chars, POLICE_FIRSTCHAR_CLASS_COUNT, true,
+                                        ctx->opt.police_sidecar_min_votes,
+                                        ctx->opt.police_sidecar_min_share,
+                                        ctx->opt.police_sidecar_min_conf,
+                                        fc_rgb, fc_w, fc_h, box, frame_seq, text, text_len);
 }
 
 static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
@@ -2114,8 +2264,64 @@ static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
     return ocr_in;
 }
 
+static void measure_special_plate_tone(const uint8_t *rgb, int w, int h,
+                                       float *white_ratio, float *dark_ratio)
+{
+    int x1, x2, y1, y2;
+    int x, y;
+    int total = 0;
+    int white = 0;
+    int dark = 0;
+
+    if (white_ratio)
+        *white_ratio = 0.0f;
+    if (dark_ratio)
+        *dark_ratio = 0.0f;
+    if (!rgb || w <= 0 || h <= 0)
+        return;
+
+    x1 = w / 6;
+    x2 = w - w / 6;
+    y1 = h / 4;
+    y2 = h - h / 4;
+    if (x2 <= x1) {
+        x1 = 0;
+        x2 = w;
+    }
+    if (y2 <= y1) {
+        y1 = 0;
+        y2 = h;
+    }
+
+    for (y = y1; y < y2; y++) {
+        for (x = x1; x < x2; x++) {
+            const uint8_t *p = rgb + ((size_t)y * (size_t)w + (size_t)x) * 3U;
+            int r = p[0];
+            int g = p[1];
+            int b = p[2];
+            int mx = r > g ? r : g;
+            int mn = r < g ? r : g;
+            if (b > mx) mx = b;
+            if (b < mn) mn = b;
+            total++;
+            if (mn >= 170 && (mx - mn) <= 70)
+                white++;
+            if (mx <= 80)
+                dark++;
+        }
+    }
+    if (total <= 0)
+        return;
+    if (white_ratio)
+        *white_ratio = (float)white / (float)total;
+    if (dark_ratio)
+        *dark_ratio = (float)dark / (float)total;
+}
+
 static const struct ocr_model *select_ocr_model(const struct app_ctx *ctx,
                                                 enum plate_color plate_color,
+                                                const uint8_t *crop_rgb,
+                                                int crop_w, int crop_h,
                                                 const char **expert_name)
 {
     if (plate_color == PLATE_COLOR_GREEN && ctx->ocr_green_model.ctx) {
@@ -2128,10 +2334,28 @@ static const struct ocr_model *select_ocr_model(const struct app_ctx *ctx,
             *expert_name = "yellow";
         return &ctx->ocr_yellow_model;
     }
-    if (plate_color == PLATE_COLOR_UNKNOWN && ctx->ocr_special_model.ctx) {
-        if (expert_name)
-            *expert_name = "special";
-        return &ctx->ocr_special_model;
+    if (plate_color == PLATE_COLOR_UNKNOWN) {
+        float white_ratio = 0.0f;
+        float dark_ratio = 0.0f;
+        measure_special_plate_tone(crop_rgb, crop_w, crop_h, &white_ratio, &dark_ratio);
+        if (ctx->ocr_police_model.ctx && white_ratio >= 0.20f && white_ratio >= dark_ratio * 0.60f) {
+            if (expert_name)
+                *expert_name = "police";
+            fprintf(stderr, "[special-route] expert=police white=%.3f dark=%.3f\n", white_ratio, dark_ratio);
+            return &ctx->ocr_police_model;
+        }
+        if (ctx->ocr_embassy_model.ctx && dark_ratio >= 0.40f && dark_ratio > white_ratio) {
+            if (expert_name)
+                *expert_name = "embassy";
+            fprintf(stderr, "[special-route] expert=embassy white=%.3f dark=%.3f\n", white_ratio, dark_ratio);
+            return &ctx->ocr_embassy_model;
+        }
+        if (ctx->ocr_special_model.ctx) {
+            if (expert_name)
+                *expert_name = "special";
+            fprintf(stderr, "[special-route] expert=special white=%.3f dark=%.3f\n", white_ratio, dark_ratio);
+            return &ctx->ocr_special_model;
+        }
     }
     if (expert_name)
         *expert_name = (plate_color == PLATE_COLOR_GREEN) ? "green-fallback-blue" : "blue";
@@ -2156,10 +2380,11 @@ static enum ocr_decode_family select_decode_family(const char *expert_name,
 static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_w, int crop_h,
                          enum plate_color plate_color,
                          char *text, size_t text_len, float *conf_out,
-                         struct ocr_diag *diag, uint8_t **model_input_out)
+                         struct ocr_diag *diag, char *expert_out, size_t expert_out_len,
+                         uint8_t **model_input_out)
 {
     const char *expert_name = NULL;
-    const struct ocr_model *m = select_ocr_model(ctx, plate_color, &expert_name);
+    const struct ocr_model *m = select_ocr_model(ctx, plate_color, crop_rgb, crop_w, crop_h, &expert_name);
     rknn_input in;
     rknn_output outs[4];
     uint8_t *ocr_in = NULL;
@@ -2172,9 +2397,14 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
 
     if (diag)
         memset(diag, 0, sizeof(*diag));
+    if (expert_out && expert_out_len > 0)
+        copy_cstr_trunc(expert_out, expert_out_len, expert_name ? expert_name : "unknown");
 
     ocr_in = prepare_ocr_input_rgb888(ctx, m, crop_rgb, crop_w, crop_h, &occ_ratio);
     if (!ocr_in) {
+        fprintf(stderr, "[ocr-error] expert=%s stage=prepare_input crop=%dx%d model_in=%ux%ux%u\n",
+                expert_name ? expert_name : "unknown", crop_w, crop_h,
+                m ? m->in_w : 0, m ? m->in_h : 0, m ? m->in_c : 0);
         return -1;
     }
 
@@ -2185,63 +2415,95 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     in.type = RKNN_TENSOR_UINT8;
     in.fmt = RKNN_TENSOR_NHWC;
     ret = rknn_inputs_set(m->ctx, 1, &in);
-    if (ret < 0)
+    if (ret < 0) {
+        fprintf(stderr, "[ocr-error] expert=%s stage=inputs_set ret=%d in_size=%u model_in=%ux%ux%u attr_fmt=%d\n",
+                expert_name ? expert_name : "unknown", ret, in.size,
+                m->in_w, m->in_h, m->in_c, m->input_attr.fmt);
         goto out;
+    }
     ret = rknn_run(m->ctx, NULL);
-    if (ret < 0)
+    if (ret < 0) {
+        fprintf(stderr, "[ocr-error] expert=%s stage=rknn_run ret=%d\n",
+                expert_name ? expert_name : "unknown", ret);
         goto out;
+    }
 
     memset(outs, 0, sizeof(outs));
     for (i = 0; i < m->io_num.n_output; i++)
         outs[i].want_float = 1;
     ret = rknn_outputs_get(m->ctx, m->io_num.n_output, outs, NULL);
-    if (ret < 0)
+    if (ret < 0) {
+        fprintf(stderr, "[ocr-error] expert=%s stage=outputs_get ret=%d outputs=%u\n",
+                expert_name ? expert_name : "unknown", ret, m->io_num.n_output);
         goto out;
+    }
 
     decode_output_idx = select_ocr_output_idx(m, expert_name);
     out_attr = &m->output_attrs[decode_output_idx];
     if (!build_ocr_layout(out_attr, &t_size, &c_size, &t_stride, &c_stride)) {
+        fprintf(stderr,
+                "[ocr-error] expert=%s stage=layout output_idx=%u fmt=%d dims=(%u,%u,%u,%u) n_dims=%u\n",
+                expert_name ? expert_name : "unknown", decode_output_idx, out_attr->fmt,
+                out_attr->dims[0], out_attr->dims[1], out_attr->dims[2], out_attr->dims[3], out_attr->n_dims);
         ret = -1;
         goto out_release;
     }
-    /* Use per-model keys if model has its own, otherwise fall back to global */
     {
+        const char *keys[MAX_OCR_KEYS];
+        struct ocr_decode_diag decode_diag;
+        enum ocr_decode_family family = select_decode_family(expert_name, plate_color);
         int effective_key_count = (m->key_count > 0) ? m->key_count : ctx->ocr_key_count;
-        /* Temporarily override ctx keys with model keys if available */
-        int saved_key_count = ctx->ocr_key_count;
+        int blank_index;
+        int ki;
+
+        if (effective_key_count > MAX_OCR_KEYS)
+            effective_key_count = MAX_OCR_KEYS;
         if (m->key_count > 0) {
-            int ki;
-            for (ki = 0; ki < m->key_count && ki < MAX_OCR_KEYS; ki++)
-                memcpy(ctx->ocr_keys[ki], m->keys[ki], MAX_OCR_KEY_LEN);
-            ctx->ocr_key_count = m->key_count;
-            effective_key_count = m->key_count;
+            for (ki = 0; ki < effective_key_count; ki++)
+                keys[ki] = m->keys[ki];
+        } else {
+            for (ki = 0; ki < effective_key_count; ki++)
+                keys[ki] = ctx->ocr_keys[ki];
         }
-        /* Always recalculate blank index for the current model */
         if (c_size == effective_key_count + 1)
-            ctx->ocr_blank_index = effective_key_count;
+            blank_index = effective_key_count;
         else
-            ctx->ocr_blank_index = c_size - 1;
-        if (!ctx->ocr_keysize_warned) {
-            if (!(c_size == effective_key_count || c_size == (effective_key_count + 1))) {
-                fprintf(stderr, "[ocr] WARN: model=%s c_size=%d key_count=%d\n",
-                        expert_name ? expert_name : "?",
-                        c_size, effective_key_count);
-            }
+            blank_index = c_size - 1;
+        if (!(c_size == effective_key_count || c_size == (effective_key_count + 1))) {
+            fprintf(stderr, "[ocr] WARN: model=%s c_size=%d key_count=%d\n",
+                    expert_name ? expert_name : "?",
+                    c_size, effective_key_count);
+        }
+        if (ctx->opt.ocr_ctc_diag ||
+            (expert_name && (strcmp(expert_name, "police") == 0 || strcmp(expert_name, "embassy") == 0))) {
             fprintf(stderr,
-                    "[ocr] expert=%s model=%s decode_output_idx=%u/%u\n",
+                    "[ocr] expert=%s model=%s decode_output_idx=%u/%u t=%d c=%d blank=%d keys=%d stride=(%d,%d)\n",
                     expert_name ? expert_name : "unknown",
                     m->name ? m->name : "ocr",
                     decode_output_idx,
-                    m->io_num.n_output);
-            ctx->ocr_keysize_warned = true;
+                    m->io_num.n_output,
+                    t_size, c_size, blank_index, effective_key_count, t_stride, c_stride);
         }
-        /* Restore global key count after decode (keys buffer is reused) */
-        ctx->ocr_key_count = saved_key_count;
-    }
-    {
-        enum ocr_decode_family family = select_decode_family(expert_name, plate_color);
-        ret = ctc_decode_logits((const float *)outs[decode_output_idx].buf, t_size, c_size, t_stride, c_stride,
-                                ctx, family, text, text_len, conf_out, diag);
+        ret = ocr_decode_logits((const float *)outs[decode_output_idx].buf,
+                                t_size, c_size, t_stride, c_stride,
+                                keys, effective_key_count, blank_index,
+                                family, text, text_len, conf_out, &decode_diag);
+        if (ret < 0) {
+            fprintf(stderr, "[ocr-error] expert=%s stage=decode ret=%d t=%d c=%d blank=%d keys=%d\n",
+                    expert_name ? expert_name : "unknown", ret, t_size, c_size, blank_index, effective_key_count);
+        } else if (text[0] == '\0' &&
+                   (ctx->opt.ocr_ctc_diag ||
+                    (expert_name && (strcmp(expert_name, "police") == 0 || strcmp(expert_name, "embassy") == 0)))) {
+            fprintf(stderr, "[ocr-empty] expert=%s t=%d c=%d blank=%d blank_top1=%.3f keys=%d\n",
+                    expert_name ? expert_name : "unknown",
+                    t_size, c_size, blank_index, decode_diag.blank_top1_ratio, effective_key_count);
+        }
+        if (ret == 0 && diag) {
+            diag->t_size = decode_diag.t_size;
+            diag->c_size = decode_diag.c_size;
+            diag->blank_idx = decode_diag.blank_idx;
+            diag->blank_top1_ratio = decode_diag.blank_top1_ratio;
+        }
     }
     if (diag)
         diag->in_occ_ratio = occ_ratio;
@@ -6459,11 +6721,11 @@ static int run_offline_once(struct app_ctx *ctx)
             if (ctx->ocr_crop_index_fp && ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max)
                 ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
                                     pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
-                                    &odiag, &ocr_input_dump);
+                                    &odiag, pd.ocr_expert, sizeof(pd.ocr_expert), &ocr_input_dump);
             else
                 ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
                                     pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
-                                    &odiag, NULL);
+                                    &odiag, pd.ocr_expert, sizeof(pd.ocr_expert), NULL);
             if (ret < 0) {
                 fprintf(stderr, "Offline OCR failed\n");
                 goto out;
@@ -6475,6 +6737,10 @@ static int run_offline_once(struct app_ctx *ctx)
     if (pd.color == PLATE_COLOR_GREEN && pd.ocr_text[0] != '\0') {
         run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
                                     &pd.box, 0, pd.ocr_text, sizeof(pd.ocr_text));
+    }
+    if (strcmp(pd.ocr_expert, "police") == 0 && pd.ocr_text[0] != '\0' && strcmp(pd.ocr_text, "UNK") != 0) {
+        run_police_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
+                           &pd.box, 0, pd.ocr_text, sizeof(pd.ocr_text));
     }
     pd.type = classify_plate_type(pd.color, pd.ocr_text);
 
@@ -6489,18 +6755,19 @@ static int run_offline_once(struct app_ctx *ctx)
                 odiag.t_size, odiag.c_size, odiag.blank_idx, odiag.blank_top1_ratio);
     }
     fprintf(stderr,
-            "[offline][pred] text=%s conf=%.4f type=%s color=%s\n",
-            pd.ocr_text, pd.ocr_conf, plate_type_str(pd.type), plate_color_str(pd.color));
+            "[offline][pred] text=%s conf=%.4f type=%s color=%s expert=%s\n",
+            pd.ocr_text, pd.ocr_conf, plate_type_str(pd.type), plate_color_str(pd.color),
+            pd.ocr_expert[0] ? pd.ocr_expert : "?");
 
     ts_us = mono_us();
     log_prediction_row(ctx, 0, ts_us, &pd);
     if (!ocr_input_dump && ctx->ocr_crop_index_fp &&
         ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
-        const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
+        const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, plate_crop, crop_w, crop_h, NULL);
         ocr_input_dump = prepare_ocr_input_rgb888(ctx, dump_model, plate_crop, crop_w, crop_h, NULL);
     }
     if (ocr_input_dump) {
-        const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
+        const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, plate_crop, crop_w, crop_h, NULL);
         dump_ocr_pair(ctx, 0, &pd, plate_crop, crop_w, crop_h,
                       ocr_input_dump, (int)dump_model->in_w, (int)dump_model->in_h,
                       firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT);
@@ -6904,6 +7171,7 @@ static void *infer_thread_main(void *arg)
             float occ_ratio = 0.0f;
             bool used_obb_warp = false;
             char overlay_txt[32];
+            memset(&pd, 0, sizeof(pd));
             pd.box = stable_plates[i];
             if (ctx->opt.plate_refine) {
                 struct det_box refined = pd.box;
@@ -6996,7 +7264,7 @@ static void *infer_thread_main(void *arg)
                 } else {
                     if (run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
                                       pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
-                                      &odiag, ocr_input_out) < 0) {
+                                      &odiag, pd.ocr_expert, sizeof(pd.ocr_expert), ocr_input_out) < 0) {
                         snprintf(pd.ocr_text, sizeof(pd.ocr_text), "UNK");
                         pd.ocr_conf = 0.0f;
                         pd.ocr_blank_top1 = 0.0f;
@@ -7023,6 +7291,10 @@ static void *infer_thread_main(void *arg)
                 run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
                                             &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text));
             }
+            if (strcmp(pd.ocr_expert, "police") == 0 && pd.ocr_text[0] != '\0' && strcmp(pd.ocr_text, "UNK") != 0) {
+                run_police_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
+                                   &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text));
+            }
             if (pd.ocr_text[0] != '\0')
                 ocr_nonempty_count++;
             pd.type = classify_plate_type(pd.color, pd.ocr_text);
@@ -7031,11 +7303,11 @@ static void *infer_thread_main(void *arg)
                 overlay_nonempty_count++;
             if (!ocr_input_dump && ctx->ocr_crop_index_fp &&
                 ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
-                const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
+                const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, plate_crop, crop_w, crop_h, NULL);
                 ocr_input_dump = prepare_ocr_input_rgb888(ctx, dump_model, plate_crop, crop_w, crop_h, NULL);
             }
             if (ocr_input_dump) {
-                const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
+                const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, plate_crop, crop_w, crop_h, NULL);
                 dump_ocr_pair(ctx, seq, &pd, plate_crop, crop_w, crop_h,
                               ocr_input_dump, (int)dump_model->in_w, (int)dump_model->in_h,
                               firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT);
@@ -7043,14 +7315,15 @@ static void *infer_thread_main(void *arg)
                 ocr_input_dump = NULL;
             }
             fprintf(stderr,
-                    "[pred] frame=%" PRIu64 " ts_us=%" PRId64 " bbox=[%d,%d,%d,%d] text=%s conf=%.2f type=%s color=%s\n",
+                    "[pred] frame=%" PRIu64 " ts_us=%" PRId64 " bbox=[%d,%d,%d,%d] text=%s conf=%.2f type=%s color=%s expert=%s\n",
                     seq,
                     mono_us(),
                     pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2,
                     pd.ocr_text,
                     pd.ocr_conf,
                     plate_type_str(pd.type),
-                    plate_color_str(pd.color));
+                    plate_color_str(pd.color),
+                    pd.ocr_expert[0] ? pd.ocr_expert : "?");
             log_prediction_row(ctx, seq, mono_us(), &pd);
             ctx->pred_rows_total++;
             r.plates[r.plate_count++] = pd;
@@ -7184,7 +7457,10 @@ static void cleanup(struct app_ctx *ctx)
     rknn_ocr_model_release(&ctx->ocr_green_model);
     rknn_ocr_model_release(&ctx->ocr_yellow_model);
     rknn_ocr_model_release(&ctx->ocr_special_model);
+    rknn_ocr_model_release(&ctx->ocr_police_model);
+    rknn_ocr_model_release(&ctx->ocr_embassy_model);
     rknn_firstchar_model_release(&ctx->green_firstchar_model);
+    rknn_firstchar_model_release(&ctx->police_sidecar_model);
     rknn_quad_refiner_model_release(&ctx->quad_refiner_model);
 
     if (ctx->pred_log_fp) {
@@ -7324,14 +7600,30 @@ int main(int argc, char **argv)
     if (strcmp(ctx.opt.ocr_yellow_model_path, ctx.opt.ocr_blue_model_path) != 0) {
         if (rknn_ocr_model_load(&ctx.ocr_yellow_model, "ocr_yellow", ctx.opt.ocr_yellow_model_path) < 0)
             goto out;
-        if (ctx.opt.ocr_yellow_keys_path && ctx.opt.ocr_yellow_keys_path[0])
-            load_ocr_model_keys(&ctx.ocr_yellow_model, ctx.opt.ocr_yellow_keys_path);
+        if (ctx.opt.ocr_yellow_keys_path && ctx.opt.ocr_yellow_keys_path[0] &&
+            load_ocr_model_keys(&ctx.ocr_yellow_model, ctx.opt.ocr_yellow_keys_path) < 0)
+            goto out;
     }
     if (strcmp(ctx.opt.ocr_special_model_path, ctx.opt.ocr_blue_model_path) != 0) {
         if (rknn_ocr_model_load(&ctx.ocr_special_model, "ocr_special", ctx.opt.ocr_special_model_path) < 0)
             goto out;
-        if (ctx.opt.ocr_special_keys_path && ctx.opt.ocr_special_keys_path[0])
-            load_ocr_model_keys(&ctx.ocr_special_model, ctx.opt.ocr_special_keys_path);
+        if (ctx.opt.ocr_special_keys_path && ctx.opt.ocr_special_keys_path[0] &&
+            load_ocr_model_keys(&ctx.ocr_special_model, ctx.opt.ocr_special_keys_path) < 0)
+            goto out;
+    }
+    if (ctx.opt.ocr_police_model_path && ctx.opt.ocr_police_model_path[0]) {
+        if (rknn_ocr_model_load(&ctx.ocr_police_model, "ocr_police", ctx.opt.ocr_police_model_path) < 0)
+            goto out;
+        if (ctx.opt.ocr_police_keys_path && ctx.opt.ocr_police_keys_path[0] &&
+            load_ocr_model_keys(&ctx.ocr_police_model, ctx.opt.ocr_police_keys_path) < 0)
+            goto out;
+    }
+    if (ctx.opt.ocr_embassy_model_path && ctx.opt.ocr_embassy_model_path[0]) {
+        if (rknn_ocr_model_load(&ctx.ocr_embassy_model, "ocr_embassy", ctx.opt.ocr_embassy_model_path) < 0)
+            goto out;
+        if (ctx.opt.ocr_embassy_keys_path && ctx.opt.ocr_embassy_keys_path[0] &&
+            load_ocr_model_keys(&ctx.ocr_embassy_model, ctx.opt.ocr_embassy_keys_path) < 0)
+            goto out;
     }
     if (!ocr_model_input_compatible(&ctx.ocr_model, &ctx.ocr_green_model)) {
         fprintf(stderr,
@@ -7352,6 +7644,21 @@ int main(int argc, char **argv)
                 ctx.opt.green_firstchar_min_votes,
                 ctx.opt.green_firstchar_min_share);
     }
+    if (rknn_firstchar_model_load(&ctx.police_sidecar_model, "police_sidecar",
+                                  ctx.opt.police_sidecar_model_path) < 0)
+        goto out;
+    if (ctx.police_sidecar_model.ctx) {
+        fprintf(stderr,
+                "[ocr] police sidecar enabled: model=%s min_votes=%d min_share=%.2f min_conf=%.2f\n",
+                ctx.opt.police_sidecar_model_path,
+                ctx.opt.police_sidecar_min_votes,
+                ctx.opt.police_sidecar_min_share,
+                ctx.opt.police_sidecar_min_conf);
+    }
+    fprintf(stderr, "[ocr] special routing: fallback=%s police=%s embassy=%s\n",
+            ctx.ocr_special_model.ctx ? ctx.opt.ocr_special_model_path : "<blue>",
+            ctx.ocr_police_model.ctx ? ctx.opt.ocr_police_model_path : "<off>",
+            ctx.ocr_embassy_model.ctx ? ctx.opt.ocr_embassy_model_path : "<off>");
     if (rknn_quad_refiner_model_load(&ctx.quad_refiner_model, "quad_refiner", ctx.opt.quad_refiner_model_path) < 0)
         goto out;
 
