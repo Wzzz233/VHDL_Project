@@ -83,7 +83,7 @@ module ips2l_pcie_dma #(
     output  wire                        o_bar2_rd_clk_en_ext    ,
     output  wire    [ADDR_WIDTH-1:0]    o_bar2_rd_addr_ext      ,
     input           [127:0]             i_ext_bar2_rd_data      ,
-    input                               i_ext_bar2_rd_sel           // 1=use external data
+    input                               i_ext_bar2_rd_sel,          // 1=use external data
     //**********************************************************************
     //bar1 passthrough interface (for I2C passthrough to OV5640)
     output  wire                        o_bar1_pt_wr_en         ,
