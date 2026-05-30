@@ -2906,7 +2906,8 @@ static void clahe_l_channel(uint8_t *rgb, int w, int h,
             for (k = 0; k < CLAHE_HIST_BINS; k++) {
                 csum += hptr[k];
                 int val = (int)((float)csum * cdf_scale + 0.5f);
-                if (val > 255) val = 255; mptr[k] = (uint8_t)val;
+                if (val > 255) val = 255;
+                mptr[k] = (uint8_t)val;
             }
         }
     }
