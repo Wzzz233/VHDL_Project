@@ -3,10 +3,28 @@ set -euo pipefail
 
 DEVICE="/dev/fpga_dma0"
 DRM_CARD="/dev/dri/card0"
-VEH_MODEL=""
+PED_MODEL=""
 PLATE_MODEL=""
 OCR_MODEL=""
+OCR_BLUE_MODEL=""
+OCR_GREEN_MODEL=""
+OCR_YELLOW_MODEL=""
+OCR_YELLOW_KEYS=""
+OCR_SPECIAL_MODEL=""
+OCR_SPECIAL_KEYS=""
+OCR_POLICE_MODEL=""
+OCR_POLICE_KEYS=""
+OCR_EMBASSY_MODEL=""
+OCR_EMBASSY_KEYS=""
 OCR_KEYS=""
+GREEN_FIRSTCHAR_MODEL=""
+POLICE_SIDECAR_MODEL=""
+POLICE_SIDECAR_MIN_VOTES="1"
+POLICE_SIDECAR_MIN_SHARE="0.00"
+POLICE_SIDECAR_MIN_CONF="0.80"
+GREEN_FIRSTCHAR_MIN_VOTES="5"
+GREEN_FIRSTCHAR_MIN_SHARE="0.60"
+QUAD_REFINER_MODEL=""
 LABELS=""
 PRED_LOG=""
 CONNECTOR_ID=""
@@ -31,7 +49,7 @@ RED_RATIO_THR="0.002"
 STOPLINE_RATIO="0.55"
 DET_RESIZE_MODE="letterbox"
 PLATE_REFINE="1"
-PLATE_DETECTOR_TYPE="yolov5"
+PLATE_DETECTOR_TYPE="yolov8_obb_rknn"
 PLATE_NMS_IOU="0.45"
 PLATE_MAX_DET="128"
 PLATE_CLASS_ID="-1"
@@ -53,13 +71,31 @@ OFFLINE_DETECT_PLATE="1"
 
 usage() {
   cat <<EOF
-Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr-keys <path> [options]
+Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-blue-model <path> --ocr-green-model <path> --ocr-keys <path> [options]
   --device <path>            FPGA device (default: ${DEVICE})
   --drm-card <path>          DRM card (default: ${DRM_CARD})
-  --veh-model <path>         Vehicle RKNN model (required for live camera mode)
+  --ped-model <path>         Pedestrian YOLOv8 detection RKNN model (optional)
   --plate-model <path>       Plate RKNN model (required)
-  --ocr-model <path>         OCR RKNN model (required)
+  --ocr-model <path>         Legacy single OCR RKNN model
+  --ocr-blue-model <path>    Blue/non-green OCR expert RKNN model
+  --ocr-green-model <path>   Green OCR expert RKNN model
+  --ocr-yellow-model <path>  Yellow OCR expert RKNN model (optional)
+  --ocr-yellow-keys <path>   Yellow OCR keys txt (optional)
+  --ocr-special-model <path> Legacy UNKNOWN fallback OCR expert RKNN model (optional)
+  --ocr-special-keys <path>  Legacy UNKNOWN fallback OCR keys txt (optional)
+  --ocr-police-model <path|off> Police OCR expert RKNN model (optional)
+  --ocr-police-keys <path>   Police OCR keys txt (required with police model)
+  --ocr-embassy-model <path|off> Embassy OCR expert RKNN model (optional)
+  --ocr-embassy-keys <path>  Embassy OCR keys txt (required with embassy model)
   --ocr-keys <path>          OCR keys txt (required)
+  --green-firstchar-model <path|off> Green first-character RKNN sidecar (default: off)
+  --police-sidecar-model <path|off> Police province sidecar RKNN (default: off)
+  --police-sidecar-min-votes <n> Min same-province votes before replacement (default: ${POLICE_SIDECAR_MIN_VOTES})
+  --police-sidecar-min-share <v> Min vote share before replacement (default: ${POLICE_SIDECAR_MIN_SHARE})
+  --police-sidecar-min-conf <v> Min single-frame sidecar confidence (default: ${POLICE_SIDECAR_MIN_CONF})
+  --green-firstchar-min-votes <n> Min same-province votes before replacement (default: ${GREEN_FIRSTCHAR_MIN_VOTES})
+  --green-firstchar-min-share <v> Min vote share before replacement (default: ${GREEN_FIRSTCHAR_MIN_SHARE})
+  --quad-refiner-model <path|off> Quad refiner RKNN path; pass off to disable
   --labels <path>            Labels file (required for live camera mode)
   --pred-log <path>          Prediction CSV output path (optional)
   --offline-image <path>     Run one-shot offline on image (jpg/png/ppm), no camera path
@@ -87,7 +123,7 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-model <path> --ocr
   --stopline-ratio <v>       Stopline Y ratio [0,1] (default: ${STOPLINE_RATIO})
   --det-resize-mode <m>      Detect resize: stretch|letterbox (default: ${DET_RESIZE_MODE})
   --plate-refine <0|1>       Enable local high-res plate refine (default: ${PLATE_REFINE})
-  --plate-detector-type <m>  Plate detector: yolov5|yolov8_obb_rknn (default: ${PLATE_DETECTOR_TYPE})
+  --plate-detector-type <m>  Plate detector: yolov8_obb_rknn|yolov8_pose_rknn (default: ${PLATE_DETECTOR_TYPE})
   --plate-nms-iou <v>        Plate NMS IoU threshold (default: ${PLATE_NMS_IOU})
   --plate-max-det <n>        Plate max detections after NMS (default: ${PLATE_MAX_DET})
   --plate-class-id <n>       Optional class filter for plate model (-1 disables, default: ${PLATE_CLASS_ID})
@@ -110,10 +146,28 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --device) DEVICE="$2"; shift 2 ;;
     --drm-card) DRM_CARD="$2"; shift 2 ;;
-    --veh-model) VEH_MODEL="$2"; shift 2 ;;
+    --ped-model) PED_MODEL="$2"; shift 2 ;;
     --plate-model) PLATE_MODEL="$2"; shift 2 ;;
     --ocr-model) OCR_MODEL="$2"; shift 2 ;;
+    --ocr-blue-model) OCR_BLUE_MODEL="$2"; shift 2 ;;
+    --ocr-green-model) OCR_GREEN_MODEL="$2"; shift 2 ;;
+    --ocr-yellow-model) OCR_YELLOW_MODEL="$2"; shift 2 ;;
+    --ocr-yellow-keys) OCR_YELLOW_KEYS="$2"; shift 2 ;;
+    --ocr-special-model) OCR_SPECIAL_MODEL="$2"; shift 2 ;;
+    --ocr-special-keys) OCR_SPECIAL_KEYS="$2"; shift 2 ;;
+    --ocr-police-model) OCR_POLICE_MODEL="$2"; shift 2 ;;
+    --ocr-police-keys) OCR_POLICE_KEYS="$2"; shift 2 ;;
+    --ocr-embassy-model) OCR_EMBASSY_MODEL="$2"; shift 2 ;;
+    --ocr-embassy-keys) OCR_EMBASSY_KEYS="$2"; shift 2 ;;
     --ocr-keys) OCR_KEYS="$2"; shift 2 ;;
+    --green-firstchar-model) GREEN_FIRSTCHAR_MODEL="$2"; shift 2 ;;
+    --police-sidecar-model|--police-firstchar-model) POLICE_SIDECAR_MODEL="$2"; shift 2 ;;
+    --police-sidecar-min-votes) POLICE_SIDECAR_MIN_VOTES="$2"; shift 2 ;;
+    --police-sidecar-min-share) POLICE_SIDECAR_MIN_SHARE="$2"; shift 2 ;;
+    --police-sidecar-min-conf) POLICE_SIDECAR_MIN_CONF="$2"; shift 2 ;;
+    --green-firstchar-min-votes) GREEN_FIRSTCHAR_MIN_VOTES="$2"; shift 2 ;;
+    --green-firstchar-min-share) GREEN_FIRSTCHAR_MIN_SHARE="$2"; shift 2 ;;
+    --quad-refiner-model) QUAD_REFINER_MODEL="$2"; shift 2 ;;
     --labels) LABELS="$2"; shift 2 ;;
     --pred-log) PRED_LOG="$2"; shift 2 ;;
     --offline-image) OFFLINE_IMAGE="$2"; shift 2 ;;
@@ -167,18 +221,40 @@ if [[ -n "$OFFLINE_IMAGE" ]]; then
   OFFLINE_MODE=1
 fi
 
+if [[ -z "$OCR_BLUE_MODEL" ]]; then
+  OCR_BLUE_MODEL="$OCR_MODEL"
+fi
+if [[ -z "$OCR_GREEN_MODEL" ]]; then
+  OCR_GREEN_MODEL="$OCR_MODEL"
+fi
+if [[ -z "$OCR_YELLOW_MODEL" ]]; then
+  OCR_YELLOW_MODEL="$OCR_BLUE_MODEL"
+fi
+if [[ -z "$OCR_SPECIAL_MODEL" ]]; then
+  OCR_SPECIAL_MODEL="$OCR_BLUE_MODEL"
+fi
+
 if [[ "$OFFLINE_MODE" == "1" ]]; then
-  if [[ -z "$PLATE_MODEL" || -z "$OCR_MODEL" || -z "$OCR_KEYS" ]]; then
-    echo "Offline mode requires: --plate-model --ocr-model --ocr-keys" >&2
+  if [[ -z "$PLATE_MODEL" || -z "$OCR_BLUE_MODEL" || -z "$OCR_GREEN_MODEL" || -z "$OCR_KEYS" ]]; then
+    echo "Offline mode requires: --plate-model --ocr-blue-model --ocr-green-model --ocr-keys" >&2
     usage
     exit 1
   fi
 else
-  if [[ -z "$VEH_MODEL" || -z "$PLATE_MODEL" || -z "$OCR_MODEL" || -z "$OCR_KEYS" || -z "$LABELS" ]]; then
-    echo "Missing required args: --veh-model --plate-model --ocr-model --ocr-keys --labels" >&2
+  if [[ -z "$PLATE_MODEL" || -z "$OCR_BLUE_MODEL" || -z "$OCR_GREEN_MODEL" || -z "$OCR_KEYS" || -z "$LABELS" ]]; then
+    echo "Missing required args: --plate-model --ocr-blue-model --ocr-green-model --ocr-keys --labels" >&2
     usage
     exit 1
   fi
+fi
+
+if [[ -n "$OCR_POLICE_MODEL" && "$OCR_POLICE_MODEL" != "off" && -z "$OCR_POLICE_KEYS" ]]; then
+  echo "--ocr-police-keys is required when --ocr-police-model is set" >&2
+  exit 1
+fi
+if [[ -n "$OCR_EMBASSY_MODEL" && "$OCR_EMBASSY_MODEL" != "off" && -z "$OCR_EMBASSY_KEYS" ]]; then
+  echo "--ocr-embassy-keys is required when --ocr-embassy-model is set" >&2
+  exit 1
 fi
 
 if [[ ! -x ./fpga_lpr_display ]]; then
@@ -209,10 +285,16 @@ if [[ "$OFFLINE_MODE" == "0" ]]; then
 fi
 
 if [[ "$OFFLINE_MODE" == "1" ]]; then
-  if [[ ! -f "$OFFLINE_IMAGE" || ! -f "$PLATE_MODEL" || ! -f "$OCR_MODEL" || ! -f "$OCR_KEYS" ]]; then
+  if [[ ! -f "$OFFLINE_IMAGE" || ! -f "$PLATE_MODEL" || ! -f "$OCR_BLUE_MODEL" || ! -f "$OCR_GREEN_MODEL" || ! -f "$OCR_KEYS" ]]; then
     echo "Offline image/model/keys file not found" >&2
     exit 3
   fi
+  for optional_path in "$OCR_POLICE_MODEL" "$OCR_POLICE_KEYS" "$OCR_EMBASSY_MODEL" "$OCR_EMBASSY_KEYS" "$POLICE_SIDECAR_MODEL"; do
+    if [[ -n "$optional_path" && "$optional_path" != "off" && ! -f "$optional_path" ]]; then
+      echo "Optional police/embassy model or keys file not found: $optional_path" >&2
+      exit 3
+    fi
+  done
   if [[ "$OFFLINE_IMAGE" =~ \.[Pp][Pp][Mm]$ ]]; then
     OFFLINE_INPUT="$OFFLINE_IMAGE"
   else
@@ -224,15 +306,24 @@ if [[ "$OFFLINE_MODE" == "1" ]]; then
     ffmpeg -loglevel error -y -i "$OFFLINE_IMAGE" -frames:v 1 "$OFFLINE_INPUT"
   fi
 else
-  if [[ ! -f "$VEH_MODEL" || ! -f "$PLATE_MODEL" || ! -f "$OCR_MODEL" || ! -f "$OCR_KEYS" || ! -f "$LABELS" ]]; then
+  if [[ ! -f "$PLATE_MODEL" || ! -f "$OCR_BLUE_MODEL" || ! -f "$OCR_GREEN_MODEL" || ! -f "$OCR_KEYS" || ! -f "$LABELS" ]]; then
     echo "Model/keys/label file not found" >&2
     exit 3
   fi
+  for optional_path in "$OCR_POLICE_MODEL" "$OCR_POLICE_KEYS" "$OCR_EMBASSY_MODEL" "$OCR_EMBASSY_KEYS" "$POLICE_SIDECAR_MODEL"; do
+    if [[ -n "$optional_path" && "$optional_path" != "off" && ! -f "$optional_path" ]]; then
+      echo "Optional police/embassy model or keys file not found: $optional_path" >&2
+      exit 3
+    fi
+  done
 fi
 
 CMD=(./fpga_lpr_display
   --plate-model "$PLATE_MODEL"
-  --ocr-model "$OCR_MODEL"
+  --ocr-blue-model "$OCR_BLUE_MODEL"
+  --ocr-green-model "$OCR_GREEN_MODEL"
+  --ocr-yellow-model "$OCR_YELLOW_MODEL"
+  --ocr-special-model "$OCR_SPECIAL_MODEL"
   --ocr-keys "$OCR_KEYS"
   --min-plate-conf "$MIN_PLATE_CONF"
   --plate-detector-type "$PLATE_DETECTOR_TYPE"
@@ -251,11 +342,42 @@ CMD=(./fpga_lpr_display
   --ocr-ctc-diag "$OCR_CTC_DIAG"
   --ocr-crop-dump-max "$OCR_CROP_DUMP_MAX")
 
+if [[ -n "$OCR_YELLOW_KEYS" ]]; then
+  CMD+=(--ocr-yellow-keys "$OCR_YELLOW_KEYS")
+fi
+if [[ -n "$OCR_SPECIAL_KEYS" ]]; then
+  CMD+=(--ocr-special-keys "$OCR_SPECIAL_KEYS")
+fi
+if [[ -n "$OCR_POLICE_MODEL" ]]; then
+  CMD+=(--ocr-police-model "$OCR_POLICE_MODEL")
+fi
+if [[ -n "$OCR_POLICE_KEYS" ]]; then
+  CMD+=(--ocr-police-keys "$OCR_POLICE_KEYS")
+fi
+if [[ -n "$OCR_EMBASSY_MODEL" ]]; then
+  CMD+=(--ocr-embassy-model "$OCR_EMBASSY_MODEL")
+fi
+if [[ -n "$OCR_EMBASSY_KEYS" ]]; then
+  CMD+=(--ocr-embassy-keys "$OCR_EMBASSY_KEYS")
+fi
+if [[ -n "$GREEN_FIRSTCHAR_MODEL" && "$GREEN_FIRSTCHAR_MODEL" != "off" ]]; then
+  CMD+=(
+    --green-firstchar-model "$GREEN_FIRSTCHAR_MODEL"
+    --green-firstchar-min-votes "$GREEN_FIRSTCHAR_MIN_VOTES"
+    --green-firstchar-min-share "$GREEN_FIRSTCHAR_MIN_SHARE")
+fi
+if [[ -n "$POLICE_SIDECAR_MODEL" && "$POLICE_SIDECAR_MODEL" != "off" ]]; then
+  CMD+=(
+    --police-sidecar-model "$POLICE_SIDECAR_MODEL"
+    --police-sidecar-min-votes "$POLICE_SIDECAR_MIN_VOTES"
+    --police-sidecar-min-share "$POLICE_SIDECAR_MIN_SHARE"
+    --police-sidecar-min-conf "$POLICE_SIDECAR_MIN_CONF")
+fi
+
 if [[ "$OFFLINE_MODE" == "0" ]]; then
   CMD+=(
     --device "$DEVICE"
     --drm-card "$DRM_CARD"
-    --veh-model "$VEH_MODEL"
     --labels "$LABELS"
     --fps "$FPS"
     --pixel-order "$PIXEL_ORDER"
@@ -292,7 +414,12 @@ fi
 if [[ -n "$OCR_CROP_DUMP_DIR" ]]; then
   CMD+=(--ocr-crop-dump-dir "$OCR_CROP_DUMP_DIR")
 fi
-
+if [[ -n "$QUAD_REFINER_MODEL" ]]; then
+  CMD+=(--quad-refiner-model "$QUAD_REFINER_MODEL")
+fi
+if [[ -n "$PED_MODEL" ]]; then
+  CMD+=(--ped-model "$PED_MODEL")
+fi
 if [[ -n "$CONNECTOR_ID" ]]; then
   CMD+=(--connector-id "$CONNECTOR_ID")
 fi
