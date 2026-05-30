@@ -56,6 +56,29 @@
 	 reg       pt_pending;
 	 reg [23:0] pt_cmd_hold;
 	 reg       pt_ack_from_20k;
+	 reg       pt_ack_prev;
+
+// synopsys translate_off
+initial begin
+    clock_20k_cnt       = 16'd0;
+    post_reset_wait_cnt = 16'd0;
+    config_step         = 2'd0;
+    i2c_data            = 32'd0;
+    reg_data            = 24'd0;
+    start               = 1'd0;
+    reg_conf_done_reg   = 1'd0;
+    reg_index           = 9'd0;
+    ack_fail_sticky     = 1'd0;
+    ack_fail_first_index= 9'd0;
+    ack_fail_count      = 9'd0;
+    pt_req_sync         = 2'd0;
+    pt_req_prev         = 1'd0;
+    pt_pending          = 1'd0;
+    pt_cmd_hold         = 24'd0;
+    pt_ack_from_20k     = 1'd0;
+    pt_ack_prev         = 1'd0;
+end
+// synopsys translate_on
 
 	 localparam [8:0] REG_INDEX_START        = 9'd0;
 	 localparam [8:0] REG_INDEX_SOFT_RESET   = 9'd1;
@@ -121,12 +144,15 @@ begin
 
        // Rising edge detect on synchronised write strobe
        pt_req_prev <= pt_req_sync[1];
-       if(pt_req_sync[1] && !pt_req_prev && pt_bar1_wr_addr[11:0] == 12'h200) begin
+       // Guard !pt_pending prevents re-triggering while a passthrough write
+       // is in progress (CDC runs at 25MHz, I2C state machine at 20kHz).
+       if(pt_req_sync[1] && !pt_req_prev && !pt_pending && pt_bar1_wr_addr[11:0] == 12'h200) begin
            pt_pending  <= 1'b1;
            pt_cmd_hold <= pt_bar1_wr_data[23:0];  // {regH, regL, data}
        end
-       // Clear when passthrough write completes (ack from clock_20k domain)
-       if(pt_ack_from_20k)
+       // Clear when passthrough write completes (edge-detect: ack is 100us wide)
+       pt_ack_prev <= pt_ack_from_20k;
+       if(pt_ack_from_20k && !pt_ack_prev)
            pt_pending <= 1'b0;
    end
 end
