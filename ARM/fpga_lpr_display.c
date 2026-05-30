@@ -33,6 +33,7 @@
 #include <rknn_api.h>
 
 #include "pcie_fpga_dma.h"
+#include "ocr_decode.h"
 
 #define DEFAULT_DEVICE "/dev/" FPGA_DMA_DEV_NAME
 #define DEFAULT_DRM_CARD "/dev/dri/card0"
@@ -41,6 +42,7 @@
 #define DEFAULT_STATS_INTERVAL 1
 #define DEFAULT_COPY_BUFFERS 2
 #define DEFAULT_QUEUE_DEPTH 1
+#define DEFAULT_QUAD_REFINER_MODEL "stage1_r18_gt_best.rknn"
 #define MIN_COPY_BUFFERS 2
 #define MAX_COPY_BUFFERS 6
 
@@ -52,9 +54,17 @@
 #define ALGO_STREAM_SIZE 640
 #define OCR_CROP_WIDTH 150
 #define OCR_CROP_HEIGHT 50
+#define FIRSTCHAR_WARP_WIDTH 224
+#define FIRSTCHAR_WARP_HEIGHT 72
 #define OBB_POINT_COUNT 8400
+#define POSE_KPT_COUNT 4
+#define POSE_KPT_DIMS 3
+#define POSE_OUTPUT_CHANNELS (4 + 1 + POSE_KPT_COUNT * POSE_KPT_DIMS)
 #define OCR_TRACK_MAX 24
 #define OCR_TRACK_HIST 8
+#define FIRSTCHAR_TRACK_HIST 8
+#define GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES 5
+#define GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE 0.60f
 #define MAX_UTF8_TOKEN_BYTES 8
 #define MAX_PLATE_TOKENS 16
 
@@ -84,7 +94,6 @@ enum plate_type {
     PLATE_TYPE_COMMON_BLUE = 0,
     PLATE_TYPE_COMMON_GREEN,
     PLATE_TYPE_YELLOW,
-    PLATE_TYPE_POLICE,
     PLATE_TYPE_TRAILER,
     PLATE_TYPE_EMBASSY_CONSULATE,
     PLATE_TYPE_UNKNOWN,
@@ -110,11 +119,13 @@ enum ocr_crop_mode {
     OCR_CROP_BOX_PAD,
     OCR_CROP_MATCH,
     OCR_CROP_OBB_WARP,
+    OCR_CROP_OBB_PIECEWISE,
 };
 
 enum detector_type {
-    DETECTOR_YOLOV5 = 0,
-    DETECTOR_YOLOV8_OBB_RKNN,
+    DETECTOR_YOLOV8_OBB_RKNN = 0,
+    DETECTOR_YOLOV8_POSE_RKNN,
+    DETECTOR_YOLOV8_DET,
 };
 
 enum ocr_resize_mode {
@@ -141,10 +152,18 @@ enum ocr_preproc_mode {
 struct options {
     const char *device_path;
     const char *drm_card_path;
-    const char *veh_model_path;
+    const char *ped_model_path;
     const char *plate_model_path;
     const char *ocr_model_path;
+    const char *ocr_blue_model_path;
+    const char *ocr_green_model_path;
+    const char *ocr_yellow_model_path;
+    const char *ocr_yellow_keys_path;
+    const char *ocr_special_model_path;
+    const char *ocr_special_keys_path;
     const char *ocr_keys_path;
+    const char *green_firstchar_model_path;
+    const char *quad_refiner_model_path;
     const char *labels_path;
     const char *pred_log_path;
     const char *offline_image_path;
@@ -186,12 +205,12 @@ struct options {
     int ocr_ctc_diag;
     int ocr_crop_dump_max;
     const char *ocr_crop_dump_dir;
-    int offline_detect_plate;
-    bool swap16;
+    int green_firstchar_min_votes;
+    float green_firstchar_min_share;
     int clahe_enable;
     int clahe_compare;
-    const char *clahe_dump_dir;
-    int clahe_dump_max;
+    int offline_detect_plate;
+    bool swap16;
 };
 
 struct det_box {
@@ -302,6 +321,10 @@ struct ocr_track {
     int hist_next;
     char province_tok[MAX_UTF8_TOKEN_BYTES];
     float province_score;
+    char fc_tok[FIRSTCHAR_TRACK_HIST][MAX_UTF8_TOKEN_BYTES];
+    float fc_conf[FIRSTCHAR_TRACK_HIST];
+    int fc_count;
+    int fc_next;
 };
 
 struct yolo_model {
@@ -331,7 +354,53 @@ struct ocr_model {
     uint32_t in_w;
     uint32_t in_h;
     uint32_t in_c;
+    char keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
+    int key_count;
 };
+
+struct quad_refiner_model {
+    const char *name;
+    const char *path;
+    rknn_context ctx;
+    rknn_input_output_num io_num;
+    rknn_tensor_attr input_attr;
+    rknn_tensor_attr output_attrs[4];
+    uint32_t in_w;
+    uint32_t in_h;
+    uint32_t in_c;
+};
+
+struct firstchar_model {
+    const char *name;
+    const char *path;
+    rknn_context ctx;
+    rknn_input_output_num io_num;
+    rknn_tensor_attr input_attr;
+    rknn_tensor_attr output_attr;
+    uint32_t in_w;
+    uint32_t in_h;
+    uint32_t in_c;
+};
+
+struct app_ctx;
+
+static bool run_quad_refiner(const struct app_ctx *ctx,
+                              const uint8_t *rgb, int img_w, int img_h,
+                              const float coarse_quad[8],
+                              float refined_quad_out[8]);
+
+static float quad_area8(const float q[8]);
+static void quad_center8(const float q[8], float *cx, float *cy);
+static float quad_edge_len8(const float q[8], int i);
+static bool quad_is_convex8(const float q[8]);
+static void rect_box_to_quad(const struct det_box *box, float quad[8]);
+static void bbox_from_quad_float(const float q[8], int img_w, int img_h,
+                                 int *x1, int *y1, int *x2, int *y2);
+static bool warp_quad_to_rect_piecewise_rgb888(const uint8_t *rgb, int img_w, int img_h,
+                                               const float quad_in[8], uint8_t *dst,
+                                               int dst_cap_w, int dst_cap_h,
+                                               int *out_w, int *out_h);
+static bool decode_refiner_output_layout(const rknn_tensor_attr *a, int *h, int *w, int *c, bool *is_nchw);
 
 struct app_ctx {
     struct options opt;
@@ -381,9 +450,14 @@ struct app_ctx {
     pthread_mutex_t result_lock;
     struct lpr_results results;
 
-    struct yolo_model veh_model;
+    struct yolo_model ped_model;
     struct yolo_model plate_model;
     struct ocr_model ocr_model;
+    struct ocr_model ocr_green_model;
+    struct ocr_model ocr_yellow_model;
+    struct ocr_model ocr_special_model;
+    struct firstchar_model green_firstchar_model;
+    struct quad_refiner_model quad_refiner_model;
     char ocr_keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
     int ocr_key_count;
     int ocr_blank_index;
@@ -391,7 +465,6 @@ struct app_ctx {
     FILE *pred_log_fp;
     FILE *ocr_crop_index_fp;
     int ocr_crop_dumped;
-    int clahe_dump_count;
     pthread_mutex_t pred_log_lock;
     char labels[MAX_LABELS][MAX_LABEL_LEN];
     int label_count;
@@ -430,6 +503,15 @@ struct frame_cookie {
 
 static volatile sig_atomic_t g_stop = 0;
 
+static const char *const g_province_chars[] = {
+    "京", "津", "冀", "晋", "蒙", "辽", "吉", "黑",
+    "沪", "苏", "浙", "皖", "闽", "赣", "鲁", "豫",
+    "鄂", "湘", "粤", "桂", "琼", "川", "贵", "云",
+    "藏", "陕", "甘", "青", "宁", "新", "渝",
+};
+
+#define GREEN_FIRSTCHAR_CLASS_COUNT ((int)(sizeof(g_province_chars) / sizeof(g_province_chars[0])))
+
 static void resize_rgb888_nn(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh);
 static void resize_rgb888_bilinear(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh);
 static void resize_rgb888_with_kernel(const uint8_t *src, int sw, int sh,
@@ -442,11 +524,18 @@ static void resize_rgb888_letterbox_kernel(const uint8_t *src, int sw, int sh,
 static void ocr_preprocess_rgb888(uint8_t *rgb, int w, int h, int mode);
 static float box_iou(const struct det_box *a, const struct det_box *b);
 static float laplacian_variance_rgb888(const uint8_t *rgb, int w, int h);
-static void clahe_l_channel(uint8_t *rgb, int w, int h, float clip_limit, int tile_size);
 static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
+                                         const struct ocr_model *m,
                                          const uint8_t *crop_rgb, int crop_w, int crop_h,
                                          float *occ_ratio_out);
 static bool append_utf8_token(char *dst, size_t dst_len, const char *token);
+static int rknn_quad_refiner_model_load(struct quad_refiner_model *m, const char *name, const char *path);
+static void rknn_quad_refiner_model_release(struct quad_refiner_model *m);
+static int rknn_firstchar_model_load(struct firstchar_model *m, const char *name, const char *path);
+static void rknn_firstchar_model_release(struct firstchar_model *m);
+static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
+                                        const struct det_box *box, uint64_t frame_seq,
+                                        char *text, size_t text_len);
 static void copy_cstr_trunc(char *dst, size_t dst_len, const char *src);
 static int utf8_token_len(const char *s);
 static uint32_t utf8_token_codepoint(const char *tok);
@@ -463,7 +552,11 @@ static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src
                             struct detect_decode_diag *diag);
 static void dump_ocr_pair(struct app_ctx *ctx, uint64_t frame_id, const struct plate_det *pd,
                           const uint8_t *crop_rgb, int crop_w, int crop_h,
-                          const uint8_t *ocr_in, int ocr_w, int ocr_h);
+                          const uint8_t *ocr_in, int ocr_w, int ocr_h,
+                          const uint8_t *fc_rgb, int fc_w, int fc_h);
+static void dump_ocr_ab_variant(const struct app_ctx *ctx, uint64_t frame_id, int sample_id,
+                                const char *tag, const float quad[8],
+                                const uint8_t *crop_rgb, int crop_w, int crop_h);
 static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t ts_us,
                                const struct plate_det *pd);
 static const char *detector_type_str(int mode);
@@ -487,8 +580,18 @@ static void print_usage(const char *prog)
             "  --drm-card <path>       DRM card (default: %s)\n"
             "  --veh-model <path>      Vehicle RKNN model path (required for live camera mode)\n"
             "  --plate-model <path>    Plate RKNN model path (required)\n"
-            "  --ocr-model <path>      OCR RKNN model path (required)\n"
-            "  --ocr-keys <path>       OCR keys file path (required)\n"
+            "  --ocr-model <path>      Legacy single OCR RKNN model path\n"
+            "  --ocr-blue-model <path> Blue/non-green OCR expert RKNN path\n"
+            "  --ocr-green-model <path> Green OCR expert RKNN path\n"
+            "  --ocr-yellow-model <path> Yellow OCR expert RKNN path\n"
+            "  --ocr-yellow-keys <path> Yellow OCR keys file path\n"
+            "  --ocr-special-model <path> Special-plate OCR expert RKNN path\n"
+            "  --ocr-special-keys <path> Special-plate OCR keys file path\n"
+            "  --ocr-keys <path>       Default OCR keys file path (required)\n"
+            "  --green-firstchar-model <path|off> Green province sidecar RKNN path (default: off)\n"
+            "  --green-firstchar-min-votes <n> Min same-province votes before replacement (default: %d)\n"
+            "  --green-firstchar-min-share <v> Min vote share before replacement (default: %.2f)\n"
+            "  --quad-refiner-model <path|off> Quad refiner RKNN path; default: " DEFAULT_QUAD_REFINER_MODEL " ; pass off to disable\n"
             "  --labels <path>         Labels file path (required for live camera mode)\n"
             "  --pred-log <path>       Prediction CSV output path (optional)\n"
             "  --offline-image <path>  One-shot offline infer on PPM(P6) image and exit\n"
@@ -516,12 +619,12 @@ static void print_usage(const char *prog)
             "  --stopline-ratio <v>    Stopline Y ratio [0,1] (default: 0.55)\n"
             "  --det-resize-mode <m>   Detect resize: stretch|letterbox (default: letterbox)\n"
             "  --plate-refine <0|1>    Enable local high-res plate refine (default: 1)\n"
-            "  --plate-detector-type <m> Plate detector: yolov5|yolov8_obb_rknn (default: yolov5)\n"
+            "  --plate-detector-type <m> Plate detector: yolov5|yolov8_obb_rknn|yolov8_pose_rknn (default: yolov5)\n"
             "  --plate-nms-iou <v>     Plate NMS IoU threshold (default: 0.45)\n"
             "  --plate-max-det <n>     Plate max detections after NMS (default: 128)\n"
             "  --plate-class-id <n>    Optional class filter for plate model (-1: disabled)\n"
             "  --ocr-channel-order <m> OCR input order: rgb|bgr (default: rgb)\n"
-            "  --ocr-crop-mode <m>     OCR crop mode: fixed|box|tight|box-pad|match|obb_warp (default: fixed)\n"
+            "  --ocr-crop-mode <m>     OCR crop mode: fixed|box|tight|box-pad|match|obb_warp|obb_piecewise (default: obb_warp)\n"
             "  --ocr-resize-mode <m>   OCR resize: stretch|letterbox (default: stretch)\n"
             "  --ocr-resize-kernel <m> OCR resize kernel: nn|bilinear (default: nn)\n"
             "  --ocr-preproc <m>       OCR crop preproc: none|gray|bin (default: none)\n"
@@ -532,12 +635,10 @@ static void print_usage(const char *prog)
             "  --ocr-ctc-diag <0|1>    Print CTC decode diagnostics (default: 0)\n"
             "  --ocr-crop-dump-dir <p> Dump OCR crops+inputs to directory (default: off)\n"
             "  --ocr-crop-dump-max <n> Max dumped OCR samples (default: 20)\n"
-            "  --clahe-enable <0|1>    Enable CLAHE L-channel enhancement (default: 0)\n"
-            "  --clahe-compare <0|1>   A/B compare CLAHE vs original (default: 0)\n"
-            "  --clahe-dump-dir <p>    Dump original + CLAHE crop PPM pair (default: off)\n"
-            "  --clahe-dump-max <n>    Max dumped CLAHE pairs (default: 100)\n"
             "  --help                  Show this help\n",
-            prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD, DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
+            prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD,
+            GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES, GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE,
+            DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
             DEFAULT_STATS_INTERVAL, DEFAULT_COPY_BUFFERS, DEFAULT_QUEUE_DEPTH);
 }
 
@@ -546,10 +647,21 @@ static int parse_options(int argc, char **argv, struct options *opt)
     static const struct option long_opts[] = {
         {"device", required_argument, NULL, 1},
         {"drm-card", required_argument, NULL, 2},
+        {"ped-model", required_argument, NULL, 3},
         {"veh-model", required_argument, NULL, 3},
         {"plate-model", required_argument, NULL, 4},
         {"ocr-model", required_argument, NULL, 5},
+        {"ocr-blue-model", required_argument, NULL, 51},
+        {"ocr-green-model", required_argument, NULL, 52},
+        {"ocr-yellow-model", required_argument, NULL, 53},
+        {"ocr-yellow-keys", required_argument, NULL, 54},
+        {"ocr-special-model", required_argument, NULL, 55},
+        {"ocr-special-keys", required_argument, NULL, 56},
         {"ocr-keys", required_argument, NULL, 6},
+        {"green-firstchar-model", required_argument, NULL, 57},
+        {"green-firstchar-min-votes", required_argument, NULL, 58},
+        {"green-firstchar-min-share", required_argument, NULL, 59},
+        {"quad-refiner-model", required_argument, NULL, 50},
         {"labels", required_argument, NULL, 7},
         {"pred-log", required_argument, NULL, 8},
         {"offline-image", required_argument, NULL, 36},
@@ -593,10 +705,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"ocr-ctc-diag", required_argument, NULL, 33},
         {"ocr-crop-dump-dir", required_argument, NULL, 34},
         {"ocr-crop-dump-max", required_argument, NULL, 35},
-        {"clahe-enable", required_argument, NULL, 100},
-        {"clahe-compare", required_argument, NULL, 101},
-        {"clahe-dump-dir", required_argument, NULL, 102},
-        {"clahe-dump-max", required_argument, NULL, 103},
+        {"clahe-enable", required_argument, NULL, 68},
+        {"clahe-compare", required_argument, NULL, 69},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -605,6 +715,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
     memset(opt, 0, sizeof(*opt));
     opt->device_path = DEFAULT_DEVICE;
     opt->drm_card_path = DEFAULT_DRM_CARD;
+    opt->quad_refiner_model_path = DEFAULT_QUAD_REFINER_MODEL;
     opt->connector_id = -1;
     opt->fps = DEFAULT_FPS;
     opt->pixel_order = PIXEL_ORDER_BGR565;
@@ -627,12 +738,12 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->stopline_ratio = 0.55f;
     opt->det_resize_mode = DET_RESIZE_LETTERBOX;
     opt->plate_refine = 1;
-    opt->plate_detector_type = DETECTOR_YOLOV5;
+    opt->plate_detector_type = DETECTOR_YOLOV8_OBB_RKNN;
     opt->plate_nms_iou = 0.45f;
     opt->plate_max_det = MAX_DETS;
     opt->plate_class_id = -1;
     opt->ocr_channel_order = OCR_CH_RGB;
-    opt->ocr_crop_mode = OCR_CROP_FIXED;
+    opt->ocr_crop_mode = OCR_CROP_OBB_WARP;
     opt->ocr_resize_mode = OCR_RESIZE_STRETCH;
     opt->ocr_resize_kernel = OCR_KERNEL_NN;
     opt->ocr_preproc_mode = OCR_PREPROC_NONE;
@@ -643,20 +754,46 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->ocr_ctc_diag = 0;
     opt->ocr_crop_dump_max = 20;
     opt->ocr_crop_dump_dir = NULL;
-    opt->offline_detect_plate = 1;
+    opt->green_firstchar_model_path = NULL;
+    opt->green_firstchar_min_votes = GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES;
+    opt->green_firstchar_min_share = GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE;
     opt->clahe_enable = 0;
     opt->clahe_compare = 0;
-    opt->clahe_dump_dir = NULL;
-    opt->clahe_dump_max = 100;
+    opt->offline_detect_plate = 1;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
         switch (c) {
         case 1: opt->device_path = optarg; break;
         case 2: opt->drm_card_path = optarg; break;
-        case 3: opt->veh_model_path = optarg; break;
+        case 3: opt->ped_model_path = optarg; break;
         case 4: opt->plate_model_path = optarg; break;
         case 5: opt->ocr_model_path = optarg; break;
+        case 51: opt->ocr_blue_model_path = optarg; break;
+        case 52: opt->ocr_green_model_path = optarg; break;
+        case 53: opt->ocr_yellow_model_path = optarg; break;
+        case 54: opt->ocr_yellow_keys_path = optarg; break;
+        case 55: opt->ocr_special_model_path = optarg; break;
+        case 56: opt->ocr_special_keys_path = optarg; break;
         case 6: opt->ocr_keys_path = optarg; break;
+        case 57:
+            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
+                opt->green_firstchar_model_path = NULL;
+            else
+                opt->green_firstchar_model_path = optarg;
+            break;
+        case 58: opt->green_firstchar_min_votes = atoi(optarg); break;
+        case 59: opt->green_firstchar_min_share = (float)atof(optarg); break;
+        case 68: opt->clahe_enable = atoi(optarg) ? 1 : 0; break;
+        case 69: opt->clahe_compare = atoi(optarg) ? 1 : 0; break;
+            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
+            else
+            break;
+        case 50:
+            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
+                opt->quad_refiner_model_path = NULL;
+            else
+                opt->quad_refiner_model_path = optarg;
+            break;
         case 7: opt->labels_path = optarg; break;
         case 8: opt->pred_log_path = optarg; break;
         case 36: opt->offline_image_path = optarg; break;
@@ -699,10 +836,10 @@ static int parse_options(int argc, char **argv, struct options *opt)
             break;
         case 40: opt->plate_refine = atoi(optarg) ? 1 : 0; break;
         case 46:
-            if (strcmp(optarg, "yolov5") == 0)
-                opt->plate_detector_type = DETECTOR_YOLOV5;
-            else if (strcmp(optarg, "yolov8_obb_rknn") == 0)
+            if (strcmp(optarg, "yolov8_obb_rknn") == 0)
                 opt->plate_detector_type = DETECTOR_YOLOV8_OBB_RKNN;
+            else if (strcmp(optarg, "yolov8_pose_rknn") == 0)
+                opt->plate_detector_type = DETECTOR_YOLOV8_POSE_RKNN;
             else
                 return -1;
             break;
@@ -730,6 +867,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
                 opt->ocr_crop_mode = OCR_CROP_MATCH;
             else if (strcmp(optarg, "obb_warp") == 0 || strcmp(optarg, "obb-warp") == 0)
                 opt->ocr_crop_mode = OCR_CROP_OBB_WARP;
+            else if (strcmp(optarg, "obb_piecewise") == 0 || strcmp(optarg, "obb-piecewise") == 0)
+                opt->ocr_crop_mode = OCR_CROP_OBB_PIECEWISE;
             else
                 return -1;
             break;
@@ -766,10 +905,6 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 33: opt->ocr_ctc_diag = atoi(optarg) ? 1 : 0; break;
         case 34: opt->ocr_crop_dump_dir = optarg; break;
         case 35: opt->ocr_crop_dump_max = atoi(optarg); break;
-        case 100: opt->clahe_enable = atoi(optarg) ? 1 : 0; break;
-        case 101: opt->clahe_compare = atoi(optarg) ? 1 : 0; break;
-        case 102: opt->clahe_dump_dir = optarg; break;
-        case 103: opt->clahe_dump_max = atoi(optarg); break;
         case 'h':
             print_usage(argv[0]);
             exit(0);
@@ -777,6 +912,15 @@ static int parse_options(int argc, char **argv, struct options *opt)
             return -1;
         }
     }
+
+    if (!opt->ocr_blue_model_path)
+        opt->ocr_blue_model_path = opt->ocr_model_path;
+    if (!opt->ocr_green_model_path)
+        opt->ocr_green_model_path = opt->ocr_model_path;
+    if (!opt->ocr_yellow_model_path)
+        opt->ocr_yellow_model_path = opt->ocr_blue_model_path;
+    if (!opt->ocr_special_model_path)
+        opt->ocr_special_model_path = opt->ocr_blue_model_path;
 
     if (opt->fps <= 0 || opt->timeout_ms <= 0 || opt->stats_interval <= 0)
         return -1;
@@ -808,12 +952,16 @@ static int parse_options(int argc, char **argv, struct options *opt)
         return -1;
     if (opt->ocr_crop_dump_max < 0 || opt->ocr_crop_dump_max > 100000)
         return -1;
+    if (opt->green_firstchar_min_votes < 1 || opt->green_firstchar_min_votes > FIRSTCHAR_TRACK_HIST)
+        return -1;
+    if (opt->green_firstchar_min_share < 0.0f || opt->green_firstchar_min_share > 1.0f)
+        return -1;
     if (opt->offline_image_path && opt->offline_image_path[0] != '\0') {
-        if (!opt->plate_model_path || !opt->ocr_model_path || !opt->ocr_keys_path)
+        if (!opt->plate_model_path || !opt->ocr_blue_model_path || !opt->ocr_green_model_path || !opt->ocr_keys_path)
             return -1;
     } else {
-        if (!opt->veh_model_path || !opt->plate_model_path ||
-            !opt->ocr_model_path || !opt->ocr_keys_path || !opt->labels_path)
+        if (!opt->plate_model_path ||
+            !opt->ocr_blue_model_path || !opt->ocr_green_model_path || !opt->ocr_keys_path || !opt->labels_path)
             return -1;
     }
     return 0;
@@ -918,6 +1066,41 @@ static int load_ocr_keys(struct app_ctx *ctx, const char *path)
     return 0;
 }
 
+static int load_ocr_model_keys(struct ocr_model *m, const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    char line[256];
+    int idx = 0;
+    if (!fp) {
+        fprintf(stderr, "Open OCR model keys failed for %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    while (fgets(line, sizeof(line), fp) && idx < MAX_OCR_KEYS) {
+        char *nl = strchr(line, '\n');
+        char *src = line;
+        size_t n;
+        if (nl) *nl = '\0';
+        nl = strchr(line, '\r');
+        if (nl) *nl = '\0';
+        if (src[0] == '\0' || src[0] == '#')
+            continue;
+        if (idx == 0 &&
+            (unsigned char)src[0] == 0xEF &&
+            (unsigned char)src[1] == 0xBB &&
+            (unsigned char)src[2] == 0xBF) {
+            src += 3;
+        }
+        n = strnlen(src, MAX_OCR_KEY_LEN - 1);
+        memcpy(m->keys[idx], src, n);
+        m->keys[idx][n] = '\0';
+        idx++;
+    }
+    fclose(fp);
+    m->key_count = idx;
+    fprintf(stderr, "[ocr] loaded %d keys for model %s from %s\n", m->key_count, m->name, path);
+    return 0;
+}
+
 static int rknn_ocr_model_load(struct ocr_model *m, const char *name, const char *path)
 {
     FILE *fp;
@@ -985,6 +1168,188 @@ static void rknn_ocr_model_release(struct ocr_model *m)
     memset(m, 0, sizeof(*m));
 }
 
+static bool ocr_model_input_compatible(const struct ocr_model *a, const struct ocr_model *b)
+{
+    return a && b &&
+           a->in_w == b->in_w &&
+           a->in_h == b->in_h &&
+           a->in_c == b->in_c;
+}
+
+static int rknn_quad_refiner_model_load(struct quad_refiner_model *m, const char *name, const char *path)
+{
+    FILE *fp;
+    long sz;
+    void *data;
+    uint32_t i;
+    memset(m, 0, sizeof(*m));
+    m->name = name;
+    m->path = path;
+
+    if (!path || path[0] == '\0')
+        return 0;
+
+    fp = fopen(path, "rb");
+    if (!fp) return -1;
+    fseek(fp, 0, SEEK_END);
+    sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    data = malloc((size_t)sz);
+    if (!data) { fclose(fp); return -1; }
+    if (fread(data, 1, (size_t)sz, fp) != (size_t)sz) { fclose(fp); free(data); return -1; }
+    fclose(fp);
+
+    if (rknn_init(&m->ctx, data, (uint32_t)sz, 0, NULL) < 0) { free(data); return -1; }
+    free(data);
+    if (rknn_query(m->ctx, RKNN_QUERY_IN_OUT_NUM, &m->io_num, sizeof(m->io_num)) < 0)
+        return -1;
+    if (m->io_num.n_output == 0 || m->io_num.n_output > 4)
+        return -1;
+
+    memset(&m->input_attr, 0, sizeof(m->input_attr));
+    m->input_attr.index = 0;
+    if (rknn_query(m->ctx, RKNN_QUERY_INPUT_ATTR, &m->input_attr, sizeof(m->input_attr)) < 0)
+        return -1;
+    if (m->input_attr.fmt == RKNN_TENSOR_NCHW) {
+        m->in_c = m->input_attr.dims[1];
+        m->in_h = m->input_attr.dims[2];
+        m->in_w = m->input_attr.dims[3];
+    } else {
+        m->in_h = m->input_attr.dims[1];
+        m->in_w = m->input_attr.dims[2];
+        m->in_c = m->input_attr.dims[3];
+    }
+
+    for (i = 0; i < m->io_num.n_output; i++) {
+        memset(&m->output_attrs[i], 0, sizeof(m->output_attrs[i]));
+        m->output_attrs[i].index = i;
+        if (rknn_query(m->ctx, RKNN_QUERY_OUTPUT_ATTR, &m->output_attrs[i], sizeof(m->output_attrs[i])) < 0)
+            return -1;
+    }
+
+    fprintf(stderr, "[%s] loaded input=%ux%ux%u outputs=%u\n",
+            name, m->in_w, m->in_h, m->in_c, m->io_num.n_output);
+    fprintf(stderr, "[%s] input_attr fmt=%d type=%d qnt=%d zp=%d scale=%.6f\n",
+            name,
+            m->input_attr.fmt,
+            m->input_attr.type,
+            m->input_attr.qnt_type,
+            m->input_attr.zp,
+            m->input_attr.scale);
+    for (i = 0; i < m->io_num.n_output; i++) {
+        const rknn_tensor_attr *a = &m->output_attrs[i];
+        fprintf(stderr, "[%s] out[%u] fmt=%d type=%d qnt=%d dims=(%u,%u,%u,%u) n_dims=%u\n",
+                name, i, a->fmt, a->type, a->qnt_type,
+                a->dims[0], a->dims[1], a->dims[2], a->dims[3], a->n_dims);
+    }
+    return 0;
+}
+
+static void rknn_quad_refiner_model_release(struct quad_refiner_model *m)
+{
+    if (m->ctx)
+        rknn_destroy(m->ctx);
+    memset(m, 0, sizeof(*m));
+}
+
+static int rknn_firstchar_model_load(struct firstchar_model *m, const char *name, const char *path)
+{
+    FILE *fp;
+    long sz;
+    void *data;
+    uint32_t i;
+
+    memset(m, 0, sizeof(*m));
+    m->name = name;
+    m->path = path;
+
+    if (!path || path[0] == '\0')
+        return 0;
+
+    fp = fopen(path, "rb");
+    if (!fp)
+        return -1;
+    fseek(fp, 0, SEEK_END);
+    sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    data = malloc((size_t)sz);
+    if (!data) {
+        fclose(fp);
+        return -1;
+    }
+    if (fread(data, 1, (size_t)sz, fp) != (size_t)sz) {
+        fclose(fp);
+        free(data);
+        return -1;
+    }
+    fclose(fp);
+
+    if (rknn_init(&m->ctx, data, (uint32_t)sz, 0, NULL) < 0) {
+        free(data);
+        return -1;
+    }
+    free(data);
+    if (rknn_query(m->ctx, RKNN_QUERY_IN_OUT_NUM, &m->io_num, sizeof(m->io_num)) < 0)
+        return -1;
+    if (m->io_num.n_output != 1)
+        return -1;
+
+    memset(&m->input_attr, 0, sizeof(m->input_attr));
+    m->input_attr.index = 0;
+    if (rknn_query(m->ctx, RKNN_QUERY_INPUT_ATTR, &m->input_attr, sizeof(m->input_attr)) < 0)
+        return -1;
+    if (m->input_attr.fmt == RKNN_TENSOR_NCHW) {
+        m->in_c = m->input_attr.dims[1];
+        m->in_h = m->input_attr.dims[2];
+        m->in_w = m->input_attr.dims[3];
+    } else {
+        m->in_h = m->input_attr.dims[1];
+        m->in_w = m->input_attr.dims[2];
+        m->in_c = m->input_attr.dims[3];
+    }
+    if (m->in_c != 1 && m->in_c != 3)
+        return -1;
+
+    memset(&m->output_attr, 0, sizeof(m->output_attr));
+    m->output_attr.index = 0;
+    if (rknn_query(m->ctx, RKNN_QUERY_OUTPUT_ATTR, &m->output_attr, sizeof(m->output_attr)) < 0)
+        return -1;
+
+    fprintf(stderr, "[%s] loaded input=%ux%ux%u outputs=%u\n",
+            name, m->in_w, m->in_h, m->in_c, m->io_num.n_output);
+    fprintf(stderr, "[%s] input_attr fmt=%d type=%d qnt=%d zp=%d scale=%.6f\n",
+            name,
+            m->input_attr.fmt,
+            m->input_attr.type,
+            m->input_attr.qnt_type,
+            m->input_attr.zp,
+            m->input_attr.scale);
+    fprintf(stderr, "[%s] out fmt=%d type=%d qnt=%d dims=(%u,%u,%u,%u) n_dims=%u\n",
+            name,
+            m->output_attr.fmt,
+            m->output_attr.type,
+            m->output_attr.qnt_type,
+            m->output_attr.dims[0],
+            m->output_attr.dims[1],
+            m->output_attr.dims[2],
+            m->output_attr.dims[3],
+            m->output_attr.n_dims);
+    for (i = 0; i < m->output_attr.n_dims; i++) {
+        if (m->output_attr.dims[i] == (uint32_t)GREEN_FIRSTCHAR_CLASS_COUNT)
+            return 0;
+    }
+    fprintf(stderr, "[%s] WARN: output shape does not explicitly expose %d classes\n",
+            name, GREEN_FIRSTCHAR_CLASS_COUNT);
+    return 0;
+}
+
+static void rknn_firstchar_model_release(struct firstchar_model *m)
+{
+    if (m->ctx)
+        rknn_destroy(m->ctx);
+    memset(m, 0, sizeof(*m));
+}
+
 static bool build_ocr_layout(const rknn_tensor_attr *a, int *t_size, int *c_size, int *t_stride, int *c_stride)
 {
     if (a->n_dims == 2) {
@@ -1030,71 +1395,29 @@ static bool build_ocr_layout(const rknn_tensor_attr *a, int *t_size, int *c_size
 }
 
 static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_stride, int c_stride,
-                             struct app_ctx *ctx, char *text, size_t text_len, float *conf_out,
+                             struct app_ctx *ctx, enum ocr_decode_family family,
+                             char *text, size_t text_len, float *conf_out,
                              struct ocr_diag *diag)
 {
-    int t;
-    int prev = -1;
-    int emitted = 0;
-    float conf_sum = 0.0f;
-    int blank_idx = ctx->ocr_blank_index;
-    int blank_top1_count = 0;
+    const char *keys[MAX_OCR_KEYS];
+    struct ocr_decode_diag decode_diag;
+    int i;
+    int ret = -1;
 
-    if (text_len == 0)
+    if (!ctx || !buf || !text || text_len == 0)
         return -1;
-    text[0] = '\0';
-
-    if (blank_idx < 0 || blank_idx >= c_size) {
-        if (c_size == ctx->ocr_key_count + 1)
-            blank_idx = ctx->ocr_key_count;
-        else
-            blank_idx = c_size - 1;
-    }
-
-    for (t = 0; t < t_size; t++) {
-        int c;
-        int best_c = 0;
-        float best_logit = -1e30f;
-        float max_logit = -1e30f;
-        float exp_sum = 0.0f;
-        const float *row = buf + (size_t)t * (size_t)t_stride;
-
-        for (c = 0; c < c_size; c++) {
-            float v = row[(size_t)c * (size_t)c_stride];
-            if (v > best_logit) {
-                best_logit = v;
-                best_c = c;
-            }
-            if (v > max_logit)
-                max_logit = v;
-        }
-        for (c = 0; c < c_size; c++) {
-            float v = row[(size_t)c * (size_t)c_stride];
-            exp_sum += expf(v - max_logit);
-        }
-        if (best_c == blank_idx)
-            blank_top1_count++;
-        if (best_c == blank_idx || best_c == prev) {
-            prev = best_c;
-            continue;
-        }
-        if (best_c >= 0 && best_c < ctx->ocr_key_count) {
-            float prob = 0.0f;
-            exp_sum = (exp_sum > 1e-8f) ? exp_sum : 1e-8f;
-            prob = expf(best_logit - max_logit) / exp_sum;
-            if (append_utf8_token(text, text_len, ctx->ocr_keys[best_c])) {
-                emitted++;
-                conf_sum += prob;
-            }
-        }
-        prev = best_c;
-    }
-    *conf_out = (emitted > 0) ? (conf_sum / (float)emitted) : 0.0f;
+    for (i = 0; i < ctx->ocr_key_count && i < MAX_OCR_KEYS; i++)
+        keys[i] = ctx->ocr_keys[i];
+    ret = ocr_decode_logits(buf, t_size, c_size, t_stride, c_stride,
+                            keys, i, ctx->ocr_blank_index,
+                            family, text, text_len, conf_out, &decode_diag);
+    if (ret < 0)
+        return ret;
     if (diag) {
-        diag->t_size = t_size;
-        diag->c_size = c_size;
-        diag->blank_idx = blank_idx;
-        diag->blank_top1_ratio = (t_size > 0) ? ((float)blank_top1_count / (float)t_size) : 0.0f;
+        diag->t_size = decode_diag.t_size;
+        diag->c_size = decode_diag.c_size;
+        diag->blank_idx = decode_diag.blank_idx;
+        diag->blank_top1_ratio = decode_diag.blank_top1_ratio;
     }
     return 0;
 }
@@ -1509,15 +1832,247 @@ static void ocr_temporal_smooth(struct app_ctx *ctx, const struct det_box *box, 
     }
 }
 
+static int firstchar_output_count(const rknn_tensor_attr *a)
+{
+    uint32_t i;
+    uint32_t n = 1;
+    if (!a || a->n_dims == 0)
+        return 0;
+    for (i = 0; i < a->n_dims; i++) {
+        if (a->dims[i] == 0)
+            return 0;
+        n *= a->dims[i];
+    }
+    return (int)n;
+}
+
+static bool replace_first_utf8_token(char *text, size_t text_len, const char *first_tok)
+{
+    char toks[MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
+    char out[64];
+    int n;
+    int i;
+
+    if (!text || text_len == 0 || !first_tok || first_tok[0] == '\0')
+        return false;
+    n = split_utf8_tokens(text, toks, MAX_PLATE_TOKENS);
+    if (n <= 1)
+        return false;
+    out[0] = '\0';
+    if (!append_utf8_token(out, sizeof(out), first_tok))
+        return false;
+    for (i = 1; i < n; i++) {
+        if (!append_utf8_token(out, sizeof(out), toks[i]))
+            return false;
+    }
+    copy_cstr_trunc(text, text_len, out);
+    return true;
+}
+
+static bool run_firstchar_model(const struct firstchar_model *m,
+                                const uint8_t *fc_rgb, int fc_w, int fc_h,
+                                char *tok_out, size_t tok_len, float *conf_out)
+{
+    uint8_t *resized = NULL;
+    uint8_t *input = NULL;
+    rknn_input in;
+    rknn_output out;
+    int ret = -1;
+    int i;
+    int class_count;
+    int best = -1;
+    float best_logit = -INFINITY;
+    float max_logit = -INFINITY;
+    float sum_exp = 0.0f;
+
+    if (!m || !m->ctx || !fc_rgb || !tok_out || tok_len == 0 || !conf_out)
+        return false;
+    tok_out[0] = '\0';
+    *conf_out = 0.0f;
+    if (m->in_w == 0 || m->in_h == 0 || (m->in_c != 1 && m->in_c != 3))
+        return false;
+
+    resized = malloc((size_t)m->in_w * (size_t)m->in_h * 3U);
+    input = malloc((size_t)m->in_w * (size_t)m->in_h * (size_t)m->in_c);
+    if (!resized || !input)
+        goto out_free;
+
+    resize_rgb888_bilinear(fc_rgb, fc_w, fc_h, resized, (int)m->in_w, (int)m->in_h);
+    if (m->in_c == 1) {
+        size_t pix = (size_t)m->in_w * (size_t)m->in_h;
+        size_t p;
+        for (p = 0; p < pix; p++) {
+            const uint8_t *q = resized + p * 3U;
+            int y = (int)(0.299f * (float)q[0] + 0.587f * (float)q[1] + 0.114f * (float)q[2] + 0.5f);
+            if (y < 0) y = 0;
+            if (y > 255) y = 255;
+            input[p] = (uint8_t)y;
+        }
+    } else {
+        memcpy(input, resized, (size_t)m->in_w * (size_t)m->in_h * 3U);
+    }
+
+    memset(&in, 0, sizeof(in));
+    in.index = 0;
+    in.buf = input;
+    in.size = m->in_w * m->in_h * m->in_c;
+    in.type = RKNN_TENSOR_UINT8;
+    in.fmt = RKNN_TENSOR_NHWC;
+    ret = rknn_inputs_set(m->ctx, 1, &in);
+    if (ret < 0)
+        goto out_free;
+    ret = rknn_run(m->ctx, NULL);
+    if (ret < 0)
+        goto out_free;
+
+    memset(&out, 0, sizeof(out));
+    out.want_float = 1;
+    ret = rknn_outputs_get(m->ctx, 1, &out, NULL);
+    if (ret < 0)
+        goto out_free;
+
+    class_count = firstchar_output_count(&m->output_attr);
+    if (class_count > GREEN_FIRSTCHAR_CLASS_COUNT)
+        class_count = GREEN_FIRSTCHAR_CLASS_COUNT;
+    if (class_count <= 0)
+        class_count = GREEN_FIRSTCHAR_CLASS_COUNT;
+
+    for (i = 0; i < class_count; i++) {
+        float v = ((const float *)out.buf)[i];
+        if (v > best_logit) {
+            best_logit = v;
+            best = i;
+        }
+        if (v > max_logit)
+            max_logit = v;
+    }
+    if (best >= 0 && best < GREEN_FIRSTCHAR_CLASS_COUNT) {
+        for (i = 0; i < class_count; i++)
+            sum_exp += expf(((const float *)out.buf)[i] - max_logit);
+        copy_cstr_trunc(tok_out, tok_len, g_province_chars[best]);
+        *conf_out = (sum_exp > 0.0f) ? expf(best_logit - max_logit) / sum_exp : 0.0f;
+        ret = 0;
+    } else {
+        ret = -1;
+    }
+    rknn_outputs_release(m->ctx, 1, &out);
+
+out_free:
+    free(resized);
+    free(input);
+    return ret == 0;
+}
+
+static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
+                                        const struct det_box *box, uint64_t frame_seq,
+                                        char *text, size_t text_len)
+{
+    struct ocr_track *tr;
+    char pred_tok[MAX_UTF8_TOKEN_BYTES];
+    char stable_tok[MAX_UTF8_TOKEN_BYTES];
+    char old_text[64];
+    float pred_conf = 0.0f;
+    int tr_idx;
+    int i, k;
+    int best_idx = -1;
+    int best_votes = 0;
+    int total_votes = 0;
+    float best_score = -1.0f;
+    char cand_tok[FIRSTCHAR_TRACK_HIST][MAX_UTF8_TOKEN_BYTES];
+    float cand_score[FIRSTCHAR_TRACK_HIST];
+    int cand_votes[FIRSTCHAR_TRACK_HIST];
+    int cand_n = 0;
+    float share;
+
+    if (!ctx || !ctx->green_firstchar_model.ctx || !fc_rgb || !box || !text || text[0] == '\0')
+        return false;
+    if (!run_firstchar_model(&ctx->green_firstchar_model, fc_rgb, fc_w, fc_h,
+                             pred_tok, sizeof(pred_tok), &pred_conf))
+        return false;
+
+    tr_idx = find_or_create_ocr_track(ctx, box);
+    if (tr_idx < 0)
+        return false;
+    tr = &ctx->ocr_tracks[tr_idx];
+    tr->used = true;
+    tr->ttl = 10;
+    tr->last_seq = frame_seq;
+    tr->box = *box;
+
+    copy_cstr_trunc(tr->fc_tok[tr->fc_next], sizeof(tr->fc_tok[tr->fc_next]), pred_tok);
+    tr->fc_conf[tr->fc_next] = fmaxf(0.0f, fminf(1.0f, pred_conf));
+    tr->fc_next = (tr->fc_next + 1) % FIRSTCHAR_TRACK_HIST;
+    if (tr->fc_count < FIRSTCHAR_TRACK_HIST)
+        tr->fc_count++;
+
+    memset(cand_score, 0, sizeof(cand_score));
+    memset(cand_votes, 0, sizeof(cand_votes));
+    for (k = 0; k < tr->fc_count; k++) {
+        int pos = (tr->fc_next - 1 - k + FIRSTCHAR_TRACK_HIST) % FIRSTCHAR_TRACK_HIST;
+        float recency = 1.0f - 0.06f * (float)k;
+        if (recency < 0.58f)
+            recency = 0.58f;
+        if (tr->fc_tok[pos][0] == '\0')
+            continue;
+        total_votes++;
+        for (i = 0; i < cand_n; i++) {
+            if (strcmp(cand_tok[i], tr->fc_tok[pos]) == 0)
+                break;
+        }
+        if (i == cand_n && cand_n < FIRSTCHAR_TRACK_HIST) {
+            copy_cstr_trunc(cand_tok[cand_n], sizeof(cand_tok[cand_n]), tr->fc_tok[pos]);
+            cand_n++;
+        }
+        if (i < cand_n) {
+            cand_votes[i]++;
+            cand_score[i] += tr->fc_conf[pos] * recency;
+        }
+    }
+    for (i = 0; i < cand_n; i++) {
+        if (cand_votes[i] > best_votes ||
+            (cand_votes[i] == best_votes && cand_score[i] > best_score)) {
+            best_idx = i;
+            best_votes = cand_votes[i];
+            best_score = cand_score[i];
+        }
+    }
+    if (best_idx < 0 || total_votes <= 0)
+        return false;
+
+    share = (float)best_votes / (float)total_votes;
+    copy_cstr_trunc(stable_tok, sizeof(stable_tok), cand_tok[best_idx]);
+    if (best_votes < ctx->opt.green_firstchar_min_votes ||
+        share < ctx->opt.green_firstchar_min_share) {
+        fprintf(stderr,
+                "[green-fc] frame=%" PRIu64 " hold pred=%s conf=%.3f top=%s votes=%d/%d share=%.2f text=%s\n",
+                frame_seq, pred_tok, pred_conf, stable_tok, best_votes, total_votes, share, text);
+        return false;
+    }
+
+    copy_cstr_trunc(old_text, sizeof(old_text), text);
+    if (!replace_first_utf8_token(text, text_len, stable_tok))
+        return false;
+    if (strcmp(old_text, text) != 0) {
+        fprintf(stderr,
+                "[green-fc] frame=%" PRIu64 " replace raw=%s fused=%s sidecar=%s votes=%d/%d share=%.2f last=%s conf=%.3f\n",
+                frame_seq, old_text, text, stable_tok, best_votes, total_votes, share, pred_tok, pred_conf);
+        return true;
+    }
+    return false;
+}
+
 static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
+                                         const struct ocr_model *m,
                                          const uint8_t *crop_rgb, int crop_w, int crop_h,
                                          float *occ_ratio_out)
 {
-    const struct ocr_model *m = &ctx->ocr_model;
     uint8_t *crop_work = NULL;
     uint8_t *ocr_in = NULL;
     struct letterbox_meta lb;
     float occ = 1.0f;
+
+    if (!m || !m->ctx)
+        return NULL;
 
     if (occ_ratio_out)
         *occ_ratio_out = 0.0f;
@@ -1569,11 +2124,52 @@ static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
     return ocr_in;
 }
 
+static const struct ocr_model *select_ocr_model(const struct app_ctx *ctx,
+                                                enum plate_color plate_color,
+                                                const char **expert_name)
+{
+    if (plate_color == PLATE_COLOR_GREEN && ctx->ocr_green_model.ctx) {
+        if (expert_name)
+            *expert_name = "green";
+        return &ctx->ocr_green_model;
+    }
+    if (plate_color == PLATE_COLOR_YELLOW && ctx->ocr_yellow_model.ctx) {
+        if (expert_name)
+            *expert_name = "yellow";
+        return &ctx->ocr_yellow_model;
+    }
+    if (plate_color == PLATE_COLOR_UNKNOWN && ctx->ocr_special_model.ctx) {
+        if (expert_name)
+            *expert_name = "special";
+        return &ctx->ocr_special_model;
+    }
+    if (expert_name)
+        *expert_name = (plate_color == PLATE_COLOR_GREEN) ? "green-fallback-blue" : "blue";
+    return &ctx->ocr_model;
+}
+
+static uint32_t select_ocr_output_idx(const struct ocr_model *m, const char *expert_name)
+{
+    if (expert_name && strcmp(expert_name, "green") == 0 && m->io_num.n_output >= 2)
+        return 1;
+    return 0;
+}
+
+static enum ocr_decode_family select_decode_family(const char *expert_name,
+                                                   enum plate_color plate_color)
+{
+    if ((expert_name && strcmp(expert_name, "green") == 0) || plate_color == PLATE_COLOR_GREEN)
+        return OCR_DECODE_FAMILY_GREEN8;
+    return OCR_DECODE_FAMILY_NONE;
+}
+
 static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_w, int crop_h,
+                         enum plate_color plate_color,
                          char *text, size_t text_len, float *conf_out,
                          struct ocr_diag *diag, uint8_t **model_input_out)
 {
-    struct ocr_model *m = &ctx->ocr_model;
+    const char *expert_name = NULL;
+    const struct ocr_model *m = select_ocr_model(ctx, plate_color, &expert_name);
     rknn_input in;
     rknn_output outs[4];
     uint8_t *ocr_in = NULL;
@@ -1587,7 +2183,7 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     if (diag)
         memset(diag, 0, sizeof(*diag));
 
-    ocr_in = prepare_ocr_input_rgb888(ctx, crop_rgb, crop_w, crop_h, &occ_ratio);
+    ocr_in = prepare_ocr_input_rgb888(ctx, m, crop_rgb, crop_w, crop_h, &occ_ratio);
     if (!ocr_in) {
         return -1;
     }
@@ -1612,37 +2208,55 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     if (ret < 0)
         goto out;
 
-    if (m->io_num.n_output >= 2)
-        decode_output_idx = 1; /* 临时 green8 测试模式：多头时优先取 green8 head */
+    decode_output_idx = select_ocr_output_idx(m, expert_name);
     out_attr = &m->output_attrs[decode_output_idx];
     if (!build_ocr_layout(out_attr, &t_size, &c_size, &t_stride, &c_stride)) {
         ret = -1;
         goto out_release;
     }
-    if (ctx->ocr_blank_index < 0 || ctx->ocr_blank_index >= c_size) {
-        if (c_size == ctx->ocr_key_count + 1)
-            ctx->ocr_blank_index = ctx->ocr_key_count;
+    /* Use per-model keys if model has its own, otherwise fall back to global */
+    {
+        int effective_key_count = (m->key_count > 0) ? m->key_count : ctx->ocr_key_count;
+        /* Temporarily override ctx keys with model keys if available */
+        int saved_key_count = ctx->ocr_key_count;
+        if (m->key_count > 0) {
+            int ki;
+            for (ki = 0; ki < m->key_count && ki < MAX_OCR_KEYS; ki++)
+                memcpy(ctx->ocr_keys[ki], m->keys[ki], MAX_OCR_KEY_LEN);
+            ctx->ocr_key_count = m->key_count;
+            effective_key_count = m->key_count;
+        }
+        /* Always recalculate blank index for the current model */
+        if (c_size == effective_key_count + 1)
+            ctx->ocr_blank_index = effective_key_count;
         else
             ctx->ocr_blank_index = c_size - 1;
-    }
-    if (!ctx->ocr_keysize_warned) {
-        if (!(c_size == ctx->ocr_key_count || c_size == (ctx->ocr_key_count + 1))) {
+        if (!ctx->ocr_keysize_warned) {
+            if (!(c_size == effective_key_count || c_size == (effective_key_count + 1))) {
+                fprintf(stderr, "[ocr] WARN: model=%s c_size=%d key_count=%d\n",
+                        expert_name ? expert_name : "?",
+                        c_size, effective_key_count);
+            }
             fprintf(stderr,
-                    "[ocr] WARN key/output mismatch: keys=%d c_size=%d (expected N or N+1)\n",
-                    ctx->ocr_key_count, c_size);
+                    "[ocr] expert=%s model=%s decode_output_idx=%u/%u\n",
+                    expert_name ? expert_name : "unknown",
+                    m->name ? m->name : "ocr",
+                    decode_output_idx,
+                    m->io_num.n_output);
+            ctx->ocr_keysize_warned = true;
         }
-        fprintf(stderr,
-                "[ocr] decode_output_idx=%u/%u%s\n",
-                decode_output_idx,
-                m->io_num.n_output,
-                (m->io_num.n_output >= 2) ? " (temporary green8 head test mode)" : "");
-        ctx->ocr_keysize_warned = true;
+        /* Restore global key count after decode (keys buffer is reused) */
+        ctx->ocr_key_count = saved_key_count;
     }
-    ret = ctc_decode_logits((const float *)outs[decode_output_idx].buf, t_size, c_size, t_stride, c_stride,
-                            ctx, text, text_len, conf_out, diag);
+    {
+        enum ocr_decode_family family = select_decode_family(expert_name, plate_color);
+        ret = ctc_decode_logits((const float *)outs[decode_output_idx].buf, t_size, c_size, t_stride, c_stride,
+                                ctx, family, text, text_len, conf_out, diag);
+    }
     if (diag)
         diag->in_occ_ratio = occ_ratio;
-    fprintf(stderr, "[ocrin] resize_mode=%s kernel=%s in_occ_ratio=%.3f\n",
+    fprintf(stderr, "[ocrin] expert=%s resize_mode=%s kernel=%s in_occ_ratio=%.3f\n",
+            expert_name ? expert_name : "unknown",
             (ctx->opt.ocr_resize_mode == OCR_RESIZE_LETTERBOX) ? "letterbox" : "stretch",
             (ctx->opt.ocr_resize_kernel == OCR_KERNEL_BILINEAR) ? "bilinear" : "nn",
             occ_ratio);
@@ -2121,16 +2735,21 @@ static int det_conf_cmp(const void *pa, const void *pb)
 
 static void nms_inplace(struct det_box *dets, int *count, float iou_thr)
 {
-    bool removed[MAX_DETS];
+    bool removed[MAX_DETS * 4];
+    int n = *count;
     int i;
     int j;
     int out = 0;
+    if (n < 0)
+        n = 0;
+    if (n > (int)(sizeof(removed) / sizeof(removed[0])))
+        n = (int)(sizeof(removed) / sizeof(removed[0]));
     memset(removed, 0, sizeof(removed));
-    qsort(dets, (size_t)(*count), sizeof(dets[0]), det_conf_cmp);
-    for (i = 0; i < *count; i++) {
+    qsort(dets, (size_t)n, sizeof(dets[0]), det_conf_cmp);
+    for (i = 0; i < n; i++) {
         if (removed[i]) continue;
         dets[out++] = dets[i];
-        for (j = i + 1; j < *count; j++) {
+        for (j = i + 1; j < n; j++) {
             if (removed[j] || dets[i].cls != dets[j].cls)
                 continue;
             if (box_iou(&dets[i], &dets[j]) > iou_thr)
@@ -2861,13 +3480,14 @@ static void clahe_l_channel(uint8_t *rgb, int w, int h,
     size_t pix = (size_t)w * h;
     l_buf = malloc(pix);
     if (!l_buf) return;
-    for (y = 0; y < h; y++)
+    for (y = 0; y < h; y++) {
         for (x = 0; x < w; x++) {
             const uint8_t *p = rgb + ((size_t)y * w + x) * 3U;
             float hh, ss, ll;
             rgb_to_hsl(p[0], p[1], p[2], &hh, &ss, &ll);
             l_buf[(size_t)y * w + x] = (uint8_t)(ll * 255.0f + 0.5f);
         }
+    }
 
     /* Step 2-4: per-tile histogram + clip + CDF */
     int ntiles = tiles_y * tiles_x;
@@ -2877,72 +3497,88 @@ static void clahe_l_channel(uint8_t *rgb, int w, int h,
     if (!hist || !map) { free(l_buf); free(hist); free(map); return; }
 
     for (y = 0; y < tiles_y; y++) {
-        int t_y0 = y * tile_size, t_y1 = t_y0 + tile_size;
+        int t_y0 = y * tile_size;
+        int t_y1 = t_y0 + tile_size;
         if (t_y1 > h) t_y1 = h;
+        int t_h = t_y1 - t_y0;
         for (x = 0; x < tiles_x; x++) {
-            int t_x0 = x * tile_size, t_x1 = t_x0 + tile_size;
+            int t_x0 = x * tile_size;
+            int t_x1 = t_x0 + tile_size;
             if (t_x1 > w) t_x1 = w;
+            int t_w = t_x1 - t_x0;
             int *hptr = hist + (y * tiles_x + x) * CLAHE_HIST_BINS;
-            int npix = (t_y1 - t_y0) * (t_x1 - t_x0);
+            int npix = t_h * t_w;
             if (npix <= 0) npix = 1;
+
+            /* Build histogram */
             int px, py;
-            for (py = t_y0; py < t_y1; py++)
-                for (px = t_x0; px < t_x1; px++)
-                    hptr[l_buf[(size_t)py * w + px]]++;
+            for (py = 0; py < t_h; py++)
+                for (px = 0; px < t_w; px++)
+                    hptr[l_buf[(size_t)(t_y0 + py) * w + (t_x0 + px)]]++;
+
+            /* Clip */
             int clip_thr = (int)(clip_limit * (float)npix / (float)CLAHE_HIST_BINS + 0.5f);
             if (clip_thr < 1) clip_thr = 1;
             int excess = 0;
             for (k = 0; k < CLAHE_HIST_BINS; k++) {
                 if (hptr[k] > clip_thr) {
-                    excess += hptr[k] - clip_thr; hptr[k] = clip_thr;
+                    excess += hptr[k] - clip_thr;
+                    hptr[k] = clip_thr;
                 }
             }
             int redist = excess / CLAHE_HIST_BINS;
             if (redist > 0)
-                for (k = 0; k < CLAHE_HIST_BINS; k++) hptr[k] += redist;
+                for (k = 0; k < CLAHE_HIST_BINS; k++)
+                    hptr[k] += redist;
+
+            /* CDF → map */
             uint8_t *mptr = map + (y * tiles_x + x) * CLAHE_HIST_BINS;
             int csum = 0;
             float cdf_scale = 255.0f / (float)npix;
             for (k = 0; k < CLAHE_HIST_BINS; k++) {
                 csum += hptr[k];
                 int val = (int)((float)csum * cdf_scale + 0.5f);
+                if (val < 0) val = 0;
                 if (val > 255) val = 255;
                 mptr[k] = (uint8_t)val;
             }
         }
     }
 
-    /* Step 5-6: bilinear interpolation + reconstruct RGB */
-    for (y = 0; y < h; y++)
+    /* Step 5: bilinear interpolation + Step 6: reconstruct RGB */
+    for (y = 0; y < h; y++) {
         for (x = 0; x < w; x++) {
             uint8_t lv = l_buf[(size_t)y * w + x];
+
             float fx = (float)x / (float)tile_size - 0.5f;
             float fy = (float)y / (float)tile_size - 0.5f;
-            int ix0 = (int)floorf(fx), iy0 = (int)floorf(fy);
-            int ix1 = ix0 + 1, iy1 = iy0 + 1;
-            float dx = fx - (float)ix0, dy = fy - (float)iy0;
+            int ix0 = (int)floorf(fx);
+            int iy0 = (int)floorf(fy);
+            int ix1 = ix0 + 1;
+            int iy1 = iy0 + 1;
+            float dx = fx - (float)ix0;
+            float dy = fy - (float)iy0;
             if (dx < 0.0f) dx = 0.0f;
             if (dx > 1.0f) dx = 1.0f;
             if (dy < 0.0f) dy = 0.0f;
             if (dy > 1.0f) dy = 1.0f;
-            int tidx[4], bvals[4];
-            tidx[0] = (iy0 * tiles_x + ix0) * CLAHE_HIST_BINS + lv;
-            tidx[1] = (iy0 * tiles_x + ix1) * CLAHE_HIST_BINS + lv;
-            tidx[2] = (iy1 * tiles_x + ix0) * CLAHE_HIST_BINS + lv;
-            tidx[3] = (iy1 * tiles_x + ix1) * CLAHE_HIST_BINS + lv;
-            for (k = 0; k < 4; k++)
-                bvals[k] = (map && k >= 0 && k < 4 && tidx[k] >= 0 && tidx[k] < hist_sz) ? map[tidx[k]] : lv;
-            if (ix0 < 0 || ix0 >= tiles_x) bvals[0] = lv;
-            if (ix1 < 0 || ix1 >= tiles_x) bvals[1] = lv;
-            if (ix0 < 0 || ix0 >= tiles_x) bvals[2] = lv;
-            if (ix1 < 0 || ix1 >= tiles_x) bvals[3] = lv;
-            if (iy0 < 0 || iy0 >= tiles_y) { bvals[0] = lv; bvals[1] = lv; }
-            if (iy1 < 0 || iy1 >= tiles_y) { bvals[2] = lv; bvals[3] = lv; }
-            float top = (float)bvals[0] * (1.0f - dx) + (float)bvals[1] * dx;
-            float bot = (float)bvals[2] * (1.0f - dx) + (float)bvals[3] * dx;
+
+            int tlu, tru, tbl, tbr;
+            if (ix0 >= 0 && iy0 >= 0 && ix0 < tiles_x && iy0 < tiles_y)
+                tlu = map[(iy0 * tiles_x + ix0) * CLAHE_HIST_BINS + lv]; else tlu = lv;
+            if (ix1 >= 0 && iy0 >= 0 && ix1 < tiles_x && iy0 < tiles_y)
+                tru = map[(iy0 * tiles_x + ix1) * CLAHE_HIST_BINS + lv]; else tru = lv;
+            if (ix0 >= 0 && iy1 >= 0 && ix0 < tiles_x && iy1 < tiles_y)
+                tbl = map[(iy1 * tiles_x + ix0) * CLAHE_HIST_BINS + lv]; else tbl = lv;
+            if (ix1 >= 0 && iy1 >= 0 && ix1 < tiles_x && iy1 < tiles_y)
+                tbr = map[(iy1 * tiles_x + ix1) * CLAHE_HIST_BINS + lv]; else tbr = lv;
+
+            float top = (float)tlu * (1.0f - dx) + (float)tru * dx;
+            float bot = (float)tbl * (1.0f - dx) + (float)tbr * dx;
             float new_l = top * (1.0f - dy) + bot * dy;
             if (new_l < 0.0f) new_l = 0.0f;
             if (new_l > 255.0f) new_l = 255.0f;
+
             const uint8_t *p = rgb + ((size_t)y * w + x) * 3U;
             float hh, ss, old_l;
             rgb_to_hsl(p[0], p[1], p[2], &hh, &ss, &old_l);
@@ -2953,6 +3589,7 @@ static void clahe_l_channel(uint8_t *rgb, int w, int h,
             rgb[((size_t)y * w + x) * 3U + 1] = ng;
             rgb[((size_t)y * w + x) * 3U + 2] = nb;
         }
+    }
 
     free(l_buf);
     free(hist);
@@ -3491,7 +4128,8 @@ static void compute_ocr_crop_box(const struct app_ctx *ctx, const struct det_box
                                  struct det_box *crop)
 {
     if (ctx->opt.ocr_crop_mode == OCR_CROP_MATCH ||
-        ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP) {
+        ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP ||
+        ctx->opt.ocr_crop_mode == OCR_CROP_OBB_PIECEWISE) {
         *crop = *src;
         clamp_box(crop, (int)ctx->frame_width, (int)ctx->frame_height);
         return;
@@ -3600,103 +4238,71 @@ static void copy_crop_rgb888(const uint8_t *rgb, int img_w, const struct det_box
 
 static void order_quad_points(const float in[8], float out[8])
 {
-    int i;
-    int tl = 0, tr = 0, br = 0, bl = 0;
-    float min_sum = 1e30f, max_sum = -1e30f;
-    float min_diff = 1e30f, max_diff = -1e30f;
-    for (i = 0; i < 4; i++) {
-        float x = in[i * 2 + 0];
-        float y = in[i * 2 + 1];
-        float sum = x + y;
-        float diff = y - x;
-        if (sum < min_sum) { min_sum = sum; tl = i; }
-        if (sum > max_sum) { max_sum = sum; br = i; }
-        if (diff < min_diff) { min_diff = diff; tr = i; }
-        if (diff > max_diff) { max_diff = diff; bl = i; }
-    }
-    out[0] = in[tl * 2 + 0]; out[1] = in[tl * 2 + 1];
-    out[2] = in[tr * 2 + 0]; out[3] = in[tr * 2 + 1];
-    out[4] = in[br * 2 + 0]; out[5] = in[br * 2 + 1];
-    out[6] = in[bl * 2 + 0]; out[7] = in[bl * 2 + 1];
-}
+    struct quad_pt {
+        float x;
+        float y;
+        float a;
+    } pts[4];
+    int idx[4] = {0, 1, 2, 3};
+    int i, j;
+    float cx = 0.0f, cy = 0.0f;
+    float area;
 
-static void clip_quad_to_image(const float in[8], int img_w, int img_h, float out[8])
-{
-    int i;
-    float tmp[8];
-    if (!in || !out || img_w <= 0 || img_h <= 0)
-        return;
-    for (i = 0; i < 4; i++) {
-        float x = in[i * 2 + 0];
-        float y = in[i * 2 + 1];
-        if (x < 0.0f) x = 0.0f;
-        if (y < 0.0f) y = 0.0f;
-        if (x > (float)(img_w - 1)) x = (float)(img_w - 1);
-        if (y > (float)(img_h - 1)) y = (float)(img_h - 1);
-        tmp[i * 2 + 0] = x;
-        tmp[i * 2 + 1] = y;
-    }
-    order_quad_points(tmp, out);
-}
-
-static void expand_quad_for_ocr(const float quad_in[8], int img_w, int img_h,
-                                float pad_w_ratio, float pad_h_ratio, float out[8])
-{
-    float q[8];
-    float center_x, center_y;
-    float ux, uy, vx, vy;
-    float norm;
-    float w_top, w_bottom, h_left, h_right;
-    float half_w, half_h;
-
-    if (!quad_in || !out)
+    if (!in || !out)
         return;
 
-    order_quad_points(quad_in, q);
-    center_x = 0.25f * (q[0] + q[2] + q[4] + q[6]);
-    center_y = 0.25f * (q[1] + q[3] + q[5] + q[7]);
+    for (i = 0; i < 4; i++) {
+        pts[i].x = in[i * 2 + 0];
+        pts[i].y = in[i * 2 + 1];
+        cx += pts[i].x;
+        cy += pts[i].y;
+    }
+    cx *= 0.25f;
+    cy *= 0.25f;
+    for (i = 0; i < 4; i++)
+        pts[i].a = atan2f(pts[i].y - cy, pts[i].x - cx);
 
-    ux = (q[2] - q[0]) + (q[4] - q[6]);
-    uy = (q[3] - q[1]) + (q[5] - q[7]);
-    norm = hypotf(ux, uy);
-    if (norm < 1e-6f) {
-        ux = 1.0f;
-        uy = 0.0f;
-    } else {
-        ux /= norm;
-        uy /= norm;
+    for (i = 0; i < 3; i++) {
+        for (j = i + 1; j < 4; j++) {
+            if (pts[idx[j]].a < pts[idx[i]].a) {
+                int t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+            }
+        }
     }
 
-    vx = (q[6] - q[0]) + (q[4] - q[2]);
-    vy = (q[7] - q[1]) + (q[5] - q[3]);
-    norm = hypotf(vx, vy);
-    if (norm < 1e-6f) {
-        vx = 0.0f;
-        vy = 1.0f;
-    } else {
-        vx /= norm;
-        vy /= norm;
+    {
+        int top_edge = 0;
+        float best_y = 0.5f * (pts[idx[0]].y + pts[idx[1]].y);
+        int pos;
+        for (i = 1; i < 4; i++) {
+            float edge_y = 0.5f * (pts[idx[i]].y + pts[idx[(i + 1) & 3]].y);
+            if (edge_y < best_y) {
+                best_y = edge_y;
+                top_edge = i;
+            }
+        }
+        if (pts[idx[top_edge]].x <= pts[idx[(top_edge + 1) & 3]].x) {
+            for (i = 0; i < 4; i++) {
+                pos = idx[(top_edge + i) & 3];
+                out[i * 2 + 0] = pts[pos].x;
+                out[i * 2 + 1] = pts[pos].y;
+            }
+        } else {
+            for (i = 0; i < 4; i++) {
+                pos = idx[(top_edge + 1 - i + 4) & 3];
+                out[i * 2 + 0] = pts[pos].x;
+                out[i * 2 + 1] = pts[pos].y;
+            }
+        }
     }
 
-    w_top = hypotf(q[2] - q[0], q[3] - q[1]);
-    w_bottom = hypotf(q[4] - q[6], q[5] - q[7]);
-    h_left = hypotf(q[6] - q[0], q[7] - q[1]);
-    h_right = hypotf(q[4] - q[2], q[5] - q[3]);
-
-    half_w = 0.25f * (w_top + w_bottom) * (1.0f + pad_w_ratio);
-    half_h = 0.25f * (h_left + h_right) * (1.0f + pad_h_ratio);
-    if (half_w < 1.0f) half_w = 1.0f;
-    if (half_h < 1.0f) half_h = 1.0f;
-
-    out[0] = center_x - ux * half_w - vx * half_h;
-    out[1] = center_y - uy * half_w - vy * half_h;
-    out[2] = center_x + ux * half_w - vx * half_h;
-    out[3] = center_y + uy * half_w - vy * half_h;
-    out[4] = center_x + ux * half_w + vx * half_h;
-    out[5] = center_y + uy * half_w + vy * half_h;
-    out[6] = center_x - ux * half_w + vx * half_h;
-    out[7] = center_y - uy * half_w + vy * half_h;
-    clip_quad_to_image(out, img_w, img_h, out);
+    area = quad_area8(out);
+    if (area < 4.0f || !quad_is_convex8(out)) {
+        /* Degenerate OBB/refiner output: preserve input order rather than risk
+         * sum/diff corner duplication or a folded homography.
+         */
+        memcpy(out, in, sizeof(float) * 8U);
+    }
 }
 
 static void bbox_from_quad(const float quad[8], int img_w, int img_h, struct det_box *box)
@@ -3857,7 +4463,6 @@ static void bilinear_sample_rgb888(const uint8_t *rgb, int img_w, int img_h,
 
 static bool warp_quad_to_rect_rgb888(const uint8_t *rgb, int img_w, int img_h, const float quad_in[8],
                                      uint8_t *dst, int dst_cap_w, int dst_cap_h,
-                                     float extra_pad_ratio, float used_quad[8],
                                      int *out_w, int *out_h)
 {
     float quad[8];
@@ -3874,14 +4479,7 @@ static bool warp_quad_to_rect_rgb888(const uint8_t *rgb, int img_w, int img_h, c
     int x;
     if (!rgb || !quad_in || !dst || !out_w || !out_h)
         return false;
-    clip_quad_to_image(quad_in, img_w, img_h, quad);
-    if (extra_pad_ratio > 0.0f) {
-        /* Baseline warp stays tight; dynpad explicitly requests expansion. */
-        float pad = extra_pad_ratio;
-        if (pad > 0.18f)
-            pad = 0.18f;
-        expand_quad_for_ocr(quad, img_w, img_h, pad, pad, quad);
-    }
+    order_quad_points(quad_in, quad);
     w_top = hypotf(quad[2] - quad[0], quad[3] - quad[1]);
     w_bottom = hypotf(quad[4] - quad[6], quad[5] - quad[7]);
     h_left = hypotf(quad[6] - quad[0], quad[7] - quad[1]);
@@ -3895,10 +4493,10 @@ static bool warp_quad_to_rect_rgb888(const uint8_t *rgb, int img_w, int img_h, c
     if (dw <= 0 || dh <= 0)
         return false;
 
-    dst_quad[0] = 0.0f;         dst_quad[1] = 0.0f;
-    dst_quad[2] = (float)dw - 1.0f; dst_quad[3] = 0.0f;
-    dst_quad[4] = (float)dw - 1.0f; dst_quad[5] = (float)dh - 1.0f;
-    dst_quad[6] = 0.0f;         dst_quad[7] = (float)dh - 1.0f;
+    dst_quad[0] = 0.0f;              dst_quad[1] = 0.0f;
+    dst_quad[2] = (float)dw - 1.0f;  dst_quad[3] = 0.0f;
+    dst_quad[4] = (float)dw - 1.0f;  dst_quad[5] = (float)dh - 1.0f;
+    dst_quad[6] = 0.0f;              dst_quad[7] = (float)dh - 1.0f;
     if (!get_homography_4pt(quad, dst_quad, h))
         return false;
     if (!invert_homography(h, inv_h))
@@ -3928,166 +4526,560 @@ static bool warp_quad_to_rect_rgb888(const uint8_t *rgb, int img_w, int img_h, c
             q[2] = pix[2];
         }
     }
-    if (used_quad)
-        memcpy(used_quad, quad, sizeof(quad));
     *out_w = dw;
     *out_h = dh;
     return true;
 }
 
-static bool warp_plate_box_with_pad_rgb888(const struct app_ctx *ctx,
-                                           const uint8_t *rgb, int img_w, int img_h,
-                                           const struct det_box *plate_box,
-                                           uint8_t *crop_buf, int crop_cap_w, int crop_cap_h,
-                                           float extra_pad_ratio,
-                                           struct det_box *crop_box, int *crop_w, int *crop_h,
-                                           float *occ_ratio)
+static bool warp_quad_to_rect_piecewise_rgb888(const uint8_t *rgb, int img_w, int img_h,
+                                               const float quad_in[8], uint8_t *dst,
+                                               int dst_cap_w, int dst_cap_h,
+                                               int *out_w, int *out_h)
 {
-    float ordered[8];
-    float used_quad[8];
-    if (!ctx || !rgb || !plate_box || !crop_buf || !crop_box || !crop_w || !crop_h || !occ_ratio)
+    float quad[8];
+    float top_w;
+    float bottom_w;
+    float left_h;
+    float right_h;
+    int dw;
+    int dh;
+    int x;
+    int y;
+
+    if (!rgb || !quad_in || !dst || !out_w || !out_h)
         return false;
-    if (!plate_box->has_obb)
+
+    order_quad_points(quad_in, quad);
+    top_w = hypotf(quad[2] - quad[0], quad[3] - quad[1]);
+    bottom_w = hypotf(quad[4] - quad[6], quad[5] - quad[7]);
+    left_h = hypotf(quad[6] - quad[0], quad[7] - quad[1]);
+    right_h = hypotf(quad[4] - quad[2], quad[5] - quad[3]);
+    dw = (int)(fmaxf(top_w, bottom_w) + 0.5f);
+    dh = (int)(fmaxf(left_h, right_h) + 0.5f);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    if (dw > dst_cap_w) dw = dst_cap_w;
+    if (dh > dst_cap_h) dh = dst_cap_h;
+    if (dw <= 0 || dh <= 0)
         return false;
-    order_quad_points(plate_box->quad, ordered);
-    if (!warp_quad_to_rect_rgb888(rgb, img_w, img_h, ordered,
-                                  crop_buf, crop_cap_w, crop_cap_h,
-                                  extra_pad_ratio, used_quad,
-                                  crop_w, crop_h))
-        return false;
-    bbox_from_quad(used_quad, img_w, img_h, crop_box);
-    *occ_ratio = estimate_ocr_occ_ratio(ctx, *crop_w, *crop_h);
+
+    for (y = 0; y < dh; y++) {
+        float ty = (dh > 1) ? ((float)y / (float)(dh - 1)) : 0.0f;
+        float lx = quad[0] + (quad[6] - quad[0]) * ty;
+        float ly = quad[1] + (quad[7] - quad[1]) * ty;
+        float rx = quad[2] + (quad[4] - quad[2]) * ty;
+        float ry = quad[3] + (quad[5] - quad[3]) * ty;
+        for (x = 0; x < dw; x++) {
+            float tx = (dw > 1) ? ((float)x / (float)(dw - 1)) : 0.0f;
+            float sx = lx + (rx - lx) * tx;
+            float sy = ly + (ry - ly) * tx;
+            uint8_t pix[3];
+            uint8_t *q;
+            if (sx < 0.0f) sx = 0.0f;
+            if (sy < 0.0f) sy = 0.0f;
+            if (sx > (float)(img_w - 1)) sx = (float)(img_w - 1);
+            if (sy > (float)(img_h - 1)) sy = (float)(img_h - 1);
+            bilinear_sample_rgb888(rgb, img_w, img_h, sx, sy, pix);
+            q = dst + ((size_t)y * (size_t)dw + (size_t)x) * 3U;
+            q[0] = pix[0];
+            q[1] = pix[1];
+            q[2] = pix[2];
+        }
+    }
+
+    *out_w = dw;
+    *out_h = dh;
     return true;
 }
 
-static bool apply_obb_warp_quality_gate(const struct app_ctx *ctx,
-                                        const uint8_t *rgb, int img_w, int img_h,
-                                        const struct det_box *plate_box,
-                                        uint8_t *crop_buf, int crop_cap_w, int crop_cap_h,
-                                        struct det_box *crop_box, int *crop_w, int *crop_h,
-                                        float *occ_ratio, bool *used_obb_warp,
-                                        bool with_frame, uint64_t frame_seq)
+static bool warp_quad_to_fixed_rgb888(const uint8_t *rgb, int img_w, int img_h,
+                                      const float quad_in[8], uint8_t *dst,
+                                      int dst_w, int dst_h)
 {
-    float warp_occ;
-    int warp_w;
-    int warp_h;
-    const char *fallback_mode = "none";
+    float quad[8];
+    float dst_quad[8];
+    float h[9];
+    float inv_h[9];
+    int y;
+    int x;
 
-    if (!ctx || !rgb || !plate_box || !crop_buf || !crop_box || !crop_w || !crop_h ||
-        !occ_ratio || !used_obb_warp)
+    if (!rgb || !quad_in || !dst || dst_w <= 0 || dst_h <= 0)
         return false;
 
-    warp_occ = *occ_ratio;
-    warp_w = *crop_w;
-    warp_h = *crop_h;
+    order_quad_points(quad_in, quad);
+    dst_quad[0] = 0.0f;                    dst_quad[1] = 0.0f;
+    dst_quad[2] = (float)dst_w - 1.0f;     dst_quad[3] = 0.0f;
+    dst_quad[4] = (float)dst_w - 1.0f;     dst_quad[5] = (float)dst_h - 1.0f;
+    dst_quad[6] = 0.0f;                    dst_quad[7] = (float)dst_h - 1.0f;
+    if (!get_homography_4pt(quad, dst_quad, h))
+        return false;
+    if (!invert_homography(h, inv_h))
+        return false;
 
-    if (*used_obb_warp &&
-        ctx->opt.ocr_min_occ_ratio > 0.0f &&
-        *occ_ratio < ctx->opt.ocr_min_occ_ratio &&
-        ctx->opt.ocr_crop_mode != OCR_CROP_TIGHT &&
-        plate_box->has_obb) {
-        enum {
-            OBB_KEEP_BASE = 0,
-            OBB_USE_DYNPAD,
-            OBB_USE_TIGHT
-        } best_mode = OBB_KEEP_BASE;
-        float best_occ = *occ_ratio;
-        float dyn_occ = 0.0f;
-        struct det_box tight_box;
-        int tight_w = 0;
-        int tight_h = 0;
-        float tight_occ = 0.0f;
-        bool dyn_ok = false;
-        bool tight_ok = false;
-        bool allow_dynpad = (*occ_ratio < 0.70f);
-        float old_occ = *occ_ratio;
+    for (y = 0; y < dst_h; y++) {
+        for (x = 0; x < dst_w; x++) {
+            float fx = (float)x;
+            float fy = (float)y;
+            float den = inv_h[6] * fx + inv_h[7] * fy + inv_h[8];
+            float sx;
+            float sy;
+            uint8_t pix[3];
+            uint8_t *q;
+            if (fabsf(den) < 1e-8f)
+                den = (den >= 0.0f) ? 1e-8f : -1e-8f;
+            sx = (inv_h[0] * fx + inv_h[1] * fy + inv_h[2]) / den;
+            sy = (inv_h[3] * fx + inv_h[4] * fy + inv_h[5]) / den;
+            if (sx < 0.0f) sx = 0.0f;
+            if (sy < 0.0f) sy = 0.0f;
+            if (sx > (float)(img_w - 1)) sx = (float)(img_w - 1);
+            if (sy > (float)(img_h - 1)) sy = (float)(img_h - 1);
+            bilinear_sample_rgb888(rgb, img_w, img_h, sx, sy, pix);
+            q = dst + ((size_t)y * (size_t)dst_w + (size_t)x) * 3U;
+            q[0] = pix[0];
+            q[1] = pix[1];
+            q[2] = pix[2];
+        }
+    }
+    return true;
+}
 
-        if (allow_dynpad) {
-            dyn_ok = warp_plate_box_with_pad_rgb888(ctx, rgb, img_w, img_h, plate_box,
-                                                    crop_buf, crop_cap_w, crop_cap_h,
-                                                    0.08f, crop_box, crop_w, crop_h, &dyn_occ);
-            if (dyn_ok && dyn_occ > best_occ + 0.015f) {
-                best_occ = dyn_occ;
-                best_mode = OBB_USE_DYNPAD;
+static float quad_area8(const float q[8])
+{
+    float s = 0.0f;
+    int i;
+    for (i = 0; i < 4; i++) {
+        int j = (i + 1) % 4;
+        s += q[i * 2 + 0] * q[j * 2 + 1] - q[j * 2 + 0] * q[i * 2 + 1];
+    }
+    return fabsf(s) * 0.5f;
+}
+
+static void quad_center8(const float q[8], float *cx, float *cy)
+{
+    int i;
+    float sx = 0.0f, sy = 0.0f;
+    for (i = 0; i < 4; i++) {
+        sx += q[i * 2 + 0];
+        sy += q[i * 2 + 1];
+    }
+    *cx = sx * 0.25f;
+    *cy = sy * 0.25f;
+}
+
+static float quad_edge_len8(const float q[8], int i)
+{
+    int j = (i + 1) % 4;
+    float dx = q[j * 2 + 0] - q[i * 2 + 0];
+    float dy = q[j * 2 + 1] - q[i * 2 + 1];
+    return hypotf(dx, dy);
+}
+
+static bool quad_is_convex8(const float q[8])
+{
+    int i;
+    bool has_pos = false, has_neg = false;
+    for (i = 0; i < 4; i++) {
+        int i1 = (i + 1) % 4;
+        int i2 = (i + 2) % 4;
+        float ax = q[i1 * 2 + 0] - q[i * 2 + 0];
+        float ay = q[i1 * 2 + 1] - q[i * 2 + 1];
+        float bx = q[i2 * 2 + 0] - q[i1 * 2 + 0];
+        float by = q[i2 * 2 + 1] - q[i1 * 2 + 1];
+        float cross = ax * by - ay * bx;
+        if (cross > 1e-5f) has_pos = true;
+        if (cross < -1e-5f) has_neg = true;
+    }
+    return !(has_pos && has_neg);
+}
+
+static void rect_box_to_quad(const struct det_box *box, float quad[8])
+{
+    if (!box || !quad)
+        return;
+    quad[0] = (float)box->x1; quad[1] = (float)box->y1;
+    quad[2] = (float)box->x2; quad[3] = (float)box->y1;
+    quad[4] = (float)box->x2; quad[5] = (float)box->y2;
+    quad[6] = (float)box->x1; quad[7] = (float)box->y2;
+}
+
+static void bbox_from_quad_float(const float q[8], int img_w, int img_h,
+                                 int *x1, int *y1, int *x2, int *y2)
+{
+    float minx = q[0], maxx = q[0], miny = q[1], maxy = q[1];
+    int i;
+    for (i = 1; i < 4; i++) {
+        float x = q[i * 2 + 0];
+        float y = q[i * 2 + 1];
+        if (x < minx) minx = x;
+        if (x > maxx) maxx = x;
+        if (y < miny) miny = y;
+        if (y > maxy) maxy = y;
+    }
+    *x1 = (int)floorf(minx + 1e-6f);
+    *y1 = (int)floorf(miny + 1e-6f);
+    *x2 = (int)ceilf(maxx - 1e-6f);
+    *y2 = (int)ceilf(maxy - 1e-6f);
+    if (*x1 < 0) *x1 = 0;
+    if (*y1 < 0) *y1 = 0;
+    if (*x2 >= img_w) *x2 = img_w - 1;
+    if (*y2 >= img_h) *y2 = img_h - 1;
+}
+
+static bool decode_refiner_output_layout(const rknn_tensor_attr *a, int *h, int *w, int *c, bool *is_nchw)
+{
+    if (!a || !h || !w || !c || !is_nchw)
+        return false;
+    if (a->n_dims != 4)
+        return false;
+    if (a->fmt == RKNN_TENSOR_NCHW) {
+        *is_nchw = true;
+        *c = (int)a->dims[1];
+        *h = (int)a->dims[2];
+        *w = (int)a->dims[3];
+    } else {
+        *is_nchw = false;
+        *h = (int)a->dims[1];
+        *w = (int)a->dims[2];
+        *c = (int)a->dims[3];
+    }
+    return (*h > 0 && *w > 0 && *c > 0);
+}
+
+static bool run_quad_refiner(const struct app_ctx *ctx,
+                              const uint8_t *rgb, int img_w, int img_h,
+                              const float coarse_quad[8],
+                              float refined_quad_out[8])
+{
+    const struct quad_refiner_model *m = &ctx->quad_refiner_model;
+    rknn_input in;
+    rknn_output outs[4];
+    float ordered[8];
+    float pred_ordered[8];
+    int patch_x1, patch_y1, patch_x2, patch_y2;
+    int patch_w, patch_h;
+    float *input_buf = NULL;
+    float *heatmaps = NULL;
+    float *offsets_buf = NULL;
+    float corner_conf[4] = {0};
+    int ref_w, ref_h;
+    int hm_h, hm_w, hm_c;
+    int off_h = 0, off_w = 0, off_c = 0;
+    bool hm_is_nchw = false;
+    bool off_is_nchw = false;
+    bool has_offset = false;
+    float scale_x, scale_y;
+    size_t input_count;
+    size_t input_size;
+    int i, c;
+    int ret = -1;
+    const char *reject_reason = "unknown";
+    float reject_metric = 0.0f;
+    float reject_limit = 0.0f;
+    float gate_area_ratio = 0.0f;
+    float gate_center_shift = 0.0f;
+    float gate_center_shift_limit = 0.0f;
+    float gate_max_corner_shift = 0.0f;
+    float gate_corner_shift_limit = 0.0f;
+    float gate_edge_ratio_sanity = 0.0f;
+    float gate_edge_ratio_limit = 0.0f;
+    const float pad_x_ratio = 0.20f;
+    const float pad_y_ratio = 0.25f;
+    const float min_corner_conf = 0.20f;
+    const float min_area_ratio = 0.50f;
+    const float max_area_ratio = 1.80f;
+    const float max_center_shift_ratio = 0.30f;
+    const float max_corner_shift_ratio = 0.28f;
+    const float max_edge_ratio_ratio = 3.0f;
+
+    if (!ctx || !rgb || !coarse_quad || !refined_quad_out || !m->ctx)
+        return false;
+
+    order_quad_points(coarse_quad, ordered);
+    bbox_from_quad_float(ordered, img_w, img_h, &patch_x1, &patch_y1, &patch_x2, &patch_y2);
+    {
+        int ex = (int)lroundf((float)(patch_x2 - patch_x1 + 1) * pad_x_ratio);
+        int ey = (int)lroundf((float)(patch_y2 - patch_y1 + 1) * pad_y_ratio);
+        patch_x1 -= ex; patch_x2 += ex;
+        patch_y1 -= ey; patch_y2 += ey;
+        if (patch_x1 < 0) patch_x1 = 0;
+        if (patch_y1 < 0) patch_y1 = 0;
+        if (patch_x2 >= img_w) patch_x2 = img_w - 1;
+        if (patch_y2 >= img_h) patch_y2 = img_h - 1;
+    }
+    patch_w = patch_x2 - patch_x1 + 1;
+    patch_h = patch_y2 - patch_y1 + 1;
+    if (patch_w < 4 || patch_h < 4)
+        return false;
+
+    ref_w = (int)m->in_w;
+    ref_h = (int)m->in_h;
+    if (ref_w <= 1 || ref_h <= 1)
+        return false;
+
+    input_count = (size_t)3 * (size_t)ref_h * (size_t)ref_w;
+    input_size = input_count * sizeof(float);
+    input_buf = (float *)malloc(input_size);
+    if (!input_buf)
+        return false;
+
+    if (m->input_attr.fmt == RKNN_TENSOR_NCHW) {
+        for (int dy = 0; dy < ref_h; dy++) {
+            float sy = (ref_h > 1) ? ((float)dy * (float)(patch_h - 1) / (float)(ref_h - 1)) : 0.0f;
+            for (int dx = 0; dx < ref_w; dx++) {
+                float sx = (ref_w > 1) ? ((float)dx * (float)(patch_w - 1) / (float)(ref_w - 1)) : 0.0f;
+                uint8_t pix[3];
+                bilinear_sample_rgb888(rgb, img_w, img_h, (float)patch_x1 + sx, (float)patch_y1 + sy, pix);
+                for (c = 0; c < 3; c++)
+                    input_buf[((size_t)c * ref_h + (size_t)dy) * ref_w + (size_t)dx] = (float)pix[c] / 255.0f;
             }
         }
-
-        compute_expand_crop_box(plate_box, img_w, img_h, 0.08f, 0.16f, &tight_box);
-        tight_w = tight_box.x2 - tight_box.x1 + 1;
-        tight_h = tight_box.y2 - tight_box.y1 + 1;
-        tight_ok = (tight_w > 0 && tight_h > 0 &&
-                    tight_w <= crop_cap_w && tight_h <= crop_cap_h);
-        if (tight_ok) {
-            tight_occ = estimate_ocr_occ_ratio(ctx, tight_w, tight_h);
-            if (tight_occ > best_occ) {
-                best_occ = tight_occ;
-                best_mode = OBB_USE_TIGHT;
+    } else {
+        for (int dy = 0; dy < ref_h; dy++) {
+            float sy = (ref_h > 1) ? ((float)dy * (float)(patch_h - 1) / (float)(ref_h - 1)) : 0.0f;
+            for (int dx = 0; dx < ref_w; dx++) {
+                float sx = (ref_w > 1) ? ((float)dx * (float)(patch_w - 1) / (float)(ref_w - 1)) : 0.0f;
+                uint8_t pix[3];
+                bilinear_sample_rgb888(rgb, img_w, img_h, (float)patch_x1 + sx, (float)patch_y1 + sy, pix);
+                for (c = 0; c < 3; c++)
+                    input_buf[((size_t)dy * ref_w + (size_t)dx) * 3 + (size_t)c] = (float)pix[c] / 255.0f;
             }
         }
+    }
 
-        if (best_mode == OBB_USE_DYNPAD) {
-            if (!warp_plate_box_with_pad_rgb888(ctx, rgb, img_w, img_h, plate_box,
-                                                crop_buf, crop_cap_w, crop_cap_h,
-                                                0.08f, crop_box, crop_w, crop_h, occ_ratio))
-                return false;
-            *used_obb_warp = true;
-            fallback_mode = "obb-dynpad";
-            if (with_frame) {
-                fprintf(stderr,
-                        "[ocr-recrop] frame=%" PRIu64 " trigger=1 old_occ=%.3f new_mode=%s new_occ=%.3f\n",
-                        frame_seq, old_occ, fallback_mode, *occ_ratio);
-            } else {
-                fprintf(stderr,
-                        "[ocr-recrop] trigger=1 old_occ=%.3f new_mode=%s new_occ=%.3f\n",
-                        old_occ, fallback_mode, *occ_ratio);
+    memset(&in, 0, sizeof(in));
+    in.index = 0;
+    in.buf = input_buf;
+    in.size = input_size;
+    in.type = RKNN_TENSOR_FLOAT32;
+    in.fmt = m->input_attr.fmt;
+    ret = rknn_inputs_set(m->ctx, 1, &in);
+    if (ret < 0)
+        goto out;
+    ret = rknn_run(m->ctx, NULL);
+    if (ret < 0)
+        goto out;
+
+    memset(outs, 0, sizeof(outs));
+    for (i = 0; i < (int)m->io_num.n_output; i++)
+        outs[i].want_float = 1;
+    ret = rknn_outputs_get(m->ctx, m->io_num.n_output, outs, NULL);
+    if (ret < 0)
+        goto out;
+
+    if (!decode_refiner_output_layout(&m->output_attrs[0], &hm_h, &hm_w, &hm_c, &hm_is_nchw))
+        goto out_release;
+    if (hm_c != 4)
+        goto out_release;
+
+    heatmaps = (float *)malloc((size_t)hm_h * (size_t)hm_w * 4U * sizeof(float));
+    if (!heatmaps)
+        goto out_release;
+
+    {
+        const float *src = (const float *)outs[0].buf;
+        if (hm_is_nchw) {
+            memcpy(heatmaps, src, (size_t)hm_h * (size_t)hm_w * 4U * sizeof(float));
+        } else {
+            for (int y = 0; y < hm_h; y++) {
+                for (int x = 0; x < hm_w; x++) {
+                    for (c = 0; c < 4; c++) {
+                        heatmaps[((size_t)c * hm_h + (size_t)y) * hm_w + (size_t)x] =
+                            src[((size_t)y * hm_w + (size_t)x) * 4U + (size_t)c];
+                    }
+                }
             }
-        } else if (best_mode == OBB_USE_TIGHT) {
-            copy_crop_rgb888(rgb, img_w, &tight_box, crop_buf);
-            *crop_box = tight_box;
-            *crop_w = tight_w;
-            *crop_h = tight_h;
-            *occ_ratio = tight_occ;
-            *used_obb_warp = false;
-            fallback_mode = "obb-fallback-tight";
-            if (with_frame) {
-                fprintf(stderr,
-                        "[ocr-recrop] frame=%" PRIu64 " trigger=1 old_occ=%.3f new_mode=%s new_occ=%.3f\n",
-                        frame_seq, old_occ, fallback_mode, *occ_ratio);
-            } else {
-                fprintf(stderr,
-                        "[ocr-recrop] trigger=1 old_occ=%.3f new_mode=%s new_occ=%.3f\n",
-                        old_occ, fallback_mode, *occ_ratio);
+        }
+    }
+
+    scale_x = (hm_w > 1 && ref_w > 1) ? (float)(ref_w - 1) / (float)(hm_w - 1) : 0.0f;
+    scale_y = (hm_h > 1 && ref_h > 1) ? (float)(ref_h - 1) / (float)(hm_h - 1) : 0.0f;
+
+    has_offset = (m->io_num.n_output >= 3);
+    if (has_offset) {
+        if (decode_refiner_output_layout(&m->output_attrs[2], &off_h, &off_w, &off_c, &off_is_nchw) && off_c == 8) {
+            offsets_buf = (float *)malloc((size_t)off_h * (size_t)off_w * 8U * sizeof(float));
+            if (offsets_buf) {
+                const float *src = (const float *)outs[2].buf;
+                if (off_is_nchw) {
+                    memcpy(offsets_buf, src, (size_t)off_h * (size_t)off_w * 8U * sizeof(float));
+                } else {
+                    for (int y = 0; y < off_h; y++) {
+                        for (int x = 0; x < off_w; x++) {
+                            for (int ch = 0; ch < 8; ch++) {
+                                offsets_buf[((size_t)ch * off_h + (size_t)y) * off_w + (size_t)x] =
+                                    src[((size_t)y * off_w + (size_t)x) * 8U + (size_t)ch];
+                            }
+                        }
+                    }
+                }
             }
         } else {
-            if (!warp_plate_box_with_pad_rgb888(ctx, rgb, img_w, img_h, plate_box,
-                                                crop_buf, crop_cap_w, crop_cap_h,
-                                                0.0f, crop_box, crop_w, crop_h, occ_ratio))
-                return false;
-            *used_obb_warp = true;
-            fallback_mode = "obb-keep";
-            if (with_frame) {
-                fprintf(stderr,
-                        "[ocr-recrop] frame=%" PRIu64 " trigger=0 old_occ=%.3f new_mode=%s reason=not-improved\n",
-                        frame_seq, old_occ, fallback_mode);
-            } else {
-                fprintf(stderr,
-                        "[ocr-recrop] trigger=0 old_occ=%.3f new_mode=%s reason=not-improved\n",
-                        old_occ, fallback_mode);
-            }
+            has_offset = false;
         }
     }
 
-    if (with_frame) {
-        fprintf(stderr,
-                "[ocr-gate] frame=%" PRIu64 " warp_ok=%d warp_occ=%.3f warp_wxh=%dx%d fallback_mode=%s final_occ=%.3f final_wxh=%dx%d\n",
-                frame_seq, 1, warp_occ, warp_w, warp_h, fallback_mode, *occ_ratio, *crop_w, *crop_h);
-    } else {
-        fprintf(stderr,
-                "[ocr-gate] warp_ok=%d warp_occ=%.3f warp_wxh=%dx%d fallback_mode=%s final_occ=%.3f final_wxh=%dx%d\n",
-                1, warp_occ, warp_w, warp_h, fallback_mode, *occ_ratio, *crop_w, *crop_h);
+    for (c = 0; c < 4; c++) {
+        float *ch = heatmaps + (size_t)c * hm_h * hm_w;
+        float best = -1e30f;
+        int best_idx = 0;
+        int by, bx;
+        float rx, ry;
+        for (i = 0; i < hm_h * hm_w; i++) {
+            float v = ch[i];
+            if (v >= 0.0f) v = 1.0f / (1.0f + expf(-v));
+            else {
+                float ev = expf(v);
+                v = ev / (1.0f + ev);
+            }
+            ch[i] = v;
+            if (v > best) {
+                best = v;
+                best_idx = i;
+            }
+        }
+        corner_conf[c] = best;
+        by = best_idx / hm_w;
+        bx = best_idx % hm_w;
+        if (offsets_buf && bx < off_w && by < off_h) {
+            size_t dx_idx = ((size_t)c * 2U * (size_t)off_h + (size_t)by) * (size_t)off_w + (size_t)bx;
+            size_t dy_idx = (((size_t)c * 2U + 1U) * (size_t)off_h + (size_t)by) * (size_t)off_w + (size_t)bx;
+            rx = (float)bx + offsets_buf[dx_idx];
+            ry = (float)by + offsets_buf[dy_idx];
+        } else {
+            int x0 = (bx > 0) ? bx - 1 : 0;
+            int x1 = (bx + 1 < hm_w) ? bx + 1 : hm_w - 1;
+            int y0 = (by > 0) ? by - 1 : 0;
+            int y1 = (by + 1 < hm_h) ? by + 1 : hm_h - 1;
+            float total = 0.0f, wx = 0.0f, wy = 0.0f;
+            int yy, xx;
+            for (yy = y0; yy <= y1; yy++) {
+                for (xx = x0; xx <= x1; xx++) {
+                    float w = ch[yy * hm_w + xx];
+                    total += w;
+                    wx += w * (float)xx;
+                    wy += w * (float)yy;
+                }
+            }
+            if (total > 1e-6f) {
+                rx = wx / total;
+                ry = wy / total;
+            } else {
+                rx = (float)bx;
+                ry = (float)by;
+            }
+        }
+        pred_ordered[c * 2 + 0] = (rx * scale_x) * ((float)(patch_w - 1) / (float)(ref_w - 1 + 1e-6f)) + (float)patch_x1;
+        pred_ordered[c * 2 + 1] = (ry * scale_y) * ((float)(patch_h - 1) / (float)(ref_h - 1 + 1e-6f)) + (float)patch_y1;
     }
 
-    return true;
+    order_quad_points(pred_ordered, refined_quad_out);
+
+    {
+        float coarse_area = fmaxf(quad_area8(ordered), 1e-6f);
+        float refined_area = quad_area8(refined_quad_out);
+        float area_ratio = refined_area / coarse_area;
+        float coarse_cx, coarse_cy, refined_cx, refined_cy;
+        float center_shift;
+        float max_corner_shift = 0.0f;
+        float edge_ratio_sanity = 1.0f;
+        float patch_diag = hypotf((float)ref_w, (float)ref_h);
+        quad_center8(ordered, &coarse_cx, &coarse_cy);
+        quad_center8(refined_quad_out, &refined_cx, &refined_cy);
+        center_shift = hypotf(refined_cx - coarse_cx, refined_cy - coarse_cy);
+        for (i = 0; i < 4; i++) {
+            float shift = hypotf(refined_quad_out[i * 2 + 0] - ordered[i * 2 + 0],
+                                 refined_quad_out[i * 2 + 1] - ordered[i * 2 + 1]);
+            float ce = fmaxf(quad_edge_len8(ordered, i), 1e-6f);
+            float re = fmaxf(quad_edge_len8(refined_quad_out, i), 1e-6f);
+            float ratio = re / ce;
+            if (shift > max_corner_shift) max_corner_shift = shift;
+            if (ratio > edge_ratio_sanity) edge_ratio_sanity = ratio;
+            if ((1.0f / ratio) > edge_ratio_sanity) edge_ratio_sanity = 1.0f / ratio;
+        }
+        gate_area_ratio = area_ratio;
+        gate_center_shift = center_shift;
+        gate_center_shift_limit = max_center_shift_ratio * patch_diag;
+        gate_max_corner_shift = max_corner_shift;
+        gate_corner_shift_limit = max_corner_shift_ratio * patch_diag;
+        gate_edge_ratio_sanity = edge_ratio_sanity;
+        gate_edge_ratio_limit = max_edge_ratio_ratio;
+        if (corner_conf[0] < min_corner_conf || corner_conf[1] < min_corner_conf ||
+            corner_conf[2] < min_corner_conf || corner_conf[3] < min_corner_conf) {
+            float min_conf_seen = corner_conf[0];
+            if (corner_conf[1] < min_conf_seen) min_conf_seen = corner_conf[1];
+            if (corner_conf[2] < min_conf_seen) min_conf_seen = corner_conf[2];
+            if (corner_conf[3] < min_conf_seen) min_conf_seen = corner_conf[3];
+            reject_reason = "low_corner_conf";
+            reject_metric = min_conf_seen;
+            reject_limit = min_corner_conf;
+            goto out_release;
+        }
+        if (!quad_is_convex8(refined_quad_out)) {
+            reject_reason = "non_convex";
+            goto out_release;
+        }
+        if (area_ratio < min_area_ratio) {
+            reject_reason = "area_ratio_low";
+            reject_metric = area_ratio;
+            reject_limit = min_area_ratio;
+            goto out_release;
+        }
+        if (area_ratio > max_area_ratio) {
+            reject_reason = "area_ratio_high";
+            reject_metric = area_ratio;
+            reject_limit = max_area_ratio;
+            goto out_release;
+        }
+        if (center_shift > max_center_shift_ratio * patch_diag) {
+            reject_reason = "center_shift";
+            reject_metric = center_shift;
+            reject_limit = max_center_shift_ratio * patch_diag;
+            goto out_release;
+        }
+        if (max_corner_shift > max_corner_shift_ratio * patch_diag) {
+            reject_reason = "corner_shift";
+            reject_metric = max_corner_shift;
+            reject_limit = max_corner_shift_ratio * patch_diag;
+            goto out_release;
+        }
+        if (edge_ratio_sanity > max_edge_ratio_ratio) {
+            reject_reason = "edge_ratio";
+            reject_metric = edge_ratio_sanity;
+            reject_limit = max_edge_ratio_ratio;
+            goto out_release;
+        }
+        if (refined_area < 4.0f) {
+            reject_reason = "refined_area";
+            reject_metric = refined_area;
+            reject_limit = 4.0f;
+            goto out_release;
+        }
+    }
+
+    ret = 0;
+out_release:
+    if (m->ctx)
+        rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+out:
+    if (offsets_buf)
+        free(offsets_buf);
+    free(input_buf);
+    free(heatmaps);
+    if (ret == 0) {
+        fprintf(stderr,
+                "[quad_refiner] gate ACCEPT conf=[%.3f %.3f %.3f %.3f] area_ratio=%.3f center_shift=%.3f/%.3f corner_shift=%.3f/%.3f edge_ratio=%.3f/%.3f\n",
+                corner_conf[0], corner_conf[1], corner_conf[2], corner_conf[3],
+                gate_area_ratio,
+                gate_center_shift, gate_center_shift_limit,
+                gate_max_corner_shift, gate_corner_shift_limit,
+                gate_edge_ratio_sanity, gate_edge_ratio_limit);
+        return true;
+    }
+    fprintf(stderr,
+            "[quad_refiner] gate REJECT/FAIL reason=%s metric=%.3f limit=%.3f conf=[%.3f %.3f %.3f %.3f]\n",
+            reject_reason, reject_metric, reject_limit,
+            corner_conf[0], corner_conf[1], corner_conf[2], corner_conf[3]);
+    return false;
 }
 
 static bool prepare_plate_crop_rgb888(const struct app_ctx *ctx,
@@ -4095,17 +5087,85 @@ static bool prepare_plate_crop_rgb888(const struct app_ctx *ctx,
                                       const struct det_box *plate_box,
                                       uint8_t *crop_buf, int crop_cap_w, int crop_cap_h,
                                       struct det_box *crop_box, int *crop_w, int *crop_h,
-                                      float *occ_ratio, bool *used_obb_warp)
+                                      float *occ_ratio, bool *used_obb_warp,
+                                      uint8_t *fc_buf, int fc_w, int fc_h,
+                                      uint64_t frame_id)
 {
+    float ordered[8];
+    float coarse_ordered[8];
+    float refined_quad[8];
+    bool have_refined = false;
     if (!ctx || !rgb || !plate_box || !crop_buf || !crop_box || !crop_w || !crop_h || !occ_ratio || !used_obb_warp)
         return false;
     *used_obb_warp = false;
+    if (fc_buf && fc_w > 0 && fc_h > 0) {
+        if (plate_box->has_obb)
+            order_quad_points(plate_box->quad, ordered);
+        else
+            rect_box_to_quad(plate_box, ordered);
+        warp_quad_to_fixed_rgb888(rgb, img_w, img_h, ordered, fc_buf, fc_w, fc_h);
+    }
 
-    if (ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP && plate_box->has_obb) {
-        if (warp_plate_box_with_pad_rgb888(ctx, rgb, img_w, img_h, plate_box,
-                                           crop_buf, crop_cap_w, crop_cap_h,
-                                           0.0f, crop_box, crop_w, crop_h, occ_ratio)) {
+    if (ctx->opt.ocr_crop_mode == OCR_CROP_OBB_WARP ||
+        ctx->opt.ocr_crop_mode == OCR_CROP_OBB_PIECEWISE) {
+        bool use_piecewise = (ctx->opt.ocr_crop_mode == OCR_CROP_OBB_PIECEWISE);
+        bool warp_ok;
+        if (plate_box->has_obb)
+            order_quad_points(plate_box->quad, ordered);
+        else
+            rect_box_to_quad(plate_box, ordered);
+        memcpy(coarse_ordered, ordered, sizeof(coarse_ordered));
+        /* Run quad refiner before OBB warp if model is loaded */
+        if (ctx->quad_refiner_model.ctx) {
+            if (run_quad_refiner(ctx, rgb, img_w, img_h, ordered, refined_quad)) {
+                /* Gate accepted: replace ordered quad with refined quad */
+                memcpy(ordered, refined_quad, sizeof(float) * 8);
+                have_refined = true;
+            }
+        }
+        warp_ok = use_piecewise ?
+            warp_quad_to_rect_piecewise_rgb888(rgb, img_w, img_h, ordered,
+                                               crop_buf, crop_cap_w, crop_cap_h,
+                                               crop_w, crop_h) :
+            warp_quad_to_rect_rgb888(rgb, img_w, img_h, ordered,
+                                     crop_buf, crop_cap_w, crop_cap_h,
+                                     crop_w, crop_h);
+        if (warp_ok) {
+            bbox_from_quad(ordered, img_w, img_h, crop_box);
+            *occ_ratio = estimate_ocr_occ_ratio(ctx, *crop_w, *crop_h);
             *used_obb_warp = true;
+            if (fc_buf && fc_w > 0 && fc_h > 0)
+                warp_quad_to_fixed_rgb888(rgb, img_w, img_h, ordered, fc_buf, fc_w, fc_h);
+            if (ctx->ocr_crop_index_fp && ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
+                uint8_t *coarse_crop = malloc((size_t)crop_cap_w * (size_t)crop_cap_h * 3U);
+                int coarse_w = 0, coarse_h = 0;
+                int sample_id = ctx->ocr_crop_dumped;
+                if (coarse_crop) {
+                    bool coarse_ok = use_piecewise ?
+                        warp_quad_to_rect_piecewise_rgb888(rgb, img_w, img_h, coarse_ordered,
+                                                           coarse_crop, crop_cap_w, crop_cap_h,
+                                                           &coarse_w, &coarse_h) :
+                        warp_quad_to_rect_rgb888(rgb, img_w, img_h, coarse_ordered,
+                                                 coarse_crop, crop_cap_w, crop_cap_h,
+                                                 &coarse_w, &coarse_h);
+                    if (coarse_ok) {
+                        dump_ocr_ab_variant(ctx, frame_id, sample_id, "coarse", coarse_ordered,
+                                            coarse_crop, coarse_w, coarse_h);
+                    }
+                    free(coarse_crop);
+                }
+                if (have_refined) {
+                    dump_ocr_ab_variant(ctx, frame_id, sample_id, "refined", ordered,
+                                        crop_buf, *crop_w, *crop_h);
+                    fprintf(stderr,
+                            "[ocr-ab] frame=%" PRIu64 " sample=%d mode=%s dump=coarse/refined refiner=accepted\n",
+                            frame_id, sample_id, use_piecewise ? "piecewise" : "homography");
+                } else {
+                    fprintf(stderr,
+                            "[ocr-ab] frame=%" PRIu64 " sample=%d mode=%s dump=coarse refiner=not_accepted\n",
+                            frame_id, sample_id, use_piecewise ? "piecewise" : "homography");
+                }
+            }
             return true;
         }
     }
@@ -4204,7 +5264,7 @@ static float rows_get_value(const float *buf, bool transposed, int n_rows, int n
     return buf[(size_t)r * (size_t)n_cols + (size_t)c];
 }
 
-static bool rows_coords_mostly_normalized(const float *buf, bool transposed, int n_rows, int n_cols)
+static bool __attribute__((unused)) rows_coords_mostly_normalized(const float *buf, bool transposed, int n_rows, int n_cols)
 {
     int i;
     int sample = (n_rows < 128) ? n_rows : 128;
@@ -4224,7 +5284,7 @@ static bool rows_coords_mostly_normalized(const float *buf, bool transposed, int
     return ((float)in01 / (float)total) >= 0.75f;
 }
 
-static bool rows_classid_like(const float *buf, bool transposed, int n_rows, int n_cols, int class_count)
+static bool __attribute__((unused)) rows_classid_like(const float *buf, bool transposed, int n_rows, int n_cols, int class_count)
 {
     int i;
     int sample = (n_rows < 128) ? n_rows : 128;
@@ -4243,430 +5303,6 @@ static bool rows_classid_like(const float *buf, bool transposed, int n_rows, int
             in_range++;
     }
     return (near_int >= (sample * 7) / 10) && (in_range >= (sample * 7) / 10);
-}
-
-static int decode_rows_mode_xywh(const float *buf, bool transposed, int n_rows, int n_cols, int class_count,
-                                 float conf_thr, int src_w, int src_h, int in_w, int in_h,
-                                 struct det_box *out, float *avg_conf_out)
-{
-    int i;
-    int count = 0;
-    float conf_sum = 0.0f;
-    int cls_lim = class_count;
-
-    if (n_cols < 6)
-        return 0;
-    if (cls_lim <= 0)
-        cls_lim = 1;
-    if (cls_lim > n_cols - 5)
-        cls_lim = n_cols - 5;
-
-    for (i = 0; i < n_rows && count < MAX_DETS; i++) {
-        int c;
-        float obj = rows_get_value(buf, transposed, n_rows, n_cols, i, 4);
-        float best = (cls_lim > 0) ? 0.0f : 1.0f;
-        int best_id = 0;
-        float cx = rows_get_value(buf, transposed, n_rows, n_cols, i, 0);
-        float cy = rows_get_value(buf, transposed, n_rows, n_cols, i, 1);
-        float bw = rows_get_value(buf, transposed, n_rows, n_cols, i, 2);
-        float bh = rows_get_value(buf, transposed, n_rows, n_cols, i, 3);
-        struct det_box b;
-
-        for (c = 0; c < cls_lim; c++) {
-            float p = rows_get_value(buf, transposed, n_rows, n_cols, i, 5 + c);
-            if (p > best) {
-                best = p;
-                best_id = c;
-            }
-        }
-        if (obj <= 1.0f) obj = sigmoidf_local(obj);
-        if (best <= 1.0f) best = sigmoidf_local(best);
-        if (obj * best < conf_thr)
-            continue;
-
-        if (bw <= 2.0f && bh <= 2.0f) {
-            cx *= (float)in_w;
-            cy *= (float)in_h;
-            bw *= (float)in_w;
-            bh *= (float)in_h;
-        }
-
-        memset(&b, 0, sizeof(b));
-        b.x1 = (int)((cx - bw * 0.5f) * ((float)src_w / (float)in_w));
-        b.y1 = (int)((cy - bh * 0.5f) * ((float)src_h / (float)in_h));
-        b.x2 = (int)((cx + bw * 0.5f) * ((float)src_w / (float)in_w));
-        b.y2 = (int)((cy + bh * 0.5f) * ((float)src_h / (float)in_h));
-        b.conf = obj * best;
-        b.cls = best_id;
-        clamp_box(&b, src_w, src_h);
-        out[count++] = b;
-        conf_sum += b.conf;
-    }
-
-    if (avg_conf_out)
-        *avg_conf_out = (count > 0) ? (conf_sum / (float)count) : 0.0f;
-    return count;
-}
-
-static int decode_rows_mode_xyxy_clsid(const float *buf, bool transposed, int n_rows, int n_cols, int class_count,
-                                       float conf_thr, int src_w, int src_h, int in_w, int in_h,
-                                       struct det_box *out, float *avg_conf_out)
-{
-    int i;
-    int count = 0;
-    float conf_sum = 0.0f;
-    bool normalized = rows_coords_mostly_normalized(buf, transposed, n_rows, n_cols);
-    bool clsid_hint = rows_classid_like(buf, transposed, n_rows, n_cols, class_count);
-
-    if (n_cols < 6 || !clsid_hint)
-        return 0;
-    if (class_count <= 0)
-        class_count = 1;
-
-    for (i = 0; i < n_rows && count < MAX_DETS; i++) {
-        float x1 = rows_get_value(buf, transposed, n_rows, n_cols, i, 0);
-        float y1 = rows_get_value(buf, transposed, n_rows, n_cols, i, 1);
-        float x2 = rows_get_value(buf, transposed, n_rows, n_cols, i, 2);
-        float y2 = rows_get_value(buf, transposed, n_rows, n_cols, i, 3);
-        float score = rows_get_value(buf, transposed, n_rows, n_cols, i, 4);
-        int cls = (int)lroundf(rows_get_value(buf, transposed, n_rows, n_cols, i, 5));
-        struct det_box b;
-        float max_x;
-        float max_y;
-
-        if (score < 0.0f || score > 1.0f)
-            score = sigmoidf_local(score);
-        if (score < conf_thr)
-            continue;
-        if (cls < 0 || cls >= class_count)
-            continue;
-
-        if (normalized) {
-            x1 *= (float)in_w;
-            x2 *= (float)in_w;
-            y1 *= (float)in_h;
-            y2 *= (float)in_h;
-        }
-
-        if (x2 < x1) { float t = x1; x1 = x2; x2 = t; }
-        if (y2 < y1) { float t = y1; y1 = y2; y2 = t; }
-        max_x = fmaxf(fabsf(x1), fabsf(x2));
-        max_y = fmaxf(fabsf(y1), fabsf(y2));
-
-        memset(&b, 0, sizeof(b));
-        if (max_x <= (float)in_w * 1.5f && max_y <= (float)in_h * 1.5f) {
-            b.x1 = (int)(x1 * ((float)src_w / (float)in_w));
-            b.y1 = (int)(y1 * ((float)src_h / (float)in_h));
-            b.x2 = (int)(x2 * ((float)src_w / (float)in_w));
-            b.y2 = (int)(y2 * ((float)src_h / (float)in_h));
-        } else {
-            b.x1 = (int)x1;
-            b.y1 = (int)y1;
-            b.x2 = (int)x2;
-            b.y2 = (int)y2;
-        }
-        b.conf = score;
-        b.cls = cls;
-        clamp_box(&b, src_w, src_h);
-        out[count++] = b;
-        conf_sum += b.conf;
-    }
-
-    if (avg_conf_out)
-        *avg_conf_out = (count > 0) ? (conf_sum / (float)count) : 0.0f;
-    return count;
-}
-
-static int decode_rows_tensor_output(const rknn_tensor_attr *a, const float *buf, int class_count,
-                                     float conf_thr, int src_w, int src_h, int in_w, int in_h,
-                                     struct det_box *out, int *out_count)
-{
-    struct det_box xywh_out[MAX_DETS];
-    struct det_box xyxy_out[MAX_DETS];
-    int n_rows;
-    int n_cols;
-    bool transposed = false;
-    int xywh_count = 0;
-    int xyxy_count = 0;
-    float xywh_avg = 0.0f;
-    float xyxy_avg = 0.0f;
-
-    *out_count = 0;
-    if (a->n_dims != 3)
-        return 0;
-
-    n_rows = (int)a->dims[1];
-    n_cols = (int)a->dims[2];
-    if (n_cols < 6 && n_rows >= 6) {
-        int t = n_rows;
-        n_rows = n_cols;
-        n_cols = t;
-        transposed = true;
-    }
-    if (n_cols < 6 || n_rows <= 0)
-        return 0;
-
-    xywh_count = decode_rows_mode_xywh(buf, transposed, n_rows, n_cols, class_count,
-                                       conf_thr, src_w, src_h, in_w, in_h,
-                                       xywh_out, &xywh_avg);
-    xyxy_count = decode_rows_mode_xyxy_clsid(buf, transposed, n_rows, n_cols, class_count,
-                                             conf_thr, src_w, src_h, in_w, in_h,
-                                             xyxy_out, &xyxy_avg);
-
-    if (xywh_count <= 0 && xyxy_count <= 0)
-        return 0;
-    if (xyxy_count <= 0 || (xywh_count > 0 && ((float)xywh_count + xywh_avg * 0.5f >= (float)xyxy_count + xyxy_avg * 0.5f))) {
-        memcpy(out, xywh_out, (size_t)xywh_count * sizeof(out[0]));
-        *out_count = xywh_count;
-        return 1; /* xywh */
-    }
-
-    memcpy(out, xyxy_out, (size_t)xyxy_count * sizeof(out[0]));
-    *out_count = xyxy_count;
-    return 2; /* xyxy+clsid */
-}
-
-enum yolo_head_layout {
-    YOLO_HEAD_4D_NCHW = 0,
-    YOLO_HEAD_4D_NHWC,
-    YOLO_HEAD_5D_AHWA,
-    YOLO_HEAD_5D_HWAA
-};
-
-struct yolo_head_view {
-    uint32_t out_idx;
-    int h;
-    int w;
-    int anchors;
-    int attrs;
-    int stride;
-    int layout;
-};
-
-static bool parse_yolo_head_view(const struct yolo_model *m, uint32_t out_idx, struct yolo_head_view *hv)
-{
-    const rknn_tensor_attr *a = &m->output_attrs[out_idx];
-    int h = 0;
-    int w = 0;
-    int anchors = 3;
-    int attrs = 0;
-    int layout = YOLO_HEAD_4D_NCHW;
-
-    if (a->n_dims == 4) {
-        int c = 0;
-        if (a->fmt == RKNN_TENSOR_NCHW) {
-            c = (int)a->dims[1];
-            h = (int)a->dims[2];
-            w = (int)a->dims[3];
-            layout = YOLO_HEAD_4D_NCHW;
-        } else if (a->fmt == RKNN_TENSOR_NHWC) {
-            h = (int)a->dims[1];
-            w = (int)a->dims[2];
-            c = (int)a->dims[3];
-            layout = YOLO_HEAD_4D_NHWC;
-        } else {
-            if (a->dims[2] == a->dims[3] && a->dims[1] >= 18) {
-                c = (int)a->dims[1];
-                h = (int)a->dims[2];
-                w = (int)a->dims[3];
-                layout = YOLO_HEAD_4D_NCHW;
-            } else if (a->dims[1] == a->dims[2] && a->dims[3] >= 18) {
-                h = (int)a->dims[1];
-                w = (int)a->dims[2];
-                c = (int)a->dims[3];
-                layout = YOLO_HEAD_4D_NHWC;
-            } else {
-                return false;
-            }
-        }
-        if (c <= 0 || c % 3 != 0)
-            return false;
-        anchors = 3;
-        attrs = c / 3;
-    } else if (a->n_dims == 5) {
-        int d1 = (int)a->dims[1];
-        int d2 = (int)a->dims[2];
-        int d3 = (int)a->dims[3];
-        int d4 = (int)a->dims[4];
-        int attrs_guess = (m->class_count > 0) ? (m->class_count + 5) : 6;
-
-        if (d1 == 3 && d2 > 0 && d3 > 0) {
-            h = d2;
-            w = d3;
-            anchors = 3;
-            attrs = (d4 >= 6) ? d4 : attrs_guess;
-            layout = YOLO_HEAD_5D_AHWA;
-        } else if (d3 == 3 && d1 > 0 && d2 > 0) {
-            h = d1;
-            w = d2;
-            anchors = 3;
-            attrs = (d4 >= 6) ? d4 : attrs_guess;
-            layout = YOLO_HEAD_5D_HWAA;
-        } else {
-            return false;
-        }
-    } else {
-        return false;
-    }
-
-    if (h <= 0 || w <= 0 || anchors != 3 || attrs < 6)
-        return false;
-
-    hv->out_idx = out_idx;
-    hv->h = h;
-    hv->w = w;
-    hv->anchors = anchors;
-    hv->attrs = attrs;
-    hv->layout = layout;
-    hv->stride = (h > 0) ? ((int)m->in_h / h) : 0;
-    return hv->stride > 0;
-}
-
-static void sort_heads_by_stride(struct yolo_head_view *heads, int n)
-{
-    int i;
-    int j;
-    for (i = 0; i < n; i++) {
-        for (j = i + 1; j < n; j++) {
-            if (heads[i].stride > heads[j].stride) {
-                struct yolo_head_view t = heads[i];
-                heads[i] = heads[j];
-                heads[j] = t;
-            }
-        }
-    }
-}
-
-static float head_read(const float *buf, const struct yolo_head_view *hv, int a, int gy, int gx, int k)
-{
-    size_t idx = 0;
-    if (hv->layout == YOLO_HEAD_4D_NCHW) {
-        int ch = a * hv->attrs + k;
-        idx = ((size_t)ch * (size_t)hv->h + (size_t)gy) * (size_t)hv->w + (size_t)gx;
-    } else if (hv->layout == YOLO_HEAD_4D_NHWC) {
-        idx = ((size_t)gy * (size_t)hv->w + (size_t)gx) * (size_t)(hv->anchors * hv->attrs) +
-              (size_t)(a * hv->attrs + k);
-    } else if (hv->layout == YOLO_HEAD_5D_AHWA) {
-        idx = ((((size_t)a * (size_t)hv->h + (size_t)gy) * (size_t)hv->w + (size_t)gx) * (size_t)hv->attrs) + (size_t)k;
-    } else {
-        idx = ((((size_t)gy * (size_t)hv->w + (size_t)gx) * (size_t)hv->anchors + (size_t)a) * (size_t)hv->attrs) + (size_t)k;
-    }
-    return buf[idx];
-}
-
-static void decode_yolo_head_output(const float *buf, const struct yolo_head_view *hv,
-                                    const float anchors[3][2], int class_count, float conf_thr,
-                                    int src_w, int src_h, int in_w, int in_h,
-                                    struct det_box *out, int *out_count)
-{
-    int gy;
-    int gx;
-    int a;
-    int classes = hv->attrs - 5;
-    int cls_lim = class_count;
-    if (classes <= 0)
-        return;
-    if (cls_lim <= 0)
-        cls_lim = 1;
-    if (cls_lim > classes)
-        cls_lim = classes;
-
-    for (gy = 0; gy < hv->h && *out_count < MAX_DETS; gy++) {
-        for (gx = 0; gx < hv->w && *out_count < MAX_DETS; gx++) {
-            for (a = 0; a < 3 && *out_count < MAX_DETS; a++) {
-                float tx = head_read(buf, hv, a, gy, gx, 0);
-                float ty = head_read(buf, hv, a, gy, gx, 1);
-                float tw = head_read(buf, hv, a, gy, gx, 2);
-                float th = head_read(buf, hv, a, gy, gx, 3);
-                float to = head_read(buf, hv, a, gy, gx, 4);
-                float obj = sigmoidf_local(to);
-                float best = (cls_lim > 0) ? 0.0f : 1.0f;
-                int best_id = 0;
-                int c;
-                struct det_box b;
-                float bx;
-                float by;
-                float bw;
-                float bh;
-                float conf;
-
-                if (obj < conf_thr * 0.5f)
-                    continue;
-
-                for (c = 0; c < cls_lim; c++) {
-                    float p = sigmoidf_local(head_read(buf, hv, a, gy, gx, 5 + c));
-                    if (p > best) {
-                        best = p;
-                        best_id = c;
-                    }
-                }
-
-                conf = obj * best;
-                if (conf < conf_thr)
-                    continue;
-
-                bx = ((sigmoidf_local(tx) * 2.0f - 0.5f) + (float)gx) * (float)hv->stride;
-                by = ((sigmoidf_local(ty) * 2.0f - 0.5f) + (float)gy) * (float)hv->stride;
-                bw = powf(sigmoidf_local(tw) * 2.0f, 2.0f) * anchors[a][0];
-                bh = powf(sigmoidf_local(th) * 2.0f, 2.0f) * anchors[a][1];
-
-                memset(&b, 0, sizeof(b));
-                b.x1 = (int)((bx - bw * 0.5f) * ((float)src_w / (float)in_w));
-                b.y1 = (int)((by - bh * 0.5f) * ((float)src_h / (float)in_h));
-                b.x2 = (int)((bx + bw * 0.5f) * ((float)src_w / (float)in_w));
-                b.y2 = (int)((by + bh * 0.5f) * ((float)src_h / (float)in_h));
-                b.conf = conf;
-                b.cls = best_id;
-                clamp_box(&b, src_w, src_h);
-                out[(*out_count)++] = b;
-            }
-        }
-    }
-}
-
-static void decode_yolo_heads_outputs(const struct yolo_model *m, const rknn_output *outs,
-                                      float conf_thr, int src_w, int src_h,
-                                      struct det_box *out, int *out_count)
-{
-    static const float anchors_p5[3][3][2] = {
-        {{10.0f, 13.0f}, {16.0f, 30.0f}, {33.0f, 23.0f}},
-        {{30.0f, 61.0f}, {62.0f, 45.0f}, {59.0f, 119.0f}},
-        {{116.0f, 90.0f}, {156.0f, 198.0f}, {373.0f, 326.0f}},
-    };
-    static const float anchors_p6[4][3][2] = {
-        {{19.0f, 27.0f}, {44.0f, 40.0f}, {38.0f, 94.0f}},
-        {{96.0f, 68.0f}, {86.0f, 152.0f}, {180.0f, 137.0f}},
-        {{140.0f, 301.0f}, {303.0f, 264.0f}, {238.0f, 542.0f}},
-        {{436.0f, 615.0f}, {739.0f, 380.0f}, {925.0f, 792.0f}},
-    };
-    struct yolo_head_view heads[8];
-    int head_count = 0;
-    uint32_t i;
-
-    *out_count = 0;
-    for (i = 0; i < m->io_num.n_output && head_count < 8; i++) {
-        if (parse_yolo_head_view(m, i, &heads[head_count]))
-            head_count++;
-    }
-    if (head_count == 0)
-        return;
-
-    sort_heads_by_stride(heads, head_count);
-    for (i = 0; i < (uint32_t)head_count && *out_count < MAX_DETS; i++) {
-        const float (*anchors)[2] = NULL;
-        if (head_count == 3 && i < 3)
-            anchors = anchors_p5[i];
-        else if (head_count == 4 && i < 4)
-            anchors = anchors_p6[i];
-        else if (i < 3)
-            anchors = anchors_p5[i];
-        if (!anchors)
-            continue;
-
-        decode_yolo_head_output((const float *)outs[heads[i].out_idx].buf, &heads[i], anchors,
-                                m->class_count, conf_thr, src_w, src_h,
-                                (int)m->in_w, (int)m->in_h, out, out_count);
-    }
 }
 
 struct tensor_cn_view {
@@ -4771,6 +5407,12 @@ struct obb_anchor_cache {
     float y[OBB_POINT_COUNT];
     float stride[OBB_POINT_COUNT];
 };
+
+static bool detector_type_uses_quad(int mode)
+{
+    return mode == DETECTOR_YOLOV8_OBB_RKNN ||
+           mode == DETECTOR_YOLOV8_POSE_RKNN;
+}
 
 static bool build_obb_anchor_cache(struct obb_anchor_cache *cache)
 {
@@ -4900,6 +5542,26 @@ static bool infer_obb_output_views(const struct yolo_model *m, const rknn_output
            angle_view->n == OBB_POINT_COUNT;
 }
 
+static bool infer_pose_output_view(const struct yolo_model *m, const rknn_output *outs,
+                                   struct tensor_cn_view *pose_view)
+{
+    uint32_t i;
+
+    if (!m || !outs || !pose_view)
+        return false;
+
+    for (i = 0; i < m->io_num.n_output; i++) {
+        struct tensor_cn_view tv;
+        if (!build_tensor_cn_view(&m->output_attrs[i], (const float *)outs[i].buf, &tv))
+            continue;
+        if (tv.n == OBB_POINT_COUNT && tv.c == POSE_OUTPUT_CHANNELS) {
+            *pose_view = tv;
+            return true;
+        }
+    }
+    return false;
+}
+
 static int decode_yolov8_obb_outputs(const struct yolo_model *m, const rknn_output *outs,
                                      float conf_thr, int src_w, int src_h,
                                      struct det_box *out, int *out_count)
@@ -5010,16 +5672,198 @@ static int decode_yolov8_obb_outputs(const struct yolo_model *m, const rknn_outp
     return 0;
 }
 
+static int decode_yolov8_pose_outputs(const struct yolo_model *m, const rknn_output *outs,
+                                      float conf_thr, int src_w, int src_h,
+                                      struct det_box *out, int *out_count)
+{
+    struct tensor_cn_view pose_view;
+    struct det_box cand[MAX_DETS * 4];
+    const int pre_nms_cap = MAX_DETS * 4;
+    int count = 0;
+    int i;
+
+    *out_count = 0;
+    if (m->in_w != ALGO_STREAM_SIZE || m->in_h != ALGO_STREAM_SIZE)
+        return -1;
+    if (m->class_filter > 0)
+        return 0;
+    if (!infer_pose_output_view(m, outs, &pose_view))
+        return -1;
+
+    for (i = 0; i < OBB_POINT_COUNT; i++) {
+        float cx = tensor_cn_read(&pose_view, 0, i);
+        float cy = tensor_cn_read(&pose_view, 1, i);
+        float bw = tensor_cn_read(&pose_view, 2, i);
+        float bh = tensor_cn_read(&pose_view, 3, i);
+        float score = tensor_cn_read(&pose_view, 4, i);
+        float ordered[8];
+        struct det_box det;
+        int k;
+        bool valid = true;
+
+        /*
+         * ONNX export already bakes in Ultralytics pose decoding:
+         *   output[0:4]  = xywh in detector-input pixels
+         *   output[4]    = sigmoid(cls)
+         *   output[5:17] = decoded keypoints in detector-input pixels, flattened as
+         *                  [x0,y0,v0,x1,y1,v1,x2,y2,v2,x3,y3,v3]
+         *
+         * Do not run dist2bbox or anchor-relative keypoint decoding again here.
+         */
+        if (!isfinite(cx) || !isfinite(cy) || !isfinite(bw) || !isfinite(bh) || !isfinite(score))
+            continue;
+        if (score < 0.0f || score > 1.0f)
+            score = sigmoidf_local(score);
+        if (score < conf_thr)
+            continue;
+
+        memset(&det, 0, sizeof(det));
+        det.cx = cx;
+        det.cy = cy;
+        det.w = bw;
+        det.h = bh;
+        det.conf = score;
+        det.cls = 0;
+        det.has_obb = 1;
+        if (det.w < 2.0f || det.h < 2.0f)
+            continue;
+
+        for (k = 0; k < POSE_KPT_COUNT; k++) {
+            float kx = tensor_cn_read(&pose_view, 5 + k * POSE_KPT_DIMS + 0, i);
+            float ky = tensor_cn_read(&pose_view, 5 + k * POSE_KPT_DIMS + 1, i);
+            float kv = tensor_cn_read(&pose_view, 5 + k * POSE_KPT_DIMS + 2, i);
+            if (!isfinite(kx) || !isfinite(ky) || !isfinite(kv)) {
+                valid = false;
+                break;
+            }
+            det.quad[k * 2 + 0] = kx;
+            det.quad[k * 2 + 1] = ky;
+        }
+        if (!valid)
+            continue;
+
+        order_quad_points(det.quad, ordered);
+        memcpy(det.quad, ordered, sizeof(ordered));
+        if (quad_area8(det.quad) < 4.0f || !quad_is_convex8(det.quad))
+            continue;
+
+        bbox_from_quad_float(det.quad, src_w, src_h, &det.x1, &det.y1, &det.x2, &det.y2);
+        clamp_box(&det, src_w, src_h);
+
+        if (count < pre_nms_cap) {
+            cand[count++] = det;
+        } else {
+            int min_i = 0;
+            float min_conf = cand[0].conf;
+            for (k = 1; k < pre_nms_cap; k++) {
+                if (cand[k].conf < min_conf) {
+                    min_conf = cand[k].conf;
+                    min_i = k;
+                }
+            }
+            if (det.conf > min_conf)
+                cand[min_i] = det;
+        }
+    }
+
+    nms_inplace(cand, &count, m->nms_iou_thr);
+    if (m->max_det > 0 && count > m->max_det)
+        count = m->max_det;
+    if (count > MAX_DETS)
+        count = MAX_DETS;
+    memcpy(out, cand, (size_t)count * sizeof(out[0]));
+    *out_count = count;
+    return 0;
+}
+
+static int decode_yolov8_det_output(const struct yolo_model *m, const rknn_output *outs,
+                                     float conf_thr, int src_w, int src_h,
+                                     struct det_box *out, int *out_count)
+{
+    struct tensor_cn_view det_view;
+    struct det_box cand[MAX_DETS * 4];
+    const int pre_nms_cap = MAX_DETS * 4;
+    int count = 0;
+    int i;
+
+    *out_count = 0;
+    if (m->io_num.n_output != 1)
+        return -1;
+    if (!build_tensor_cn_view(&m->output_attrs[0], (const float *)outs[0].buf, &det_view))
+        return -1;
+    if (det_view.c != 5 || det_view.n != OBB_POINT_COUNT)
+        return -1;
+
+    /* output tensor [1,5,8400] (NCHW or NHWC)
+     * rows: 0=cx, 1=cy, 2=w, 3=h (pixel coords, 0-640)
+     *       4=confidence (sigmoided, ultralytics Detect.forward includes cls.sigmoid())
+     * stride multiplication (* self.strides) is in the ONNX graph,
+     * NOT needed here (unlike OBB/Pose where board must decode stride).
+     */
+    for (i = 0; i < OBB_POINT_COUNT; i++) {
+        float cx = tensor_cn_read(&det_view, 0, i);
+        float cy = tensor_cn_read(&det_view, 1, i);
+        float w  = tensor_cn_read(&det_view, 2, i);
+        float h  = tensor_cn_read(&det_view, 3, i);
+        float score = tensor_cn_read(&det_view, 4, i);
+        struct det_box det;
+
+        /* score is already sigmoided by the ONNX graph */
+        if (score < conf_thr)
+            continue;
+        if (w <= 0.0f || h <= 0.0f)
+            continue;
+
+        /* cx,cy,w,h are already in 640x640 pixel space */
+        memset(&det, 0, sizeof(det));
+        det.cx = cx;
+        det.cy = cy;
+        det.w = w;
+        det.h = h;
+        det.x1 = (int)(cx - w * 0.5f + 0.5f);
+        det.y1 = (int)(cy - h * 0.5f + 0.5f);
+        det.x2 = (int)(cx + w * 0.5f + 0.5f);
+        det.y2 = (int)(cy + h * 0.5f + 0.5f);
+        det.conf = score;
+        det.cls = 0;
+        det.has_obb = 0;
+        clamp_box(&det, src_w, src_h);
+        if (det.x2 <= det.x1 || det.y2 <= det.y1)
+            continue;
+
+        if (count < pre_nms_cap) {
+            cand[count++] = det;
+        } else {
+            int k;
+            int min_i = 0;
+            float min_conf = cand[0].conf;
+            for (k = 1; k < pre_nms_cap; k++) {
+                if (cand[k].conf < min_conf) {
+                    min_conf = cand[k].conf;
+                    min_i = k;
+                }
+            }
+            if (det.conf > min_conf)
+                cand[min_i] = det;
+        }
+    }
+
+    nms_inplace(cand, &count, m->nms_iou_thr);
+    if (m->max_det > 0 && count > m->max_det)
+        count = m->max_det;
+    if (count > MAX_DETS)
+        count = MAX_DETS;
+    memcpy(out, cand, (size_t)count * sizeof(out[0]));
+    *out_count = count;
+    return 0;
+}
+
 static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src_w, int src_h,
                             float conf_thr, struct det_box *out, int *out_count,
                             struct detect_decode_diag *diag)
 {
     rknn_input in;
     rknn_output outs[8];
-    struct det_box rows_out[MAX_DETS];
-    struct det_box heads_out[MAX_DETS];
-    int rows_count = 0;
-    int heads_count = 0;
     uint32_t i;
     int ret;
 
@@ -5060,84 +5904,57 @@ static int run_model_detect(struct yolo_model *m, const uint8_t *in_rgb, int src
         }
         rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
         return 0;
-    }
-
-    for (i = 0; i < m->io_num.n_output; i++) {
-        const rknn_tensor_attr *a = &m->output_attrs[i];
-        if (a->n_dims == 3 && rows_count == 0)
-            decode_rows_tensor_output(a, (const float *)outs[i].buf, m->class_count,
-                                      conf_thr, src_w, src_h, (int)m->in_w, (int)m->in_h,
-                                      rows_out, &rows_count);
-    }
-    decode_yolo_heads_outputs(m, outs, conf_thr, src_w, src_h, heads_out, &heads_count);
-
-    if (diag) {
-        diag->rows_raw = rows_count;
-        diag->heads_raw = heads_count;
-        diag->rows_keep = 0;
-        diag->heads_keep = 0;
-        diag->mode = PLATE_DECODE_NONE;
-    }
-
-    if (rows_count > 0 && heads_count > 0) {
-        int i2;
-        int n = 0;
-        for (i2 = 0; i2 < rows_count && n < MAX_DETS; i2++)
-            out[n++] = rows_out[i2];
-        for (i2 = 0; i2 < heads_count && n < MAX_DETS; i2++)
-            out[n++] = heads_out[i2];
-        *out_count = n;
-        nms_inplace(out, out_count, m->nms_iou_thr);
-        if (diag) {
-            diag->mode = PLATE_DECODE_MERGED;
-            diag->rows_keep = rows_count;
-            diag->heads_keep = heads_count;
+    } else if (m->detector_type == DETECTOR_YOLOV8_POSE_RKNN) {
+        ret = decode_yolov8_pose_outputs(m, outs, conf_thr, src_w, src_h, out, out_count);
+        if (ret < 0) {
+            *out_count = 0;
+            rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+            return ret;
         }
-    } else if (rows_count > 0) {
-        memcpy(out, rows_out, (size_t)rows_count * sizeof(out[0]));
-        *out_count = rows_count;
-        nms_inplace(out, out_count, m->nms_iou_thr);
         if (diag) {
-            diag->mode = PLATE_DECODE_ROWS;
-            diag->rows_keep = *out_count;
-        }
-    } else if (heads_count > 0) {
-        memcpy(out, heads_out, (size_t)heads_count * sizeof(out[0]));
-        *out_count = heads_count;
-        nms_inplace(out, out_count, m->nms_iou_thr);
-        if (diag) {
-            diag->mode = PLATE_DECODE_HEADS;
+            diag->rows_raw = 0;
+            diag->heads_raw = *out_count;
+            diag->rows_keep = 0;
             diag->heads_keep = *out_count;
+            diag->mode = (*out_count > 0) ? PLATE_DECODE_OBB : PLATE_DECODE_NONE;
         }
-    } else {
-        *out_count = 0;
+        rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+        return 0;
+    } else if (m->detector_type == DETECTOR_YOLOV8_DET) {
+        ret = decode_yolov8_det_output(m, outs, conf_thr, src_w, src_h, out, out_count);
+        if (ret < 0) {
+            *out_count = 0;
+            rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+            return ret;
+        }
         if (diag) {
-            diag->mode = PLATE_DECODE_NONE;
+            diag->rows_raw = 0;
+            diag->heads_raw = *out_count;
+            diag->rows_keep = 0;
+            diag->heads_keep = *out_count;
+            diag->mode = (*out_count > 0) ? PLATE_DECODE_OBB : PLATE_DECODE_NONE;
         }
+        rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+        return 0;
     }
-
-    if (*out_count > m->max_det)
-        *out_count = m->max_det;
-    if (*out_count > MAX_DETS)
-        *out_count = MAX_DETS;
 
     rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+    *out_count = 0;
     return 0;
 }
 
-static enum plate_color classify_plate_color_region_rgb(const uint8_t *rgb, int w, int h,
-                                                        int x1, int y1, int x2, int y2)
+static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int h, const struct det_box *b)
 {
+    int x1 = b->x1 + (b->x2 - b->x1) / 6;
+    int x2 = b->x2 - (b->x2 - b->x1) / 6;
+    int y1 = b->y1 + (b->y2 - b->y1) / 6;
+    int y2 = b->y2 - (b->y2 - b->y1) / 6;
     int x, y;
-    int total = 0, blue_cnt = 0, green_cnt = 0, yellow_cnt = 0;
-    if (!rgb || w <= 0 || h <= 0)
-        return PLATE_COLOR_UNKNOWN;
+    int total = 0, blue_cnt = 0, green_cnt = 0, yellow_cnt = 0, dark_cnt = 0;
     if (x1 < 0) x1 = 0;
     if (y1 < 0) y1 = 0;
     if (x2 >= w) x2 = w - 1;
     if (y2 >= h) y2 = h - 1;
-    if (x2 < x1 || y2 < y1)
-        return PLATE_COLOR_UNKNOWN;
     for (y = y1; y <= y2; y++) {
         for (x = x1; x <= x2; x++) {
             const uint8_t *p = rgb + (y * w + x) * 3;
@@ -5150,6 +5967,7 @@ static enum plate_color classify_plate_color_region_rgb(const uint8_t *rgb, int 
             float h_deg = 0.0f;
             float s = (mx == 0.0f) ? 0.0f : (d / mx);
             float v = mx;
+            if (v < 0.20f) dark_cnt++;
             if (d > 1e-6f) {
                 if (mx == r) h_deg = 60.0f * fmodf((g - bch) / d, 6.0f);
                 else if (mx == g) h_deg = 60.0f * (((bch - r) / d) + 2.0f);
@@ -5157,9 +5975,9 @@ static enum plate_color classify_plate_color_region_rgb(const uint8_t *rgb, int 
             }
             if (h_deg < 0.0f) h_deg += 360.0f;
             total++;
-            if (h_deg >= 90.0f && h_deg <= 130.0f && s > 0.23f && v > 0.16f) blue_cnt++;
-            else if (h_deg >= 35.0f && h_deg <= 90.0f && s > 0.20f && v > 0.16f) green_cnt++;
-            else if (h_deg >= 15.0f && h_deg <= 55.0f && s > 0.20f && v > 0.16f) yellow_cnt++;
+            if (h_deg >= 190.0f && h_deg <= 260.0f && s > 0.23f && v > 0.16f) blue_cnt++;
+            else if (h_deg >= 75.0f && h_deg <= 155.0f && s > 0.20f && v > 0.16f) green_cnt++;
+            else if (h_deg >= 15.0f && h_deg <= 55.0f && s > 0.15f && v > 0.16f) yellow_cnt++;
         }
     }
     if (total == 0) return PLATE_COLOR_UNKNOWN;
@@ -5167,41 +5985,10 @@ static enum plate_color classify_plate_color_region_rgb(const uint8_t *rgb, int 
         return PLATE_COLOR_BLUE;
     if ((float)green_cnt / (float)total >= 0.20f && green_cnt > blue_cnt + (int)(0.05f * total))
         return PLATE_COLOR_GREEN;
-    if ((float)yellow_cnt / (float)total >= 0.18f)
+    if ((float)yellow_cnt / (float)total >= 0.18f &&
+        (float)dark_cnt / (float)total < 0.50f)
         return PLATE_COLOR_YELLOW;
     return PLATE_COLOR_UNKNOWN;
-}
-
-static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int h, const struct det_box *b)
-{
-    int x1;
-    int x2;
-    int y1;
-    int y2;
-
-    if (!b)
-        return PLATE_COLOR_UNKNOWN;
-    x1 = b->x1 + (b->x2 - b->x1) / 6;
-    x2 = b->x2 - (b->x2 - b->x1) / 6;
-    y1 = b->y1 + (b->y2 - b->y1) / 6;
-    y2 = b->y2 - (b->y2 - b->y1) / 6;
-    return classify_plate_color_region_rgb(rgb, w, h, x1, y1, x2, y2);
-}
-
-static enum plate_color classify_plate_color_crop_rgb(const uint8_t *crop_rgb, int w, int h)
-{
-    int x1;
-    int x2;
-    int y1;
-    int y2;
-
-    if (!crop_rgb || w <= 0 || h <= 0)
-        return PLATE_COLOR_UNKNOWN;
-    x1 = w / 10;
-    x2 = w - 1 - w / 10;
-    y1 = h / 10;
-    y2 = h - 1 - h / 10;
-    return classify_plate_color_region_rgb(crop_rgb, w, h, x1, y1, x2, y2);
 }
 
 static int find_parent_car(const struct det_box *plate, const struct det_box *cars, int car_count)
@@ -5244,19 +6031,15 @@ static const char *plate_color_str(enum plate_color c)
 
 static enum plate_type classify_plate_type(enum plate_color color, const char *text)
 {
-    const char *utf8_police = "\xE8\xAD\xA6";
     const char *utf8_trailer = "\xE6\x8C\x82";
     const char *utf8_embassy = "\xE4\xBD\xBF";
     const char *utf8_consulate = "\xE9\xA2\x86";
 
-    if (text && strstr(text, utf8_police))
-        return PLATE_TYPE_POLICE;
     if (text && strstr(text, utf8_trailer))
         return PLATE_TYPE_TRAILER;
     if (text && (strstr(text, utf8_embassy) || strstr(text, utf8_consulate)))
         return PLATE_TYPE_EMBASSY_CONSULATE;
     if (text && strncmp(text, "WJ", 2) == 0)
-        return PLATE_TYPE_POLICE;
 
     if (color == PLATE_COLOR_GREEN)
         return PLATE_TYPE_COMMON_GREEN;
@@ -5273,7 +6056,6 @@ static const char *plate_type_str(enum plate_type t)
     case PLATE_TYPE_COMMON_BLUE: return "common_blue";
     case PLATE_TYPE_COMMON_GREEN: return "common_green";
     case PLATE_TYPE_YELLOW: return "yellow";
-    case PLATE_TYPE_POLICE: return "police";
     case PLATE_TYPE_TRAILER: return "trailer";
     case PLATE_TYPE_EMBASSY_CONSULATE: return "embassy_consulate";
     default: return "unknown";
@@ -5293,7 +6075,11 @@ static const char *detector_type_str(int mode)
 {
     if (mode == DETECTOR_YOLOV8_OBB_RKNN)
         return "yolov8_obb_rknn";
-    return "yolov5";
+    if (mode == DETECTOR_YOLOV8_POSE_RKNN)
+        return "yolov8_pose_rknn";
+    if (mode == DETECTOR_YOLOV8_DET)
+        return "yolov8_det";
+    return "unknown";
 }
 
 static const char *ocr_channel_order_str(int mode)
@@ -5308,6 +6094,7 @@ static const char *ocr_crop_mode_str(int mode)
     if (mode == OCR_CROP_BOX_PAD) return "box-pad";
     if (mode == OCR_CROP_MATCH) return "match";
     if (mode == OCR_CROP_OBB_WARP) return "obb_warp";
+    if (mode == OCR_CROP_OBB_PIECEWISE) return "obb_piecewise";
     return "fixed";
 }
 
@@ -5429,6 +6216,20 @@ static bool plate_box_pass_rules_obb(const struct det_box *b, int frame_w, int f
     return true;
 }
 
+static bool plate_box_pass_rules_for_detector(int detector_type, const struct det_box *b,
+                                              int frame_w, int frame_h)
+{
+    if (plate_box_pass_rules(b, frame_w, frame_h))
+        return true;
+    if (detector_type_uses_quad(detector_type)) {
+        if (plate_box_pass_rules_obb(b, frame_w, frame_h))
+            return true;
+        if (plate_box_pass_rules_relaxed(b, frame_w, frame_h))
+            return true;
+    }
+    return false;
+}
+
 static bool has_iou_match(const struct det_box *cur, const struct det_box *hist, int hist_count, float iou_thr)
 {
     int i;
@@ -5448,7 +6249,7 @@ static void temporal_confirm_and_update(struct app_ctx *ctx,
     float iou_thr_hist2 = 0.30f;
     float direct_keep_thr = 0.55f;
     *confirmed_count = 0;
-    if (ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
+    if (detector_type_uses_quad(ctx->opt.plate_detector_type)) {
         iou_thr_hist1 = 0.30f;
         iou_thr_hist2 = 0.22f;
         direct_keep_thr = fmaxf(0.55f, ctx->opt.min_plate_conf + 0.08f);
@@ -5462,7 +6263,7 @@ static void temporal_confirm_and_update(struct app_ctx *ctx,
         }
     }
     if (*confirmed_count == 0 &&
-        ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
+        detector_type_uses_quad(ctx->opt.plate_detector_type)) {
         for (i = 0; i < filtered_count && *confirmed_count < MAX_DETS; i++) {
             if (filtered[i].conf >= direct_keep_thr)
                 confirmed[(*confirmed_count)++] = filtered[i];
@@ -5670,6 +6471,7 @@ static int run_offline_once(struct app_ctx *ctx)
     uint8_t *plate_in = NULL;
     uint8_t *plate_crop = NULL;
     uint8_t *ocr_input_dump = NULL;
+    uint8_t *firstchar_crop = NULL;
     struct det_box dets[MAX_DETS];
     struct detect_decode_diag plate_diag;
     struct plate_det pd;
@@ -5688,7 +6490,6 @@ static int run_offline_once(struct app_ctx *ctx)
     const uint8_t *det_src_rgb = NULL;
     float occ_ratio = 0.0f;
     bool used_obb_warp = false;
-    bool obb_gate_applied = false;
 
     if (read_ppm_rgb888(ctx->opt.offline_image_path, &rgb, &w, &h) < 0) {
         fprintf(stderr, "Offline image load failed (need PPM P6): %s\n",
@@ -5700,6 +6501,9 @@ static int run_offline_once(struct app_ctx *ctx)
     det_src_rgb = rgb;
     plate_crop = malloc((size_t)w * h * 3U);
     if (!plate_crop)
+        goto out;
+    firstchar_crop = malloc((size_t)FIRSTCHAR_WARP_WIDTH * (size_t)FIRSTCHAR_WARP_HEIGHT * 3U);
+    if (!firstchar_crop)
         goto out;
     if (ctx->opt.sw_preproc) {
         rgb_detect = malloc((size_t)w * h * 3U);
@@ -5738,7 +6542,7 @@ static int run_offline_once(struct app_ctx *ctx)
             goto out;
         }
         for (i = 0; i < det_count && valid_count < MAX_DETS; i++) {
-            if (plate_box_pass_rules(&dets[i], w, h))
+            if (plate_box_pass_rules_for_detector(ctx->opt.plate_detector_type, &dets[i], w, h))
                 valid[valid_count++] = dets[i];
         }
         if (valid_count <= 0) {
@@ -5761,8 +6565,7 @@ static int run_offline_once(struct app_ctx *ctx)
                 }
                 ctx->opt.det_resize_mode = saved_mode;
                 for (i = 0; i < det_count && valid_count < MAX_DETS; i++) {
-                    if (plate_box_pass_rules(&dets[i], w, h) ||
-                        plate_box_pass_rules_relaxed(&dets[i], w, h))
+                    if (plate_box_pass_rules_for_detector(ctx->opt.plate_detector_type, &dets[i], w, h))
                         valid[valid_count++] = dets[i];
                 }
                 if (valid_count > 0)
@@ -5781,7 +6584,7 @@ static int run_offline_once(struct app_ctx *ctx)
         if (ctx->opt.plate_refine) {
             struct det_box refined = box;
             if (refine_plate_box_local(ctx, det_src_rgb, w, h, &box, algo_rgb, plate_in, &refined) &&
-                plate_box_pass_rules(&refined, w, h))
+                plate_box_pass_rules_for_detector(ctx->opt.plate_detector_type, &refined, w, h))
                 box = refined;
         }
     } else {
@@ -5790,24 +6593,15 @@ static int run_offline_once(struct app_ctx *ctx)
     }
 
     pd.box = box;
-    pd.color = PLATE_COLOR_UNKNOWN;
+    pd.color = classify_plate_color_rgb(rgb, w, h, &pd.box);
     if (!prepare_plate_crop_rgb888(ctx, rgb, w, h, &pd.box,
                                    plate_crop, w, h, &pd.crop_box, &crop_w, &crop_h,
-                                   &occ_ratio, &used_obb_warp))
+                                   &occ_ratio, &used_obb_warp,
+                                   firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT, 0))
         goto out;
-    if (used_obb_warp) {
-        obb_gate_applied = true;
-        if (!apply_obb_warp_quality_gate(ctx, rgb, w, h, &pd.box,
-                                         plate_crop, w, h,
-                                         &pd.crop_box, &crop_w, &crop_h,
-                                         &occ_ratio, &used_obb_warp,
-                                         false, 0))
-            goto out;
-    }
     if (ctx->opt.ocr_min_occ_ratio > 0.0f &&
         occ_ratio < ctx->opt.ocr_min_occ_ratio &&
         ctx->opt.ocr_crop_mode != OCR_CROP_TIGHT &&
-        !obb_gate_applied &&
         !used_obb_warp) {
         struct det_box recrop_box;
         float old_occ = occ_ratio;
@@ -5839,14 +6633,15 @@ static int run_offline_once(struct app_ctx *ctx)
             }
         }
     }
-    pd.color = classify_plate_color_crop_rgb(plate_crop, crop_w, crop_h);
-    if (pd.color == PLATE_COLOR_UNKNOWN)
-        pd.color = classify_plate_color_rgb(rgb, w, h, &pd.crop_box);
     pd.ocr_in_occ_ratio = occ_ratio;
     fprintf(stderr, "[crop-geom] box=[%d,%d,%d,%d] crop=[%d,%d,%d,%d] iou=%.3f\n",
             pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2,
             pd.crop_box.x1, pd.crop_box.y1, pd.crop_box.x2, pd.crop_box.y2,
             box_iou(&pd.box, &pd.crop_box));
+
+    /* ── CLAHE L-channel enhancement ── */
+    if (ctx->opt.clahe_enable)
+        clahe_l_channel(plate_crop, crop_w, crop_h, 2.0f, 8);
 
     if ((pd.box.y2 - pd.box.y1 + 1) < ctx->opt.ocr_min_plate_h) {
         pd.ocr_text[0] = '\0';
@@ -5864,11 +6659,11 @@ static int run_offline_once(struct app_ctx *ctx)
                     sharp, ctx->opt.ocr_min_sharpness);
         } else {
             if (ctx->ocr_crop_index_fp && ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max)
-                ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h,
+                ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
                                     pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
                                     &odiag, &ocr_input_dump);
             else
-                ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h,
+                ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
                                     pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
                                     &odiag, NULL);
             if (ret < 0) {
@@ -5878,6 +6673,10 @@ static int run_offline_once(struct app_ctx *ctx)
             pd.ocr_blank_top1 = odiag.blank_top1_ratio;
             pd.ocr_in_occ_ratio = odiag.in_occ_ratio;
         }
+    }
+    if (pd.color == PLATE_COLOR_GREEN && pd.ocr_text[0] != '\0') {
+        run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
+                                    &pd.box, 0, pd.ocr_text, sizeof(pd.ocr_text));
     }
     pd.type = classify_plate_type(pd.color, pd.ocr_text);
 
@@ -5899,11 +6698,14 @@ static int run_offline_once(struct app_ctx *ctx)
     log_prediction_row(ctx, 0, ts_us, &pd);
     if (!ocr_input_dump && ctx->ocr_crop_index_fp &&
         ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
-        ocr_input_dump = prepare_ocr_input_rgb888(ctx, plate_crop, crop_w, crop_h, NULL);
+        const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
+        ocr_input_dump = prepare_ocr_input_rgb888(ctx, dump_model, plate_crop, crop_w, crop_h, NULL);
     }
     if (ocr_input_dump) {
+        const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
         dump_ocr_pair(ctx, 0, &pd, plate_crop, crop_w, crop_h,
-                      ocr_input_dump, (int)ctx->ocr_model.in_w, (int)ctx->ocr_model.in_h);
+                      ocr_input_dump, (int)dump_model->in_w, (int)dump_model->in_h,
+                      firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT);
         free(ocr_input_dump);
         ocr_input_dump = NULL;
     }
@@ -5911,6 +6713,7 @@ static int run_offline_once(struct app_ctx *ctx)
 
 out:
     free(ocr_input_dump);
+    free(firstchar_crop);
     free(plate_crop);
     free(plate_in);
     free(algo_rgb);
@@ -5921,10 +6724,12 @@ out:
 
 static void dump_ocr_pair(struct app_ctx *ctx, uint64_t frame_id, const struct plate_det *pd,
                           const uint8_t *crop_rgb, int crop_w, int crop_h,
-                          const uint8_t *ocr_in, int ocr_w, int ocr_h)
+                          const uint8_t *ocr_in, int ocr_w, int ocr_h,
+                          const uint8_t *fc_rgb, int fc_w, int fc_h)
 {
     char crop_path[640];
     char in_path[640];
+    char fc_path[640];
     char safe_text[64];
     int idx;
     int64_t ts;
@@ -5943,6 +6748,8 @@ static void dump_ocr_pair(struct app_ctx *ctx, uint64_t frame_id, const struct p
              ctx->opt.ocr_crop_dump_dir, idx, frame_id);
     snprintf(in_path, sizeof(in_path), "%s/ocrin_%04d_f%06" PRIu64 ".ppm",
              ctx->opt.ocr_crop_dump_dir, idx, frame_id);
+    snprintf(fc_path, sizeof(fc_path), "%s/fc224_%04d_f%06" PRIu64 ".ppm",
+             ctx->opt.ocr_crop_dump_dir, idx, frame_id);
 
     if (write_ppm_rgb888(crop_path, crop_rgb, crop_w, crop_h) < 0)
         return;
@@ -5952,17 +6759,59 @@ static void dump_ocr_pair(struct app_ctx *ctx, uint64_t frame_id, const struct p
     } else {
         in_path[0] = '\0';
     }
+    if (fc_rgb && fc_w > 0 && fc_h > 0) {
+        if (write_ppm_rgb888(fc_path, fc_rgb, fc_w, fc_h) < 0)
+            return;
+    } else {
+        fc_path[0] = '\0';
+    }
 
     ts = mono_us();
     csv_safe_text(pd->ocr_text, safe_text, sizeof(safe_text));
     fprintf(ctx->ocr_crop_index_fp,
-            "%d,%" PRIu64 ",%" PRId64 ",%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%.4f,%s,%s\n",
+            "%d,%" PRIu64 ",%" PRId64 ",%d,%d,%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%.4f,%s,%s,%s\n",
             idx, frame_id, ts,
             pd->box.x1, pd->box.y1, pd->box.x2, pd->box.y2,
             pd->crop_box.x1, pd->crop_box.y1, pd->crop_box.x2, pd->crop_box.y2,
-            safe_text, pd->ocr_conf, pd->ocr_blank_top1, pd->ocr_in_occ_ratio, crop_path, in_path);
+            safe_text, pd->ocr_conf, pd->ocr_blank_top1, pd->ocr_in_occ_ratio,
+            crop_path, in_path, fc_path);
     fflush(ctx->ocr_crop_index_fp);
     ctx->ocr_crop_dumped++;
+}
+
+static void dump_ocr_ab_variant(const struct app_ctx *ctx, uint64_t frame_id, int sample_id,
+                                const char *tag, const float quad[8],
+                                const uint8_t *crop_rgb, int crop_w, int crop_h)
+{
+    char crop_path[640];
+    char meta_path[640];
+    FILE *fp;
+    const char *dir;
+    int i;
+
+    if (!ctx || !ctx->opt.ocr_crop_dump_dir || ctx->opt.ocr_crop_dump_dir[0] == '\0' ||
+        !tag || !quad || !crop_rgb || crop_w <= 0 || crop_h <= 0)
+        return;
+
+    dir = ctx->opt.ocr_crop_dump_dir;
+    snprintf(crop_path, sizeof(crop_path), "%s/%s_%04d_f%06" PRIu64 ".ppm",
+             dir, tag, sample_id, frame_id);
+    snprintf(meta_path, sizeof(meta_path), "%s/%s_%04d_f%06" PRIu64 ".quad.txt",
+             dir, tag, sample_id, frame_id);
+
+    if (write_ppm_rgb888(crop_path, crop_rgb, crop_w, crop_h) < 0)
+        return;
+
+    fp = fopen(meta_path, "w");
+    if (!fp)
+        return;
+    fprintf(fp, "tag=%s\nframe_id=%" PRIu64 "\nsample_id=%d\ncrop_w=%d\ncrop_h=%d\nquad=",
+            tag, frame_id, sample_id, crop_w, crop_h);
+    for (i = 0; i < 4; i++) {
+        fprintf(fp, "%s%.3f,%.3f", (i == 0) ? "" : ";", quad[i * 2 + 0], quad[i * 2 + 1]);
+    }
+    fprintf(fp, "\n");
+    fclose(fp);
 }
 
 static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t ts_us,
@@ -6028,7 +6877,6 @@ static void build_overlay_ascii_text(const struct plate_det *pd, char *out, size
         if (pd->type == PLATE_TYPE_COMMON_BLUE) fb = "BLUE";
         else if (pd->type == PLATE_TYPE_COMMON_GREEN) fb = "GREEN";
         else if (pd->type == PLATE_TYPE_YELLOW) fb = "YELLOW";
-        else if (pd->type == PLATE_TYPE_POLICE) fb = "POLICE";
         else if (pd->type == PLATE_TYPE_TRAILER) fb = "TRAILER";
         else if (pd->type == PLATE_TYPE_EMBASSY_CONSULATE) fb = "EMB";
         while (*fb && i + 1 < out_len)
@@ -6051,13 +6899,22 @@ static void *infer_thread_main(void *arg)
     uint8_t *rgb_detect = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
     uint8_t *a_map = malloc((size_t)ctx->frame_width * ctx->frame_height);
     uint8_t *algo_rgb = malloc((size_t)ALGO_STREAM_SIZE * ALGO_STREAM_SIZE * 3U);
-    uint8_t *veh_in = malloc((size_t)ctx->veh_model.in_w * ctx->veh_model.in_h * 3U);
+    uint8_t *ped_in = NULL;
+    uint8_t *firstchar_crop = NULL;
+    if (ctx->ped_model.ctx)
+        ped_in = malloc((size_t)ctx->ped_model.in_w * ctx->ped_model.in_h * 3U);
     uint8_t *plate_in = malloc((size_t)ctx->plate_model.in_w * ctx->plate_model.in_h * 3U);
     uint8_t *plate_crop = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
     uint8_t *plate_crop_noclahe = NULL;
-    if (!raw_local || !rgb_full || !rgb_detect || !a_map || !algo_rgb || !veh_in || !plate_in || !plate_crop) {
+    if (ctx->opt.clahe_compare)
+        plate_crop_noclahe = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
+    firstchar_crop = malloc((size_t)FIRSTCHAR_WARP_WIDTH * (size_t)FIRSTCHAR_WARP_HEIGHT * 3U);
+    if (!raw_local || !rgb_full || !rgb_detect || !a_map || !algo_rgb ||
+        (ctx->ped_model.ctx && !ped_in) || !plate_in || !plate_crop || !firstchar_crop ||
+        (ctx->opt.clahe_compare && !plate_crop_noclahe)) {
         free(raw_local); free(rgb_full); free(rgb_detect); free(a_map); free(algo_rgb);
-        free(veh_in); free(plate_in); free(plate_crop);
+        free(ped_in); free(plate_in); free(plate_crop); free(firstchar_crop);
+        free(plate_crop_noclahe);
         return NULL;
     }
 
@@ -6134,10 +6991,10 @@ static void *infer_thread_main(void *arg)
 
         memset(&plate_diag, 0, sizeof(plate_diag));
 
-        if (!ctx->opt.plate_only || ctx->opt.ped_event) {
-            if (run_detect_on_rgb(ctx, &ctx->veh_model, det_src_rgb, (int)ctx->frame_width, (int)ctx->frame_height,
-                                  ctx->opt.min_car_conf, algo_rgb, veh_in, cars, &car_count, NULL) < 0)
-                car_count = 0;
+        if (ctx->opt.ped_model_path && ctx->opt.ped_model_path[0]) {
+            if (run_detect_on_rgb(ctx, &ctx->ped_model, det_src_rgb, (int)ctx->frame_width, (int)ctx->frame_height,
+                                  ctx->opt.min_car_conf, algo_rgb, ped_in, persons, &person_count, NULL) < 0)
+                person_count = 0;
         }
         {
             float plate_thr = ctx->opt.min_plate_conf;
@@ -6147,7 +7004,7 @@ static void *infer_thread_main(void *arg)
                                   plate_thr, algo_rgb, plate_in, raw_plates, &raw_plate_count, &plate_diag) < 0)
                 raw_plate_count = 0;
             if (raw_plate_count <= 0 &&
-                ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+                detector_type_uses_quad(ctx->opt.plate_detector_type) &&
                 ctx->opt.det_resize_mode == DET_RESIZE_LETTERBOX) {
                 int saved_mode = ctx->opt.det_resize_mode;
                 fprintf(stderr,
@@ -6168,26 +7025,21 @@ static void *infer_thread_main(void *arg)
             ctx->gate_plate_raw_positive_streak = 0;
         }
 
-        for (i = 0; i < car_count && person_count < MAX_DETS; i++) {
-            if (cars[i].cls == ctx->person_class_id)
-                persons[person_count++] = cars[i];
-        }
         if (ctx->opt.ped_event)
             ped_events = update_ped_tracks_nn(ctx, persons, person_count, light_red, seq,
                                               tracked_persons, &tracked_person_count);
 
         for (i = 0; i < raw_plate_count && filtered_plate_count < MAX_DETS; i++) {
-            bool keep = plate_box_pass_rules(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height);
-            if (!keep && ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
-                keep = plate_box_pass_rules_obb(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height) ||
-                       plate_box_pass_rules_relaxed(&raw_plates[i], (int)ctx->frame_width, (int)ctx->frame_height);
-            }
+            bool keep = plate_box_pass_rules_for_detector(ctx->opt.plate_detector_type,
+                                                          &raw_plates[i],
+                                                          (int)ctx->frame_width,
+                                                          (int)ctx->frame_height);
             if (keep)
                 filtered_plates[filtered_plate_count++] = raw_plates[i];
         }
         if (filtered_plate_count == 0 &&
             raw_plate_count > 0 &&
-            ctx->opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) {
+            detector_type_uses_quad(ctx->opt.plate_detector_type)) {
             int best_i = 0;
             float best_conf = raw_plates[0].conf;
             for (i = 1; i < raw_plate_count; i++) {
@@ -6257,7 +7109,6 @@ static void *infer_thread_main(void *arg)
             float sharpness = 0.0f;
             float occ_ratio = 0.0f;
             bool used_obb_warp = false;
-            bool obb_gate_applied = false;
             char overlay_txt[32];
             pd.box = stable_plates[i];
             if (ctx->opt.plate_refine) {
@@ -6271,24 +7122,15 @@ static void *infer_thread_main(void *arg)
             if (!ctx->opt.plate_only && ctx->opt.plate_on_car_only && parent < 0)
                 continue;
             pd.parent_car = parent;
-            pd.color = PLATE_COLOR_UNKNOWN;
+            pd.color = classify_plate_color_rgb(rgb_full, (int)ctx->frame_width, (int)ctx->frame_height, &pd.box);
             if (!prepare_plate_crop_rgb888(ctx, rgb_full, (int)ctx->frame_width, (int)ctx->frame_height,
                                            &pd.box, plate_crop, (int)ctx->frame_width, (int)ctx->frame_height,
-                                           &pd.crop_box, &crop_w, &crop_h, &occ_ratio, &used_obb_warp))
+                                           &pd.crop_box, &crop_w, &crop_h, &occ_ratio, &used_obb_warp,
+                                           firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT, seq))
                 continue;
-            if (used_obb_warp) {
-                obb_gate_applied = true;
-                if (!apply_obb_warp_quality_gate(ctx, rgb_full, (int)ctx->frame_width, (int)ctx->frame_height, &pd.box,
-                                                 plate_crop, (int)ctx->frame_width, (int)ctx->frame_height,
-                                                 &pd.crop_box, &crop_w, &crop_h,
-                                                 &occ_ratio, &used_obb_warp,
-                                                 true, seq))
-                    continue;
-            }
             if (ctx->opt.ocr_min_occ_ratio > 0.0f &&
                 occ_ratio < ctx->opt.ocr_min_occ_ratio &&
                 ctx->opt.ocr_crop_mode != OCR_CROP_TIGHT &&
-                !obb_gate_applied &&
                 !used_obb_warp) {
                 struct det_box recrop_box;
                 float old_occ = occ_ratio;
@@ -6324,11 +7166,6 @@ static void *infer_thread_main(void *arg)
                     }
                 }
             }
-            pd.color = classify_plate_color_crop_rgb(plate_crop, crop_w, crop_h);
-            if (pd.color == PLATE_COLOR_UNKNOWN) {
-                pd.color = classify_plate_color_rgb(rgb_full, (int)ctx->frame_width,
-                                                    (int)ctx->frame_height, &pd.crop_box);
-            }
             pd.ocr_in_occ_ratio = occ_ratio;
             fprintf(stderr,
                     "[crop-geom] frame=%" PRIu64 " box=[%d,%d,%d,%d] crop=[%d,%d,%d,%d] iou=%.3f\n",
@@ -6339,13 +7176,8 @@ static void *infer_thread_main(void *arg)
 
             /* ── CLAHE L-channel enhancement ── */
             if (ctx->opt.clahe_enable || ctx->opt.clahe_compare) {
-                if (ctx->opt.clahe_compare) {
-                    /* Save original crop for A/B comparison */
-                    if (!plate_crop_noclahe)
-                        plate_crop_noclahe = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
-                    if (plate_crop_noclahe)
-                        memcpy(plate_crop_noclahe, plate_crop, (size_t)crop_w * crop_h * 3U);
-                }
+                if (ctx->opt.clahe_compare)
+                    memcpy(plate_crop_noclahe, plate_crop, (size_t)crop_w * crop_h * 3U);
                 if (ctx->opt.clahe_enable)
                     clahe_l_channel(plate_crop, crop_w, crop_h, 2.0f, 8);
             }
@@ -6377,7 +7209,7 @@ static void *infer_thread_main(void *arg)
                             seq, sharpness, ctx->opt.ocr_min_sharpness,
                             pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2);
                 } else {
-                    if (run_model_ocr(ctx, plate_crop, crop_w, crop_h,
+                    if (run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
                                       pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
                                       &odiag, ocr_input_out) < 0) {
                         snprintf(pd.ocr_text, sizeof(pd.ocr_text), "UNK");
@@ -6397,31 +7229,14 @@ static void *infer_thread_main(void *arg)
                             uint8_t *cmp_buf = malloc((size_t)crop_w * crop_h * 3U);
                             if (cmp_buf) {
                                 memcpy(cmp_buf, plate_crop_noclahe, (size_t)crop_w * crop_h * 3U);
-                                if (run_model_ocr(ctx, cmp_buf, crop_w, crop_h,
+                                if (run_model_ocr(ctx, cmp_buf, crop_w, crop_h, pd.color,
                                                   orig_text, sizeof(orig_text), &orig_conf,
-                                                  &orig_diag, NULL) == 0) {
+                                                  &orig_diag, pd.ocr_expert, sizeof(pd.ocr_expert), NULL) == 0) {
                                     int diff = (strcmp(pd.ocr_text, orig_text) != 0);
                                     fprintf(stderr,
                                             "[clahe-cmp] frame=%" PRIu64 " orig=\"%s\" conf=%.2f clahe=\"%s\" conf=%.2f %s\n",
                                             seq, orig_text, orig_conf, pd.ocr_text, pd.ocr_conf,
                                             diff ? "\xe2\x98\x85" : "");
-
-                                    /* ── Dump PPM pair if clahe-dump-dir set ── */
-                                    if (ctx->opt.clahe_dump_dir &&
-                                        ctx->clahe_dump_count < ctx->opt.clahe_dump_max) {
-                                        char path[512];
-                                        int idx = ctx->clahe_dump_count;
-                                        snprintf(path, sizeof(path), "%s/frame_%05" PRIu64 "_%d_orig.ppm",
-                                                 ctx->opt.clahe_dump_dir, seq, idx);
-                                        write_ppm_rgb888(path, plate_crop_noclahe, crop_w, crop_h);
-                                        snprintf(path, sizeof(path), "%s/frame_%05" PRIu64 "_%d_clahe.ppm",
-                                                 ctx->opt.clahe_dump_dir, seq, idx);
-                                        write_ppm_rgb888(path, plate_crop, crop_w, crop_h);
-                                        ctx->clahe_dump_count++;
-                                        fprintf(stderr,
-                                                "[clahe-dump] frame=%" PRIu64 " idx=%d w=%d h=%d dir=%s\n",
-                                                seq, idx, crop_w, crop_h, ctx->opt.clahe_dump_dir);
-                                    }
                                 }
                                 free(cmp_buf);
                             }
@@ -6438,13 +7253,11 @@ static void *infer_thread_main(void *arg)
                         pd.ocr_text);
             }
             if (pd.ocr_text[0] != '\0') {
-                if (pd.ocr_in_occ_ratio >= 0.70f) {
-                    ocr_temporal_smooth(ctx, &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf);
-                } else {
-                    fprintf(stderr,
-                            "[ocr-smooth] frame=%" PRIu64 " skip=1 reason=low-occ occ=%.3f conf=%.2f text=%s\n",
-                            seq, pd.ocr_in_occ_ratio, pd.ocr_conf, pd.ocr_text);
-                }
+                ocr_temporal_smooth(ctx, &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf);
+            }
+            if (pd.color == PLATE_COLOR_GREEN && pd.ocr_text[0] != '\0') {
+                run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
+                                            &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text));
             }
             if (pd.ocr_text[0] != '\0')
                 ocr_nonempty_count++;
@@ -6454,11 +7267,14 @@ static void *infer_thread_main(void *arg)
                 overlay_nonempty_count++;
             if (!ocr_input_dump && ctx->ocr_crop_index_fp &&
                 ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
-                ocr_input_dump = prepare_ocr_input_rgb888(ctx, plate_crop, crop_w, crop_h, NULL);
+                const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
+                ocr_input_dump = prepare_ocr_input_rgb888(ctx, dump_model, plate_crop, crop_w, crop_h, NULL);
             }
             if (ocr_input_dump) {
+                const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
                 dump_ocr_pair(ctx, seq, &pd, plate_crop, crop_w, crop_h,
-                              ocr_input_dump, (int)ctx->ocr_model.in_w, (int)ctx->ocr_model.in_h);
+                              ocr_input_dump, (int)dump_model->in_w, (int)dump_model->in_h,
+                              firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT);
                 free(ocr_input_dump);
                 ocr_input_dump = NULL;
             }
@@ -6492,7 +7308,7 @@ static void *infer_thread_main(void *arg)
     }
 
     free(raw_local); free(rgb_full); free(rgb_detect); free(a_map); free(algo_rgb);
-    free(veh_in); free(plate_in); free(plate_crop);
+    free(ped_in); free(plate_in); free(plate_crop); free(firstchar_crop);
     free(plate_crop_noclahe);
     return NULL;
 }
@@ -6589,7 +7405,6 @@ static void print_stats(struct app_ctx *ctx)
     ctx->last_stats_infer = r.infer_frames_total;
     ctx->last_stats_us = now;
 }
-
 static void cleanup(struct app_ctx *ctx)
 {
     int i;
@@ -6600,9 +7415,14 @@ static void cleanup(struct app_ctx *ctx)
     if (ctx->infer_thread)
         pthread_join(ctx->infer_thread, NULL);
 
-    rknn_model_release(&ctx->veh_model);
+    rknn_model_release(&ctx->ped_model);
     rknn_model_release(&ctx->plate_model);
     rknn_ocr_model_release(&ctx->ocr_model);
+    rknn_ocr_model_release(&ctx->ocr_green_model);
+    rknn_ocr_model_release(&ctx->ocr_yellow_model);
+    rknn_ocr_model_release(&ctx->ocr_special_model);
+    rknn_firstchar_model_release(&ctx->green_firstchar_model);
+    rknn_quad_refiner_model_release(&ctx->quad_refiner_model);
 
     if (ctx->pred_log_fp) {
         fclose(ctx->pred_log_fp);
@@ -6667,29 +7487,41 @@ int main(int argc, char **argv)
         print_usage(argv[0]);
         goto out;
     }
-    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
-        ctx.opt.ocr_crop_mode != OCR_CROP_OBB_WARP) {
+    if (detector_type_uses_quad(ctx.opt.plate_detector_type) &&
+        ctx.opt.ocr_crop_mode != OCR_CROP_OBB_WARP &&
+        ctx.opt.ocr_crop_mode != OCR_CROP_OBB_PIECEWISE) {
         fprintf(stderr,
-                "[cfg] detector=yolov8_obb_rknn requires ocr-crop-mode=obb_warp, force switching\n");
+                "[cfg] detector=%s requires ocr-crop-mode=obb_warp|obb_piecewise, force switching\n",
+                detector_type_str(ctx.opt.plate_detector_type));
         ctx.opt.ocr_crop_mode = OCR_CROP_OBB_WARP;
     }
-    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+    if (detector_type_uses_quad(ctx.opt.plate_detector_type) &&
         ctx.opt.ocr_channel_order != OCR_CH_BGR) {
         fprintf(stderr,
-                "[cfg] detector=yolov8_obb_rknn keeps OCR contract, force ocr-channel-order=bgr\n");
+                "[cfg] detector=%s keeps OCR contract, force ocr-channel-order=bgr\n",
+                detector_type_str(ctx.opt.plate_detector_type));
         ctx.opt.ocr_channel_order = OCR_CH_BGR;
     }
-    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+    if (detector_type_uses_quad(ctx.opt.plate_detector_type) &&
         ctx.opt.ocr_resize_mode != OCR_RESIZE_LETTERBOX) {
         fprintf(stderr,
-                "[cfg] detector=yolov8_obb_rknn keeps OCR contract, force ocr-resize-mode=letterbox\n");
+                "[cfg] detector=%s keeps OCR contract, force ocr-resize-mode=letterbox\n",
+                detector_type_str(ctx.opt.plate_detector_type));
         ctx.opt.ocr_resize_mode = OCR_RESIZE_LETTERBOX;
     }
-    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN &&
+    if (detector_type_uses_quad(ctx.opt.plate_detector_type) &&
         ctx.opt.ocr_resize_kernel != OCR_KERNEL_NN) {
         fprintf(stderr,
-                "[cfg] detector=yolov8_obb_rknn keeps OCR contract, force ocr-resize-kernel=nn\n");
+                "[cfg] detector=%s keeps OCR contract, force ocr-resize-kernel=nn\n",
+                detector_type_str(ctx.opt.plate_detector_type));
         ctx.opt.ocr_resize_kernel = OCR_KERNEL_NN;
+    }
+    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_POSE_RKNN &&
+        ctx.opt.quad_refiner_model_path) {
+        fprintf(stderr,
+                "[cfg] detector=%s uses direct keypoints, disable quad-refiner\n",
+                detector_type_str(ctx.opt.plate_detector_type));
+        ctx.opt.quad_refiner_model_path = NULL;
     }
     offline_mode = (ctx.opt.offline_image_path && ctx.opt.offline_image_path[0] != '\0');
 
@@ -6711,9 +7543,9 @@ int main(int argc, char **argv)
         goto out;
     if (!offline_mode && init_copy_slots(&ctx) < 0)
         goto out;
-    if (!offline_mode &&
-        rknn_model_load(&ctx.veh_model, "vehicle", ctx.opt.veh_model_path,
-                        ctx.label_count, DETECTOR_YOLOV5) < 0)
+    if (ctx.opt.ped_model_path && ctx.opt.ped_model_path[0] &&
+        rknn_model_load(&ctx.ped_model, "pedestrian", ctx.opt.ped_model_path,
+                        1, DETECTOR_YOLOV8_DET) < 0)
         goto out;
     if (rknn_model_load(&ctx.plate_model, "plate", ctx.opt.plate_model_path,
                         (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) ? 0 : 1,
@@ -6722,7 +7554,42 @@ int main(int argc, char **argv)
     ctx.plate_model.nms_iou_thr = ctx.opt.plate_nms_iou;
     ctx.plate_model.max_det = ctx.opt.plate_max_det;
     ctx.plate_model.class_filter = ctx.opt.plate_class_id;
-    if (rknn_ocr_model_load(&ctx.ocr_model, "ocr", ctx.opt.ocr_model_path) < 0)
+    if (rknn_ocr_model_load(&ctx.ocr_model, "ocr_blue", ctx.opt.ocr_blue_model_path) < 0)
+        goto out;
+    if (rknn_ocr_model_load(&ctx.ocr_green_model, "ocr_green", ctx.opt.ocr_green_model_path) < 0)
+        goto out;
+    if (strcmp(ctx.opt.ocr_yellow_model_path, ctx.opt.ocr_blue_model_path) != 0) {
+        if (rknn_ocr_model_load(&ctx.ocr_yellow_model, "ocr_yellow", ctx.opt.ocr_yellow_model_path) < 0)
+            goto out;
+        if (ctx.opt.ocr_yellow_keys_path && ctx.opt.ocr_yellow_keys_path[0])
+            load_ocr_model_keys(&ctx.ocr_yellow_model, ctx.opt.ocr_yellow_keys_path);
+    }
+    if (strcmp(ctx.opt.ocr_special_model_path, ctx.opt.ocr_blue_model_path) != 0) {
+        if (rknn_ocr_model_load(&ctx.ocr_special_model, "ocr_special", ctx.opt.ocr_special_model_path) < 0)
+            goto out;
+        if (ctx.opt.ocr_special_keys_path && ctx.opt.ocr_special_keys_path[0])
+            load_ocr_model_keys(&ctx.ocr_special_model, ctx.opt.ocr_special_keys_path);
+    }
+    if (!ocr_model_input_compatible(&ctx.ocr_model, &ctx.ocr_green_model)) {
+        fprintf(stderr,
+                "[ocr] FATAL blue/green input shape mismatch: blue=%ux%ux%u green=%ux%ux%u\n",
+                ctx.ocr_model.in_w, ctx.ocr_model.in_h, ctx.ocr_model.in_c,
+                ctx.ocr_green_model.in_w, ctx.ocr_green_model.in_h, ctx.ocr_green_model.in_c);
+        goto out;
+    }
+    fprintf(stderr, "[ocr] expert routing enabled: blue=%s green=%s\n",
+            ctx.opt.ocr_blue_model_path, ctx.opt.ocr_green_model_path);
+    if (rknn_firstchar_model_load(&ctx.green_firstchar_model, "green_firstchar",
+                                  ctx.opt.green_firstchar_model_path) < 0)
+        goto out;
+    if (ctx.green_firstchar_model.ctx) {
+        fprintf(stderr,
+                "[ocr] green firstchar sidecar enabled: model=%s min_votes=%d min_share=%.2f\n",
+                ctx.opt.green_firstchar_model_path,
+                ctx.opt.green_firstchar_min_votes,
+                ctx.opt.green_firstchar_min_share);
+    }
+    if (rknn_quad_refiner_model_load(&ctx.quad_refiner_model, "quad_refiner", ctx.opt.quad_refiner_model_path) < 0)
         goto out;
 
     if (ctx.opt.pred_log_path && ctx.opt.pred_log_path[0] != '\0') {
@@ -6743,7 +7610,7 @@ int main(int argc, char **argv)
         fprintf(ctx.ocr_crop_index_fp,
                 "sample_id,frame_id,ts_us,box_x1,box_y1,box_x2,box_y2,"
                 "crop_x1,crop_y1,crop_x2,crop_y2,app_text,app_conf,app_blank_top1,app_occ_ratio,"
-                "crop_path,ocr_input_path\n");
+                "crop_path,ocr_input_path,firstchar224_path\n");
         fflush(ctx.ocr_crop_index_fp);
     }
 
@@ -6752,7 +7619,7 @@ int main(int argc, char **argv)
                 "Start OFFLINE OCR: image=%s roi=%s auto_det=%d min_plate=%.2f det_resize=%s plate_refine=%d "
                 "plate_det=%s nms_iou=%.2f max_det=%d cls_filter=%d "
                 "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_kernel=%s ocr_pp=%s min_h=%d min_sharp=%.2f min_occ=%.2f "
-                "crop_src=fullres_raw det_src=%s\n",
+                "crop_src=fullres_raw det_src=%s green_firstchar=%s fc_votes=%d fc_share=%.2f quad_refiner=%s\n",
                 ctx.opt.offline_image_path,
                 (ctx.opt.offline_roi_arg && ctx.opt.offline_roi_arg[0]) ? ctx.opt.offline_roi_arg : "<none>",
                 ctx.opt.offline_detect_plate,
@@ -6771,7 +7638,11 @@ int main(int argc, char **argv)
                 ctx.opt.ocr_min_plate_h,
                 ctx.opt.ocr_min_sharpness,
                 ctx.opt.ocr_min_occ_ratio,
-                ctx.opt.sw_preproc ? "preproc" : "raw");
+                ctx.opt.sw_preproc ? "preproc" : "raw",
+                ctx.opt.green_firstchar_model_path ? ctx.opt.green_firstchar_model_path : "<off>",
+                ctx.opt.green_firstchar_min_votes,
+                ctx.opt.green_firstchar_min_share,
+                ctx.opt.quad_refiner_model_path ? ctx.opt.quad_refiner_model_path : "<off>");
         if (run_offline_once(&ctx) < 0)
             goto out;
         ret = 0;
@@ -6791,7 +7662,8 @@ int main(int argc, char **argv)
             "sw_preproc=%d fpga_a_mask=%d ped_event=%d det_resize=%s plate_refine=%d "
             "plate_det=%s nms_iou=%.2f max_det=%d cls_filter=%d "
             "ocr_ch=%s ocr_crop=%s ocr_resize=%s ocr_kernel=%s ocr_pp=%s min_h=%d min_sharp=%.2f min_occ=%.2f show_crop=%d "
-            "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d pred_log=%s\n",
+            "crop_src=fullres_raw det_src=%s ctc_diag=%d ocr_dump=%s max=%d pred_log=%s "
+            "green_firstchar=%s fc_votes=%d fc_share=%.2f quad_refiner=%s\n",
             ctx.opt.fps,
             ctx.src_is_bgrx ? "bgrx8888" : "bgr565",
             (ctx.opt.pixel_order == PIXEL_ORDER_BGR565) ? "bgr565" : "rgb565",
@@ -6820,7 +7692,11 @@ int main(int argc, char **argv)
             ctx.opt.ocr_ctc_diag,
             ctx.opt.ocr_crop_dump_dir ? ctx.opt.ocr_crop_dump_dir : "<off>",
             ctx.opt.ocr_crop_dump_max,
-            ctx.opt.pred_log_path ? ctx.opt.pred_log_path : "<off>");
+            ctx.opt.pred_log_path ? ctx.opt.pred_log_path : "<off>",
+            ctx.opt.green_firstchar_model_path ? ctx.opt.green_firstchar_model_path : "<off>",
+            ctx.opt.green_firstchar_min_votes,
+            ctx.opt.green_firstchar_min_share,
+            ctx.opt.quad_refiner_model_path ? ctx.opt.quad_refiner_model_path : "<off>");
 
     ctx.last_stats_us = mono_us();
 
