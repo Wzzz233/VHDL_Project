@@ -209,6 +209,8 @@ struct options {
     float green_firstchar_min_share;
     int clahe_enable;
     int clahe_compare;
+    const char *clahe_dump_dir;
+    int clahe_dump_max;
     int offline_detect_plate;
     bool swap16;
 };
@@ -764,6 +766,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->green_firstchar_min_share = GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE;
     opt->clahe_enable = 0;
     opt->clahe_compare = 0;
+    opt->clahe_dump_dir = NULL;
+    opt->clahe_dump_max = 100;
     opt->offline_detect_plate = 1;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
