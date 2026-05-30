@@ -6650,7 +6650,7 @@ static int run_offline_once(struct app_ctx *ctx)
             box_iou(&pd.box, &pd.crop_box));
 
     /* ── CLAHE L-channel enhancement ── */
-    if (ctx->opt.clahe_enable)
+    if (ctx->opt.clahe_enable || ctx->opt.clahe_compare)
         clahe_l_channel(plate_crop, crop_w, crop_h, 2.0f, 8);
 
     if ((pd.box.y2 - pd.box.y1 + 1) < ctx->opt.ocr_min_plate_h) {
@@ -7188,7 +7188,7 @@ static void *infer_thread_main(void *arg)
             if (ctx->opt.clahe_enable || ctx->opt.clahe_compare) {
                 if (ctx->opt.clahe_compare)
                     memcpy(plate_crop_noclahe, plate_crop, (size_t)crop_w * crop_h * 3U);
-                if (ctx->opt.clahe_enable)
+                if (ctx->opt.clahe_enable || ctx->opt.clahe_compare)
                     clahe_l_channel(plate_crop, crop_w, crop_h, 2.0f, 8);
             }
 
