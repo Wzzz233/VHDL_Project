@@ -245,6 +245,7 @@ struct plate_det {
     float ocr_conf;
     float ocr_blank_top1;
     float ocr_in_occ_ratio;
+    int det_cls;
 };
 
 struct frame_slot {
@@ -6651,6 +6652,7 @@ static int run_offline_once(struct app_ctx *ctx)
     }
 
     pd.box = box;
+    pd.det_cls = box.cls;
     pd.color = classify_plate_color_rgb(rgb, w, h, &pd.box);
     if (!prepare_plate_crop_rgb888(ctx, rgb, w, h, &pd.box,
                                    plate_crop, w, h, &pd.crop_box, &crop_w, &crop_h,
@@ -7169,6 +7171,7 @@ static void *infer_thread_main(void *arg)
             bool used_obb_warp = false;
             char overlay_txt[32];
             pd.box = stable_plates[i];
+            pd.det_cls = stable_plates[i].cls;
             if (ctx->opt.plate_refine) {
                 struct det_box refined = pd.box;
                 if (refine_plate_box_local(ctx, det_src_rgb, (int)ctx->frame_width, (int)ctx->frame_height,
