@@ -24,28 +24,14 @@ displayapp: fpga_hdmi_display.c
 
 RKNN_CFLAGS ?=
 RKNN_LIBS ?= -lrknnrt
-HOST_CC ?= gcc
-HOST_CFLAGS ?= -Wall -Wextra -O2 -std=c11
 
-lprapp: fpga_lpr_display.c ocr_decode.c ocr_decode.h lpr_special_route.h
-	$(CROSS_COMPILE)gcc -Wall -O2 -o fpga_lpr_display fpga_lpr_display.c ocr_decode.c -pthread $(GST_CFLAGS) $(GST_LIBS) $(RKNN_CFLAGS) $(RKNN_LIBS) -lm
-
-decode-test: test_ocr_decode.c ocr_decode.c ocr_decode.h
-	$(HOST_CC) $(HOST_CFLAGS) -o test_ocr_decode test_ocr_decode.c ocr_decode.c -lm
-
-special-route-test: test_lpr_special_route.c lpr_special_route.h
-	$(HOST_CC) $(HOST_CFLAGS) -o test_lpr_special_route test_lpr_special_route.c
-
-test: decode-test special-route-test
-	./test_ocr_decode
-	./test_lpr_special_route
+lprapp: fpga_lpr_display.c
+	$(CROSS_COMPILE)gcc -Wall -O2 -o fpga_lpr_display fpga_lpr_display.c -pthread $(GST_CFLAGS) $(GST_LIBS) $(RKNN_CFLAGS) $(RKNN_LIBS) -lm
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f fpga_dma_test
 	rm -f fpga_hdmi_display
 	rm -f fpga_lpr_display
-	rm -f test_ocr_decode
-	rm -f test_lpr_special_route
 	rm -f *.raw
 	rm -f Module.symvers modules.order *.mod.c *.o .*.cmd
