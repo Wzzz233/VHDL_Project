@@ -452,7 +452,7 @@ ips2l_pcie_dma #(
     .o_bar2_rd_clk_en_ext	(mwr_rd_clk_en),
     .o_bar2_rd_addr_ext		(mwr_rd_addr),
     .i_ext_bar2_rd_data		(mwr_rd_data),
-    .i_ext_bar2_rd_sel		(1'b1)				// Always use external frame data
+    .i_ext_bar2_rd_sel		(1'b1),				// Always use external frame data
 
 	// BAR1 passthrough interface
     .o_bar1_pt_wr_en	(bar1_pt_wr_en),
