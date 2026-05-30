@@ -465,6 +465,7 @@ struct app_ctx {
     FILE *pred_log_fp;
     FILE *ocr_crop_index_fp;
     int ocr_crop_dumped;
+    int clahe_dump_count;
     pthread_mutex_t pred_log_lock;
     char labels[MAX_LABELS][MAX_LABEL_LEN];
     int label_count;
@@ -632,6 +633,10 @@ static void print_usage(const char *prog)
             "  --ocr-min-plate-h <n>   Skip OCR if plate box h < n (default: 24)\n"
             "  --ocr-min-sharpness <v> Skip OCR if Laplacian var < v (default: 20)\n"
             "  --ocr-min-occ-ratio <v> Re-crop once if OCR width occupancy < v (default: 0)\n"
+            "  --clahe-enable <0|1>    Enable CLAHE L-channel enhancement (default: 0)\n"
+            "  --clahe-compare <0|1>   A/B compare CLAHE vs original (default: 0)\n"
+            "  --clahe-dump-dir <p>    Dump original + CLAHE crop PPM pair (default: off)\n"
+            "  --clahe-dump-max <n>    Max dumped CLAHE pairs (default: 100)\n"
             "  --ocr-ctc-diag <0|1>    Print CTC decode diagnostics (default: 0)\n"
             "  --ocr-crop-dump-dir <p> Dump OCR crops+inputs to directory (default: off)\n"
             "  --ocr-crop-dump-max <n> Max dumped OCR samples (default: 20)\n"
@@ -7234,6 +7239,23 @@ static void *infer_thread_main(void *arg)
                                             "[clahe-cmp] frame=%" PRIu64 " orig=\"%s\" conf=%.2f clahe=\"%s\" conf=%.2f %s\n",
                                             seq, orig_text, orig_conf, pd.ocr_text, pd.ocr_conf,
                                             diff ? "\xe2\x98\x85" : "");
+
+                                    /* ── Dump PPM pair ── */
+                                    if (ctx->opt.clahe_dump_dir &&
+                                        ctx->clahe_dump_count < ctx->opt.clahe_dump_max) {
+                                        char path[512];
+                                        int idx = ctx->clahe_dump_count;
+                                        snprintf(path, sizeof(path), "%s/frame_%05" PRIu64 "_%d_orig.ppm",
+                                                 ctx->opt.clahe_dump_dir, seq, idx);
+                                        write_ppm_rgb888(path, plate_crop_noclahe, crop_w, crop_h);
+                                        snprintf(path, sizeof(path), "%s/frame_%05" PRIu64 "_%d_clahe.ppm",
+                                                 ctx->opt.clahe_dump_dir, seq, idx);
+                                        write_ppm_rgb888(path, plate_crop, crop_w, crop_h);
+                                        ctx->clahe_dump_count++;
+                                        fprintf(stderr,
+                                                "[clahe-dump] frame=%" PRIu64 " idx=%d w=%d h=%d dir=%s\n",
+                                                seq, idx, crop_w, crop_h, ctx->opt.clahe_dump_dir);
+                                    }
                                 }
                                 free(cmp_buf);
                             }
