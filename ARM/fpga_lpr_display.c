@@ -59,7 +59,11 @@
 #define OBB_POINT_COUNT 8400
 #define POSE_KPT_COUNT 4
 #define POSE_KPT_DIMS 3
-#define POSE_OUTPUT_CHANNELS (4 + 1 + POSE_KPT_COUNT * POSE_KPT_DIMS)
+#define POSE_BOX_CHANNELS 4
+#define POSE_KPT_CHANNELS (POSE_KPT_COUNT * POSE_KPT_DIMS) /* 12 */
+#define POSE_MIN_CHANNELS (POSE_BOX_CHANNELS + 1 + POSE_KPT_CHANNELS) /* 17 */
+/* POSE_OUTPUT_CHANNELS kept for backward compat references */
+#define POSE_OUTPUT_CHANNELS POSE_MIN_CHANNELS
 #define OCR_TRACK_MAX 24
 #define OCR_TRACK_HIST 8
 #define FIRSTCHAR_TRACK_HIST 8
@@ -5553,21 +5557,30 @@ static bool infer_obb_output_views(const struct yolo_model *m, const rknn_output
 }
 
 static bool infer_pose_output_view(const struct yolo_model *m, const rknn_output *outs,
-                                   struct tensor_cn_view *pose_view)
+                                   struct tensor_cn_view *pose_view,
+                                   int *pose_nc)
 {
     uint32_t i;
 
     if (!m || !outs || !pose_view)
         return false;
+    if (pose_nc)
+        *pose_nc = 0;
 
     for (i = 0; i < m->io_num.n_output; i++) {
+        int nc;
         struct tensor_cn_view tv;
         if (!build_tensor_cn_view(&m->output_attrs[i], (const float *)outs[i].buf, &tv))
             continue;
-        if (tv.n == OBB_POINT_COUNT && tv.c == POSE_OUTPUT_CHANNELS) {
-            *pose_view = tv;
-            return true;
-        }
+        if (tv.n != OBB_POINT_COUNT || tv.c < POSE_MIN_CHANNELS)
+            continue;
+        nc = tv.c - POSE_BOX_CHANNELS - POSE_KPT_CHANNELS;
+        if (nc < 1)
+            continue;
+        *pose_view = tv;
+        if (pose_nc)
+            *pose_nc = nc;
+        return true;
     }
     return false;
 }
@@ -5689,42 +5702,74 @@ static int decode_yolov8_pose_outputs(const struct yolo_model *m, const rknn_out
     struct tensor_cn_view pose_view;
     struct det_box cand[MAX_DETS * 4];
     const int pre_nms_cap = MAX_DETS * 4;
+    int pose_nc;
     int count = 0;
     int i;
 
     *out_count = 0;
     if (m->in_w != ALGO_STREAM_SIZE || m->in_h != ALGO_STREAM_SIZE)
         return -1;
-    if (m->class_filter > 0)
-        return 0;
-    if (!infer_pose_output_view(m, outs, &pose_view))
+    if (!infer_pose_output_view(m, outs, &pose_view, &pose_nc))
         return -1;
+
+    if (pose_nc != 1 && pose_nc != 5)
+        fprintf(stderr,
+                "[pose] WARN: unexpected nc=%d from output channels=%d (n=%d)\n",
+                pose_nc, pose_view.c, pose_view.n);
 
     for (i = 0; i < OBB_POINT_COUNT; i++) {
         float cx = tensor_cn_read(&pose_view, 0, i);
         float cy = tensor_cn_read(&pose_view, 1, i);
         float bw = tensor_cn_read(&pose_view, 2, i);
         float bh = tensor_cn_read(&pose_view, 3, i);
-        float score = tensor_cn_read(&pose_view, 4, i);
+        float score;
+        int best_id;
+        int kpt_base;
         float ordered[8];
         struct det_box det;
+        int c;
         int k;
         bool valid = true;
 
+        if (!isfinite(cx) || !isfinite(cy) || !isfinite(bw) || !isfinite(bh))
+            continue;
+
         /*
          * ONNX export already bakes in Ultralytics pose decoding:
-         *   output[0:4]  = xywh in detector-input pixels
-         *   output[4]    = sigmoid(cls)
-         *   output[5:17] = decoded keypoints in detector-input pixels, flattened as
-         *                  [x0,y0,v0,x1,y1,v1,x2,y2,v2,x3,y3,v3]
+         *   output[0:4]      = xywh in detector-input pixels
+         *   output[4..]       = class scores (1 or more)
+         *   output[4+nc..]   = decoded keypoints
          *
          * Do not run dist2bbox or anchor-relative keypoint decoding again here.
          */
-        if (!isfinite(cx) || !isfinite(cy) || !isfinite(bw) || !isfinite(bh) || !isfinite(score))
+        if (pose_nc == 1) {
+            /* Old single-class model: score at channel 4, class_id=0 */
+            score = tensor_cn_read(&pose_view, 4, i);
+            best_id = 0;
+        } else {
+            /* Multi-class model: argmax over channels 4..4+nc-1 */
+            int best_c = 0;
+            float best_s = -1.0f;
+            for (c = 0; c < pose_nc; c++) {
+                float s = tensor_cn_read(&pose_view, 4 + c, i);
+                if (s > best_s) {
+                    best_s = s;
+                    best_c = c;
+                }
+            }
+            score = best_s;
+            best_id = best_c;
+        }
+
+        if (!isfinite(score))
             continue;
         if (score < 0.0f || score > 1.0f)
             score = sigmoidf_local(score);
         if (score < conf_thr)
+            continue;
+
+        /* Apply class filter if set */
+        if (m->class_filter >= 0 && m->class_filter < pose_nc && best_id != m->class_filter)
             continue;
 
         memset(&det, 0, sizeof(det));
@@ -5733,15 +5778,18 @@ static int decode_yolov8_pose_outputs(const struct yolo_model *m, const rknn_out
         det.w = bw;
         det.h = bh;
         det.conf = score;
-        det.cls = 0;
+        det.cls = best_id >= 0 && best_id < pose_nc ? best_id : 0;
         det.has_obb = 1;
         if (det.w < 2.0f || det.h < 2.0f)
             continue;
 
+        /* Keypoints start after box + class scores */
+        kpt_base = POSE_BOX_CHANNELS + pose_nc;
+
         for (k = 0; k < POSE_KPT_COUNT; k++) {
-            float kx = tensor_cn_read(&pose_view, 5 + k * POSE_KPT_DIMS + 0, i);
-            float ky = tensor_cn_read(&pose_view, 5 + k * POSE_KPT_DIMS + 1, i);
-            float kv = tensor_cn_read(&pose_view, 5 + k * POSE_KPT_DIMS + 2, i);
+            float kx = tensor_cn_read(&pose_view, kpt_base + k * POSE_KPT_DIMS + 0, i);
+            float ky = tensor_cn_read(&pose_view, kpt_base + k * POSE_KPT_DIMS + 1, i);
+            float kv = tensor_cn_read(&pose_view, kpt_base + k * POSE_KPT_DIMS + 2, i);
             if (!isfinite(kx) || !isfinite(ky) || !isfinite(kv)) {
                 valid = false;
                 break;
@@ -7576,7 +7624,8 @@ int main(int argc, char **argv)
                         1, DETECTOR_YOLOV8_DET) < 0)
         goto out;
     if (rknn_model_load(&ctx.plate_model, "plate", ctx.opt.plate_model_path,
-                        (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) ? 0 : 1,
+                        (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_OBB_RKNN) ? 0 :
+                         (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_POSE_RKNN) ? 0 : 1,
                         ctx.opt.plate_detector_type) < 0)
         goto out;
     ctx.plate_model.nms_iou_thr = ctx.opt.plate_nms_iou;
