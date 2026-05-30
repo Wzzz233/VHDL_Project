@@ -785,9 +785,6 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 59: opt->green_firstchar_min_share = (float)atof(optarg); break;
         case 68: opt->clahe_enable = atoi(optarg) ? 1 : 0; break;
         case 69: opt->clahe_compare = atoi(optarg) ? 1 : 0; break;
-            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
-            else
-            break;
         case 50:
             if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
                 opt->quad_refiner_model_path = NULL;
@@ -7231,7 +7228,7 @@ static void *infer_thread_main(void *arg)
                                 memcpy(cmp_buf, plate_crop_noclahe, (size_t)crop_w * crop_h * 3U);
                                 if (run_model_ocr(ctx, cmp_buf, crop_w, crop_h, pd.color,
                                                   orig_text, sizeof(orig_text), &orig_conf,
-                                                  &orig_diag, pd.ocr_expert, sizeof(pd.ocr_expert), NULL) == 0) {
+                                                  &orig_diag, NULL) == 0) {
                                     int diff = (strcmp(pd.ocr_text, orig_text) != 0);
                                     fprintf(stderr,
                                             "[clahe-cmp] frame=%" PRIu64 " orig=\"%s\" conf=%.2f clahe=\"%s\" conf=%.2f %s\n",
