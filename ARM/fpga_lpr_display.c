@@ -7253,6 +7253,7 @@ static void *infer_thread_main(void *arg)
                                         ctx->clahe_dump_count < ctx->opt.clahe_dump_max) {
                                         char path[512];
                                         int idx = ctx->clahe_dump_count;
+                                        mkdir_p_simple(ctx->opt.clahe_dump_dir);
                                         snprintf(path, sizeof(path), "%s/frame_%05" PRIu64 "_%d_orig.ppm",
                                                  ctx->opt.clahe_dump_dir, seq, idx);
                                         write_ppm_rgb888(path, plate_crop_noclahe, crop_w, crop_h);
