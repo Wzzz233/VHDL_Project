@@ -216,6 +216,7 @@ struct options {
     const char *clahe_dump_dir;
     int clahe_dump_max;
     int offline_detect_plate;
+    int pose_nc;
     bool swap16;
 };
 
@@ -246,6 +247,8 @@ struct plate_det {
     float ocr_blank_top1;
     float ocr_in_occ_ratio;
     int det_cls;
+    char route_name[24];
+    char ocr_expert[24];
 };
 
 struct frame_slot {
@@ -544,6 +547,16 @@ static void rknn_firstchar_model_release(struct firstchar_model *m);
 static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
                                         const struct det_box *box, uint64_t frame_seq,
                                         char *text, size_t text_len);
+static int detect_pose_nc_from_model(const struct yolo_model *m);
+static const char *det_cls_route_name(int det_cls, int pose_nc);
+static const char *det_cls_to_expert_name(int det_cls, int pose_nc);
+static const struct ocr_model *select_ocr_model_by_det_cls(
+    const struct app_ctx *ctx,
+    int det_cls,
+    int pose_nc,
+    enum plate_color fallback_color,
+    const char **expert_name,
+    const char **route_name);
 static void copy_cstr_trunc(char *dst, size_t dst_len, const char *src);
 static int utf8_token_len(const char *s);
 static uint32_t utf8_token_codepoint(const char *tok);
@@ -776,6 +789,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->clahe_dump_dir = NULL;
     opt->clahe_dump_max = 100;
     opt->offline_detect_plate = 1;
+    opt->pose_nc = 0;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
         switch (c) {
@@ -2139,6 +2153,91 @@ static uint8_t *prepare_ocr_input_rgb888(const struct app_ctx *ctx,
     return ocr_in;
 }
 
+static int detect_pose_nc_from_model(const struct yolo_model *m)
+{
+    uint32_t i;
+    if (!m)
+        return 0;
+    for (i = 0; i < m->io_num.n_output; i++) {
+        struct tensor_cn_view tv;
+        /* We don't need actual data, just the shape */
+        memset(&tv, 0, sizeof(tv));
+        /* Use build_tensor_cn_view to get c,n from the attr alone.
+         * It needs a buffer pointer but only stores it; pass any non-NULL. */
+        if (!build_tensor_cn_view(&m->output_attrs[i], (const float *)&tv, &tv))
+            continue;
+        if (tv.n != OBB_POINT_COUNT)
+            continue;
+        if (tv.c < POSE_MIN_CHANNELS)
+            continue;
+        {
+            int nc = tv.c - POSE_BOX_CHANNELS - POSE_KPT_CHANNELS;
+            if (nc >= 1)
+                return nc;
+        }
+    }
+    return 0;
+}
+
+static const char *det_cls_route_name(int det_cls, int pose_nc)
+{
+    if (pose_nc >= 5 && det_cls >= 0 && det_cls <= 4)
+        return "det_cls";
+    return "color_fallback";
+}
+
+static const char *det_cls_to_expert_name(int det_cls, int pose_nc)
+{
+    if (pose_nc >= 5 && det_cls >= 0 && det_cls <= 4) {
+        static const char *const names[] = {
+            "blue", "green", "yellow", "police", "embassy"
+        };
+        if (det_cls < 5)
+            return names[det_cls];
+    }
+    return "color";
+}
+
+static const struct ocr_model *select_ocr_model_by_det_cls(
+    const struct app_ctx *ctx,
+    int det_cls,
+    int pose_nc,
+    enum plate_color fallback_color,
+    const char **expert_name,
+    const char **route_name)
+{
+    /* Multi-class pose model → use det_cls for routing */
+    if (pose_nc >= 5 && det_cls >= 0 && det_cls <= 4) {
+        if (route_name)
+            *route_name = "det_cls";
+        switch (det_cls) {
+        case 0:
+            if (expert_name) *expert_name = "blue";
+            return &ctx->ocr_model;
+        case 1:
+            if (expert_name) *expert_name = "green";
+            return &ctx->ocr_green_model;
+        case 2:
+            if (expert_name) *expert_name = "yellow";
+            if (ctx->ocr_yellow_model.ctx)
+                return &ctx->ocr_yellow_model;
+            return &ctx->ocr_model;
+        case 3:
+            if (expert_name) *expert_name = "police";
+            return &ctx->ocr_special_model;
+        case 4:
+            if (expert_name) *expert_name = "embassy";
+            return &ctx->ocr_special_model;
+        default:
+            break;
+        }
+    }
+    /* Fallback: use color-based routing */
+    if (route_name)
+        *route_name = "color_fallback";
+    return select_ocr_model(ctx, fallback_color, expert_name);
+}
+
 static const struct ocr_model *select_ocr_model(const struct app_ctx *ctx,
                                                 enum plate_color plate_color,
                                                 const char **expert_name)
@@ -2180,11 +2279,18 @@ static enum ocr_decode_family select_decode_family(const char *expert_name,
 
 static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_w, int crop_h,
                          enum plate_color plate_color,
+                         int det_cls, int pose_nc,
                          char *text, size_t text_len, float *conf_out,
-                         struct ocr_diag *diag, uint8_t **model_input_out)
+                         struct ocr_diag *diag, uint8_t **model_input_out,
+                         const char **expert_name_out)
 {
     const char *expert_name = NULL;
-    const struct ocr_model *m = select_ocr_model(ctx, plate_color, &expert_name);
+    const char *route_name = "color_fallback";
+    const struct ocr_model *m = select_ocr_model_by_det_cls(ctx, det_cls, pose_nc,
+                                                            plate_color,
+                                                            &expert_name, &route_name);
+    if (expert_name_out)
+        *expert_name_out = expert_name;
     rknn_input in;
     rknn_output outs[4];
     uint8_t *ocr_in = NULL;
@@ -6720,12 +6826,14 @@ static int run_offline_once(struct app_ctx *ctx)
         } else {
             if (ctx->ocr_crop_index_fp && ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max)
                 ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
+                                    pd.det_cls, ctx->opt.pose_nc,
                                     pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
-                                    &odiag, &ocr_input_dump);
+                                    &odiag, &ocr_input_dump, NULL);
             else
                 ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
+                                    pd.det_cls, ctx->opt.pose_nc,
                                     pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
-                                    &odiag, NULL);
+                                    &odiag, NULL, NULL);
             if (ret < 0) {
                 fprintf(stderr, "Offline OCR failed\n");
                 goto out;
@@ -6734,9 +6842,17 @@ static int run_offline_once(struct app_ctx *ctx)
             pd.ocr_in_occ_ratio = odiag.in_occ_ratio;
         }
     }
-    if (pd.color == PLATE_COLOR_GREEN && pd.ocr_text[0] != '\0') {
-        run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
-                                    &pd.box, 0, pd.ocr_text, sizeof(pd.ocr_text));
+    if (pd.ocr_text[0] != '\0') {
+        bool green_fc_allowed = false;
+        if (ctx->opt.pose_nc >= 5) {
+            green_fc_allowed = (pd.det_cls == 1);
+        } else {
+            green_fc_allowed = (pd.color == PLATE_COLOR_GREEN);
+        }
+        if (green_fc_allowed) {
+            run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
+                                        &pd.box, 0, pd.ocr_text, sizeof(pd.ocr_text));
+        }
     }
     pd.type = classify_plate_type(pd.color, pd.ocr_text);
 
@@ -6751,18 +6867,21 @@ static int run_offline_once(struct app_ctx *ctx)
                 odiag.t_size, odiag.c_size, odiag.blank_idx, odiag.blank_top1_ratio);
     }
     fprintf(stderr,
-            "[offline][pred] text=%s conf=%.4f type=%s color=%s\n",
-            pd.ocr_text, pd.ocr_conf, plate_type_str(pd.type), plate_color_str(pd.color));
+            "[offline][pred] text=%s conf=%.4f type=%s color=%s det_cls=%d route=%s expert=%s\n",
+            pd.ocr_text, pd.ocr_conf, plate_type_str(pd.type), plate_color_str(pd.color),
+            pd.det_cls,
+            det_cls_route_name(pd.det_cls, ctx->opt.pose_nc),
+            det_cls_to_expert_name(pd.det_cls, ctx->opt.pose_nc));
 
     ts_us = mono_us();
     log_prediction_row(ctx, 0, ts_us, &pd);
     if (!ocr_input_dump && ctx->ocr_crop_index_fp &&
         ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
-        const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
+        const struct ocr_model *dump_model = select_ocr_model_by_det_cls(ctx, pd.det_cls, ctx->opt.pose_nc, pd.color, NULL, NULL);
         ocr_input_dump = prepare_ocr_input_rgb888(ctx, dump_model, plate_crop, crop_w, crop_h, NULL);
     }
     if (ocr_input_dump) {
-        const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
+        const struct ocr_model *dump_model = select_ocr_model_by_det_cls(ctx, pd.det_cls, ctx->opt.pose_nc, pd.color, NULL, NULL);
         dump_ocr_pair(ctx, 0, &pd, plate_crop, crop_w, crop_h,
                       ocr_input_dump, (int)dump_model->in_w, (int)dump_model->in_h,
                       firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT);
@@ -6878,18 +6997,22 @@ static void log_prediction_row(struct app_ctx *ctx, uint64_t frame_id, int64_t t
                                const struct plate_det *pd)
 {
     char safe_text[64];
+    const char *route;
     if (!ctx->pred_log_fp)
         return;
     csv_safe_text(pd->ocr_text, safe_text, sizeof(safe_text));
+    route = pd->route_name[0] ? pd->route_name : det_cls_route_name(pd->det_cls, ctx->opt.pose_nc);
     pthread_mutex_lock(&ctx->pred_log_lock);
     fprintf(ctx->pred_log_fp,
-            "%" PRIu64 ",%s,%s,%.4f,%d,%d,%d,%d,%" PRId64 "\n",
+            "%" PRIu64 ",%s,%s,%.4f,%d,%d,%d,%d,%" PRId64 ",%d,%s\n",
             frame_id,
             safe_text,
             plate_type_str(pd->type),
             pd->ocr_conf,
             pd->box.x1, pd->box.y1, pd->box.x2, pd->box.y2,
-            ts_us);
+            ts_us,
+            pd->det_cls,
+            route);
     fflush(ctx->pred_log_fp);
     pthread_mutex_unlock(&ctx->pred_log_lock);
 }
@@ -7271,8 +7394,9 @@ static void *infer_thread_main(void *arg)
                             pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2);
                 } else {
                     if (run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
+                                      pd.det_cls, ctx->opt.pose_nc,
                                       pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
-                                      &odiag, ocr_input_out) < 0) {
+                                      &odiag, ocr_input_out, NULL) < 0) {
                         snprintf(pd.ocr_text, sizeof(pd.ocr_text), "UNK");
                         pd.ocr_conf = 0.0f;
                         pd.ocr_blank_top1 = 0.0f;
@@ -7291,8 +7415,9 @@ static void *infer_thread_main(void *arg)
                             if (cmp_buf) {
                                 memcpy(cmp_buf, plate_crop_noclahe, (size_t)crop_w * crop_h * 3U);
                                 if (run_model_ocr(ctx, cmp_buf, crop_w, crop_h, pd.color,
+                                                  pd.det_cls, ctx->opt.pose_nc,
                                                   orig_text, sizeof(orig_text), &orig_conf,
-                                                  &orig_diag, NULL) == 0) {
+                                                  &orig_diag, NULL, NULL) == 0) {
                                     int diff = (strcmp(pd.ocr_text, orig_text) != 0);
                                     fprintf(stderr,
                                             "[clahe-cmp] frame=%" PRIu64 " orig=\"%s\" conf=%.2f clahe=\"%s\" conf=%.2f %s\n",
@@ -7334,9 +7459,19 @@ static void *infer_thread_main(void *arg)
             if (pd.ocr_text[0] != '\0') {
                 ocr_temporal_smooth(ctx, &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf);
             }
-            if (pd.color == PLATE_COLOR_GREEN && pd.ocr_text[0] != '\0') {
-                run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
-                                            &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text));
+            if (pd.ocr_text[0] != '\0') {
+                bool green_fc_allowed = false;
+                if (ctx->opt.pose_nc >= 5) {
+                    /* Multi-class mode: gate by det_cls */
+                    green_fc_allowed = (pd.det_cls == 1);
+                } else {
+                    /* Single-class / fallback: gate by color */
+                    green_fc_allowed = (pd.color == PLATE_COLOR_GREEN);
+                }
+                if (green_fc_allowed) {
+                    run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
+                                                &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text));
+                }
             }
             if (pd.ocr_text[0] != '\0')
                 ocr_nonempty_count++;
@@ -7346,26 +7481,35 @@ static void *infer_thread_main(void *arg)
                 overlay_nonempty_count++;
             if (!ocr_input_dump && ctx->ocr_crop_index_fp &&
                 ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
-                const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
+                const struct ocr_model *dump_model = select_ocr_model_by_det_cls(ctx, pd.det_cls, ctx->opt.pose_nc, pd.color, NULL, NULL);
                 ocr_input_dump = prepare_ocr_input_rgb888(ctx, dump_model, plate_crop, crop_w, crop_h, NULL);
             }
             if (ocr_input_dump) {
-                const struct ocr_model *dump_model = select_ocr_model(ctx, pd.color, NULL);
+                const struct ocr_model *dump_model = select_ocr_model_by_det_cls(ctx, pd.det_cls, ctx->opt.pose_nc, pd.color, NULL, NULL);
                 dump_ocr_pair(ctx, seq, &pd, plate_crop, crop_w, crop_h,
                               ocr_input_dump, (int)dump_model->in_w, (int)dump_model->in_h,
                               firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT);
                 free(ocr_input_dump);
                 ocr_input_dump = NULL;
             }
-            fprintf(stderr,
-                    "[pred] frame=%" PRIu64 " ts_us=%" PRId64 " bbox=[%d,%d,%d,%d] text=%s conf=%.2f type=%s color=%s\n",
-                    seq,
-                    mono_us(),
-                    pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2,
-                    pd.ocr_text,
-                    pd.ocr_conf,
-                    plate_type_str(pd.type),
-                    plate_color_str(pd.color));
+            {
+                const char *route = pd.route_name[0] ? pd.route_name
+                    : det_cls_route_name(pd.det_cls, ctx->opt.pose_nc);
+                const char *expert = pd.ocr_expert[0] ? pd.ocr_expert
+                    : det_cls_to_expert_name(pd.det_cls, ctx->opt.pose_nc);
+                fprintf(stderr,
+                        "[pred] frame=%" PRIu64 " ts_us=%" PRId64 " bbox=[%d,%d,%d,%d] text=%s conf=%.2f type=%s color=%s det_cls=%d expert=%s route=%s\n",
+                        seq,
+                        mono_us(),
+                        pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2,
+                        pd.ocr_text,
+                        pd.ocr_conf,
+                        plate_type_str(pd.type),
+                        plate_color_str(pd.color),
+                        pd.det_cls,
+                        expert,
+                        route);
+            }
             log_prediction_row(ctx, seq, mono_us(), &pd);
             ctx->pred_rows_total++;
             r.plates[r.plate_count++] = pd;
@@ -7634,6 +7778,15 @@ int main(int argc, char **argv)
     ctx.plate_model.nms_iou_thr = ctx.opt.plate_nms_iou;
     ctx.plate_model.max_det = ctx.opt.plate_max_det;
     ctx.plate_model.class_filter = ctx.opt.plate_class_id;
+
+    /* Detect pose class count from model output shape */
+    if (ctx.opt.plate_detector_type == DETECTOR_YOLOV8_POSE_RKNN) {
+        ctx.opt.pose_nc = detect_pose_nc_from_model(&ctx.plate_model);
+        fprintf(stderr, "[pose] pose_nc=%d\n", ctx.opt.pose_nc);
+        if (ctx.opt.pose_nc >= 5)
+            fprintf(stderr, "[pose] route=det_cls enabled\n");
+    }
+
     if (rknn_ocr_model_load(&ctx.ocr_model, "ocr_blue", ctx.opt.ocr_blue_model_path) < 0)
         goto out;
     if (rknn_ocr_model_load(&ctx.ocr_green_model, "ocr_green", ctx.opt.ocr_green_model_path) < 0)
