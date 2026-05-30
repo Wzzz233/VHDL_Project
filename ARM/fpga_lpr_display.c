@@ -190,6 +190,8 @@ struct options {
     bool swap16;
     int clahe_enable;
     int clahe_compare;
+    const char *clahe_dump_dir;
+    int clahe_dump_max;
 };
 
 struct det_box {
@@ -389,6 +391,7 @@ struct app_ctx {
     FILE *pred_log_fp;
     FILE *ocr_crop_index_fp;
     int ocr_crop_dumped;
+    int clahe_dump_count;
     pthread_mutex_t pred_log_lock;
     char labels[MAX_LABELS][MAX_LABEL_LEN];
     int label_count;
@@ -529,6 +532,10 @@ static void print_usage(const char *prog)
             "  --ocr-ctc-diag <0|1>    Print CTC decode diagnostics (default: 0)\n"
             "  --ocr-crop-dump-dir <p> Dump OCR crops+inputs to directory (default: off)\n"
             "  --ocr-crop-dump-max <n> Max dumped OCR samples (default: 20)\n"
+            "  --clahe-enable <0|1>    Enable CLAHE L-channel enhancement (default: 0)\n"
+            "  --clahe-compare <0|1>   A/B compare CLAHE vs original (default: 0)\n"
+            "  --clahe-dump-dir <p>    Dump original + CLAHE crop PPM pair (default: off)\n"
+            "  --clahe-dump-max <n>    Max dumped CLAHE pairs (default: 100)\n"
             "  --help                  Show this help\n",
             prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD, DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
             DEFAULT_STATS_INTERVAL, DEFAULT_COPY_BUFFERS, DEFAULT_QUEUE_DEPTH);
@@ -588,6 +595,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"ocr-crop-dump-max", required_argument, NULL, 35},
         {"clahe-enable", required_argument, NULL, 100},
         {"clahe-compare", required_argument, NULL, 101},
+        {"clahe-dump-dir", required_argument, NULL, 102},
+        {"clahe-dump-max", required_argument, NULL, 103},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -637,6 +646,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->offline_detect_plate = 1;
     opt->clahe_enable = 0;
     opt->clahe_compare = 0;
+    opt->clahe_dump_dir = NULL;
+    opt->clahe_dump_max = 100;
 
     while ((c = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
         switch (c) {
@@ -757,6 +768,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 35: opt->ocr_crop_dump_max = atoi(optarg); break;
         case 100: opt->clahe_enable = atoi(optarg) ? 1 : 0; break;
         case 101: opt->clahe_compare = atoi(optarg) ? 1 : 0; break;
+        case 102: opt->clahe_dump_dir = optarg; break;
+        case 103: opt->clahe_dump_max = atoi(optarg); break;
         case 'h':
             print_usage(argv[0]);
             exit(0);
@@ -6391,6 +6404,23 @@ static void *infer_thread_main(void *arg)
                                             "[clahe-cmp] frame=%" PRIu64 " orig=\"%s\" conf=%.2f clahe=\"%s\" conf=%.2f %s\n",
                                             seq, orig_text, orig_conf, pd.ocr_text, pd.ocr_conf,
                                             diff ? "\xe2\x98\x85" : "");
+
+                                    /* ── Dump PPM pair if clahe-dump-dir set ── */
+                                    if (ctx->opt.clahe_dump_dir &&
+                                        ctx->clahe_dump_count < ctx->opt.clahe_dump_max) {
+                                        char path[512];
+                                        int idx = ctx->clahe_dump_count;
+                                        snprintf(path, sizeof(path), "%s/frame_%05" PRIu64 "_%d_orig.ppm",
+                                                 ctx->opt.clahe_dump_dir, seq, idx);
+                                        write_ppm_rgb888(path, plate_crop_noclahe, crop_w, crop_h);
+                                        snprintf(path, sizeof(path), "%s/frame_%05" PRIu64 "_%d_clahe.ppm",
+                                                 ctx->opt.clahe_dump_dir, seq, idx);
+                                        write_ppm_rgb888(path, plate_crop, crop_w, crop_h);
+                                        ctx->clahe_dump_count++;
+                                        fprintf(stderr,
+                                                "[clahe-dump] frame=%" PRIu64 " idx=%d w=%d h=%d dir=%s\n",
+                                                seq, idx, crop_w, crop_h, ctx->opt.clahe_dump_dir);
+                                    }
                                 }
                                 free(cmp_buf);
                             }

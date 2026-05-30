@@ -28,6 +28,8 @@ A_ROI_IOU_MIN="0.05"
 PED_EVENT="0"
 CLAHE_ENABLE="0"
 CLAHE_COMPARE="0"
+CLAHE_DUMP_DIR=""
+CLAHE_DUMP_MAX="100"
 RED_STABLE_FRAMES="5"
 RED_RATIO_THR="0.002"
 STOPLINE_RATIO="0.55"
@@ -142,6 +144,8 @@ while [[ $# -gt 0 ]]; do
     --ped-event) PED_EVENT="$2"; shift 2 ;;
     --clahe-enable) CLAHE_ENABLE="$2"; shift 2 ;;
     --clahe-compare) CLAHE_COMPARE="$2"; shift 2 ;;
+    --clahe-dump-dir) CLAHE_DUMP_DIR="$2"; shift 2 ;;
+    --clahe-dump-max) CLAHE_DUMP_MAX="$2"; shift 2 ;;
     --red-stable-frames) RED_STABLE_FRAMES="$2"; shift 2 ;;
     --red-ratio-thr) RED_RATIO_THR="$2"; shift 2 ;;
     --stopline-ratio) STOPLINE_RATIO="$2"; shift 2 ;;
@@ -285,6 +289,8 @@ if [[ "$OFFLINE_MODE" == "0" ]]; then
     --plate-refine "$PLATE_REFINE"
     --clahe-enable "$CLAHE_ENABLE"
     --clahe-compare "$CLAHE_COMPARE")
+    --clahe-dump-dir "$CLAHE_DUMP_DIR"
+    --clahe-dump-max "$CLAHE_DUMP_MAX"
 else
   CMD+=(
     --offline-image "$OFFLINE_INPUT"
@@ -294,6 +300,8 @@ else
     --plate-refine "$PLATE_REFINE"
     --clahe-enable "$CLAHE_ENABLE"
     --clahe-compare "$CLAHE_COMPARE")
+    --clahe-dump-dir "$CLAHE_DUMP_DIR"
+    --clahe-dump-max "$CLAHE_DUMP_MAX"
   if [[ -n "$OFFLINE_ROI" ]]; then
     CMD+=(--offline-roi "$OFFLINE_ROI")
   fi
