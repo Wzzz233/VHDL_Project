@@ -714,6 +714,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"ocr-crop-dump-max", required_argument, NULL, 35},
         {"clahe-enable", required_argument, NULL, 68},
         {"clahe-compare", required_argument, NULL, 69},
+        {"clahe-dump-dir", required_argument, NULL, 70},
+        {"clahe-dump-max", required_argument, NULL, 71},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -794,6 +796,8 @@ static int parse_options(int argc, char **argv, struct options *opt)
         case 59: opt->green_firstchar_min_share = (float)atof(optarg); break;
         case 68: opt->clahe_enable = atoi(optarg) ? 1 : 0; break;
         case 69: opt->clahe_compare = atoi(optarg) ? 1 : 0; break;
+        case 70: opt->clahe_dump_dir = optarg; break;
+        case 71: opt->clahe_dump_max = atoi(optarg); break;
         case 50:
             if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
                 opt->quad_refiner_model_path = NULL;
