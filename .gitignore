@@ -38,3 +38,4 @@ multiseed_summary.csv
 *.bak
 *.orig
 ~*
+.alma-snapshots

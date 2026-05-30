@@ -45,6 +45,8 @@ A_PROJ_RATIO="0.35"
 A_ROI_IOU_MIN="0.05"
 PED_EVENT="0"
 RED_STABLE_FRAMES="5"
+CLAHE_ENABLE="0"
+CLAHE_COMPARE="0"
 RED_RATIO_THR="0.002"
 STOPLINE_RATIO="0.55"
 DET_RESIZE_MODE="letterbox"
@@ -119,6 +121,8 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-blue-model <path> 
   --a-roi-iou-min <v>        Min IoU for A-ROI filtering (default: ${A_ROI_IOU_MIN})
   --ped-event <0|1>          Enable pedestrian red-light event (default: ${PED_EVENT})
   --red-stable-frames <n>    Red light debounce frames (default: ${RED_STABLE_FRAMES})
+  --clahe-enable <0|1>       CLAHE L-channel enhancement (default: ${CLAHE_ENABLE})
+  --clahe-compare <0|1>      A/B compare CLAHE vs original (default: ${CLAHE_COMPARE})
   --red-ratio-thr <v>        A-channel red ratio threshold (default: ${RED_RATIO_THR})
   --stopline-ratio <v>       Stopline Y ratio [0,1] (default: ${STOPLINE_RATIO})
   --det-resize-mode <m>      Detect resize: stretch|letterbox (default: ${DET_RESIZE_MODE})
@@ -191,6 +195,8 @@ while [[ $# -gt 0 ]]; do
     --a-roi-iou-min) A_ROI_IOU_MIN="$2"; shift 2 ;;
     --ped-event) PED_EVENT="$2"; shift 2 ;;
     --red-stable-frames) RED_STABLE_FRAMES="$2"; shift 2 ;;
+    --clahe-enable) CLAHE_ENABLE="$2"; shift 2 ;;
+    --clahe-compare) CLAHE_COMPARE="$2"; shift 2 ;;
     --red-ratio-thr) RED_RATIO_THR="$2"; shift 2 ;;
     --stopline-ratio) STOPLINE_RATIO="$2"; shift 2 ;;
     --det-resize-mode) DET_RESIZE_MODE="$2"; shift 2 ;;
@@ -398,14 +404,18 @@ if [[ "$OFFLINE_MODE" == "0" ]]; then
     --red-ratio-thr "$RED_RATIO_THR"
     --stopline-ratio "$STOPLINE_RATIO"
     --det-resize-mode "$DET_RESIZE_MODE"
-    --plate-refine "$PLATE_REFINE")
+    --plate-refine "$PLATE_REFINE"
+    --clahe-enable "$CLAHE_ENABLE"
+    --clahe-compare "$CLAHE_COMPARE")
 else
   CMD+=(
     --offline-image "$OFFLINE_INPUT"
     --offline-detect-plate "$OFFLINE_DETECT_PLATE"
     --sw-preproc "$SW_PREPROC"
     --det-resize-mode "$DET_RESIZE_MODE"
-    --plate-refine "$PLATE_REFINE")
+    --plate-refine "$PLATE_REFINE"
+    --clahe-enable "$CLAHE_ENABLE"
+    --clahe-compare "$CLAHE_COMPARE")
   if [[ -n "$OFFLINE_ROI" ]]; then
     CMD+=(--offline-roi "$OFFLINE_ROI")
   fi
