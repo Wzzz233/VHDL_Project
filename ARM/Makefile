@@ -36,9 +36,13 @@ decode-test: test_ocr_decode.c ocr_decode.c ocr_decode.h
 special-route-test: test_lpr_special_route.c lpr_special_route.h
 	$(HOST_CC) $(HOST_CFLAGS) -o test_lpr_special_route test_lpr_special_route.c
 
-test: decode-test special-route-test
+pose-decoder-test: test_pose_decoder.c
+	$(HOST_CC) $(HOST_CFLAGS) -o test_pose_decoder test_pose_decoder.c -lm
+
+test: decode-test special-route-test pose-decoder-test
 	./test_ocr_decode
 	./test_lpr_special_route
+	./test_pose_decoder
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
@@ -47,5 +51,6 @@ clean:
 	rm -f fpga_lpr_display
 	rm -f test_ocr_decode
 	rm -f test_lpr_special_route
+	rm -f test_pose_decoder
 	rm -f *.raw
 	rm -f Module.symvers modules.order *.mod.c *.o .*.cmd
