@@ -211,10 +211,6 @@ struct options {
     const char *ocr_crop_dump_dir;
     int green_firstchar_min_votes;
     float green_firstchar_min_share;
-    int clahe_enable;
-    int clahe_compare;
-    const char *clahe_dump_dir;
-    int clahe_dump_max;
     int offline_detect_plate;
     int pose_nc;
     bool swap16;
@@ -475,7 +471,6 @@ struct app_ctx {
     FILE *pred_log_fp;
     FILE *ocr_crop_index_fp;
     int ocr_crop_dumped;
-    int clahe_dump_count;
     pthread_mutex_t pred_log_lock;
     char labels[MAX_LABELS][MAX_LABEL_LEN];
     int label_count;
@@ -653,10 +648,6 @@ static void print_usage(const char *prog)
             "  --ocr-min-plate-h <n>   Skip OCR if plate box h < n (default: 24)\n"
             "  --ocr-min-sharpness <v> Skip OCR if Laplacian var < v (default: 20)\n"
             "  --ocr-min-occ-ratio <v> Re-crop once if OCR width occupancy < v (default: 0)\n"
-            "  --clahe-enable <0|1>    Enable CLAHE L-channel enhancement (default: 0)\n"
-            "  --clahe-compare <0|1>   A/B compare CLAHE vs original (default: 0)\n"
-            "  --clahe-dump-dir <p>    Dump original + CLAHE crop PPM pair (default: off)\n"
-            "  --clahe-dump-max <n>    Max dumped CLAHE pairs (default: 100)\n"
             "  --ocr-ctc-diag <0|1>    Print CTC decode diagnostics (default: 0)\n"
             "  --ocr-crop-dump-dir <p> Dump OCR crops+inputs to directory (default: off)\n"
             "  --ocr-crop-dump-max <n> Max dumped OCR samples (default: 20)\n"
@@ -730,10 +721,6 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"ocr-ctc-diag", required_argument, NULL, 33},
         {"ocr-crop-dump-dir", required_argument, NULL, 34},
         {"ocr-crop-dump-max", required_argument, NULL, 35},
-        {"clahe-enable", required_argument, NULL, 68},
-        {"clahe-compare", required_argument, NULL, 69},
-        {"clahe-dump-dir", required_argument, NULL, 70},
-        {"clahe-dump-max", required_argument, NULL, 71},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -784,10 +771,6 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->green_firstchar_model_path = NULL;
     opt->green_firstchar_min_votes = GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES;
     opt->green_firstchar_min_share = GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE;
-    opt->clahe_enable = 0;
-    opt->clahe_compare = 0;
-    opt->clahe_dump_dir = NULL;
-    opt->clahe_dump_max = 100;
     opt->offline_detect_plate = 1;
     opt->pose_nc = 0;
 
@@ -813,10 +796,6 @@ static int parse_options(int argc, char **argv, struct options *opt)
             break;
         case 58: opt->green_firstchar_min_votes = atoi(optarg); break;
         case 59: opt->green_firstchar_min_share = (float)atof(optarg); break;
-        case 68: opt->clahe_enable = atoi(optarg) ? 1 : 0; break;
-        case 69: opt->clahe_compare = atoi(optarg) ? 1 : 0; break;
-        case 70: opt->clahe_dump_dir = optarg; break;
-        case 71: opt->clahe_dump_max = atoi(optarg); break;
         case 50:
             if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
                 opt->quad_refiner_model_path = NULL;
@@ -3526,198 +3505,6 @@ static float laplacian_variance_rgb888(const uint8_t *rgb, int w, int h)
     }
 }
 
-/* ── CLAHE on L channel (RGB→HSL→CLAHE_L→HSL→RGB) ─────────────── */
-#define CLAHE_DEFAULT_TILE_SIZE 8
-#define CLAHE_DEFAULT_CLIP_LIMIT 2.0f
-#define CLAHE_HIST_BINS 256
-
-static void rgb_to_hsl(uint8_t r, uint8_t g, uint8_t b,
-                       float *h_out, float *s_out, float *l_out)
-{
-    float rf = r / 255.0f, gf = g / 255.0f, bf = b / 255.0f;
-    float mx = rf > gf ? (rf > bf ? rf : bf) : (gf > bf ? gf : bf);
-    float mn = rf < gf ? (rf < bf ? rf : bf) : (gf < bf ? gf : bf);
-    float d = mx - mn;
-    float l = (mx + mn) / 2.0f;
-    float h = 0.0f, s = 0.0f;
-    if (d > 1e-6f) {
-        s = l > 0.5f ? d / (2.0f - mx - mn) : d / (mx + mn);
-        if (mx == rf)
-            h = 60.0f * fmodf((gf - bf) / d, 6.0f);
-        else if (mx == gf)
-            h = 60.0f * ((bf - rf) / d + 2.0f);
-        else
-            h = 60.0f * ((rf - gf) / d + 4.0f);
-    }
-    if (h < 0.0f) h += 360.0f;
-    *h_out = h; *s_out = s; *l_out = l;
-}
-
-static float hsl_hue_to_rgb(float p, float q, float t)
-{
-    if (t < 0.0f) t += 1.0f;
-    if (t > 1.0f) t -= 1.0f;
-    if (t < 1.0f / 6.0f) return p + (q - p) * 6.0f * t;
-    if (t < 1.0f / 2.0f) return q;
-    if (t < 2.0f / 3.0f) return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
-    return p;
-}
-
-static void hsl_to_rgb(float h, float s, float l,
-                       uint8_t *r_out, uint8_t *g_out, uint8_t *b_out)
-{
-    float r, g, b;
-    if (s < 1e-6f) {
-        r = g = b = l;
-    } else {
-        float q = l < 0.5f ? l * (1.0f + s) : l + s - l * s;
-        float p = 2.0f * l - q;
-        float hk = h / 360.0f;
-        r = hsl_hue_to_rgb(p, q, hk + 1.0f / 3.0f);
-        g = hsl_hue_to_rgb(p, q, hk);
-        b = hsl_hue_to_rgb(p, q, hk - 1.0f / 3.0f);
-    }
-    *r_out = (uint8_t)(r * 255.0f + 0.5f);
-    *g_out = (uint8_t)(g * 255.0f + 0.5f);
-    *b_out = (uint8_t)(b * 255.0f + 0.5f);
-}
-
-static void clahe_l_channel(uint8_t *rgb, int w, int h,
-                            float clip_limit, int tile_size)
-{
-    int tiles_x, tiles_y, k, y, x;
-    uint8_t *l_buf = NULL;
-    int *hist = NULL;
-    uint8_t *map = NULL;
-
-    if (!rgb || w <= 0 || h <= 0) return;
-    if (tile_size < 2) tile_size = CLAHE_DEFAULT_TILE_SIZE;
-    if (clip_limit <= 0.0f) clip_limit = CLAHE_DEFAULT_CLIP_LIMIT;
-
-    tiles_x = (w + tile_size - 1) / tile_size;
-    tiles_y = (h + tile_size - 1) / tile_size;
-    if (tiles_x < 1) tiles_x = 1;
-    if (tiles_y < 1) tiles_y = 1;
-
-    /* Step 1: extract L channel */
-    size_t pix = (size_t)w * h;
-    l_buf = malloc(pix);
-    if (!l_buf) return;
-    for (y = 0; y < h; y++) {
-        for (x = 0; x < w; x++) {
-            const uint8_t *p = rgb + ((size_t)y * w + x) * 3U;
-            float hh, ss, ll;
-            rgb_to_hsl(p[0], p[1], p[2], &hh, &ss, &ll);
-            l_buf[(size_t)y * w + x] = (uint8_t)(ll * 255.0f + 0.5f);
-        }
-    }
-
-    /* Step 2-4: per-tile histogram + clip + CDF */
-    int ntiles = tiles_y * tiles_x;
-    int hist_sz = ntiles * CLAHE_HIST_BINS;
-    hist = calloc((size_t)hist_sz, sizeof(int));
-    map  = malloc((size_t)hist_sz);
-    if (!hist || !map) { free(l_buf); free(hist); free(map); return; }
-
-    for (y = 0; y < tiles_y; y++) {
-        int t_y0 = y * tile_size;
-        int t_y1 = t_y0 + tile_size;
-        if (t_y1 > h) t_y1 = h;
-        int t_h = t_y1 - t_y0;
-        for (x = 0; x < tiles_x; x++) {
-            int t_x0 = x * tile_size;
-            int t_x1 = t_x0 + tile_size;
-            if (t_x1 > w) t_x1 = w;
-            int t_w = t_x1 - t_x0;
-            int *hptr = hist + (y * tiles_x + x) * CLAHE_HIST_BINS;
-            int npix = t_h * t_w;
-            if (npix <= 0) npix = 1;
-
-            /* Build histogram */
-            int px, py;
-            for (py = 0; py < t_h; py++)
-                for (px = 0; px < t_w; px++)
-                    hptr[l_buf[(size_t)(t_y0 + py) * w + (t_x0 + px)]]++;
-
-            /* Clip */
-            int clip_thr = (int)(clip_limit * (float)npix / (float)CLAHE_HIST_BINS + 0.5f);
-            if (clip_thr < 1) clip_thr = 1;
-            int excess = 0;
-            for (k = 0; k < CLAHE_HIST_BINS; k++) {
-                if (hptr[k] > clip_thr) {
-                    excess += hptr[k] - clip_thr;
-                    hptr[k] = clip_thr;
-                }
-            }
-            int redist = excess / CLAHE_HIST_BINS;
-            if (redist > 0)
-                for (k = 0; k < CLAHE_HIST_BINS; k++)
-                    hptr[k] += redist;
-
-            /* CDF → map */
-            uint8_t *mptr = map + (y * tiles_x + x) * CLAHE_HIST_BINS;
-            int csum = 0;
-            float cdf_scale = 255.0f / (float)npix;
-            for (k = 0; k < CLAHE_HIST_BINS; k++) {
-                csum += hptr[k];
-                int val = (int)((float)csum * cdf_scale + 0.5f);
-                if (val < 0) val = 0;
-                if (val > 255) val = 255;
-                mptr[k] = (uint8_t)val;
-            }
-        }
-    }
-
-    /* Step 5: bilinear interpolation + Step 6: reconstruct RGB */
-    for (y = 0; y < h; y++) {
-        for (x = 0; x < w; x++) {
-            uint8_t lv = l_buf[(size_t)y * w + x];
-
-            float fx = (float)x / (float)tile_size - 0.5f;
-            float fy = (float)y / (float)tile_size - 0.5f;
-            int ix0 = (int)floorf(fx);
-            int iy0 = (int)floorf(fy);
-            int ix1 = ix0 + 1;
-            int iy1 = iy0 + 1;
-            float dx = fx - (float)ix0;
-            float dy = fy - (float)iy0;
-            if (dx < 0.0f) dx = 0.0f;
-            if (dx > 1.0f) dx = 1.0f;
-            if (dy < 0.0f) dy = 0.0f;
-            if (dy > 1.0f) dy = 1.0f;
-
-            int tlu, tru, tbl, tbr;
-            if (ix0 >= 0 && iy0 >= 0 && ix0 < tiles_x && iy0 < tiles_y)
-                tlu = map[(iy0 * tiles_x + ix0) * CLAHE_HIST_BINS + lv]; else tlu = lv;
-            if (ix1 >= 0 && iy0 >= 0 && ix1 < tiles_x && iy0 < tiles_y)
-                tru = map[(iy0 * tiles_x + ix1) * CLAHE_HIST_BINS + lv]; else tru = lv;
-            if (ix0 >= 0 && iy1 >= 0 && ix0 < tiles_x && iy1 < tiles_y)
-                tbl = map[(iy1 * tiles_x + ix0) * CLAHE_HIST_BINS + lv]; else tbl = lv;
-            if (ix1 >= 0 && iy1 >= 0 && ix1 < tiles_x && iy1 < tiles_y)
-                tbr = map[(iy1 * tiles_x + ix1) * CLAHE_HIST_BINS + lv]; else tbr = lv;
-
-            float top = (float)tlu * (1.0f - dx) + (float)tru * dx;
-            float bot = (float)tbl * (1.0f - dx) + (float)tbr * dx;
-            float new_l = top * (1.0f - dy) + bot * dy;
-            if (new_l < 0.0f) new_l = 0.0f;
-            if (new_l > 255.0f) new_l = 255.0f;
-
-            const uint8_t *p = rgb + ((size_t)y * w + x) * 3U;
-            float hh, ss, old_l;
-            rgb_to_hsl(p[0], p[1], p[2], &hh, &ss, &old_l);
-            (void)old_l;
-            uint8_t nr, ng, nb;
-            hsl_to_rgb(hh, ss, new_l / 255.0f, &nr, &ng, &nb);
-            rgb[((size_t)y * w + x) * 3U + 0] = nr;
-            rgb[((size_t)y * w + x) * 3U + 1] = ng;
-            rgb[((size_t)y * w + x) * 3U + 2] = nb;
-        }
-    }
-
-    free(l_buf);
-    free(hist);
-    free(map);
-}
 
 static void ocr_preprocess_rgb888(uint8_t *rgb, int w, int h, int mode)
 {
@@ -6809,10 +6596,6 @@ static int run_offline_once(struct app_ctx *ctx)
             pd.crop_box.x1, pd.crop_box.y1, pd.crop_box.x2, pd.crop_box.y2,
             box_iou(&pd.box, &pd.crop_box));
 
-    /* ── CLAHE L-channel enhancement ── */
-    if (ctx->opt.clahe_enable || ctx->opt.clahe_compare)
-        clahe_l_channel(plate_crop, crop_w, crop_h, 2.0f, 8);
-
     if ((pd.box.y2 - pd.box.y1 + 1) < ctx->opt.ocr_min_plate_h) {
         pd.ocr_text[0] = '\0';
         pd.ocr_conf = 0.0f;
@@ -7092,16 +6875,11 @@ static void *infer_thread_main(void *arg)
         ped_in = malloc((size_t)ctx->ped_model.in_w * ctx->ped_model.in_h * 3U);
     uint8_t *plate_in = malloc((size_t)ctx->plate_model.in_w * ctx->plate_model.in_h * 3U);
     uint8_t *plate_crop = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
-    uint8_t *plate_crop_noclahe = NULL;
-    if (ctx->opt.clahe_compare)
-        plate_crop_noclahe = malloc((size_t)ctx->frame_width * ctx->frame_height * 3U);
     firstchar_crop = malloc((size_t)FIRSTCHAR_WARP_WIDTH * (size_t)FIRSTCHAR_WARP_HEIGHT * 3U);
     if (!raw_local || !rgb_full || !rgb_detect || !a_map || !algo_rgb ||
-        (ctx->ped_model.ctx && !ped_in) || !plate_in || !plate_crop || !firstchar_crop ||
-        (ctx->opt.clahe_compare && !plate_crop_noclahe)) {
+        (ctx->ped_model.ctx && !ped_in) || !plate_in || !plate_crop || !firstchar_crop) {
         free(raw_local); free(rgb_full); free(rgb_detect); free(a_map); free(algo_rgb);
         free(ped_in); free(plate_in); free(plate_crop); free(firstchar_crop);
-        free(plate_crop_noclahe);
         return NULL;
     }
 
@@ -7362,14 +7140,6 @@ static void *infer_thread_main(void *arg)
                     pd.crop_box.x1, pd.crop_box.y1, pd.crop_box.x2, pd.crop_box.y2,
                     box_iou(&pd.box, &pd.crop_box));
 
-            /* ── CLAHE L-channel enhancement ── */
-            if (ctx->opt.clahe_enable || ctx->opt.clahe_compare) {
-                if (ctx->opt.clahe_compare)
-                    memcpy(plate_crop_noclahe, plate_crop, (size_t)crop_w * crop_h * 3U);
-                if (ctx->opt.clahe_enable || ctx->opt.clahe_compare)
-                    clahe_l_channel(plate_crop, crop_w, crop_h, 2.0f, 8);
-            }
-
             plate_h = pd.box.y2 - pd.box.y1 + 1;
             if (ctx->ocr_crop_index_fp &&
                 ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max)
@@ -7410,47 +7180,6 @@ static void *infer_thread_main(void *arg)
                         pd.ocr_in_occ_ratio = odiag.in_occ_ratio;
                         ocr_run_count++;
 
-                        /* ── CLAHE compare mode: run OCR on original crop too ── */
-#ifdef CLAHE_DEBUG
-                        if (ctx->opt.clahe_compare && plate_crop_noclahe) {
-                            char orig_text[64];
-                            float orig_conf = 0.0f;
-                            struct ocr_diag orig_diag;
-                            uint8_t *cmp_buf = malloc((size_t)crop_w * crop_h * 3U);
-                            if (cmp_buf) {
-                                memcpy(cmp_buf, plate_crop_noclahe, (size_t)crop_w * crop_h * 3U);
-                                if (run_model_ocr(ctx, cmp_buf, crop_w, crop_h, pd.color,
-                                                  pd.det_cls, ctx->opt.pose_nc,
-                                                  orig_text, sizeof(orig_text), &orig_conf,
-                                                  &orig_diag, NULL, NULL) == 0) {
-                                    int diff = (strcmp(pd.ocr_text, orig_text) != 0);
-                                    fprintf(stderr,
-                                            "[clahe-cmp] frame=%" PRIu64 " orig=\"%s\" conf=%.2f clahe=\"%s\" conf=%.2f %s\n",
-                                            seq, orig_text, orig_conf, pd.ocr_text, pd.ocr_conf,
-                                            diff ? "\xe2\x98\x85" : "");
-
-                                    /* ── Dump PPM pair ── */
-                                    if (ctx->opt.clahe_dump_dir &&
-                                        ctx->clahe_dump_count < ctx->opt.clahe_dump_max) {
-                                        char path[512];
-                                        int idx = ctx->clahe_dump_count;
-                                        mkdir_p_simple(ctx->opt.clahe_dump_dir);
-                                        snprintf(path, sizeof(path), "%s/frame_%05" PRIu64 "_%d_orig.ppm",
-                                                 ctx->opt.clahe_dump_dir, seq, idx);
-                                        write_ppm_rgb888(path, plate_crop_noclahe, crop_w, crop_h);
-                                        snprintf(path, sizeof(path), "%s/frame_%05" PRIu64 "_%d_clahe.ppm",
-                                                 ctx->opt.clahe_dump_dir, seq, idx);
-                                        write_ppm_rgb888(path, plate_crop, crop_w, crop_h);
-                                        ctx->clahe_dump_count++;
-                                        fprintf(stderr,
-                                                "[clahe-dump] frame=%" PRIu64 " idx=%d w=%d h=%d dir=%s\n",
-                                                seq, idx, crop_w, crop_h, ctx->opt.clahe_dump_dir);
-                                    }
-                                }
-                                free(cmp_buf);
-                            }
-                        }
-#endif /* CLAHE_DEBUG */
                     }
                 }
             }
@@ -7538,7 +7267,6 @@ static void *infer_thread_main(void *arg)
 
     free(raw_local); free(rgb_full); free(rgb_detect); free(a_map); free(algo_rgb);
     free(ped_in); free(plate_in); free(plate_crop); free(firstchar_crop);
-    free(plate_crop_noclahe);
     return NULL;
 }
 

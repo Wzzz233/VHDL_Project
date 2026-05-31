@@ -68,7 +68,7 @@ static int decode_pose_inline(const float *data, int c_stride, int n_stride,
                               int total_c, int n_points,
                               float conf_thr,
                               struct det_box *out, int max_out,
-                              int pose_nc, int nms_class_sep)
+                              int pose_nc, int nms_class_sep, bool c_major)
 {
     struct tensor_cn_view view;
     int count = 0;
@@ -77,7 +77,7 @@ static int decode_pose_inline(const float *data, int c_stride, int n_stride,
     view.buf = data;
     view.c = total_c;
     view.n = n_points;
-    view.c_major = (c_stride > 1); /* if c_stride != 1 then c-major */
+    view.c_major = c_major;
 
     for (i = 0; i < n_points && count < max_out; i++) {
         float cx = tensor_cn_read(&view, 0, i);
