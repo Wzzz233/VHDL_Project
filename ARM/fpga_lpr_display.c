@@ -5994,12 +5994,27 @@ static const char *plate_color_str(enum plate_color c)
     return "UNK";
 }
 
+static enum plate_type det_cls_to_plate_type(int det_cls)
+{
+    switch (det_cls) {
+    case 0: return PLATE_TYPE_COMMON_BLUE;
+    case 1: return PLATE_TYPE_COMMON_GREEN;
+    case 2: return PLATE_TYPE_YELLOW;
+    case 3: return PLATE_TYPE_POLICE;
+    case 4: return PLATE_TYPE_EMBASSY_CONSULATE;
+    default: return PLATE_TYPE_UNKNOWN;
+    }
+}
+
 static enum plate_type classify_plate_type(enum plate_color color, const char *text)
 {
     const char *utf8_trailer = "\xE6\x8C\x82";
     const char *utf8_embassy = "\xE4\xBD\xBF";
     const char *utf8_consulate = "\xE9\xA2\x86";
+    const char *utf8_police = "\xE8\xAD\xA6";
 
+    if (text && strstr(text, utf8_police))
+        return PLATE_TYPE_POLICE;
     if (text && strstr(text, utf8_trailer))
         return PLATE_TYPE_TRAILER;
     if (text && (strstr(text, utf8_embassy) || strstr(text, utf8_consulate)))
@@ -6019,6 +6034,7 @@ static const char *plate_type_str(enum plate_type t)
     case PLATE_TYPE_COMMON_BLUE: return "common_blue";
     case PLATE_TYPE_COMMON_GREEN: return "common_green";
     case PLATE_TYPE_YELLOW: return "yellow";
+    case PLATE_TYPE_POLICE: return "police";
     case PLATE_TYPE_TRAILER: return "trailer";
     case PLATE_TYPE_EMBASSY_CONSULATE: return "embassy_consulate";
     default: return "unknown";
@@ -6648,7 +6664,10 @@ static int run_offline_once(struct app_ctx *ctx)
                                         &pd.box, 0, pd.ocr_text, sizeof(pd.ocr_text));
         }
     }
-    pd.type = classify_plate_type(pd.color, pd.ocr_text);
+    if (ctx->opt.pose_nc >= 5 && pd.det_cls >= 0 && pd.det_cls <= 4)
+        pd.type = det_cls_to_plate_type(pd.det_cls);
+    else
+        pd.type = classify_plate_type(pd.color, pd.ocr_text);
 
     fprintf(stderr,
             "[offline] image=%s size=%dx%d box=[%d,%d,%d,%d] crop=[%d,%d,%d,%d]\n",
@@ -6854,6 +6873,7 @@ static void build_overlay_ascii_text(const struct plate_det *pd, char *out, size
         if (pd->type == PLATE_TYPE_COMMON_BLUE) fb = "BLUE";
         else if (pd->type == PLATE_TYPE_COMMON_GREEN) fb = "GREEN";
         else if (pd->type == PLATE_TYPE_YELLOW) fb = "YELLOW";
+        else if (pd->type == PLATE_TYPE_POLICE) fb = "POLICE";
         else if (pd->type == PLATE_TYPE_TRAILER) fb = "TRAILER";
         else if (pd->type == PLATE_TYPE_EMBASSY_CONSULATE) fb = "EMB";
         while (*fb && i + 1 < out_len)
@@ -7217,7 +7237,10 @@ static void *infer_thread_main(void *arg)
             }
             if (pd.ocr_text[0] != '\0')
                 ocr_nonempty_count++;
-            pd.type = classify_plate_type(pd.color, pd.ocr_text);
+            if (ctx->opt.pose_nc >= 5 && pd.det_cls >= 0 && pd.det_cls <= 4)
+                pd.type = det_cls_to_plate_type(pd.det_cls);
+            else
+                pd.type = classify_plate_type(pd.color, pd.ocr_text);
             build_overlay_ascii_text(&pd, overlay_txt, sizeof(overlay_txt));
             if (overlay_txt[0] != '\0')
                 overlay_nonempty_count++;
