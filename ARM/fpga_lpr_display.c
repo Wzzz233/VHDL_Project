@@ -698,6 +698,13 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"green-firstchar-model", required_argument, NULL, 57},
         {"green-firstchar-min-votes", required_argument, NULL, 58},
         {"green-firstchar-min-share", required_argument, NULL, 59},
+        {"police-firstchar-model", required_argument, NULL, 60},
+        {"police-firstchar-min-votes", required_argument, NULL, 61},
+        {"police-firstchar-min-share", required_argument, NULL, 62},
+        {"ocr-police-model", required_argument, NULL, 63},
+        {"ocr-police-keys", required_argument, NULL, 64},
+        {"ocr-embassy-model", required_argument, NULL, 65},
+        {"ocr-embassy-keys", required_argument, NULL, 66},
         {"quad-refiner-model", required_argument, NULL, 50},
         {"labels", required_argument, NULL, 7},
         {"pred-log", required_argument, NULL, 8},
@@ -817,6 +824,18 @@ static int parse_options(int argc, char **argv, struct options *opt)
             break;
         case 58: opt->green_firstchar_min_votes = atoi(optarg); break;
         case 59: opt->green_firstchar_min_share = (float)atof(optarg); break;
+        case 60:
+            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
+                opt->police_firstchar_model_path = NULL;
+            else
+                opt->police_firstchar_model_path = optarg;
+            break;
+        case 61: opt->police_firstchar_min_votes = atoi(optarg); break;
+        case 62: opt->police_firstchar_min_share = (float)atof(optarg); break;
+        case 63: opt->ocr_police_model_path = optarg; break;
+        case 64: opt->ocr_police_keys_path = optarg; break;
+        case 65: opt->ocr_embassy_model_path = optarg; break;
+        case 66: opt->ocr_embassy_keys_path = optarg; break;
         case 50:
             if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
                 opt->quad_refiner_model_path = NULL;
