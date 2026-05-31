@@ -166,6 +166,10 @@ struct options {
     const char *ocr_yellow_keys_path;
     const char *ocr_special_model_path;
     const char *ocr_special_keys_path;
+    const char *ocr_police_model_path;
+    const char *ocr_police_keys_path;
+    const char *ocr_embassy_model_path;
+    const char *ocr_embassy_keys_path;
     const char *ocr_keys_path;
     const char *green_firstchar_model_path;
     const char *quad_refiner_model_path;
@@ -212,6 +216,8 @@ struct options {
     const char *ocr_crop_dump_dir;
     int green_firstchar_min_votes;
     float green_firstchar_min_share;
+    int police_firstchar_min_votes;
+    float police_firstchar_min_share;
     int offline_detect_plate;
     int pose_nc;
     bool swap16;
