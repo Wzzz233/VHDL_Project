@@ -454,7 +454,10 @@ struct app_ctx {
     struct ocr_model ocr_green_model;
     struct ocr_model ocr_yellow_model;
     struct ocr_model ocr_special_model;
+    struct ocr_model ocr_police_model;
+    struct ocr_model ocr_embassy_model;
     struct firstchar_model green_firstchar_model;
+    struct firstchar_model police_firstchar_model;
     struct quad_refiner_model quad_refiner_model;
     char ocr_keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
     int ocr_key_count;
