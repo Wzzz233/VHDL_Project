@@ -555,8 +555,6 @@ static const struct ocr_model *select_ocr_model_by_det_cls(
 static const struct ocr_model *select_ocr_model(const struct app_ctx *ctx,
                                                  enum plate_color fallback_color,
                                                  const char **expert_name);
-static bool build_tensor_cn_view(const rknn_tensor_attr *a, const float *buf,
-                                 struct tensor_cn_view *tv);
 
 struct tensor_cn_view {
     const float *buf;
@@ -564,6 +562,9 @@ struct tensor_cn_view {
     int n;
     bool c_major;
 };
+
+static bool build_tensor_cn_view(const rknn_tensor_attr *a, const float *buf,
+                                 struct tensor_cn_view *tv);
 
 static void copy_cstr_trunc(char *dst, size_t dst_len, const char *src);
 static int utf8_token_len(const char *s);
