@@ -363,6 +363,12 @@ static int fpga_dma_perform_transfer_irq(struct fpga_dma_dev *dev,
         return -EINVAL;
     }
 
+    /* Drain any stale completions from previous transfers, then reset.
+       Must happen BEFORE triggering DMA so a fast real MSI is not lost. */
+    while (try_wait_for_completion(&dev->dma_done))
+        ;
+    reinit_completion(&dev->dma_done);
+
     /* Fixed write order: BAR1+0x120 -> BAR1+0x110 -> BAR1+0x100. */
     fpga_dma_write_reg(dev, BAR1_DMA_H_ADDR, upper_32_bits(dma_handle));
     fpga_dma_write_reg(dev, BAR1_DMA_L_ADDR, lower_32_bits(dma_handle));
@@ -370,11 +376,6 @@ static int fpga_dma_perform_transfer_irq(struct fpga_dma_dev *dev,
               (total_dwords & DMA_CMD_FRAME_DWORDS_MASK);
     fpga_dma_write_reg(dev, BAR1_DMA_CMD_REG, cmd_reg);
     fpga_dma_flush_posted_writes(dev);
-
-    /* Drain any spurious IRQ completions, then reinit for this transfer */
-    while (try_wait_for_completion(&dev->dma_done))
-        ;
-    reinit_completion(&dev->dma_done);
 
     wait_ret = wait_for_completion_timeout(&dev->dma_done, msecs_to_jiffies(dma_timeout_ms));
     if (!wait_ret) {
