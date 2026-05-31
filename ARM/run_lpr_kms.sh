@@ -334,14 +334,14 @@ if [[ "$OFFLINE_MODE" == "0" ]]; then
     --red-ratio-thr "$RED_RATIO_THR"
     --stopline-ratio "$STOPLINE_RATIO"
     --det-resize-mode "$DET_RESIZE_MODE"
-    --plate-refine "$PLATE_REFINE"
+    --plate-refine "$PLATE_REFINE")
 else
   CMD+=(
     --offline-image "$OFFLINE_INPUT"
     --offline-detect-plate "$OFFLINE_DETECT_PLATE"
     --sw-preproc "$SW_PREPROC"
     --det-resize-mode "$DET_RESIZE_MODE"
-    --plate-refine "$PLATE_REFINE"
+    --plate-refine "$PLATE_REFINE")
   if [[ -n "$OFFLINE_ROI" ]]; then
     CMD+=(--offline-roi "$OFFLINE_ROI")
   fi
