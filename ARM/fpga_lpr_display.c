@@ -7593,6 +7593,20 @@ int main(int argc, char **argv)
         if (ctx.opt.ocr_special_keys_path && ctx.opt.ocr_special_keys_path[0])
             load_ocr_model_keys(&ctx.ocr_special_model, ctx.opt.ocr_special_keys_path);
     }
+    if (ctx.opt.ocr_police_model_path && ctx.opt.ocr_police_model_path[0] &&
+        strcmp(ctx.opt.ocr_police_model_path, ctx.opt.ocr_special_model_path) != 0) {
+        if (rknn_ocr_model_load(&ctx.ocr_police_model, "ocr_police", ctx.opt.ocr_police_model_path) < 0)
+            goto out;
+        if (ctx.opt.ocr_police_keys_path && ctx.opt.ocr_police_keys_path[0])
+            load_ocr_model_keys(&ctx.ocr_police_model, ctx.opt.ocr_police_keys_path);
+    }
+    if (ctx.opt.ocr_embassy_model_path && ctx.opt.ocr_embassy_model_path[0] &&
+        strcmp(ctx.opt.ocr_embassy_model_path, ctx.opt.ocr_special_model_path) != 0) {
+        if (rknn_ocr_model_load(&ctx.ocr_embassy_model, "ocr_embassy", ctx.opt.ocr_embassy_model_path) < 0)
+            goto out;
+        if (ctx.opt.ocr_embassy_keys_path && ctx.opt.ocr_embassy_keys_path[0])
+            load_ocr_model_keys(&ctx.ocr_embassy_model, ctx.opt.ocr_embassy_keys_path);
+    }
     if (!ocr_model_input_compatible(&ctx.ocr_model, &ctx.ocr_green_model)) {
         fprintf(stderr,
                 "[ocr] FATAL blue/green input shape mismatch: blue=%ux%ux%u green=%ux%ux%u\n",
@@ -7627,6 +7641,16 @@ int main(int argc, char **argv)
                 ctx.opt.green_firstchar_model_path,
                 ctx.opt.green_firstchar_min_votes,
                 ctx.opt.green_firstchar_min_share);
+    }
+    if (rknn_firstchar_model_load(&ctx.police_firstchar_model, "police_firstchar",
+                                  ctx.opt.police_firstchar_model_path) < 0)
+        goto out;
+    if (ctx.police_firstchar_model.ctx) {
+        fprintf(stderr,
+                "[ocr] police firstchar sidecar enabled: model=%s min_votes=%d min_share=%.2f\n",
+                ctx.opt.police_firstchar_model_path,
+                ctx.opt.police_firstchar_min_votes,
+                ctx.opt.police_firstchar_min_share);
     }
     if (rknn_quad_refiner_model_load(&ctx.quad_refiner_model, "quad_refiner", ctx.opt.quad_refiner_model_path) < 0)
         goto out;
