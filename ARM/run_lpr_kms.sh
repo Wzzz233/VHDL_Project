@@ -16,6 +16,13 @@ OCR_KEYS=""
 GREEN_FIRSTCHAR_MODEL=""
 GREEN_FIRSTCHAR_MIN_VOTES="5"
 GREEN_FIRSTCHAR_MIN_SHARE="0.60"
+OCR_POLICE_MODEL=""
+OCR_POLICE_KEYS=""
+OCR_EMBASSY_MODEL=""
+OCR_EMBASSY_KEYS=""
+POLICE_FIRSTCHAR_MODEL=""
+POLICE_FIRSTCHAR_MIN_VOTES="1"
+POLICE_FIRSTCHAR_MIN_SHARE="0.00"
 QUAD_REFINER_MODEL=""
 LABELS=""
 PRED_LOG=""
@@ -143,6 +150,13 @@ while [[ $# -gt 0 ]]; do
     --green-firstchar-model) GREEN_FIRSTCHAR_MODEL="$2"; shift 2 ;;
     --green-firstchar-min-votes) GREEN_FIRSTCHAR_MIN_VOTES="$2"; shift 2 ;;
     --green-firstchar-min-share) GREEN_FIRSTCHAR_MIN_SHARE="$2"; shift 2 ;;
+    --ocr-police-model) OCR_POLICE_MODEL="$2"; shift 2 ;;
+    --ocr-police-keys) OCR_POLICE_KEYS="$2"; shift 2 ;;
+    --ocr-embassy-model) OCR_EMBASSY_MODEL="$2"; shift 2 ;;
+    --ocr-embassy-keys) OCR_EMBASSY_KEYS="$2"; shift 2 ;;
+    --police-firstchar-model) POLICE_FIRSTCHAR_MODEL="$2"; shift 2 ;;
+    --police-firstchar-min-votes) POLICE_FIRSTCHAR_MIN_VOTES="$2"; shift 2 ;;
+    --police-firstchar-min-share) POLICE_FIRSTCHAR_MIN_SHARE="$2"; shift 2 ;;
     --quad-refiner-model) QUAD_REFINER_MODEL="$2"; shift 2 ;;
     --labels) LABELS="$2"; shift 2 ;;
     --pred-log) PRED_LOG="$2"; shift 2 ;;
@@ -279,6 +293,8 @@ CMD=(./fpga_lpr_display
   --ocr-green-model "$OCR_GREEN_MODEL"
   --ocr-yellow-model "$OCR_YELLOW_MODEL"
   --ocr-special-model "$OCR_SPECIAL_MODEL"
+  --ocr-police-model "$OCR_POLICE_MODEL"
+  --ocr-embassy-model "$OCR_EMBASSY_MODEL"
   --ocr-keys "$OCR_KEYS"
   --min-plate-conf "$MIN_PLATE_CONF"
   --plate-detector-type "$PLATE_DETECTOR_TYPE"
@@ -303,11 +319,23 @@ fi
 if [[ -n "$OCR_SPECIAL_KEYS" ]]; then
   CMD+=(--ocr-special-keys "$OCR_SPECIAL_KEYS")
 fi
+if [[ -n "$OCR_POLICE_KEYS" ]]; then
+  CMD+=(--ocr-police-keys "$OCR_POLICE_KEYS")
+fi
+if [[ -n "$OCR_EMBASSY_KEYS" ]]; then
+  CMD+=(--ocr-embassy-keys "$OCR_EMBASSY_KEYS")
+fi
 if [[ -n "$GREEN_FIRSTCHAR_MODEL" && "$GREEN_FIRSTCHAR_MODEL" != "off" ]]; then
   CMD+=(
     --green-firstchar-model "$GREEN_FIRSTCHAR_MODEL"
     --green-firstchar-min-votes "$GREEN_FIRSTCHAR_MIN_VOTES"
     --green-firstchar-min-share "$GREEN_FIRSTCHAR_MIN_SHARE")
+fi
+if [[ -n "$POLICE_FIRSTCHAR_MODEL" && "$POLICE_FIRSTCHAR_MODEL" != "off" ]]; then
+  CMD+=(
+    --police-firstchar-model "$POLICE_FIRSTCHAR_MODEL"
+    --police-firstchar-min-votes "$POLICE_FIRSTCHAR_MIN_VOTES"
+    --police-firstchar-min-share "$POLICE_FIRSTCHAR_MIN_SHARE")
 fi
 
 if [[ "$OFFLINE_MODE" == "0" ]]; then
