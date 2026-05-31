@@ -549,6 +549,9 @@ static void rknn_firstchar_model_release(struct firstchar_model *m);
 static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
                                         const struct det_box *box, uint64_t frame_seq,
                                         char *text, size_t text_len);
+static bool run_police_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
+                                          const struct det_box *box, uint64_t frame_seq,
+                                          char *text, size_t text_len);
 static int detect_pose_nc_from_model(const struct yolo_model *m);
 static const char *det_cls_route_name(int det_cls, int pose_nc);
 static const char *det_cls_to_expert_name(int det_cls, int pose_nc);
@@ -2101,6 +2104,79 @@ static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_r
         fprintf(stderr,
                 "[green-fc] frame=%" PRIu64 " replace raw=%s fused=%s sidecar=%s votes=%d/%d share=%.2f last=%s conf=%.3f\n",
                 frame_seq, old_text, text, stable_tok, best_votes, total_votes, share, pred_tok, pred_conf);
+        return true;
+    }
+    return false;
+}
+
+/* Police firstchar sidecar — analogous to green, using police-specific model and params. */
+static bool run_police_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
+                                          const struct det_box *box, uint64_t frame_seq,
+                                          char *text, size_t text_len)
+{
+    struct firstchar_model *const m = &ctx->police_firstchar_model;
+    const int min_votes = ctx->opt.police_firstchar_min_votes;
+    const float min_share = ctx->opt.police_firstchar_min_share;
+    const char *const tag = "police-fc";
+    struct ocr_track *tr;
+    char pred_tok[MAX_UTF8_TOKEN_BYTES], stable_tok[MAX_UTF8_TOKEN_BYTES], old_text[64];
+    float pred_conf = 0.0f;
+    int tr_idx, i, k, best_idx = -1, best_votes = 0, total_votes = 0, cand_n = 0;
+    float best_score = -1.0f, share;
+    char cand_tok[FIRSTCHAR_TRACK_HIST][MAX_UTF8_TOKEN_BYTES];
+    float cand_score[FIRSTCHAR_TRACK_HIST];
+    int cand_votes[FIRSTCHAR_TRACK_HIST];
+
+    if (!ctx || !m->ctx || !fc_rgb || !box || !text || text[0] == '\0')
+        return false;
+    if (!run_firstchar_model(m, fc_rgb, fc_w, fc_h, pred_tok, sizeof(pred_tok), &pred_conf))
+        return false;
+
+    tr_idx = find_or_create_ocr_track(ctx, box);
+    if (tr_idx < 0) return false;
+    tr = &ctx->ocr_tracks[tr_idx];
+    tr->used = true; tr->ttl = 10; tr->last_seq = frame_seq; tr->box = *box;
+
+    copy_cstr_trunc(tr->fc_tok[tr->fc_next], sizeof(tr->fc_tok[tr->fc_next]), pred_tok);
+    tr->fc_conf[tr->fc_next] = fmaxf(0.0f, fminf(1.0f, pred_conf));
+    tr->fc_next = (tr->fc_next + 1) % FIRSTCHAR_TRACK_HIST;
+    if (tr->fc_count < FIRSTCHAR_TRACK_HIST) tr->fc_count++;
+
+    memset(cand_score, 0, sizeof(cand_score));
+    memset(cand_votes, 0, sizeof(cand_votes));
+    for (k = 0; k < tr->fc_count; k++) {
+        int pos = (tr->fc_next - 1 - k + FIRSTCHAR_TRACK_HIST) % FIRSTCHAR_TRACK_HIST;
+        float recency = 1.0f - 0.06f * (float)k;
+        if (recency < 0.58f) recency = 0.58f;
+        if (tr->fc_tok[pos][0] == '\0') continue;
+        total_votes++;
+        for (i = 0; i < cand_n; i++)
+            if (strcmp(cand_tok[i], tr->fc_tok[pos]) == 0) break;
+        if (i == cand_n && cand_n < FIRSTCHAR_TRACK_HIST) {
+            copy_cstr_trunc(cand_tok[cand_n], sizeof(cand_tok[cand_n]), tr->fc_tok[pos]);
+            cand_n++;
+        }
+        if (i < cand_n) { cand_votes[i]++; cand_score[i] += tr->fc_conf[pos] * recency; }
+    }
+    for (i = 0; i < cand_n; i++)
+        if (cand_votes[i] > best_votes || (cand_votes[i] == best_votes && cand_score[i] > best_score))
+            { best_idx = i; best_votes = cand_votes[i]; best_score = cand_score[i]; }
+    if (best_idx < 0 || total_votes <= 0) return false;
+
+    share = (float)best_votes / (float)total_votes;
+    copy_cstr_trunc(stable_tok, sizeof(stable_tok), cand_tok[best_idx]);
+    if (best_votes < min_votes || share < min_share) {
+        fprintf(stderr,
+                "[%s] frame=%" PRIu64 " hold pred=%s conf=%.3f top=%s votes=%d/%d share=%.2f text=%s\n",
+                tag, frame_seq, pred_tok, pred_conf, stable_tok, best_votes, total_votes, share, text);
+        return false;
+    }
+    copy_cstr_trunc(old_text, sizeof(old_text), text);
+    if (!replace_first_utf8_token(text, text_len, stable_tok)) return false;
+    if (strcmp(old_text, text) != 0) {
+        fprintf(stderr,
+                "[%s] frame=%" PRIu64 " replace raw=%s fused=%s sidecar=%s votes=%d/%d share=%.2f last=%s conf=%.3f\n",
+                tag, frame_seq, old_text, text, stable_tok, best_votes, total_votes, share, pred_tok, pred_conf);
         return true;
     }
     return false;
@@ -6693,6 +6769,11 @@ static int run_offline_once(struct app_ctx *ctx)
             run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
                                         &pd.box, 0, pd.ocr_text, sizeof(pd.ocr_text));
         }
+        if (ctx->opt.pose_nc >= 5 && pd.det_cls == 3 &&
+            ctx->police_firstchar_model.ctx) {
+            run_police_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
+                                          &pd.box, 0, pd.ocr_text, sizeof(pd.ocr_text));
+        }
     }
     if (ctx->opt.pose_nc >= 5 && pd.det_cls >= 0 && pd.det_cls <= 4)
         pd.type = det_cls_to_plate_type(pd.det_cls);
@@ -7263,6 +7344,11 @@ static void *infer_thread_main(void *arg)
                 if (green_fc_allowed) {
                     run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
                                                 &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text));
+                }
+                if (ctx->opt.pose_nc >= 5 && pd.det_cls == 3 &&
+                    ctx->police_firstchar_model.ctx) {
+                    run_police_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
+                                                  &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text));
                 }
             }
             if (pd.ocr_text[0] != '\0')
