@@ -2240,9 +2240,13 @@ static const struct ocr_model *select_ocr_model_by_det_cls(
             return &ctx->ocr_model;
         case 3:
             if (expert_name) *expert_name = "police";
+            if (ctx->ocr_police_model.ctx)
+                return &ctx->ocr_police_model;
             return &ctx->ocr_special_model;
         case 4:
             if (expert_name) *expert_name = "embassy";
+            if (ctx->ocr_embassy_model.ctx)
+                return &ctx->ocr_embassy_model;
             return &ctx->ocr_special_model;
         default:
             break;
