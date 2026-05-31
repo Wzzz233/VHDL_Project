@@ -57,7 +57,8 @@
 /* Maximum DMA transfer size per chunk in DWORDs.
  * cmd_reg[9:0] encodes (length - 1); 0x3FF encodes 1024 DW.
  * The RTL uses 10-bit length where value 0 represents 1024 DW. */
-#define DMA_MAX_LEN_DWORDS   1024
+#define DMA_MAX_LEN_DWORDS   1024   /* Hardware max (10-bit len-1 encoding). */
+                                     /* Module param defaults to 1023 for legacy RTL. */
 #define DMA_MAX_LEN_BYTES    (DMA_MAX_LEN_DWORDS * 4)
 
 /* IOCTL magic number */

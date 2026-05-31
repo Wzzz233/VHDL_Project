@@ -79,7 +79,8 @@ MODULE_PARM_DESC(dma_ring_buffers, "Number of DMA frame ring buffers (1..8)");
 struct fpga_dma_dev {
     struct pci_dev *pdev;
     struct cdev cdev;
-    struct device *dev;
+    struct device *dev;      /* PCI device (&pdev->dev) */
+    struct device *cls_dev;  /* class device from device_create */
 
     /* BAR mappings */
     void __iomem *bar0;  /* 64KB for PIO/data readback */
@@ -177,16 +178,6 @@ static void fpga_dma_free_ring_buffers(struct fpga_dma_dev *dev)
         dev->dma_handles[i] = (dma_addr_t)0;
     }
     dev->dma_buf_count = 0;
-}
-
-/**
- * fpga_dma_read_reg - Read a 32-bit register from BAR1
- */
-static u32 __maybe_unused fpga_dma_read_reg(struct fpga_dma_dev *dev, u32 offset)
-{
-    /* BAR1 is Write-Only in current FPGA RTL. Reading causes Bus Error. */
-    /* return ioread32(dev->bar1 + offset); */
-    return 0;
 }
 
 /**
@@ -297,8 +288,18 @@ static int fpga_dma_perform_transfer_polling(struct fpga_dma_dev *dev,
         fpga_dma_flush_posted_writes(dev);
 
         deadline = jiffies + msecs_to_jiffies(dma_timeout_ms);
+        poll_count = 0;
         while ((READ_ONCE(*chunk_tail0) == tail_sentinel0) ||
                (chunk_tail1 && (READ_ONCE(*chunk_tail1) == tail_sentinel1))) {
+            /* Secondary timeout guard: if sentinel values collided with
+               actual DMA data the loop would never observe a change.
+               Bail after an impossibly high iteration count. */
+            if (++poll_count > 50000000) {
+                dev_err(dev->dev,
+                        "Chunk %d stuck (sentinel collision suspected) addr=0x%llx\n",
+                        chunk_num, (u64)current_addr);
+                return -ETIMEDOUT;
+            }
             if (time_after(jiffies, deadline)) {
                 dev_err(dev->dev,
                         "Chunk %d timeout waiting RAM overwrite (addr=0x%llx size=%zu)\n",
@@ -362,14 +363,18 @@ static int fpga_dma_perform_transfer_irq(struct fpga_dma_dev *dev,
         return -EINVAL;
     }
 
-    reinit_completion(&dev->dma_done);
-
     /* Fixed write order: BAR1+0x120 -> BAR1+0x110 -> BAR1+0x100. */
     fpga_dma_write_reg(dev, BAR1_DMA_H_ADDR, upper_32_bits(dma_handle));
     fpga_dma_write_reg(dev, BAR1_DMA_L_ADDR, lower_32_bits(dma_handle));
-    cmd_reg = DMA_CMD_FRAME_MODE | (total_dwords & DMA_CMD_FRAME_DWORDS_MASK);
+    cmd_reg = DMA_CMD_FRAME_MODE | DMA_CMD_64BIT_ADDR | DMA_CMD_WRITE |
+              (total_dwords & DMA_CMD_FRAME_DWORDS_MASK);
     fpga_dma_write_reg(dev, BAR1_DMA_CMD_REG, cmd_reg);
     fpga_dma_flush_posted_writes(dev);
+
+    /* Drain any spurious IRQ completions, then reinit for this transfer */
+    while (try_wait_for_completion(&dev->dma_done))
+        ;
+    reinit_completion(&dev->dma_done);
 
     wait_ret = wait_for_completion_timeout(&dev->dma_done, msecs_to_jiffies(dma_timeout_ms));
     if (!wait_ret) {
@@ -593,11 +598,15 @@ static int fpga_dma_mmap(struct file *file, struct vm_area_struct *vma)
     dev_dbg(dev->dev, "mmap requested: idx=%u size=%zu offset=0x%llx\n",
             buf_index, size, mmap_offset_bytes);
 
-    /* Map coherent DMA memory with the DMA API helper to avoid wrong PFN mapping. */
+    /* Serialise with DMA transfers to avoid mapping a buffer mid-DMA.
+       Note: user-space reads of the mapped region after mmap returns
+       are NOT protected — caller must use application-level fencing. */
+    mutex_lock(&dev->dma_lock);
     saved_vm_pgoff = vma->vm_pgoff;
     vma->vm_pgoff = 0;
     ret = dma_mmap_coherent(&dev->pdev->dev, vma, dma_buf, dma_handle, size);
     vma->vm_pgoff = saved_vm_pgoff;
+    mutex_unlock(&dev->dma_lock);
     if (ret) {
         dev_err(dev->dev, "dma_mmap_coherent failed: %d\n", ret);
         return ret;
@@ -634,6 +643,14 @@ static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     dev->irq_count = 0;
 
     pci_set_drvdata(pdev, dev);
+
+    /* Clamp module parameters to safe ranges */
+    if (dma_max_len_dwords < 1 || dma_max_len_dwords > DMA_MAX_LEN_DWORDS) {
+        dev_warn(&pdev->dev,
+                 "dma_max_len_dwords=%d out of range [1,%d], clamping to 1023\n",
+                 dma_max_len_dwords, DMA_MAX_LEN_DWORDS);
+        dma_max_len_dwords = 1023;
+    }
 
     /* Enable PCI device */
     ret = pci_enable_device(pdev);
@@ -796,11 +813,11 @@ static int fpga_dma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     }
 
     /* Create device node in sysfs */
-    dev->dev = device_create(fpga_dma_class, &pdev->dev,
-                             MKDEV(dev->major, 0), dev,
-                             FPGA_DMA_DEV_NAME);
-    if (IS_ERR(dev->dev)) {
-        ret = PTR_ERR(dev->dev);
+    dev->cls_dev = device_create(fpga_dma_class, &pdev->dev,
+                                 MKDEV(dev->major, 0), dev,
+                                 FPGA_DMA_DEV_NAME);
+    if (IS_ERR(dev->cls_dev)) {
+        ret = PTR_ERR(dev->cls_dev);
         dev_err(&pdev->dev, "Cannot create device\n");
         goto err_cdev_del;
     }

@@ -12,14 +12,14 @@ all: module testapp
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
 
-testapp: fpga_dma_test.c
+testapp: fpga_dma_test.c pcie_fpga_dma.h
 	$(CROSS_COMPILE)gcc -Wall -O2 -o fpga_dma_test fpga_dma_test.c
 
 GST_PKGS := gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 libdrm
 GST_CFLAGS ?= $(shell pkg-config --cflags $(GST_PKGS))
 GST_LIBS ?= $(shell pkg-config --libs $(GST_PKGS))
 
-displayapp: fpga_hdmi_display.c
+displayapp: fpga_hdmi_display.c pcie_fpga_dma.h
 	$(CROSS_COMPILE)gcc -Wall -O2 -o fpga_hdmi_display fpga_hdmi_display.c $(GST_CFLAGS) $(GST_LIBS)
 
 RKNN_CFLAGS ?=
@@ -27,7 +27,7 @@ RKNN_LIBS ?= -lrknnrt
 HOST_CC ?= gcc
 HOST_CFLAGS ?= -Wall -Wextra -O2 -std=c11
 
-lprapp: fpga_lpr_display.c ocr_decode.c ocr_decode.h lpr_special_route.h
+lprapp: fpga_lpr_display.c ocr_decode.c ocr_decode.h lpr_special_route.h fpga_lpr_types.h pcie_fpga_dma.h
 	$(CROSS_COMPILE)gcc -Wall -O2 -o fpga_lpr_display fpga_lpr_display.c ocr_decode.c -pthread $(GST_CFLAGS) $(GST_LIBS) $(RKNN_CFLAGS) $(RKNN_LIBS) -lm
 
 decode-test: test_ocr_decode.c ocr_decode.c ocr_decode.h

@@ -258,12 +258,16 @@ static int constrained_decode(const float *buf, int t_size, int c_size, int t_st
 {
     struct beam_state beams[OCR_DECODE_MAX_BEAMS];
     struct beam_state next_beams[OCR_DECODE_MAX_BEAMS];
-    double log_probs[256];
+    double *log_probs = NULL;
     int beam_count = 1;
     int t;
+    int ret = -1;
 
-    if (c_size > (int)(sizeof(log_probs) / sizeof(log_probs[0])) ||
-        key_count <= 0 || blank_idx < 0 || blank_idx >= c_size)
+    if (key_count <= 0 || blank_idx < 0 || blank_idx >= c_size)
+        return -1;
+
+    log_probs = (double *)malloc((size_t)c_size * sizeof(double));
+    if (!log_probs)
         return -1;
     memset(beams, 0, sizeof(beams));
     beams[0].pb = 0.0;
@@ -303,7 +307,7 @@ static int constrained_decode(const float *buf, int t_size, int c_size, int t_st
             blank_state = beam_state_upsert(next_beams, &next_count,
                                             beams[b].token_ids, beams[b].token_count, keys);
             if (blank_state < 0)
-                return -1;
+                goto cleanup;
             next_beams[blank_state].pb = logaddexp2(next_beams[blank_state].pb,
                                                     total_score + log_probs[blank_idx]);
 
@@ -327,7 +331,7 @@ static int constrained_decode(const float *buf, int t_size, int c_size, int t_st
                     continue;
                 state_idx = beam_state_upsert(next_beams, &next_count, new_ids, new_count, keys);
                 if (state_idx < 0)
-                    return -1;
+                    goto cleanup;
                 same_as_last = (beams[b].token_count > 0 && beams[b].token_ids[beams[b].token_count - 1] == c);
                 if (same_as_last)
                     score = beams[b].pb + log_probs[c];
@@ -338,7 +342,7 @@ static int constrained_decode(const float *buf, int t_size, int c_size, int t_st
                     int repeat_state = beam_state_upsert(next_beams, &next_count,
                                                          beams[b].token_ids, beams[b].token_count, keys);
                     if (repeat_state < 0)
-                        return -1;
+                        goto cleanup;
                     next_beams[repeat_state].pnb = logaddexp2(next_beams[repeat_state].pnb,
                                                               beams[b].pnb + log_probs[c]);
                 }
@@ -353,18 +357,53 @@ static int constrained_decode(const float *buf, int t_size, int c_size, int t_st
     for (int i = 0; i < beam_count; i++) {
         if (!family_full_valid(family, beams[i].token_ids, beams[i].token_count, keys, key_count))
             continue;
-        strncpy(text, beams[i].text, text_len - 1);
-        text[text_len - 1] = '\0';
-        return 0;
+        {
+            /* UTF-8 safe copy: never split a multi-byte character.
+               Walk backwards from the truncation point to find a valid
+               start byte (0xxxxxxx or 11xxxxxx) or continuation byte
+               boundary. */
+            size_t max_copy = text_len - 1;
+            size_t src_len = strlen(beams[i].text);
+            size_t n = src_len < max_copy ? src_len : max_copy;
+            if (n > 0 && text_len > 0) {
+                /* Find last byte that is NOT a UTF-8 continuation byte (10xxxxxx) */
+                while (n > 0 && (beams[i].text[n] & 0xC0) == 0x80)
+                    n--;
+                memcpy(text, beams[i].text, n);
+                text[n] = '\0';
+            } else {
+                text[0] = '\0';
+            }
+        }
+        ret = 0;
+        goto cleanup;
     }
     for (int i = 0; i < beam_count; i++) {
         if (!family_prefix_valid(family, beams[i].token_ids, beams[i].token_count, keys, key_count))
             continue;
-        strncpy(text, beams[i].text, text_len - 1);
-        text[text_len - 1] = '\0';
-        return 0;
+        {
+            /* UTF-8 safe copy (same logic as above) */
+            size_t max_copy = text_len - 1;
+            size_t src_len = strlen(beams[i].text);
+            size_t n = src_len < max_copy ? src_len : max_copy;
+            if (n > 0 && text_len > 0) {
+                while (n > 0 && (beams[i].text[n] & 0xC0) == 0x80)
+                    n--;
+                memcpy(text, beams[i].text, n);
+                text[n] = '\0';
+            } else {
+                text[0] = '\0';
+            }
+        }
+        ret = 0;
+        goto cleanup;
     }
-    return -1;
+
+    ret = -1;
+
+cleanup:
+    free(log_probs);
+    return ret;
 }
 
 int ocr_decode_logits(const float *buf, int t_size, int c_size, int t_stride, int c_stride,

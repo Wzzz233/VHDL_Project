@@ -270,7 +270,8 @@ static int save_frame(const char *filename, const void *buffer, size_t size)
     }
 
     if (fwrite(buffer, 1, size, fp) != size) {
-        print_color(COLOR_RED, "Failed to write frame data: %s", strerror(errno));
+        int saved_errno = errno;
+        print_color(COLOR_RED, "Failed to write frame data: %s", strerror(saved_errno));
         fclose(fp);
         return -1;
     }
@@ -346,7 +347,7 @@ static int test_mmap(int fd)
     printf("Buffer size: %u bytes\n", map.size);
 
     /* Map buffer to userspace */
-    mapped = mmap(NULL, map.size, PROT_READ, MAP_SHARED, fd, 0);
+    mapped = mmap(NULL, map.size, PROT_READ, MAP_SHARED, fd, map.offset);
     if (mapped == MAP_FAILED) {
         print_color(COLOR_RED, "mmap failed: %s", strerror(errno));
         return -1;
@@ -354,16 +355,31 @@ static int test_mmap(int fd)
 
     print_color(COLOR_GREEN, "Buffer mapped at %p", mapped);
 
-    /* Trigger a DMA read */
-    ret = read_frame(fd, NULL, FPGA_FRAME_SIZE);
-    if (ret < 0) {
-        munmap(mapped, map.size);
-        return -1;
+    /* Trigger a DMA read into a temporary buffer, then compare with mmap */
+    {
+        uint8_t *tmp_buf = (uint8_t *)malloc(FPGA_FRAME_SIZE);
+        if (!tmp_buf) {
+            print_color(COLOR_RED, "malloc failed for tmp DMA buffer");
+            munmap(mapped, map.size);
+            return -1;
+        }
+        ret = read_frame(fd, tmp_buf, FPGA_FRAME_SIZE);
+        if (ret < 0) {
+            free(tmp_buf);
+            munmap(mapped, map.size);
+            return -1;
+        }
+        /* Verify mmap data matches copied data */
+        if (memcmp(mapped, tmp_buf, FPGA_FRAME_SIZE) == 0)
+            print_color(COLOR_GREEN, "mmap data matches DMA copy buffer");
+        else
+            print_color(COLOR_YELLOW, "mmap data differs from DMA copy (may be OK if async)");
+        free(tmp_buf);
     }
 
     /* Access the mapped data */
     printf("First 16 bytes via mmap: ");
-    for (ret = 0; ret < 16 && ret < map.size; ret++) {
+    for (ret = 0; ret < 16 && ret < (int)map.size; ret++) {
         printf("%02x ", *((uint8_t*)mapped + ret));
     }
     printf("\n");

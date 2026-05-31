@@ -184,7 +184,6 @@ static void test_old_17ch_model(void)
     int n = 100; /* small slice */
     float *buf = calloc((size_t)total_c * n, sizeof(float));
     struct det_box dets[10];
-    int i;
 
     /* Fill bbox valid for point 5 */
     fill_cmaj(buf, total_c, n, 0, 5, 50.0f); /* cx */
@@ -199,7 +198,7 @@ static void test_old_17ch_model(void)
     fill_cmaj(buf, total_c, n, 11, 5, 70.0f); fill_cmaj(buf, total_c, n, 12, 5, 60.0f); fill_cmaj(buf, total_c, n, 13, 5, 1.0f);
     fill_cmaj(buf, total_c, n, 14, 5, 30.0f); fill_cmaj(buf, total_c, n, 15, 5, 60.0f); fill_cmaj(buf, total_c, n, 16, 5, 1.0f);
 
-    int cnt = decode_pose_inline(buf, total_c, 1, total_c, n, 0.5f, dets, 10, nc, 1);
+    int cnt = decode_pose_inline(buf, total_c, 1, total_c, n, 0.5f, dets, 10, nc, 1, true);
     TEST_ASSERT(cnt == 1, "old 17ch: one detection");
     TEST_ASSERT(dets[0].cls == 0, "old 17ch: cls == 0");
     TEST_ASSERT(dets[0].conf > 0.8f, "old 17ch: conf > 0.8");
@@ -218,7 +217,6 @@ static void test_new_21ch_cls4(void)
     int n = 100;
     float *buf = calloc((size_t)total_c * n, sizeof(float));
     struct det_box dets[10];
-    int i;
 
     /* Point 3: cls 4 (embassy) has highest score */
     fill_cmaj(buf, total_c, n, 0, 3, 55.0f);
@@ -237,7 +235,7 @@ static void test_new_21ch_cls4(void)
     fill_cmaj(buf, total_c, n, 15, 3, 75.0f); fill_cmaj(buf, total_c, n, 16, 3, 65.0f); fill_cmaj(buf, total_c, n, 17, 3, 1.0f);
     fill_cmaj(buf, total_c, n, 18, 3, 35.0f); fill_cmaj(buf, total_c, n, 19, 3, 65.0f); fill_cmaj(buf, total_c, n, 20, 3, 1.0f);
 
-    int cnt = decode_pose_inline(buf, total_c, 1, total_c, n, 0.5f, dets, 10, nc, 1);
+    int cnt = decode_pose_inline(buf, total_c, 1, total_c, n, 0.5f, dets, 10, nc, 1, true);
     TEST_ASSERT(cnt >= 1, "new 21ch cls4: at least one detection");
     /* The embassy detection (cls=4) should be present */
     bool found_embassy = false;
@@ -280,7 +278,7 @@ static void test_new_21ch_cls3(void)
     fill_cmaj(buf, total_c, n, 15, 7, 72.0f); fill_cmaj(buf, total_c, n, 16, 7, 62.0f); fill_cmaj(buf, total_c, n, 17, 7, 1.0f);
     fill_cmaj(buf, total_c, n, 18, 7, 32.0f); fill_cmaj(buf, total_c, n, 19, 7, 62.0f); fill_cmaj(buf, total_c, n, 20, 7, 1.0f);
 
-    int cnt = decode_pose_inline(buf, total_c, 1, total_c, n, 0.5f, dets, 10, nc, 1);
+    int cnt = decode_pose_inline(buf, total_c, 1, total_c, n, 0.5f, dets, 10, nc, 1, true);
     TEST_ASSERT(cnt >= 1, "new 21ch cls3: at least one detection");
     bool found_police = false;
     int j;
@@ -316,7 +314,7 @@ static void test_sigmoid_fallback(void)
     fill_cmaj(buf, total_c, n, kp_base+6, 2, 70.0f); fill_cmaj(buf, total_c, n, kp_base+7, 2, 60.0f); fill_cmaj(buf, total_c, n, kp_base+8, 2, 1.0f);
     fill_cmaj(buf, total_c, n, kp_base+9, 2, 30.0f); fill_cmaj(buf, total_c, n, kp_base+10, 2, 60.0f); fill_cmaj(buf, total_c, n, kp_base+11, 2, 1.0f);
 
-    int cnt = decode_pose_inline(buf, total_c, 1, total_c, n, 0.05f, dets, 10, nc, 1);
+    int cnt = decode_pose_inline(buf, total_c, 1, total_c, n, 0.05f, dets, 10, nc, 1, true);
     TEST_ASSERT(cnt == 1, "sigmoid fallback: detection with logit");
     /* sigmoid(-2.0) = 0.119... */
     TEST_ASSERT(dets[0].conf > 0.1f && dets[0].conf < 0.13f,
@@ -346,7 +344,7 @@ static void test_nc2_unknown_warning(void)
     fill_cmaj(buf, total_c, n, kp_base+6, 0, 70.0f); fill_cmaj(buf, total_c, n, kp_base+7, 0, 60.0f); fill_cmaj(buf, total_c, n, kp_base+8, 0, 1.0f);
     fill_cmaj(buf, total_c, n, kp_base+9, 0, 30.0f); fill_cmaj(buf, total_c, n, kp_base+10, 0, 60.0f); fill_cmaj(buf, total_c, n, kp_base+11, 0, 1.0f);
 
-    int cnt = decode_pose_inline(buf, total_c, 1, total_c, n, 0.5f, dets, 10, nc, 1);
+    int cnt = decode_pose_inline(buf, total_c, 1, total_c, n, 0.5f, dets, 10, nc, 1, true);
     TEST_ASSERT(cnt == 1, "nc=2 unknown: detection works");
     TEST_ASSERT(dets[0].cls == 1, "nc=2 unknown: cls=1 (argmax)");
 

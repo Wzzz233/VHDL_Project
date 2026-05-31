@@ -1424,21 +1424,18 @@ static bool build_ocr_layout(const rknn_tensor_attr *a, int *t_size, int *c_size
 }
 
 static int ctc_decode_logits(const float *buf, int t_size, int c_size, int t_stride, int c_stride,
-                             struct app_ctx *ctx, enum ocr_decode_family family,
+                             const char *const *keys, int key_count, int blank_index,
+                             enum ocr_decode_family family,
                              char *text, size_t text_len, float *conf_out,
                              struct ocr_diag *diag)
 {
-    const char *keys[MAX_OCR_KEYS];
     struct ocr_decode_diag decode_diag;
-    int i;
     int ret = -1;
 
-    if (!ctx || !buf || !text || text_len == 0)
+    if (!buf || !text || text_len == 0)
         return -1;
-    for (i = 0; i < ctx->ocr_key_count && i < MAX_OCR_KEYS; i++)
-        keys[i] = ctx->ocr_keys[i];
     ret = ocr_decode_logits(buf, t_size, c_size, t_stride, c_stride,
-                            keys, i, ctx->ocr_blank_index,
+                            keys, key_count, blank_index,
                             family, text, text_len, conf_out, &decode_diag);
     if (ret < 0)
         return ret;
@@ -2162,9 +2159,9 @@ static int detect_pose_nc_from_model(const struct yolo_model *m)
         struct tensor_cn_view tv;
         /* We don't need actual data, just the shape */
         memset(&tv, 0, sizeof(tv));
-        /* Use build_tensor_cn_view to get c,n from the attr alone.
-         * It needs a buffer pointer but only stores it; pass any non-NULL. */
-        if (!build_tensor_cn_view(&m->output_attrs[i], (const float *)&tv, &tv))
+        /* Shape-only query: get c,n from attr alone. buf=NULL is safe —
+           build_tensor_cn_view accepts NULL for dimension queries. */
+        if (!build_tensor_cn_view(&m->output_attrs[i], NULL, &tv))
             continue;
         if (tv.n != OBB_POINT_COUNT)
             continue;
@@ -2335,28 +2332,32 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
         ret = -1;
         goto out_release;
     }
-    /* Use per-model keys if model has its own, otherwise fall back to global */
+    /* Resolve keys: per-model > global fallback. No ctx mutation — thread-safe. */
     {
-        int effective_key_count = (m->key_count > 0) ? m->key_count : ctx->ocr_key_count;
-        /* Temporarily override ctx keys with model keys if available */
-        int saved_key_count = ctx->ocr_key_count;
+        const char *keys[MAX_OCR_KEYS];
+        int key_count = (m->key_count > 0) ? m->key_count : ctx->ocr_key_count;
+        int blank_index;
+        int ki;
+
         if (m->key_count > 0) {
-            int ki;
             for (ki = 0; ki < m->key_count && ki < MAX_OCR_KEYS; ki++)
-                memcpy(ctx->ocr_keys[ki], m->keys[ki], MAX_OCR_KEY_LEN);
-            ctx->ocr_key_count = m->key_count;
-            effective_key_count = m->key_count;
+                keys[ki] = m->keys[ki];
+        } else {
+            for (ki = 0; ki < ctx->ocr_key_count && ki < MAX_OCR_KEYS; ki++)
+                keys[ki] = ctx->ocr_keys[ki];
         }
-        /* Always recalculate blank index for the current model */
-        if (c_size == effective_key_count + 1)
-            ctx->ocr_blank_index = effective_key_count;
+
+        /* Compute blank index for the current model */
+        if (c_size == key_count + 1)
+            blank_index = key_count;
         else
-            ctx->ocr_blank_index = c_size - 1;
+            blank_index = c_size - 1;
+
         if (!ctx->ocr_keysize_warned) {
-            if (!(c_size == effective_key_count || c_size == (effective_key_count + 1))) {
+            if (!(c_size == key_count || c_size == (key_count + 1))) {
                 fprintf(stderr, "[ocr] WARN: model=%s c_size=%d key_count=%d\n",
                         expert_name ? expert_name : "?",
-                        c_size, effective_key_count);
+                        c_size, key_count);
             }
             fprintf(stderr,
                     "[ocr] expert=%s model=%s decode_output_idx=%u/%u\n",
@@ -2366,13 +2367,14 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
                     m->io_num.n_output);
             ctx->ocr_keysize_warned = true;
         }
-        /* Restore global key count after decode (keys buffer is reused) */
-        ctx->ocr_key_count = saved_key_count;
-    }
-    {
-        enum ocr_decode_family family = select_decode_family(expert_name, plate_color);
-        ret = ctc_decode_logits((const float *)outs[decode_output_idx].buf, t_size, c_size, t_stride, c_stride,
-                                ctx, family, text, text_len, conf_out, diag);
+
+        {
+            enum ocr_decode_family family = select_decode_family(expert_name, plate_color);
+            ret = ctc_decode_logits((const float *)outs[decode_output_idx].buf,
+                                    t_size, c_size, t_stride, c_stride,
+                                    keys, key_count, blank_index,
+                                    family, text, text_len, conf_out, diag);
+        }
     }
     if (diag)
         diag->in_occ_ratio = occ_ratio;
@@ -5438,8 +5440,12 @@ static bool build_tensor_cn_view(const rknn_tensor_attr *a, const float *buf, st
     int dims[4];
     int k = 0;
     int i;
-    if (!a || !buf || !tv)
+    if (!a || !tv)
         return false;
+    /* buf may be NULL for shape-only queries (detect_pose_nc_from_model).
+       Store it but callers must not dereference tv->buf unless they passed
+       a valid data buffer. */
+    (void)buf;
     memset(tv, 0, sizeof(*tv));
     if (a->n_dims == 3) {
         int d1 = (int)a->dims[1];
@@ -6204,8 +6210,6 @@ static enum plate_type classify_plate_type(enum plate_color color, const char *t
         return PLATE_TYPE_TRAILER;
     if (text && (strstr(text, utf8_embassy) || strstr(text, utf8_consulate)))
         return PLATE_TYPE_EMBASSY_CONSULATE;
-    if (text && strncmp(text, "WJ", 2) == 0)
-
     if (color == PLATE_COLOR_GREEN)
         return PLATE_TYPE_COMMON_GREEN;
     if (color == PLATE_COLOR_BLUE)
@@ -7407,6 +7411,7 @@ static void *infer_thread_main(void *arg)
                         ocr_run_count++;
 
                         /* ── CLAHE compare mode: run OCR on original crop too ── */
+#ifdef CLAHE_DEBUG
                         if (ctx->opt.clahe_compare && plate_crop_noclahe) {
                             char orig_text[64];
                             float orig_conf = 0.0f;
@@ -7445,6 +7450,7 @@ static void *infer_thread_main(void *arg)
                                 free(cmp_buf);
                             }
                         }
+#endif /* CLAHE_DEBUG */
                     }
                 }
             }
@@ -7808,6 +7814,22 @@ int main(int argc, char **argv)
                 "[ocr] FATAL blue/green input shape mismatch: blue=%ux%ux%u green=%ux%ux%u\n",
                 ctx.ocr_model.in_w, ctx.ocr_model.in_h, ctx.ocr_model.in_c,
                 ctx.ocr_green_model.in_w, ctx.ocr_green_model.in_h, ctx.ocr_green_model.in_c);
+        goto out;
+    }
+    if (ctx.ocr_yellow_model.ctx &&
+        !ocr_model_input_compatible(&ctx.ocr_model, &ctx.ocr_yellow_model)) {
+        fprintf(stderr,
+                "[ocr] FATAL blue/yellow input shape mismatch: blue=%ux%ux%u yellow=%ux%ux%u\n",
+                ctx.ocr_model.in_w, ctx.ocr_model.in_h, ctx.ocr_model.in_c,
+                ctx.ocr_yellow_model.in_w, ctx.ocr_yellow_model.in_h, ctx.ocr_yellow_model.in_c);
+        goto out;
+    }
+    if (ctx.ocr_special_model.ctx &&
+        !ocr_model_input_compatible(&ctx.ocr_model, &ctx.ocr_special_model)) {
+        fprintf(stderr,
+                "[ocr] FATAL blue/special input shape mismatch: blue=%ux%ux%u special=%ux%ux%u\n",
+                ctx.ocr_model.in_w, ctx.ocr_model.in_h, ctx.ocr_model.in_c,
+                ctx.ocr_special_model.in_w, ctx.ocr_special_model.in_h, ctx.ocr_special_model.in_c);
         goto out;
     }
     fprintf(stderr, "[ocr] expert routing enabled: blue=%s green=%s\n",
