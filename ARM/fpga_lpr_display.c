@@ -69,6 +69,8 @@
 #define FIRSTCHAR_TRACK_HIST 8
 #define GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES 5
 #define GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE 0.60f
+#define POLICE_FIRSTCHAR_DEFAULT_MIN_VOTES 1
+#define POLICE_FIRSTCHAR_DEFAULT_MIN_SHARE 0.00f
 #define MAX_UTF8_TOKEN_BYTES 8
 #define MAX_PLATE_TOKENS 16
 
@@ -172,6 +174,7 @@ struct options {
     const char *ocr_embassy_keys_path;
     const char *ocr_keys_path;
     const char *green_firstchar_model_path;
+    const char *police_firstchar_model_path;
     const char *quad_refiner_model_path;
     const char *labels_path;
     const char *pred_log_path;
@@ -469,7 +472,10 @@ struct app_ctx {
     struct ocr_model ocr_green_model;
     struct ocr_model ocr_yellow_model;
     struct ocr_model ocr_special_model;
+    struct ocr_model ocr_police_model;
+    struct ocr_model ocr_embassy_model;
     struct firstchar_model green_firstchar_model;
+    struct firstchar_model police_firstchar_model;
     struct quad_refiner_model quad_refiner_model;
     char ocr_keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
     int ocr_key_count;
@@ -685,6 +691,7 @@ static void print_usage(const char *prog)
             "  --help                  Show this help\n",
             prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD,
             GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES, GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE,
+            POLICE_FIRSTCHAR_DEFAULT_MIN_VOTES, POLICE_FIRSTCHAR_DEFAULT_MIN_SHARE,
             DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
             DEFAULT_STATS_INTERVAL, DEFAULT_COPY_BUFFERS, DEFAULT_QUEUE_DEPTH);
 }
@@ -809,6 +816,9 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->green_firstchar_model_path = NULL;
     opt->green_firstchar_min_votes = GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES;
     opt->green_firstchar_min_share = GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE;
+    opt->police_firstchar_model_path = NULL;
+    opt->police_firstchar_min_votes = POLICE_FIRSTCHAR_DEFAULT_MIN_VOTES;
+    opt->police_firstchar_min_share = POLICE_FIRSTCHAR_DEFAULT_MIN_SHARE;
     opt->offline_detect_plate = 1;
     opt->pose_nc = 0;
 
