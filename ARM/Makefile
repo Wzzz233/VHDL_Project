@@ -33,14 +33,18 @@ lprapp: fpga_lpr_display.c ocr_decode.c ocr_decode.h lpr_special_route.h fpga_lp
 decode-test: test_ocr_decode.c ocr_decode.c ocr_decode.h
 	$(HOST_CC) $(HOST_CFLAGS) -o test_ocr_decode test_ocr_decode.c ocr_decode.c -lm
 
+ocr-layout-test: test_ocr_layout.c
+	$(HOST_CC) $(HOST_CFLAGS) -o test_ocr_layout test_ocr_layout.c
+
 special-route-test: test_lpr_special_route.c lpr_special_route.h
 	$(HOST_CC) $(HOST_CFLAGS) -o test_lpr_special_route test_lpr_special_route.c
 
 pose-decoder-test: test_pose_decoder.c
 	$(HOST_CC) $(HOST_CFLAGS) -o test_pose_decoder test_pose_decoder.c -lm
 
-test: decode-test special-route-test pose-decoder-test
+test: decode-test ocr-layout-test special-route-test pose-decoder-test
 	./test_ocr_decode
+	./test_ocr_layout
 	./test_lpr_special_route
 	./test_pose_decoder
 
@@ -50,6 +54,7 @@ clean:
 	rm -f fpga_hdmi_display
 	rm -f fpga_lpr_display
 	rm -f test_ocr_decode
+	rm -f test_ocr_layout
 	rm -f test_lpr_special_route
 	rm -f test_pose_decoder
 	rm -f *.raw

@@ -1462,57 +1462,94 @@ static void rknn_firstchar_model_release(struct firstchar_model *m)
     memset(m, 0, sizeof(*m));
 }
 
-static bool build_ocr_layout(const rknn_tensor_attr *a, int *t_size, int *c_size, int *t_stride, int *c_stride)
+static bool dim_matches_ocr_class_count(int dim, int key_count)
+{
+    return dim > 1 && key_count > 0 && (dim == key_count || dim == key_count + 1);
+}
+
+static void set_ocr_layout_ct(int c, int t, int *t_size, int *c_size, int *t_stride, int *c_stride)
+{
+    *c_size = c;
+    *t_size = t;
+    *t_stride = 1;
+    *c_stride = *t_size;
+}
+
+static void set_ocr_layout_tc(int t, int c, int *t_size, int *c_size, int *t_stride, int *c_stride)
+{
+    *t_size = t;
+    *c_size = c;
+    *t_stride = *c_size;
+    *c_stride = 1;
+}
+
+static bool build_ocr_layout(const rknn_tensor_attr *a, int key_count,
+                             int *t_size, int *c_size, int *t_stride, int *c_stride)
 {
     if (a->n_dims == 2) {
-        *t_size = (int)a->dims[0];
-        *c_size = (int)a->dims[1];
-        *t_stride = *c_size;
-        *c_stride = 1;
+        int d0 = (int)a->dims[0];
+        int d1 = (int)a->dims[1];
+        bool d0_class;
+        bool d1_class;
+        if (d0 <= 0 || d1 <= 1)
+            return false;
+        d0_class = dim_matches_ocr_class_count(d0, key_count);
+        d1_class = dim_matches_ocr_class_count(d1, key_count);
+        if (d0_class && !d1_class)
+            set_ocr_layout_ct(d0, d1, t_size, c_size, t_stride, c_stride);
+        else if (d1_class && !d0_class)
+            set_ocr_layout_tc(d0, d1, t_size, c_size, t_stride, c_stride);
+        else if (d1 == 18 && d0 != 18)
+            set_ocr_layout_ct(d0, d1, t_size, c_size, t_stride, c_stride);
+        else if (d0 == 18 && d1 != 18)
+            set_ocr_layout_tc(d0, d1, t_size, c_size, t_stride, c_stride);
+        else if (d0 > d1)
+            set_ocr_layout_ct(d0, d1, t_size, c_size, t_stride, c_stride);
+        else
+            set_ocr_layout_tc(d0, d1, t_size, c_size, t_stride, c_stride);
         return (*t_size > 0 && *c_size > 1);
     }
     if (a->n_dims == 3) {
         int d1 = (int)a->dims[1];
         int d2 = (int)a->dims[2];
+        bool d1_class;
+        bool d2_class;
         if (d1 <= 0 || d2 <= 1)
             return false;
-        if (a->fmt == RKNN_TENSOR_NCHW) {
-            *c_size = d1;
-            *t_size = d2;
-            *t_stride = 1;
-            *c_stride = *t_size;
-        } else if (a->fmt == RKNN_TENSOR_NHWC) {
-            *t_size = d1;
-            *c_size = d2;
-            *t_stride = *c_size;
-            *c_stride = 1;
-        } else {
-            if (d1 <= d2) {
-                *t_size = d1;
-                *c_size = d2;
-                *t_stride = *c_size;
-                *c_stride = 1;
-            } else {
-                *t_size = d2;
-                *c_size = d1;
-                *t_stride = 1;
-                *c_stride = *t_size;
-            }
-        }
+        d1_class = dim_matches_ocr_class_count(d1, key_count);
+        d2_class = dim_matches_ocr_class_count(d2, key_count);
+        if (d1_class && !d2_class)
+            set_ocr_layout_ct(d1, d2, t_size, c_size, t_stride, c_stride);
+        else if (d2_class && !d1_class)
+            set_ocr_layout_tc(d1, d2, t_size, c_size, t_stride, c_stride);
+        else if (d2 == 18 && d1 != 18)
+            set_ocr_layout_ct(d1, d2, t_size, c_size, t_stride, c_stride);
+        else if (d1 == 18 && d2 != 18)
+            set_ocr_layout_tc(d1, d2, t_size, c_size, t_stride, c_stride);
+        else if (a->fmt == RKNN_TENSOR_NCHW)
+            set_ocr_layout_ct(d1, d2, t_size, c_size, t_stride, c_stride);
+        else if (a->fmt == RKNN_TENSOR_NHWC)
+            set_ocr_layout_tc(d1, d2, t_size, c_size, t_stride, c_stride);
+        else if (d1 > d2)
+            set_ocr_layout_ct(d1, d2, t_size, c_size, t_stride, c_stride);
+        else
+            set_ocr_layout_tc(d1, d2, t_size, c_size, t_stride, c_stride);
         return true;
     }
     if (a->n_dims == 4) {
-        if (a->fmt == RKNN_TENSOR_NCHW) {
-            *c_size = (int)a->dims[1];
-            *t_size = (int)a->dims[2] * (int)a->dims[3];
-            *t_stride = 1;
-            *c_stride = *t_size;
-        } else {
-            *t_size = (int)a->dims[1] * (int)a->dims[2];
-            *c_size = (int)a->dims[3];
-            *t_stride = *c_size;
-            *c_stride = 1;
-        }
+        int d1 = (int)a->dims[1];
+        int d2 = (int)a->dims[2];
+        int d3 = (int)a->dims[3];
+        if (d1 <= 0 || d2 <= 0 || d3 <= 1)
+            return false;
+        if (dim_matches_ocr_class_count(d1, key_count))
+            set_ocr_layout_ct(d1, d2 * d3, t_size, c_size, t_stride, c_stride);
+        else if (dim_matches_ocr_class_count(d3, key_count))
+            set_ocr_layout_tc(d1 * d2, d3, t_size, c_size, t_stride, c_stride);
+        else if (a->fmt == RKNN_TENSOR_NCHW)
+            set_ocr_layout_ct(d1, d2 * d3, t_size, c_size, t_stride, c_stride);
+        else
+            set_ocr_layout_tc(d1 * d2, d3, t_size, c_size, t_stride, c_stride);
         return (*t_size > 0 && *c_size > 1);
     }
     return false;
@@ -2600,6 +2637,7 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     const rknn_tensor_attr *out_attr;
     uint32_t decode_output_idx = 0;
     int t_size, c_size, t_stride, c_stride;
+    int key_count;
     int ret = -1;
     uint32_t i;
     float occ_ratio = 0.0f;
@@ -2634,14 +2672,14 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
 
     decode_output_idx = select_ocr_output_idx(m, expert_name);
     out_attr = &m->output_attrs[decode_output_idx];
-    if (!build_ocr_layout(out_attr, &t_size, &c_size, &t_stride, &c_stride)) {
+    key_count = (m->key_count > 0) ? m->key_count : ctx->ocr_key_count;
+    if (!build_ocr_layout(out_attr, key_count, &t_size, &c_size, &t_stride, &c_stride)) {
         ret = -1;
         goto out_release;
     }
     /* Resolve keys: per-model > global fallback. No ctx mutation — thread-safe. */
     {
         const char *keys[MAX_OCR_KEYS];
-        int key_count = (m->key_count > 0) ? m->key_count : ctx->ocr_key_count;
         int blank_index;
         int ki;
 
