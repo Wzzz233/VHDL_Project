@@ -1432,16 +1432,28 @@ static bool build_ocr_layout(const rknn_tensor_attr *a, int *t_size, int *c_size
         int d2 = (int)a->dims[2];
         if (d1 <= 0 || d2 <= 1)
             return false;
-        if (d1 <= d2) {
+        if (a->fmt == RKNN_TENSOR_NCHW) {
+            *c_size = d1;
+            *t_size = d2;
+            *t_stride = 1;
+            *c_stride = *t_size;
+        } else if (a->fmt == RKNN_TENSOR_NHWC) {
             *t_size = d1;
             *c_size = d2;
             *t_stride = *c_size;
             *c_stride = 1;
         } else {
-            *t_size = d2;
-            *c_size = d1;
-            *t_stride = 1;
-            *c_stride = *t_size;
+            if (d1 <= d2) {
+                *t_size = d1;
+                *c_size = d2;
+                *t_stride = *c_size;
+                *c_stride = 1;
+            } else {
+                *t_size = d2;
+                *c_size = d1;
+                *t_stride = 1;
+                *c_stride = *t_size;
+            }
         }
         return true;
     }
@@ -7735,6 +7747,22 @@ int main(int argc, char **argv)
                 "[ocr] FATAL blue/special input shape mismatch: blue=%ux%ux%u special=%ux%ux%u\n",
                 ctx.ocr_model.in_w, ctx.ocr_model.in_h, ctx.ocr_model.in_c,
                 ctx.ocr_special_model.in_w, ctx.ocr_special_model.in_h, ctx.ocr_special_model.in_c);
+        goto out;
+    }
+    if (ctx.ocr_police_model.ctx &&
+        !ocr_model_input_compatible(&ctx.ocr_model, &ctx.ocr_police_model)) {
+        fprintf(stderr,
+                "[ocr] FATAL blue/police input shape mismatch: blue=%ux%ux%u police=%ux%ux%u\n",
+                ctx.ocr_model.in_w, ctx.ocr_model.in_h, ctx.ocr_model.in_c,
+                ctx.ocr_police_model.in_w, ctx.ocr_police_model.in_h, ctx.ocr_police_model.in_c);
+        goto out;
+    }
+    if (ctx.ocr_embassy_model.ctx &&
+        !ocr_model_input_compatible(&ctx.ocr_model, &ctx.ocr_embassy_model)) {
+        fprintf(stderr,
+                "[ocr] FATAL blue/embassy input shape mismatch: blue=%ux%ux%u embassy=%ux%ux%u\n",
+                ctx.ocr_model.in_w, ctx.ocr_model.in_h, ctx.ocr_model.in_c,
+                ctx.ocr_embassy_model.in_w, ctx.ocr_embassy_model.in_h, ctx.ocr_embassy_model.in_c);
         goto out;
     }
     fprintf(stderr, "[ocr] expert routing enabled: blue=%s green=%s\n",
