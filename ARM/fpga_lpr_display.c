@@ -71,6 +71,9 @@
 #define GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE 0.60f
 #define POLICE_FIRSTCHAR_DEFAULT_MIN_VOTES 1
 #define POLICE_FIRSTCHAR_DEFAULT_MIN_SHARE 0.00f
+#define PLATE_TYPE_CLASS_COUNT 6
+#define PLATE_TYPE_CLASSIFIER_DEFAULT_MIN_CONF 0.80f
+#define PLATE_TYPE_CLASSIFIER_DEFAULT_SPECIAL_MIN_CONF 0.70f
 #define MAX_UTF8_TOKEN_BYTES 8
 #define MAX_PLATE_TOKENS 16
 
@@ -175,6 +178,7 @@ struct options {
     const char *ocr_keys_path;
     const char *green_firstchar_model_path;
     const char *police_firstchar_model_path;
+    const char *plate_type_classifier_model_path;
     const char *quad_refiner_model_path;
     const char *labels_path;
     const char *pred_log_path;
@@ -221,6 +225,8 @@ struct options {
     float green_firstchar_min_share;
     int police_firstchar_min_votes;
     float police_firstchar_min_share;
+    float plate_type_classifier_min_conf;
+    float plate_type_classifier_special_min_conf;
     int offline_detect_plate;
     int pose_nc;
     bool swap16;
@@ -253,6 +259,9 @@ struct plate_det {
     float ocr_blank_top1;
     float ocr_in_occ_ratio;
     int det_cls;
+    int det_cls_detector;
+    int ptype_cls;
+    float ptype_conf;
     char route_name[24];
     char ocr_expert[24];
 };
@@ -476,6 +485,7 @@ struct app_ctx {
     struct ocr_model ocr_embassy_model;
     struct firstchar_model green_firstchar_model;
     struct firstchar_model police_firstchar_model;
+    struct firstchar_model plate_type_classifier_model;
     struct quad_refiner_model quad_refiner_model;
     char ocr_keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
     int ocr_key_count;
@@ -552,6 +562,11 @@ static int rknn_quad_refiner_model_load(struct quad_refiner_model *m, const char
 static void rknn_quad_refiner_model_release(struct quad_refiner_model *m);
 static int rknn_firstchar_model_load(struct firstchar_model *m, const char *name, const char *path);
 static void rknn_firstchar_model_release(struct firstchar_model *m);
+static bool run_plate_type_classifier(const struct firstchar_model *m, const uint8_t *plate_rgb, int plate_w, int plate_h,
+                                      int *cls_out, float *conf_out);
+static bool maybe_apply_plate_type_classifier(struct app_ctx *ctx, struct plate_det *pd,
+                                              const uint8_t *plate_rgb, int plate_w, int plate_h,
+                                              uint64_t frame_seq);
 static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_rgb, int fc_w, int fc_h,
                                         const struct det_box *box, uint64_t frame_seq,
                                         char *text, size_t text_len);
@@ -561,6 +576,7 @@ static bool run_police_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_
 static int detect_pose_nc_from_model(const struct yolo_model *m);
 static const char *det_cls_route_name(int det_cls, int pose_nc);
 static const char *det_cls_to_expert_name(int det_cls, int pose_nc);
+static bool plate_det_has_ptype_route(const struct plate_det *pd);
 static const struct ocr_model *select_ocr_model_by_det_cls(
     const struct app_ctx *ctx,
     int det_cls,
@@ -640,6 +656,9 @@ static void print_usage(const char *prog)
             "  --police-firstchar-model <path|off> Police province sidecar RKNN (default: off)\n"
             "  --police-firstchar-min-votes <n> Min same-province votes for police (default: %d)\n"
             "  --police-firstchar-min-share <v> Min vote share for police (default: %.2f)\n"
+            "  --plate-type-classifier-model <path|off> Plate type classifier RKNN, 6 classes, RGB 224x72 (default: off)\n"
+            "  --plate-type-classifier-min-conf <v> Min confidence for classifier route override (default: %.2f)\n"
+            "  --plate-type-classifier-special-min-conf <v> Min confidence for police/embassy override (default: %.2f)\n"
             "  --ocr-police-model <path> Police OCR expert RKNN path (default: same as special)\n"
             "  --ocr-police-keys <path>  Police OCR keys file path\n"
             "  --ocr-embassy-model <path> Embassy OCR expert RKNN path (default: same as special)\n"
@@ -692,6 +711,8 @@ static void print_usage(const char *prog)
             prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD,
             GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES, GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE,
             POLICE_FIRSTCHAR_DEFAULT_MIN_VOTES, POLICE_FIRSTCHAR_DEFAULT_MIN_SHARE,
+            PLATE_TYPE_CLASSIFIER_DEFAULT_MIN_CONF,
+            PLATE_TYPE_CLASSIFIER_DEFAULT_SPECIAL_MIN_CONF,
             DEFAULT_FPS, DEFAULT_TIMEOUT_MS,
             DEFAULT_STATS_INTERVAL, DEFAULT_COPY_BUFFERS, DEFAULT_QUEUE_DEPTH);
 }
@@ -718,6 +739,9 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"police-firstchar-model", required_argument, NULL, 60},
         {"police-firstchar-min-votes", required_argument, NULL, 61},
         {"police-firstchar-min-share", required_argument, NULL, 62},
+        {"plate-type-classifier-model", required_argument, NULL, 67},
+        {"plate-type-classifier-min-conf", required_argument, NULL, 68},
+        {"plate-type-classifier-special-min-conf", required_argument, NULL, 69},
         {"ocr-police-model", required_argument, NULL, 63},
         {"ocr-police-keys", required_argument, NULL, 64},
         {"ocr-embassy-model", required_argument, NULL, 65},
@@ -819,6 +843,9 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->police_firstchar_model_path = NULL;
     opt->police_firstchar_min_votes = POLICE_FIRSTCHAR_DEFAULT_MIN_VOTES;
     opt->police_firstchar_min_share = POLICE_FIRSTCHAR_DEFAULT_MIN_SHARE;
+    opt->plate_type_classifier_model_path = NULL;
+    opt->plate_type_classifier_min_conf = PLATE_TYPE_CLASSIFIER_DEFAULT_MIN_CONF;
+    opt->plate_type_classifier_special_min_conf = PLATE_TYPE_CLASSIFIER_DEFAULT_SPECIAL_MIN_CONF;
     opt->offline_detect_plate = 1;
     opt->pose_nc = 0;
 
@@ -852,6 +879,14 @@ static int parse_options(int argc, char **argv, struct options *opt)
             break;
         case 61: opt->police_firstchar_min_votes = atoi(optarg); break;
         case 62: opt->police_firstchar_min_share = (float)atof(optarg); break;
+        case 67:
+            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
+                opt->plate_type_classifier_model_path = NULL;
+            else
+                opt->plate_type_classifier_model_path = optarg;
+            break;
+        case 68: opt->plate_type_classifier_min_conf = (float)atof(optarg); break;
+        case 69: opt->plate_type_classifier_special_min_conf = (float)atof(optarg); break;
         case 63: opt->ocr_police_model_path = optarg; break;
         case 64: opt->ocr_police_keys_path = optarg; break;
         case 65: opt->ocr_embassy_model_path = optarg; break;
@@ -1023,6 +1058,14 @@ static int parse_options(int argc, char **argv, struct options *opt)
     if (opt->green_firstchar_min_votes < 1 || opt->green_firstchar_min_votes > FIRSTCHAR_TRACK_HIST)
         return -1;
     if (opt->green_firstchar_min_share < 0.0f || opt->green_firstchar_min_share > 1.0f)
+        return -1;
+    if (opt->police_firstchar_min_votes < 1 || opt->police_firstchar_min_votes > FIRSTCHAR_TRACK_HIST)
+        return -1;
+    if (opt->police_firstchar_min_share < 0.0f || opt->police_firstchar_min_share > 1.0f)
+        return -1;
+    if (opt->plate_type_classifier_min_conf < 0.0f || opt->plate_type_classifier_min_conf > 1.0f)
+        return -1;
+    if (opt->plate_type_classifier_special_min_conf < 0.0f || opt->plate_type_classifier_special_min_conf > 1.0f)
         return -1;
     if (opt->offline_image_path && opt->offline_image_path[0] != '\0') {
         if (!opt->plate_model_path || !opt->ocr_blue_model_path || !opt->ocr_green_model_path || !opt->ocr_keys_path)
@@ -1403,11 +1446,12 @@ static int rknn_firstchar_model_load(struct firstchar_model *m, const char *name
             m->output_attr.dims[3],
             m->output_attr.n_dims);
     for (i = 0; i < m->output_attr.n_dims; i++) {
-        if (m->output_attr.dims[i] == (uint32_t)GREEN_FIRSTCHAR_CLASS_COUNT)
+        if (m->output_attr.dims[i] == (uint32_t)GREEN_FIRSTCHAR_CLASS_COUNT ||
+            m->output_attr.dims[i] == (uint32_t)PLATE_TYPE_CLASS_COUNT)
             return 0;
     }
-    fprintf(stderr, "[%s] WARN: output shape does not explicitly expose %d classes\n",
-            name, GREEN_FIRSTCHAR_CLASS_COUNT);
+    fprintf(stderr, "[%s] WARN: output shape does not explicitly expose %d or %d classes\n",
+            name, GREEN_FIRSTCHAR_CLASS_COUNT, PLATE_TYPE_CLASS_COUNT);
     return 0;
 }
 
@@ -1923,6 +1967,139 @@ static int firstchar_output_count(const rknn_tensor_attr *a)
     return (int)n;
 }
 
+static const char *plate_type_class_name(int cls)
+{
+    static const char *const names[PLATE_TYPE_CLASS_COUNT] = {
+        "blue", "green", "yellow", "police", "embassy", "other"
+    };
+    if (cls >= 0 && cls < PLATE_TYPE_CLASS_COUNT)
+        return names[cls];
+    return "unknown";
+}
+
+static bool plate_det_has_ptype_route(const struct plate_det *pd)
+{
+    return pd && strcmp(pd->route_name, "ptype_cls") == 0 && pd->det_cls >= 0 && pd->det_cls <= 4;
+}
+
+static bool run_plate_type_classifier(const struct firstchar_model *m,
+                                      const uint8_t *plate_rgb, int plate_w, int plate_h,
+                                      int *cls_out, float *conf_out)
+{
+    uint8_t *input = NULL;
+    rknn_input in;
+    rknn_output out;
+    int ret = -1;
+    int class_count;
+    int i;
+    int best = -1;
+    float best_logit = -INFINITY;
+    float max_logit = -INFINITY;
+    float sum_exp = 0.0f;
+
+    if (!m || !m->ctx || !plate_rgb || !cls_out || !conf_out)
+        return false;
+    *cls_out = -1;
+    *conf_out = 0.0f;
+    if (m->in_w == 0 || m->in_h == 0 || m->in_c != 3)
+        return false;
+
+    input = malloc((size_t)m->in_w * (size_t)m->in_h * 3U);
+    if (!input)
+        return false;
+    resize_rgb888_bilinear(plate_rgb, plate_w, plate_h, input, (int)m->in_w, (int)m->in_h);
+
+    memset(&in, 0, sizeof(in));
+    in.index = 0;
+    in.buf = input;
+    in.size = m->in_w * m->in_h * 3U;
+    in.type = RKNN_TENSOR_UINT8;
+    in.fmt = RKNN_TENSOR_NHWC;
+    ret = rknn_inputs_set(m->ctx, 1, &in);
+    if (ret < 0)
+        goto out_free;
+    ret = rknn_run(m->ctx, NULL);
+    if (ret < 0)
+        goto out_free;
+
+    memset(&out, 0, sizeof(out));
+    out.want_float = 1;
+    ret = rknn_outputs_get(m->ctx, 1, &out, NULL);
+    if (ret < 0)
+        goto out_free;
+
+    class_count = firstchar_output_count(&m->output_attr);
+    if (class_count > PLATE_TYPE_CLASS_COUNT)
+        class_count = PLATE_TYPE_CLASS_COUNT;
+    if (class_count != PLATE_TYPE_CLASS_COUNT) {
+        ret = -1;
+        goto out_release;
+    }
+
+    for (i = 0; i < class_count; i++) {
+        float v = ((const float *)out.buf)[i];
+        if (v > best_logit) {
+            best_logit = v;
+            best = i;
+        }
+        if (v > max_logit)
+            max_logit = v;
+    }
+    if (best >= 0) {
+        for (i = 0; i < class_count; i++)
+            sum_exp += expf(((const float *)out.buf)[i] - max_logit);
+        *cls_out = best;
+        *conf_out = (sum_exp > 0.0f) ? expf(best_logit - max_logit) / sum_exp : 0.0f;
+        ret = 0;
+    }
+
+out_release:
+    rknn_outputs_release(m->ctx, 1, &out);
+out_free:
+    free(input);
+    return ret == 0;
+}
+
+static bool maybe_apply_plate_type_classifier(struct app_ctx *ctx, struct plate_det *pd,
+                                              const uint8_t *plate_rgb, int plate_w, int plate_h,
+                                              uint64_t frame_seq)
+{
+    int pred_cls = -1;
+    float pred_conf = 0.0f;
+    int old_cls;
+    float threshold;
+    bool apply = false;
+
+    if (!ctx || !pd || !ctx->plate_type_classifier_model.ctx || !plate_rgb)
+        return false;
+    if (!run_plate_type_classifier(&ctx->plate_type_classifier_model, plate_rgb, plate_w, plate_h,
+                                   &pred_cls, &pred_conf))
+        return false;
+
+    pd->ptype_cls = pred_cls;
+    pd->ptype_conf = pred_conf;
+    old_cls = pd->det_cls;
+
+    if (pred_cls >= 0 && pred_cls <= 4) {
+        threshold = ctx->opt.plate_type_classifier_min_conf;
+        if ((pred_cls == 3 || pred_cls == 4) && pred_conf >= ctx->opt.plate_type_classifier_special_min_conf)
+            apply = true;
+        if (pred_conf >= threshold)
+            apply = true;
+    }
+
+    if (apply) {
+        pd->det_cls = pred_cls;
+        copy_cstr_trunc(pd->route_name, sizeof(pd->route_name), "ptype_cls");
+        copy_cstr_trunc(pd->ocr_expert, sizeof(pd->ocr_expert), plate_type_class_name(pred_cls));
+    }
+
+    fprintf(stderr,
+            "[ptype] frame=%" PRIu64 " pred=%s cls=%d conf=%.3f old_det_cls=%d final_det_cls=%d apply=%d\n",
+            frame_seq, plate_type_class_name(pred_cls), pred_cls, pred_conf, old_cls, pd->det_cls, apply ? 1 : 0);
+    return apply;
+}
+
 static bool replace_first_utf8_token(char *text, size_t text_len, const char *first_tok)
 {
     char toks[MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
@@ -2327,9 +2504,9 @@ static const struct ocr_model *select_ocr_model_by_det_cls(
     const char **expert_name,
     const char **route_name)
 {
-    /* Multi-class pose model → use det_cls for routing */
-    if (pose_nc >= 5 && det_cls >= 0 && det_cls <= 4) {
-        if (route_name)
+    /* Multi-class pose model, or plate-type sidecar promoted into det_cls, uses det_cls for routing. */
+    if (det_cls >= 0 && det_cls <= 4 && (pose_nc >= 5 || (route_name && *route_name && strcmp(*route_name, "ptype_cls") == 0))) {
+        if (route_name && (!*route_name || strcmp(*route_name, "ptype_cls") != 0))
             *route_name = "det_cls";
         switch (det_cls) {
         case 0:
@@ -2410,8 +2587,9 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
                          const char **expert_name_out)
 {
     const char *expert_name = NULL;
-    const char *route_name = "color_fallback";
-    const struct ocr_model *m = select_ocr_model_by_det_cls(ctx, det_cls, pose_nc,
+    const char *route_name = (pose_nc < 0) ? "ptype_cls" : "color_fallback";
+    int route_pose_nc = (pose_nc < 0) ? 0 : pose_nc;
+    const struct ocr_model *m = select_ocr_model_by_det_cls(ctx, det_cls, route_pose_nc,
                                                             plate_color,
                                                             &expert_name, &route_name);
     if (expert_name_out)
@@ -6708,6 +6886,9 @@ static int run_offline_once(struct app_ctx *ctx)
 
     pd.box = box;
     pd.det_cls = box.cls;
+    pd.det_cls_detector = box.cls;
+    pd.ptype_cls = -1;
+    pd.ptype_conf = 0.0f;
     pd.color = classify_plate_color_rgb(rgb, w, h, &pd.box);
     if (!prepare_plate_crop_rgb888(ctx, rgb, w, h, &pd.box,
                                    plate_crop, w, h, &pd.crop_box, &crop_w, &crop_h,
@@ -6749,6 +6930,7 @@ static int run_offline_once(struct app_ctx *ctx)
         }
     }
     pd.ocr_in_occ_ratio = occ_ratio;
+    maybe_apply_plate_type_classifier(ctx, &pd, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT, 0);
     fprintf(stderr, "[crop-geom] box=[%d,%d,%d,%d] crop=[%d,%d,%d,%d] iou=%.3f\n",
             pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2,
             pd.crop_box.x1, pd.crop_box.y1, pd.crop_box.x2, pd.crop_box.y2,
@@ -6771,12 +6953,12 @@ static int run_offline_once(struct app_ctx *ctx)
         } else {
             if (ctx->ocr_crop_index_fp && ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max)
                 ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
-                                    pd.det_cls, ctx->opt.pose_nc,
+                                    pd.det_cls, plate_det_has_ptype_route(&pd) ? -1 : ctx->opt.pose_nc,
                                     pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
                                     &odiag, &ocr_input_dump, NULL);
             else
                 ret = run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
-                                    pd.det_cls, ctx->opt.pose_nc,
+                                    pd.det_cls, plate_det_has_ptype_route(&pd) ? -1 : ctx->opt.pose_nc,
                                     pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
                                     &odiag, NULL, NULL);
             if (ret < 0) {
@@ -6789,7 +6971,8 @@ static int run_offline_once(struct app_ctx *ctx)
     }
     if (pd.ocr_text[0] != '\0') {
         bool green_fc_allowed = false;
-        if (ctx->opt.pose_nc >= 5) {
+        bool routed_by_cls = (ctx->opt.pose_nc >= 5) || plate_det_has_ptype_route(&pd);
+        if (routed_by_cls) {
             green_fc_allowed = (pd.det_cls == 1);
         } else {
             green_fc_allowed = (pd.color == PLATE_COLOR_GREEN);
@@ -6798,13 +6981,12 @@ static int run_offline_once(struct app_ctx *ctx)
             run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
                                         &pd.box, 0, pd.ocr_text, sizeof(pd.ocr_text));
         }
-        if (ctx->opt.pose_nc >= 5 && pd.det_cls == 3 &&
-            ctx->police_firstchar_model.ctx) {
+        if (routed_by_cls && pd.det_cls == 3 && ctx->police_firstchar_model.ctx) {
             run_police_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
                                           &pd.box, 0, pd.ocr_text, sizeof(pd.ocr_text));
         }
     }
-    if (ctx->opt.pose_nc >= 5 && pd.det_cls >= 0 && pd.det_cls <= 4)
+    if (((ctx->opt.pose_nc >= 5) || plate_det_has_ptype_route(&pd)) && pd.det_cls >= 0 && pd.det_cls <= 4)
         pd.type = det_cls_to_plate_type(pd.det_cls);
     else
         pd.type = classify_plate_type(pd.color, pd.ocr_text);
@@ -6819,22 +7001,26 @@ static int run_offline_once(struct app_ctx *ctx)
                 "[offline][ctc] t=%d c=%d blank=%d blank_top1=%.3f\n",
                 odiag.t_size, odiag.c_size, odiag.blank_idx, odiag.blank_top1_ratio);
     }
-    fprintf(stderr,
-            "[offline][pred] text=%s conf=%.4f type=%s color=%s det_cls=%d route=%s expert=%s\n",
-            pd.ocr_text, pd.ocr_conf, plate_type_str(pd.type), plate_color_str(pd.color),
-            pd.det_cls,
-            det_cls_route_name(pd.det_cls, ctx->opt.pose_nc),
-            det_cls_to_expert_name(pd.det_cls, ctx->opt.pose_nc));
+    {
+        const char *route = pd.route_name[0] ? pd.route_name : det_cls_route_name(pd.det_cls, ctx->opt.pose_nc);
+        const char *expert = pd.ocr_expert[0] ? pd.ocr_expert : det_cls_to_expert_name(pd.det_cls, ctx->opt.pose_nc);
+        fprintf(stderr,
+                "[offline][pred] text=%s conf=%.4f type=%s color=%s det_cls=%d route=%s expert=%s\n",
+                pd.ocr_text, pd.ocr_conf, plate_type_str(pd.type), plate_color_str(pd.color),
+                pd.det_cls, route, expert);
+    }
 
     ts_us = mono_us();
     log_prediction_row(ctx, 0, ts_us, &pd);
     if (!ocr_input_dump && ctx->ocr_crop_index_fp &&
         ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
-        const struct ocr_model *dump_model = select_ocr_model_by_det_cls(ctx, pd.det_cls, ctx->opt.pose_nc, pd.color, NULL, NULL);
+        const char *dump_route = plate_det_has_ptype_route(&pd) ? "ptype_cls" : NULL;
+        const struct ocr_model *dump_model = select_ocr_model_by_det_cls(ctx, pd.det_cls, ctx->opt.pose_nc, pd.color, NULL, &dump_route);
         ocr_input_dump = prepare_ocr_input_rgb888(ctx, dump_model, plate_crop, crop_w, crop_h, NULL);
     }
     if (ocr_input_dump) {
-        const struct ocr_model *dump_model = select_ocr_model_by_det_cls(ctx, pd.det_cls, ctx->opt.pose_nc, pd.color, NULL, NULL);
+        const char *dump_route = plate_det_has_ptype_route(&pd) ? "ptype_cls" : NULL;
+        const struct ocr_model *dump_model = select_ocr_model_by_det_cls(ctx, pd.det_cls, ctx->opt.pose_nc, pd.color, NULL, &dump_route);
         dump_ocr_pair(ctx, 0, &pd, plate_crop, crop_w, crop_h,
                       ocr_input_dump, (int)dump_model->in_w, (int)dump_model->in_h,
                       firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT);
@@ -7244,6 +7430,9 @@ static void *infer_thread_main(void *arg)
             char overlay_txt[32];
             pd.box = stable_plates[i];
             pd.det_cls = stable_plates[i].cls;
+            pd.det_cls_detector = stable_plates[i].cls;
+            pd.ptype_cls = -1;
+            pd.ptype_conf = 0.0f;
             if (ctx->opt.plate_refine) {
                 struct det_box refined = pd.box;
                 if (refine_plate_box_local(ctx, det_src_rgb, (int)ctx->frame_width, (int)ctx->frame_height,
@@ -7300,6 +7489,7 @@ static void *infer_thread_main(void *arg)
                 }
             }
             pd.ocr_in_occ_ratio = occ_ratio;
+            maybe_apply_plate_type_classifier(ctx, &pd, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT, seq);
             fprintf(stderr,
                     "[crop-geom] frame=%" PRIu64 " box=[%d,%d,%d,%d] crop=[%d,%d,%d,%d] iou=%.3f\n",
                     seq,
@@ -7335,7 +7525,7 @@ static void *infer_thread_main(void *arg)
                             pd.box.x1, pd.box.y1, pd.box.x2, pd.box.y2);
                 } else {
                     if (run_model_ocr(ctx, plate_crop, crop_w, crop_h, pd.color,
-                                      pd.det_cls, ctx->opt.pose_nc,
+                                      pd.det_cls, plate_det_has_ptype_route(&pd) ? -1 : ctx->opt.pose_nc,
                                       pd.ocr_text, sizeof(pd.ocr_text), &pd.ocr_conf,
                                       &odiag, ocr_input_out, NULL) < 0) {
                         snprintf(pd.ocr_text, sizeof(pd.ocr_text), "UNK");
@@ -7363,8 +7553,9 @@ static void *infer_thread_main(void *arg)
             }
             if (pd.ocr_text[0] != '\0') {
                 bool green_fc_allowed = false;
-                if (ctx->opt.pose_nc >= 5) {
-                    /* Multi-class mode: gate by det_cls */
+                bool routed_by_cls = (ctx->opt.pose_nc >= 5) || plate_det_has_ptype_route(&pd);
+                if (routed_by_cls) {
+                    /* Multi-class detector or plate-type classifier: gate by final det_cls. */
                     green_fc_allowed = (pd.det_cls == 1);
                 } else {
                     /* Single-class / fallback: gate by color */
@@ -7374,15 +7565,14 @@ static void *infer_thread_main(void *arg)
                     run_green_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
                                                 &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text));
                 }
-                if (ctx->opt.pose_nc >= 5 && pd.det_cls == 3 &&
-                    ctx->police_firstchar_model.ctx) {
+                if (routed_by_cls && pd.det_cls == 3 && ctx->police_firstchar_model.ctx) {
                     run_police_firstchar_sidecar(ctx, firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT,
                                                   &pd.box, seq, pd.ocr_text, sizeof(pd.ocr_text));
                 }
             }
             if (pd.ocr_text[0] != '\0')
                 ocr_nonempty_count++;
-            if (ctx->opt.pose_nc >= 5 && pd.det_cls >= 0 && pd.det_cls <= 4)
+            if (((ctx->opt.pose_nc >= 5) || plate_det_has_ptype_route(&pd)) && pd.det_cls >= 0 && pd.det_cls <= 4)
                 pd.type = det_cls_to_plate_type(pd.det_cls);
             else
                 pd.type = classify_plate_type(pd.color, pd.ocr_text);
@@ -7391,11 +7581,13 @@ static void *infer_thread_main(void *arg)
                 overlay_nonempty_count++;
             if (!ocr_input_dump && ctx->ocr_crop_index_fp &&
                 ctx->ocr_crop_dumped < ctx->opt.ocr_crop_dump_max) {
-                const struct ocr_model *dump_model = select_ocr_model_by_det_cls(ctx, pd.det_cls, ctx->opt.pose_nc, pd.color, NULL, NULL);
+                const char *dump_route = plate_det_has_ptype_route(&pd) ? "ptype_cls" : NULL;
+                const struct ocr_model *dump_model = select_ocr_model_by_det_cls(ctx, pd.det_cls, ctx->opt.pose_nc, pd.color, NULL, &dump_route);
                 ocr_input_dump = prepare_ocr_input_rgb888(ctx, dump_model, plate_crop, crop_w, crop_h, NULL);
             }
             if (ocr_input_dump) {
-                const struct ocr_model *dump_model = select_ocr_model_by_det_cls(ctx, pd.det_cls, ctx->opt.pose_nc, pd.color, NULL, NULL);
+                const char *dump_route = plate_det_has_ptype_route(&pd) ? "ptype_cls" : NULL;
+                const struct ocr_model *dump_model = select_ocr_model_by_det_cls(ctx, pd.det_cls, ctx->opt.pose_nc, pd.color, NULL, &dump_route);
                 dump_ocr_pair(ctx, seq, &pd, plate_crop, crop_w, crop_h,
                               ocr_input_dump, (int)dump_model->in_w, (int)dump_model->in_h,
                               firstchar_crop, FIRSTCHAR_WARP_WIDTH, FIRSTCHAR_WARP_HEIGHT);
@@ -7554,6 +7746,8 @@ static void cleanup(struct app_ctx *ctx)
     rknn_ocr_model_release(&ctx->ocr_yellow_model);
     rknn_ocr_model_release(&ctx->ocr_special_model);
     rknn_firstchar_model_release(&ctx->green_firstchar_model);
+    rknn_firstchar_model_release(&ctx->police_firstchar_model);
+    rknn_firstchar_model_release(&ctx->plate_type_classifier_model);
     rknn_quad_refiner_model_release(&ctx->quad_refiner_model);
 
     if (ctx->pred_log_fp) {
@@ -7786,6 +7980,18 @@ int main(int argc, char **argv)
                 ctx.opt.police_firstchar_model_path,
                 ctx.opt.police_firstchar_min_votes,
                 ctx.opt.police_firstchar_min_share);
+    }
+    if (rknn_firstchar_model_load(&ctx.plate_type_classifier_model, "plate_type_classifier",
+                                  ctx.opt.plate_type_classifier_model_path) < 0)
+        goto out;
+    if (ctx.plate_type_classifier_model.ctx) {
+        fprintf(stderr,
+                "[ptype] classifier enabled: model=%s min_conf=%.2f special_min_conf=%.2f input=RGB %ux%u\n",
+                ctx.opt.plate_type_classifier_model_path,
+                ctx.opt.plate_type_classifier_min_conf,
+                ctx.opt.plate_type_classifier_special_min_conf,
+                ctx.plate_type_classifier_model.in_w,
+                ctx.plate_type_classifier_model.in_h);
     }
     if (rknn_quad_refiner_model_load(&ctx.quad_refiner_model, "quad_refiner", ctx.opt.quad_refiner_model_path) < 0)
         goto out;

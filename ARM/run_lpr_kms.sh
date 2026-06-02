@@ -23,6 +23,9 @@ OCR_EMBASSY_KEYS=""
 POLICE_FIRSTCHAR_MODEL=""
 POLICE_FIRSTCHAR_MIN_VOTES="1"
 POLICE_FIRSTCHAR_MIN_SHARE="0.00"
+PLATE_TYPE_CLASSIFIER_MODEL=""
+PLATE_TYPE_CLASSIFIER_MIN_CONF="0.80"
+PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF="0.70"
 QUAD_REFINER_MODEL=""
 LABELS=""
 PRED_LOG=""
@@ -86,6 +89,9 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-blue-model <path> 
   --green-firstchar-model <path|off> Green first-character RKNN sidecar (default: off)
   --green-firstchar-min-votes <n> Min same-province votes before replacement (default: ${GREEN_FIRSTCHAR_MIN_VOTES})
   --green-firstchar-min-share <v> Min vote share before replacement (default: ${GREEN_FIRSTCHAR_MIN_SHARE})
+  --plate-type-classifier-model <path|off> Plate type classifier RKNN, RGB 224x72 (default: off)
+  --plate-type-classifier-min-conf <v> Min confidence for route override (default: ${PLATE_TYPE_CLASSIFIER_MIN_CONF})
+  --plate-type-classifier-special-min-conf <v> Min police/embassy override confidence (default: ${PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF})
   --quad-refiner-model <path|off> Quad refiner RKNN path; pass off to disable
   --labels <path>            Labels file (required for live camera mode)
   --pred-log <path>          Prediction CSV output path (optional)
@@ -157,6 +163,9 @@ while [[ $# -gt 0 ]]; do
     --police-firstchar-model) POLICE_FIRSTCHAR_MODEL="$2"; shift 2 ;;
     --police-firstchar-min-votes) POLICE_FIRSTCHAR_MIN_VOTES="$2"; shift 2 ;;
     --police-firstchar-min-share) POLICE_FIRSTCHAR_MIN_SHARE="$2"; shift 2 ;;
+    --plate-type-classifier-model) PLATE_TYPE_CLASSIFIER_MODEL="$2"; shift 2 ;;
+    --plate-type-classifier-min-conf) PLATE_TYPE_CLASSIFIER_MIN_CONF="$2"; shift 2 ;;
+    --plate-type-classifier-special-min-conf) PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF="$2"; shift 2 ;;
     --quad-refiner-model) QUAD_REFINER_MODEL="$2"; shift 2 ;;
     --labels) LABELS="$2"; shift 2 ;;
     --pred-log) PRED_LOG="$2"; shift 2 ;;
@@ -336,6 +345,12 @@ if [[ -n "$POLICE_FIRSTCHAR_MODEL" && "$POLICE_FIRSTCHAR_MODEL" != "off" ]]; the
     --police-firstchar-model "$POLICE_FIRSTCHAR_MODEL"
     --police-firstchar-min-votes "$POLICE_FIRSTCHAR_MIN_VOTES"
     --police-firstchar-min-share "$POLICE_FIRSTCHAR_MIN_SHARE")
+fi
+if [[ -n "$PLATE_TYPE_CLASSIFIER_MODEL" && "$PLATE_TYPE_CLASSIFIER_MODEL" != "off" ]]; then
+  CMD+=(
+    --plate-type-classifier-model "$PLATE_TYPE_CLASSIFIER_MODEL"
+    --plate-type-classifier-min-conf "$PLATE_TYPE_CLASSIFIER_MIN_CONF"
+    --plate-type-classifier-special-min-conf "$PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF")
 fi
 
 if [[ "$OFFLINE_MODE" == "0" ]]; then
