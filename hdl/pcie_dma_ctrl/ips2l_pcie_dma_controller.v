@@ -117,16 +117,22 @@ wire                mwr64_req_vld /*synthesis PAP_MARK_DEBUG="1"*/;
 wire                mrd32_req_vld;
 wire                mrd64_req_vld;
 
-localparam  [1:0]   FRAME_IDLE          = 2'd0;
-localparam  [1:0]   FRAME_REQ_START     = 2'd1;
-localparam  [1:0]   FRAME_WAIT_ACK      = 2'd2;
-localparam  [1:0]   FRAME_WAIT_DONE     = 2'd3;
+localparam  [2:0]   FRAME_IDLE          = 3'd0;
+localparam  [2:0]   FRAME_REQ_START     = 3'd1;
+localparam  [2:0]   FRAME_WAIT_ACK      = 3'd2;
+localparam  [2:0]   FRAME_WAIT_DONE     = 3'd3;
 
-reg     [1:0]       frame_state;
+// Pace frame-mode MWR chunks so the external frame-read stream is not
+// drained faster than DDR can refill it. At 125 MHz, 2048 cycles is about
+// 16 us per 4 KB chunk, keeping 720p BGRX frame DMA inside a 30 fps budget.
+localparam  [11:0]  FRAME_CHUNK_GAP_CYCLES = 12'd2048;
+
+reg     [2:0]       frame_state;
 reg                 frame_active;
 reg     [63:0]      frame_cur_addr;
 reg     [23:0]      frame_remaining_dwords;
 reg     [10:0]      frame_chunk_dwords;
+reg     [11:0]      frame_chunk_gap_cnt;
 reg                 frame_req_vld;
 reg     [9:0]       frame_req_length;
 reg     [63:0]      frame_req_addr;
@@ -292,6 +298,7 @@ begin
         frame_cur_addr <= 64'd0;
         frame_remaining_dwords <= 24'd0;
         frame_chunk_dwords <= 11'd0;
+        frame_chunk_gap_cnt <= 12'd0;
         frame_req_vld <= 1'b0;
         frame_req_length <= 10'd0;
         frame_req_addr <= 64'd0;
@@ -306,11 +313,13 @@ begin
         begin
             frame_state <= FRAME_IDLE;
             frame_chunk_dwords <= 11'd0;
+            frame_chunk_gap_cnt <= 12'd0;
             if(frame_mode_total_dwords != 24'd0)
             begin
                 frame_active <= 1'b1;
                 frame_cur_addr <= {dma_cmd_h_addr, dma_cmd_l_addr};
                 frame_remaining_dwords <= frame_mode_total_dwords;
+                frame_chunk_gap_cnt <= FRAME_CHUNK_GAP_CYCLES;
                 frame_state <= FRAME_REQ_START;
             end
             else
@@ -326,27 +335,36 @@ begin
             frame_state <= FRAME_IDLE;
             frame_remaining_dwords <= 24'd0;
             frame_chunk_dwords <= 11'd0;
+            frame_chunk_gap_cnt <= 12'd0;
         end
         else if(frame_active)
         begin
             case(frame_state)
                 FRAME_REQ_START:
                 begin
-                    frame_chunk_dwords <= frame_chunk_dwords_next;
-                    frame_req_length <= frame_chunk_len_code_next;
-                    frame_req_addr <= frame_cur_addr;
-                    if (frame_chunk_dwords_next != 11'd0)
+                    if (frame_chunk_gap_cnt != 12'd0)
                     begin
-                        frame_req_vld <= 1'b1;
-                        frame_state <= FRAME_WAIT_ACK;
+                        frame_chunk_gap_cnt <= frame_chunk_gap_cnt - 12'd1;
                     end
                     else
                     begin
-                        frame_active <= 1'b0;
-                        frame_state <= FRAME_IDLE;
-                        frame_remaining_dwords <= 24'd0;
-                        frame_chunk_dwords <= 11'd0;
-                        o_frame_done_pulse <= 1'b1;
+                        frame_chunk_dwords <= frame_chunk_dwords_next;
+                        frame_req_length <= frame_chunk_len_code_next;
+                        frame_req_addr <= frame_cur_addr;
+                        if (frame_chunk_dwords_next != 11'd0)
+                        begin
+                            frame_req_vld <= 1'b1;
+                            frame_state <= FRAME_WAIT_ACK;
+                        end
+                        else
+                        begin
+                            frame_active <= 1'b0;
+                            frame_state <= FRAME_IDLE;
+                            frame_remaining_dwords <= 24'd0;
+                            frame_chunk_dwords <= 11'd0;
+                            frame_chunk_gap_cnt <= 12'd0;
+                            o_frame_done_pulse <= 1'b1;
+                        end
                     end
                 end
                 FRAME_WAIT_ACK:
@@ -364,12 +382,14 @@ begin
                             frame_state <= FRAME_IDLE;
                             frame_remaining_dwords <= 24'd0;
                             frame_chunk_dwords <= 11'd0;
+                            frame_chunk_gap_cnt <= 12'd0;
                             o_frame_done_pulse <= 1'b1;
                         end
                         else
                         begin
                             frame_remaining_dwords <= frame_remaining_dwords - {13'd0, frame_chunk_dwords};
                             frame_cur_addr <= frame_cur_addr + {51'd0, frame_chunk_dwords, 2'b0};
+                            frame_chunk_gap_cnt <= FRAME_CHUNK_GAP_CYCLES;
                             frame_state <= FRAME_REQ_START;
                         end
                     end
@@ -384,6 +404,7 @@ begin
         begin
             frame_state <= FRAME_IDLE;
             frame_chunk_dwords <= 11'd0;
+            frame_chunk_gap_cnt <= 12'd0;
         end
     end
 end
