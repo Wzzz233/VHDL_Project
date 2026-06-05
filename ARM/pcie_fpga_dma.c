@@ -40,6 +40,7 @@
 static int major_num;
 static int dma_timeout_ms = 5000;  /* 5 seconds default timeout */
 static int dma_chunk_delay_us = 0; /* inter-chunk pacing, default 0us */
+static int dma_frame_start_delay_us = 300; /* let FPGA frame reader prefetch before frame-mode MWR */
 static int dma_poll_sleep_us = 5;      /* initial sleep in wait loop (0=busy poll) */
 static int dma_poll_sleep_max_us = 80; /* adaptive backoff upper bound */
 static int dma_poll_backoff_polls = 8; /* bump sleep every N polls */
@@ -56,6 +57,8 @@ module_param(dma_timeout_ms, int, 0644);
 MODULE_PARM_DESC(dma_timeout_ms, "DMA transfer timeout in milliseconds");
 module_param(dma_chunk_delay_us, int, 0644);
 MODULE_PARM_DESC(dma_chunk_delay_us, "Delay in microseconds after each DMA chunk trigger");
+module_param(dma_frame_start_delay_us, int, 0644);
+MODULE_PARM_DESC(dma_frame_start_delay_us, "Delay after BAR1 low-address write before frame-mode DMA command");
 module_param(dma_poll_sleep_us, int, 0644);
 MODULE_PARM_DESC(dma_poll_sleep_us, "Initial sleep in microseconds while polling DMA completion (0=busy)");
 module_param(dma_poll_sleep_max_us, int, 0644);
@@ -369,9 +372,17 @@ static int fpga_dma_perform_transfer_irq(struct fpga_dma_dev *dev,
         ;
     reinit_completion(&dev->dma_done);
 
-    /* Fixed write order: BAR1+0x120 -> BAR1+0x110 -> BAR1+0x100. */
+    /* Fixed write order: BAR1+0x120 -> BAR1+0x110 -> BAR1+0x100.
+       The FPGA uses the low-address write as the frame-reader restart pulse,
+       so flush it and give rd_buf a short prefetch window before the command
+       lets PCIe MWR start draining BAR2 data. */
     fpga_dma_write_reg(dev, BAR1_DMA_H_ADDR, upper_32_bits(dma_handle));
     fpga_dma_write_reg(dev, BAR1_DMA_L_ADDR, lower_32_bits(dma_handle));
+    fpga_dma_flush_posted_writes(dev);
+    if (dma_frame_start_delay_us >= 1000)
+        usleep_range(dma_frame_start_delay_us, dma_frame_start_delay_us + 100);
+    else if (dma_frame_start_delay_us > 0)
+        udelay(dma_frame_start_delay_us);
     cmd_reg = DMA_CMD_FRAME_MODE | DMA_CMD_64BIT_ADDR | DMA_CMD_WRITE |
               (total_dwords & DMA_CMD_FRAME_DWORDS_MASK);
     fpga_dma_write_reg(dev, BAR1_DMA_CMD_REG, cmd_reg);
