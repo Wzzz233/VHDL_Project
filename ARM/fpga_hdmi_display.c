@@ -632,6 +632,8 @@ static int init_fpga_dma(struct app_ctx *ctx)
         int i;
 
         if (ctx->zero_copy_mode) {
+            fprintf(stderr,
+                    "Warning: mmap zero-copy wraps live DMA coherent buffers; use --mmap-mode=staged when checking HDMI tearing\n");
             requested_maps = ctx->opt.copy_buffers;
             if (requested_maps < 3) {
                 fprintf(stderr,
