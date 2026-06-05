@@ -35,7 +35,7 @@
 #define DEFAULT_FPS 10
 #define DEFAULT_TIMEOUT_MS 5000
 #define DEFAULT_STATS_INTERVAL 1
-#define DEFAULT_COPY_BUFFERS 3
+#define DEFAULT_COPY_BUFFERS 6
 #define DEFAULT_QUEUE_DEPTH 2
 #define DEFAULT_RELEASE_DELAY_MS 20
 #define MIN_COPY_BUFFERS 2
@@ -993,18 +993,22 @@ static GstBuffer *build_frame_buffer(struct app_ctx *ctx, const struct slot_tick
     return buf;
 }
 
-static void get_slot_counts(struct app_ctx *ctx, int *free_slots, int *used_slots)
+static void get_slot_counts(struct app_ctx *ctx, int *free_slots, int *used_slots, int *pending_slots)
 {
     int i;
     int free_cnt = 0;
     int used_cnt = 0;
+    int pending_cnt = 0;
 
     g_mutex_lock(&ctx->slots_lock);
     for (i = 0; i < ctx->slot_count; i++) {
-        if (ctx->slots[i].in_use)
+        if (ctx->slots[i].in_use) {
             used_cnt++;
-        else
+            if (ctx->slots[i].release_pending)
+                pending_cnt++;
+        } else {
             free_cnt++;
+        }
     }
     g_mutex_unlock(&ctx->slots_lock);
 
@@ -1012,6 +1016,8 @@ static void get_slot_counts(struct app_ctx *ctx, int *free_slots, int *used_slot
         *free_slots = free_cnt;
     if (used_slots)
         *used_slots = used_cnt;
+    if (pending_slots)
+        *pending_slots = pending_cnt;
 }
 
 static void print_stats(struct app_ctx *ctx)
@@ -1022,6 +1028,7 @@ static void print_stats(struct app_ctx *ctx)
     double avg_slot_wait_ms;
     int free_slots;
     int used_slots;
+    int pending_slots;
 
     if (dt < (int64_t)ctx->opt.stats_interval * 1000000LL)
         return;
@@ -1031,17 +1038,18 @@ static void print_stats(struct app_ctx *ctx)
         ? ((double)ctx->slot_wait_total_us / (double)ctx->slot_wait_samples / 1000.0)
         : 0.0;
 
-    get_slot_counts(ctx, &free_slots, &used_slots);
+    get_slot_counts(ctx, &free_slots, &used_slots, &pending_slots);
 
     fprintf(stderr,
             "[stats] cap=%" PRIu64 " push=%" PRIu64 " rel=%" PRIu64
-            " free=%d used=%d timeout=%" PRIu64
+            " free=%d used=%d pending=%d timeout=%" PRIu64
             " fps=%.2f rel_fps=%.2f avg_loop=%.2fms avg_slot_wait=%.2fms\n",
             ctx->captured_frames,
             ctx->pushed_frames,
             ctx->released_frames,
             free_slots,
             used_slots,
+            pending_slots,
             ctx->slot_wait_timeout_count,
             (double)(ctx->captured_frames - ctx->last_stats_captured) * 1000000.0 / (double)dt,
             (double)(ctx->released_frames - ctx->last_stats_released) * 1000000.0 / (double)dt,

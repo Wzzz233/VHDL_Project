@@ -49,7 +49,7 @@ static bool dma_verbose = false;   /* verbose transfer logs */
 static int dma_pixel_format = FPGA_PIXEL_FORMAT_BGRX8888;
 static int dma_allow_poll_fallback = 0;
 static int dma_irq_timeout_retry_poll = 1;
-static int dma_ring_buffers = 3;
+static int dma_ring_buffers = 6;
 
 module_param(major_num, int, 0);
 MODULE_PARM_DESC(major_num, "Major device number (0=dynamic)");
