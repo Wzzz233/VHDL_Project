@@ -39,6 +39,7 @@
 #define DEFAULT_QUEUE_DEPTH 2
 #define DEFAULT_RELEASE_DELAY_MS 20
 #define MIN_COPY_BUFFERS 2
+#define MIN_DELAYED_ZERO_COPY_BUFFERS 5
 #define MAX_COPY_BUFFERS 6
 
 enum pixel_order {
@@ -150,6 +151,19 @@ static volatile sig_atomic_t g_stop = 0;
 static int64_t mono_us(void)
 {
     return g_get_monotonic_time();
+}
+
+static void sleep_until_us(int64_t target_us)
+{
+    struct timespec ts;
+
+    if (target_us <= mono_us())
+        return;
+
+    ts.tv_sec = (time_t)(target_us / 1000000LL);
+    ts.tv_nsec = (long)((target_us % 1000000LL) * 1000LL);
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) < 0 && errno == EINTR)
+        ;
 }
 
 static void signal_handler(int signo)
@@ -650,6 +664,14 @@ static int init_fpga_dma(struct app_ctx *ctx)
             fprintf(stderr,
                     "Warning: mmap zero-copy wraps live DMA coherent buffers; use --mmap-mode=staged when checking HDMI tearing\n");
             requested_maps = ctx->opt.copy_buffers;
+            if (ctx->opt.release_delay_ms > 0 && requested_maps < MIN_DELAYED_ZERO_COPY_BUFFERS) {
+                fprintf(stderr,
+                        "Note: zero-copy with release delay needs at least %d buffers, forcing copy_buffers=%d\n",
+                        MIN_DELAYED_ZERO_COPY_BUFFERS,
+                        MIN_DELAYED_ZERO_COPY_BUFFERS);
+                requested_maps = MIN_DELAYED_ZERO_COPY_BUFFERS;
+                ctx->opt.copy_buffers = MIN_DELAYED_ZERO_COPY_BUFFERS;
+            }
             if (requested_maps < 3) {
                 fprintf(stderr,
                         "Note: mmap zero-copy mode needs at least 3 buffers for stable 60fps, forcing copy_buffers=3\n");
@@ -1221,6 +1243,7 @@ int main(int argc, char **argv)
 {
     struct app_ctx ctx;
     int ret = 1;
+    int64_t next_frame_us = 0;
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.dev_fd = -1;
@@ -1276,6 +1299,7 @@ int main(int argc, char **argv)
 
     ctx.start_us = mono_us();
     ctx.last_stats_us = ctx.start_us;
+    next_frame_us = ctx.start_us;
 
     while (ctx.running) {
         struct slot_ticket ticket;
@@ -1340,8 +1364,10 @@ int main(int argc, char **argv)
 
         print_stats(&ctx);
 
-        if ((t1 - t0) < target_us)
-            usleep((useconds_t)(target_us - (t1 - t0)));
+        next_frame_us += target_us;
+        if (t1 > next_frame_us + target_us)
+            next_frame_us = t1 + target_us;
+        sleep_until_us(next_frame_us);
     }
 
     fprintf(stderr,
