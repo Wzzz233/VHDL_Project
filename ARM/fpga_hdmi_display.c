@@ -37,6 +37,7 @@
 #define DEFAULT_STATS_INTERVAL 1
 #define DEFAULT_COPY_BUFFERS 3
 #define DEFAULT_QUEUE_DEPTH 2
+#define DEFAULT_RELEASE_DELAY_MS 20
 #define MIN_COPY_BUFFERS 2
 #define MAX_COPY_BUFFERS 6
 
@@ -66,6 +67,7 @@ struct options {
     int stats_interval;
     int copy_buffers;
     int queue_depth;
+    int release_delay_ms;
     enum io_mode io_mode;
     enum mmap_mode mmap_mode;
     bool swap16;
@@ -76,6 +78,8 @@ struct frame_slot {
     uint8_t *data;
     bool owns_data;
     bool in_use;
+    bool release_pending;
+    int64_t release_at_us;
     uint64_t generation;
 };
 
@@ -169,6 +173,7 @@ static void print_usage(const char *prog)
             "  --stats-interval <sec>  Stats print interval (default: %d)\n"
             "  --copy-buffers <num>    Copy ring size (default: %d, range: %d..%d)\n"
             "  --queue-depth <num>     appsrc max frame queue (default: %d)\n"
+            "  --release-delay-ms <ms> Hold released slots before reuse (default: %d)\n"
             "  --io-mode <mode>        mmap|copy (default: mmap)\n"
             "  --mmap-mode <mode>      staged|zero-copy (default: staged)\n"
             "  --swap16 <0|1>          Swap bytes in each 16-bit pixel (default: 1)\n"
@@ -183,7 +188,8 @@ static void print_usage(const char *prog)
             DEFAULT_COPY_BUFFERS,
             MIN_COPY_BUFFERS,
             MAX_COPY_BUFFERS,
-            DEFAULT_QUEUE_DEPTH);
+            DEFAULT_QUEUE_DEPTH,
+            DEFAULT_RELEASE_DELAY_MS);
 }
 
 static int parse_options(int argc, char **argv, struct options *opt)
@@ -203,6 +209,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
         {"swap16", required_argument, NULL, 12},
         {"mmap-mode", required_argument, NULL, 13},
         {"display-sync", required_argument, NULL, 14},
+        {"release-delay-ms", required_argument, NULL, 15},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -219,6 +226,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->stats_interval = DEFAULT_STATS_INTERVAL;
     opt->copy_buffers = DEFAULT_COPY_BUFFERS;
     opt->queue_depth = DEFAULT_QUEUE_DEPTH;
+    opt->release_delay_ms = DEFAULT_RELEASE_DELAY_MS;
     opt->io_mode = IO_MODE_MMAP;
     opt->mmap_mode = MMAP_MODE_STAGED;
     opt->swap16 = true;
@@ -325,6 +333,13 @@ static int parse_options(int argc, char **argv, struct options *opt)
                 opt->display_sync = false;
             } else {
                 fprintf(stderr, "Invalid --display-sync: %s (use 0|1)\n", optarg);
+                return -1;
+            }
+            break;
+        case 15:
+            opt->release_delay_ms = atoi(optarg);
+            if (opt->release_delay_ms < 0 || opt->release_delay_ms > 1000) {
+                fprintf(stderr, "Invalid --release-delay-ms: %s (range 0..1000)\n", optarg);
                 return -1;
             }
             break;
@@ -861,7 +876,15 @@ static void release_slot_ticket(struct app_ctx *ctx, const struct slot_ticket *t
     g_mutex_lock(&ctx->slots_lock);
     if (ctx->slots[ticket->idx].in_use &&
         ctx->slots[ticket->idx].generation == ticket->generation) {
-        ctx->slots[ticket->idx].in_use = false;
+        if (ctx->opt.release_delay_ms > 0) {
+            ctx->slots[ticket->idx].release_pending = true;
+            ctx->slots[ticket->idx].release_at_us = mono_us() +
+                (int64_t)ctx->opt.release_delay_ms * 1000LL;
+        } else {
+            ctx->slots[ticket->idx].in_use = false;
+            ctx->slots[ticket->idx].release_pending = false;
+            ctx->slots[ticket->idx].release_at_us = 0;
+        }
         if (count_release)
             ctx->released_frames++;
         g_cond_signal(&ctx->slots_cond);
@@ -896,9 +919,21 @@ static int acquire_free_slot(struct app_ctx *ctx, struct slot_ticket *ticket)
             return -1;
 
         g_mutex_lock(&ctx->slots_lock);
+        now = mono_us();
+        for (i = 0; i < ctx->slot_count; i++) {
+            if (ctx->slots[i].in_use && ctx->slots[i].release_pending &&
+                now >= ctx->slots[i].release_at_us) {
+                ctx->slots[i].in_use = false;
+                ctx->slots[i].release_pending = false;
+                ctx->slots[i].release_at_us = 0;
+            }
+        }
+
         for (i = 0; i < ctx->slot_count; i++) {
             if (!ctx->slots[i].in_use) {
                 ctx->slots[i].in_use = true;
+                ctx->slots[i].release_pending = false;
+                ctx->slots[i].release_at_us = 0;
                 ctx->slots[i].generation++;
                 ticket->idx = i;
                 ticket->generation = ctx->slots[i].generation;
@@ -1119,8 +1154,12 @@ static int build_pipeline(struct app_ctx *ctx)
     }
 
     fprintf(stderr,
-            "Pipeline started: appsrc(format=%s,block=false) -> queue(leaky=downstream,1) -> kmssink(sync=%s) (copy_buffers=%d queue_depth=%d)\n",
-            fmt, ctx->opt.display_sync ? "on" : "off", ctx->opt.copy_buffers, ctx->opt.queue_depth);
+            "Pipeline started: appsrc(format=%s,block=false) -> queue(leaky=downstream,1) -> kmssink(sync=%s) (copy_buffers=%d queue_depth=%d release_delay_ms=%d)\n",
+            fmt,
+            ctx->opt.display_sync ? "on" : "off",
+            ctx->opt.copy_buffers,
+            ctx->opt.queue_depth,
+            ctx->opt.release_delay_ms);
     print_pad_caps("appsrc:src", ctx->appsrc, "src");
     print_pad_caps("kmssink:sink", ctx->sink, "sink");
     return 0;
@@ -1213,7 +1252,7 @@ int main(int argc, char **argv)
         goto out;
 
     fprintf(stderr,
-            "Start display loop: fps=%d src_fmt=%s io-mode=%s mmap-mode=%s zero-copy=%s display-sync=%s pixel-order=%s swap16=%s timeout=%dms copy_buffers=%d queue_depth=%d\n",
+            "Start display loop: fps=%d src_fmt=%s io-mode=%s mmap-mode=%s zero-copy=%s display-sync=%s pixel-order=%s swap16=%s timeout=%dms copy_buffers=%d queue_depth=%d release_delay_ms=%d\n",
             ctx.opt.fps,
             pixel_format_name(ctx.pixel_format),
             (ctx.opt.io_mode == IO_MODE_MMAP) ? "mmap" : "copy",
@@ -1224,7 +1263,8 @@ int main(int argc, char **argv)
             ctx.opt.swap16 ? "on" : "off",
             ctx.opt.timeout_ms,
             ctx.opt.copy_buffers,
-            ctx.opt.queue_depth);
+            ctx.opt.queue_depth,
+            ctx.opt.release_delay_ms);
 
     ctx.start_us = mono_us();
     ctx.last_stats_us = ctx.start_us;

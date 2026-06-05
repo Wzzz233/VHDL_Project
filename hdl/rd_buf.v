@@ -247,17 +247,13 @@ module rd_buf #(
             locked_frame_idx <= 2'd0;
         else if(wr_rst)
         begin
-            // 3-bank mode: read one full bank behind the most recently
-            // completed frame. The write-side frame index advances on VSYNC,
-            // before all DDR write bursts for the previous frame are
-            // guaranteed to be drained, so reading only wr_idx-1 can race the
-            // tail of the previous frame and produce a stable horizontal tear.
-            // wr_idx-2 costs one frame of latency but keeps the DMA snapshot
-            // away from the active and just-finished write banks.
+            // 3-bank mode: read the previously completed frame bank. Reading
+            // two banks behind adds a full frame of latency and did not address
+            // the observed HDMI scanout tear.
             case (i_wr_frame_idx)
-                2'd0: locked_frame_idx <= 2'd1;
-                2'd1: locked_frame_idx <= 2'd2;
-                default: locked_frame_idx <= 2'd0;
+                2'd0: locked_frame_idx <= 2'd2;
+                2'd1: locked_frame_idx <= 2'd0;
+                default: locked_frame_idx <= 2'd1;
             endcase
         end
         else
