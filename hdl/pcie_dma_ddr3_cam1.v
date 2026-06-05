@@ -419,8 +419,8 @@ ips2l_pcie_dma #(
     .o_axis_slave1_tuser	(axis_slave1_tuser),		
 
 	// AXI4-Stream slave2 interface
-	// Gate MWR transmit readiness until the frame read stream has valid data.
-    .i_axis_slave2_trdy		(axis_slave2_tready_fc),
+	// Keep raw ready here; gating this path can deadlock frame-mode MWR.
+    .i_axis_slave2_trdy		(axis_slave2_tready_raw),
     .o_axis_slave2_tvld		(axis_slave2_tvalid),		
     .o_axis_slave2_tdata	(axis_slave2_tdata),		
     .o_axis_slave2_tlast	(axis_slave2_tlast),		
