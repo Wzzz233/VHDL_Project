@@ -18,6 +18,8 @@ testapp: fpga_dma_test.c pcie_fpga_dma.h
 GST_PKGS := gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 libdrm
 GST_CFLAGS ?= $(shell pkg-config --cflags $(GST_PKGS))
 GST_LIBS ?= $(shell pkg-config --libs $(GST_PKGS))
+OPENCV_CFLAGS ?= $(shell pkg-config --cflags opencv4)
+OPENCV_LIBS ?= $(shell pkg-config --libs opencv4)
 
 displayapp: fpga_hdmi_display.c pcie_fpga_dma.h
 	$(CROSS_COMPILE)gcc -Wall -O2 -o fpga_hdmi_display fpga_hdmi_display.c $(GST_CFLAGS) $(GST_LIBS)
@@ -29,6 +31,9 @@ HOST_CFLAGS ?= -Wall -Wextra -O2 -std=c11
 
 lprapp: fpga_lpr_display.c ocr_decode.c ocr_decode.h lpr_special_route.h fpga_lpr_types.h pcie_fpga_dma.h
 	$(CROSS_COMPILE)gcc -Wall -O2 -o fpga_lpr_display fpga_lpr_display.c ocr_decode.c -pthread $(GST_CFLAGS) $(GST_LIBS) $(RKNN_CFLAGS) $(RKNN_LIBS) -lm
+
+crosswalk-test: crosswalk_ped_cv_test.cpp pcie_fpga_dma.h
+	$(CROSS_COMPILE)g++ -Wall -O2 -std=c++17 -o crosswalk_ped_cv_test crosswalk_ped_cv_test.cpp -pthread $(GST_CFLAGS) $(OPENCV_CFLAGS) $(GST_LIBS) $(OPENCV_LIBS) $(RKNN_CFLAGS) $(RKNN_LIBS) -lm
 
 decode-test: test_ocr_decode.c ocr_decode.c ocr_decode.h
 	$(HOST_CC) $(HOST_CFLAGS) -o test_ocr_decode test_ocr_decode.c ocr_decode.c -lm
@@ -53,6 +58,7 @@ clean:
 	rm -f fpga_dma_test
 	rm -f fpga_hdmi_display
 	rm -f fpga_lpr_display
+	rm -f crosswalk_ped_cv_test
 	rm -f test_ocr_decode
 	rm -f test_ocr_layout
 	rm -f test_lpr_special_route
