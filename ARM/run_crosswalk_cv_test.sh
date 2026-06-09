@@ -71,11 +71,6 @@ if [[ ! -x ./crosswalk_ped_cv_test ]]; then
   exit 2
 fi
 
-if ! pkg-config --exists opencv4; then
-  echo "opencv4 pkg-config metadata not found" >&2
-  exit 2
-fi
-
 if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
   echo "gst-inspect-1.0 not found" >&2
   exit 2
@@ -90,6 +85,13 @@ done
 
 if ! ldconfig -p 2>/dev/null | grep -q "librknnrt"; then
   echo "Warning: librknnrt not found in ldconfig cache; continuing in case LD_LIBRARY_PATH is set" >&2
+fi
+if command -v ldd >/dev/null 2>&1; then
+  if ldd ./crosswalk_ped_cv_test 2>/dev/null | grep -q "not found"; then
+    echo "Missing runtime libraries for crosswalk_ped_cv_test:" >&2
+    ldd ./crosswalk_ped_cv_test | grep "not found" >&2
+    exit 2
+  fi
 fi
 
 if [[ ! -c "$DEVICE" ]]; then
