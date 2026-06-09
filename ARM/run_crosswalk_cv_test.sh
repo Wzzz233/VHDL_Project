@@ -16,6 +16,9 @@ QUEUE_DEPTH="1"
 MIN_PERSON_CONF="0.35"
 CV_EVERY_N="3"
 SCENE_SMOOTH="10"
+DEBUG_DUMP_DIR=""
+DEBUG_DUMP_EVERY_N="30"
+DEBUG_DUMP_MAX="30"
 
 usage() {
   cat <<EOF
@@ -35,6 +38,9 @@ Usage: $0 --ped-model <path> --labels <path> [options]
   --min-person-conf <v>      Person confidence threshold (default: ${MIN_PERSON_CONF})
   --cv-every-n <n>           Run scene CV every N frames (default: ${CV_EVERY_N})
   --scene-smooth <n>         Stable ROI hold TTL in CV samples (default: ${SCENE_SMOOTH})
+  --debug-dump-dir <path>    Dump raw/overlay PPM and metadata text (default: off)
+  --debug-dump-every-n <n>   Dump every N frames when enabled (default: ${DEBUG_DUMP_EVERY_N})
+  --debug-dump-max <n>       Max debug samples to dump (default: ${DEBUG_DUMP_MAX})
 EOF
 }
 
@@ -55,6 +61,9 @@ while [[ $# -gt 0 ]]; do
     --min-person-conf) MIN_PERSON_CONF="$2"; shift 2 ;;
     --cv-every-n) CV_EVERY_N="$2"; shift 2 ;;
     --scene-smooth) SCENE_SMOOTH="$2"; shift 2 ;;
+    --debug-dump-dir) DEBUG_DUMP_DIR="$2"; shift 2 ;;
+    --debug-dump-every-n) DEBUG_DUMP_EVERY_N="$2"; shift 2 ;;
+    --debug-dump-max) DEBUG_DUMP_MAX="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -122,6 +131,13 @@ CMD=(./crosswalk_ped_cv_test
   --min-person-conf "$MIN_PERSON_CONF"
   --cv-every-n "$CV_EVERY_N"
   --scene-smooth "$SCENE_SMOOTH")
+
+if [[ -n "$DEBUG_DUMP_DIR" ]]; then
+  CMD+=(
+    --debug-dump-dir "$DEBUG_DUMP_DIR"
+    --debug-dump-every-n "$DEBUG_DUMP_EVERY_N"
+    --debug-dump-max "$DEBUG_DUMP_MAX")
+fi
 
 if [[ -n "$CONNECTOR_ID" ]]; then
   CMD+=(--connector-id "$CONNECTOR_ID")

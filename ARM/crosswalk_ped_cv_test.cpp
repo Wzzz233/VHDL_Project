@@ -23,6 +23,7 @@
 #include <string>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -59,6 +60,9 @@ struct options {
     float min_person_conf = 0.35f;
     int cv_every_n = 3;
     int scene_smooth = 10;
+    const char *debug_dump_dir = nullptr;
+    int debug_dump_every_n = 30;
+    int debug_dump_max = 30;
 };
 
 struct det_box {
@@ -119,6 +123,13 @@ struct scene_state {
     int road_ttl = 0;
 };
 
+enum output_layout_kind {
+    OUTPUT_LAYOUT_UNKNOWN = 0,
+    OUTPUT_LAYOUT_YOLO_OBJ_CLASSES,
+    OUTPUT_LAYOUT_YOLO_CLASSES,
+    OUTPUT_LAYOUT_SINGLE_CLASS_CONF,
+};
+
 struct app_ctx {
     options opt;
     int dev_fd = -1;
@@ -144,6 +155,7 @@ struct app_ctx {
     uint64_t frame_seq = 0;
     uint64_t pushed_frames = 0;
     uint64_t crossing_total = 0;
+    int debug_dumped = 0;
     int64_t last_stats_us = 0;
 };
 
@@ -183,7 +195,10 @@ static void print_usage(const char *prog)
             "  --queue-depth <num>      appsrc queue depth (default: 1)\n"
             "  --min-person-conf <v>    Person confidence threshold (default: 0.35)\n"
             "  --cv-every-n <n>         Run CV every N frames (default: 3)\n"
-            "  --scene-smooth <n>       ROI hold TTL in CV samples (default: 10)\n",
+            "  --scene-smooth <n>       ROI hold TTL in CV samples (default: 10)\n"
+            "  --debug-dump-dir <path>  Dump raw/overlay PPM and metadata text (default: off)\n"
+            "  --debug-dump-every-n <n> Dump every N frames when enabled (default: 30)\n"
+            "  --debug-dump-max <n>     Max debug samples to dump (default: 30)\n",
             prog, DEFAULT_DEVICE, DEFAULT_DRM_CARD);
 }
 
@@ -218,6 +233,9 @@ static int parse_options(int argc, char **argv, options *opt)
         {"min-person-conf", required_argument, NULL, 13},
         {"cv-every-n", required_argument, NULL, 14},
         {"scene-smooth", required_argument, NULL, 15},
+        {"debug-dump-dir", required_argument, NULL, 16},
+        {"debug-dump-every-n", required_argument, NULL, 17},
+        {"debug-dump-max", required_argument, NULL, 18},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -249,6 +267,9 @@ static int parse_options(int argc, char **argv, options *opt)
         case 13: opt->min_person_conf = (float)atof(optarg); break;
         case 14: opt->cv_every_n = atoi(optarg); break;
         case 15: opt->scene_smooth = atoi(optarg); break;
+        case 16: opt->debug_dump_dir = optarg; break;
+        case 17: opt->debug_dump_every_n = atoi(optarg); break;
+        case 18: opt->debug_dump_max = atoi(optarg); break;
         case 'h': print_usage(argv[0]); exit(0);
         default: return -1;
         }
@@ -266,6 +287,8 @@ static int parse_options(int argc, char **argv, options *opt)
     if (opt->min_person_conf < 0.0f || opt->min_person_conf > 1.0f) return -1;
     if (opt->cv_every_n <= 0 || opt->cv_every_n > 120) return -1;
     if (opt->scene_smooth <= 0 || opt->scene_smooth > 300) return -1;
+    if (opt->debug_dump_every_n <= 0 || opt->debug_dump_every_n > 10000) return -1;
+    if (opt->debug_dump_max < 0 || opt->debug_dump_max > 100000) return -1;
     return 0;
 }
 
@@ -374,6 +397,15 @@ static int rknn_model_load(yolo_model *m, const char *path)
         fprintf(stderr, "  out[%u]: n_dims=%u dims=%u,%u,%u,%u fmt=%s\n",
                 i, a->n_dims, a->dims[0], a->dims[1], a->dims[2], a->dims[3],
                 tensor_fmt_name(a->fmt));
+        for (uint32_t j = 0; j < a->n_dims; j++) {
+            if (a->dims[j] == 5 && m->class_count != 1) {
+                fprintf(stderr,
+                        "  warn: output stride 5 is single-class [x,y,w,h,conf]; "
+                        "labels has %d entries. Prefer a one-line labels file containing person.\n",
+                        m->class_count);
+                break;
+            }
+        }
     }
     return 0;
 }
@@ -628,7 +660,8 @@ static void map_from_letterbox(det_box &b, const letterbox_meta &lb)
 }
 
 static bool choose_stride_layout(const rknn_tensor_attr &attr, int class_count,
-                                 bool *channel_first, int *stride, int *count)
+                                 bool *channel_first, int *stride, int *count,
+                                 output_layout_kind *layout)
 {
     size_t elems = 1;
     std::vector<int> dims;
@@ -646,6 +679,16 @@ static bool choose_stride_layout(const rknn_tensor_attr &attr, int class_count,
             *stride = d;
             *count = (int)(elems / (size_t)d);
             *channel_first = (dims.size() >= 3 && dims[1] == d && dims.back() != d);
+            *layout = (d == y5) ? OUTPUT_LAYOUT_YOLO_OBJ_CLASSES : OUTPUT_LAYOUT_YOLO_CLASSES;
+            return true;
+        }
+    }
+    for (int d : dims) {
+        if (d == 5 && elems % (size_t)d == 0) {
+            *stride = d;
+            *count = (int)(elems / (size_t)d);
+            *channel_first = (dims.size() >= 3 && dims[1] == d && dims.back() != d);
+            *layout = OUTPUT_LAYOUT_SINGLE_CLASS_CONF;
             return true;
         }
     }
@@ -654,6 +697,7 @@ static bool choose_stride_layout(const rknn_tensor_attr &attr, int class_count,
             *stride = d;
             *count = (int)(elems / (size_t)d);
             *channel_first = (dims.size() >= 3 && dims[1] == d && dims.back() != d);
+            *layout = (d >= 5 + class_count) ? OUTPUT_LAYOUT_YOLO_OBJ_CLASSES : OUTPUT_LAYOUT_YOLO_CLASSES;
             return true;
         }
     }
@@ -671,13 +715,15 @@ static void decode_output(const float *buf, const rknn_tensor_attr &attr, const 
     bool channel_first = false;
     int stride = 0;
     int count = 0;
-    if (!choose_stride_layout(attr, m.class_count, &channel_first, &stride, &count))
+    output_layout_kind layout = OUTPUT_LAYOUT_UNKNOWN;
+    if (!choose_stride_layout(attr, m.class_count, &channel_first, &stride, &count, &layout))
         return;
 
-    bool has_obj = (stride >= 5 + m.class_count);
+    bool single_class_conf = (layout == OUTPUT_LAYOUT_SINGLE_CLASS_CONF);
+    bool has_obj = (layout == OUTPUT_LAYOUT_YOLO_OBJ_CLASSES);
     int cls_base = has_obj ? 5 : 4;
-    int cls_n = std::min(m.class_count, stride - cls_base);
-    if (cls_n <= 0)
+    int cls_n = single_class_conf ? 0 : std::min(m.class_count, stride - cls_base);
+    if (!single_class_conf && cls_n <= 0)
         return;
 
     for (int i = 0; i < count; i++) {
@@ -685,19 +731,24 @@ static void decode_output(const float *buf, const rknn_tensor_attr &attr, const 
         float cy = output_value(buf, channel_first, stride, count, i, 1);
         float bw = output_value(buf, channel_first, stride, count, i, 2);
         float bh = output_value(buf, channel_first, stride, count, i, 3);
-        float obj = has_obj ? output_value(buf, channel_first, stride, count, i, 4) : 1.0f;
+        float obj = (has_obj || single_class_conf) ?
+            output_value(buf, channel_first, stride, count, i, 4) : 1.0f;
         if (obj > 1.0f || obj < 0.0f)
             obj = sigmoidf_local(obj);
 
-        int best_cls = -1;
-        float best_score = 0.0f;
-        for (int c = 0; c < cls_n; c++) {
-            float s = output_value(buf, channel_first, stride, count, i, cls_base + c);
-            if (s > 1.0f || s < 0.0f)
-                s = sigmoidf_local(s);
-            if (s > best_score) {
-                best_score = s;
-                best_cls = c;
+        int best_cls = m.person_class_id;
+        float best_score = 1.0f;
+        if (!single_class_conf) {
+            best_cls = -1;
+            best_score = 0.0f;
+            for (int c = 0; c < cls_n; c++) {
+                float s = output_value(buf, channel_first, stride, count, i, cls_base + c);
+                if (s > 1.0f || s < 0.0f)
+                    s = sigmoidf_local(s);
+                if (s > best_score) {
+                    best_score = s;
+                    best_cls = c;
+                }
             }
         }
         float conf = obj * best_score;
@@ -1094,6 +1145,95 @@ static void overlay_results(app_ctx *ctx, cv::Mat &bgr, const std::vector<det_bo
                 0.75, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
 }
 
+static void write_poly(FILE *fp, const char *name, bool valid, bool hold,
+                       const std::vector<cv::Point> &poly)
+{
+    fprintf(fp, "%s_valid=%d\n", name, valid ? 1 : 0);
+    fprintf(fp, "%s_hold=%d\n", name, hold ? 1 : 0);
+    fprintf(fp, "%s_points=%zu", name, poly.size());
+    for (const auto &p : poly)
+        fprintf(fp, " %d,%d", p.x, p.y);
+    fprintf(fp, "\n");
+}
+
+static int write_ppm_bgr(const char *path, const cv::Mat &bgr)
+{
+    FILE *fp;
+    if (bgr.empty() || bgr.type() != CV_8UC3)
+        return -1;
+    fp = fopen(path, "wb");
+    if (!fp)
+        return -1;
+    fprintf(fp, "P6\n%d %d\n255\n", bgr.cols, bgr.rows);
+    for (int y = 0; y < bgr.rows; y++) {
+        const cv::Vec3b *row = bgr.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < bgr.cols; x++) {
+            uint8_t rgb[3] = { row[x][2], row[x][1], row[x][0] };
+            fwrite(rgb, 1, 3, fp);
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
+static void maybe_dump_debug(app_ctx *ctx, const cv::Mat &raw_bgr, const cv::Mat &overlay_bgr,
+                             const std::vector<det_box> &persons,
+                             const std::vector<region_state> &regions,
+                             const std::vector<bool> &crossing,
+                             int crossing_count)
+{
+    char raw_path[512], overlay_path[512], meta_path[512];
+    FILE *fp;
+
+    if (!ctx->opt.debug_dump_dir || ctx->opt.debug_dump_max <= 0)
+        return;
+    if (ctx->debug_dumped >= ctx->opt.debug_dump_max)
+        return;
+    if ((ctx->frame_seq % (uint64_t)ctx->opt.debug_dump_every_n) != 0)
+        return;
+
+    mkdir(ctx->opt.debug_dump_dir, 0777);
+    snprintf(raw_path, sizeof(raw_path), "%s/raw_%06" PRIu64 ".ppm",
+             ctx->opt.debug_dump_dir, ctx->frame_seq);
+    snprintf(overlay_path, sizeof(overlay_path), "%s/overlay_%06" PRIu64 ".ppm",
+             ctx->opt.debug_dump_dir, ctx->frame_seq);
+    snprintf(meta_path, sizeof(meta_path), "%s/meta_%06" PRIu64 ".txt",
+             ctx->opt.debug_dump_dir, ctx->frame_seq);
+
+    if (write_ppm_bgr(raw_path, raw_bgr) < 0)
+        fprintf(stderr, "[dump] failed raw=%s\n", raw_path);
+    if (write_ppm_bgr(overlay_path, overlay_bgr) < 0)
+        fprintf(stderr, "[dump] failed overlay=%s\n", overlay_path);
+
+    fp = fopen(meta_path, "w");
+    if (fp) {
+        fprintf(fp, "frame=%" PRIu64 "\n", ctx->frame_seq);
+        fprintf(fp, "image=%dx%d\n", raw_bgr.cols, raw_bgr.rows);
+        fprintf(fp, "persons=%zu\n", persons.size());
+        fprintf(fp, "crossing_count=%d\n", crossing_count);
+        write_poly(fp, "crosswalk", ctx->scene.crosswalk_valid, ctx->scene.crosswalk_hold,
+                   ctx->scene.crosswalk_poly);
+        write_poly(fp, "road", ctx->scene.road_valid, ctx->scene.road_hold,
+                   ctx->scene.road_poly);
+        for (size_t i = 0; i < persons.size(); i++) {
+            cv::Point foot((persons[i].x1 + persons[i].x2) / 2, persons[i].y2);
+            fprintf(fp,
+                    "person[%zu]=bbox:%d,%d,%d,%d conf:%.4f foot:%d,%d region:%s crossing:%d\n",
+                    i, persons[i].x1, persons[i].y1, persons[i].x2, persons[i].y2,
+                    persons[i].conf, foot.x, foot.y,
+                    (i < regions.size()) ? region_name(regions[i]) : "NA",
+                    (i < crossing.size() && crossing[i]) ? 1 : 0);
+        }
+        fclose(fp);
+    } else {
+        fprintf(stderr, "[dump] failed meta=%s\n", meta_path);
+    }
+
+    fprintf(stderr, "[dump] frame=%" PRIu64 " raw=%s overlay=%s meta=%s\n",
+            ctx->frame_seq, raw_path, overlay_path, meta_path);
+    ctx->debug_dumped++;
+}
+
 static int push_frame(app_ctx *ctx, const cv::Mat &bgr)
 {
     cv::Mat bgrx;
@@ -1209,7 +1349,12 @@ int main(int argc, char **argv)
         int crossing_count = update_tracks_and_count(&ctx, persons, &regions, &crossing);
         ctx.crossing_total += (uint64_t)crossing_count;
 
+        cv::Mat raw_for_dump;
+        if (ctx.opt.debug_dump_dir)
+            raw_for_dump = bgr.clone();
         overlay_results(&ctx, bgr, persons, regions, crossing);
+        maybe_dump_debug(&ctx, ctx.opt.debug_dump_dir ? raw_for_dump : bgr, bgr,
+                         persons, regions, crossing, crossing_count);
         if (push_frame(&ctx, bgr) < 0)
             break;
         print_stats(&ctx, (int)persons.size(), crossing_count);
