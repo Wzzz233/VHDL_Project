@@ -831,6 +831,25 @@ static bool point_in_poly(const std::vector<cv::Point> &poly, const cv::Point &p
     return cv::pointPolygonTest(poly, p, false) >= 0.0;
 }
 
+static float polygon_area_abs(const std::vector<cv::Point> &poly)
+{
+    if (poly.size() < 3)
+        return 0.0f;
+    return (float)std::fabs(cv::contourArea(poly));
+}
+
+static bool frame_has_active_scene(const cv::Mat &bgr)
+{
+    cv::Mat gray;
+    cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+    cv::Scalar mean = cv::mean(gray);
+    cv::Mat bright;
+    cv::threshold(gray, bright, 80, 255, cv::THRESH_BINARY);
+    double bright_ratio = (double)cv::countNonZero(bright) / (double)gray.total();
+
+    return mean[0] >= 45.0 && bright_ratio >= 0.12;
+}
+
 static void update_scene_hold(scene_state *scene, int ttl)
 {
     if (scene->crosswalk_ttl > 0) {
@@ -856,67 +875,112 @@ static void update_scene_hold(scene_state *scene, int ttl)
 
 static bool detect_crosswalk(const cv::Mat &bgr, std::vector<cv::Point> *poly)
 {
-    cv::Mat small, gray, eq, white, morph, edges;
+    struct stripe_seg {
+        int x1;
+        int y1;
+        int x2;
+        int y2;
+        float len;
+        float angle;
+        float cx;
+        float cy;
+    };
+
+    cv::Mat small, hsv, roi, mask, morph, edges;
     double scale = 640.0 / (double)bgr.cols;
     cv::resize(bgr, small, cv::Size(), scale, scale, cv::INTER_AREA);
-    cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
-    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
-    clahe->apply(gray, eq);
-    cv::threshold(eq, white, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
-    cv::morphologyEx(white, morph, cv::MORPH_CLOSE,
-                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9, 5)));
-    cv::Canny(morph, edges, 60, 160);
+    int h = small.rows;
+    int w = small.cols;
+    int y0 = (int)std::round((double)h * 0.50);
+    int y1 = (int)std::round((double)h * 0.98);
+    cv::cvtColor(small, hsv, cv::COLOR_BGR2HSV);
+    roi = hsv(cv::Rect(0, y0, w, y1 - y0));
+    cv::inRange(roi, cv::Scalar(0, 0, 115), cv::Scalar(179, 155, 255), mask);
+    cv::morphologyEx(mask, morph, cv::MORPH_OPEN,
+                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(7, 3)));
+    cv::Canny(morph, edges, 50, 140);
 
     std::vector<cv::Vec4i> lines;
-    cv::HoughLinesP(edges, lines, 1, CV_PI / 180.0, 45, 35, 12);
-    std::vector<cv::Point> pts;
-    std::vector<float> angles;
+    cv::HoughLinesP(edges, lines, 1, CV_PI / 180.0, 25, 25, 15);
+    std::vector<stripe_seg> segs;
     for (const auto &l : lines) {
-        float dx = (float)(l[2] - l[0]);
-        float dy = (float)(l[3] - l[1]);
+        int x1l = l[0];
+        int y1l = l[1] + y0;
+        int x2l = l[2];
+        int y2l = l[3] + y0;
+        float dx = (float)(x2l - x1l);
+        float dy = (float)(y2l - y1l);
         float len = std::hypot(dx, dy);
-        if (len < 35.0f)
+        if (len < 25.0f || len > (float)w * 0.55f)
             continue;
         float angle = std::atan2(dy, dx) * 180.0f / (float)CV_PI;
         if (angle < -90.0f) angle += 180.0f;
         if (angle > 90.0f) angle -= 180.0f;
-        angles.push_back(angle);
-    }
-    if (angles.size() < 6)
-        return false;
-    std::nth_element(angles.begin(), angles.begin() + angles.size() / 2, angles.end());
-    float median_angle = angles[angles.size() / 2];
-
-    for (const auto &l : lines) {
-        float dx = (float)(l[2] - l[0]);
-        float dy = (float)(l[3] - l[1]);
-        float len = std::hypot(dx, dy);
-        if (len < 35.0f)
+        if (std::fabs(angle) > 22.0f)
             continue;
-        float angle = std::atan2(dy, dx) * 180.0f / (float)CV_PI;
-        if (angle < -90.0f) angle += 180.0f;
-        if (angle > 90.0f) angle -= 180.0f;
-        if (std::fabs(angle - median_angle) > 14.0f)
+        float cy = ((float)y1l + (float)y2l) * 0.5f;
+        float cx = ((float)x1l + (float)x2l) * 0.5f;
+        if (cy < (float)h * 0.53f || cy > (float)h * 0.95f)
             continue;
-        pts.emplace_back(l[0], l[1]);
-        pts.emplace_back(l[2], l[3]);
+        if (len > (float)w * 0.45f && cy < (float)h * 0.62f)
+            continue;
+        segs.push_back({x1l, y1l, x2l, y2l, len, angle, cx, cy});
     }
-    if (pts.size() < 10)
+    if (segs.size() < 3)
         return false;
 
-    cv::RotatedRect rr = cv::minAreaRect(pts);
-    if (rr.size.width < 80.0f || rr.size.height < 25.0f)
-        return false;
-    float area = rr.size.width * rr.size.height;
-    if (area < 4000.0f)
+    float best_score = 0.0f;
+    cv::Rect best_rect;
+    for (const auto &s : segs) {
+        std::vector<stripe_seg> cluster;
+        for (const auto &t : segs) {
+            if (std::fabs(t.angle - s.angle) > 10.0f)
+                continue;
+            if (std::fabs(t.cy - s.cy) > (float)h * 0.30f)
+                continue;
+            if (std::fabs(t.cx - s.cx) > (float)w * 0.36f)
+                continue;
+            cluster.push_back(t);
+        }
+        if (cluster.size() < 3)
+            continue;
+
+        int min_x = w - 1, min_y = h - 1, max_x = 0, max_y = 0;
+        float len_sum = 0.0f;
+        for (const auto &c : cluster) {
+            min_x = std::min(min_x, std::min(c.x1, c.x2));
+            min_y = std::min(min_y, std::min(c.y1, c.y2));
+            max_x = std::max(max_x, std::max(c.x1, c.x2));
+            max_y = std::max(max_y, std::max(c.y1, c.y2));
+            len_sum += c.len;
+        }
+        int bw = max_x - min_x;
+        int bh = max_y - min_y;
+        if (bw < (int)((float)w * 0.10f) || bh < (int)((float)h * 0.03f))
+            continue;
+        if (bw > (int)((float)w * 0.62f) || bh > (int)((float)h * 0.35f))
+            continue;
+        float score = (float)cluster.size() * 1000.0f + len_sum +
+                      (float)min_x * 0.1f + (float)min_y * 0.2f;
+        if (score > best_score) {
+            best_score = score;
+            best_rect = cv::Rect(cv::Point(min_x, min_y), cv::Point(max_x, max_y));
+        }
+    }
+    if (best_score <= 0.0f)
         return false;
 
-    cv::Point2f corners[4];
-    rr.points(corners);
+    int pad = 14;
+    int x0 = std::max(0, best_rect.x - pad);
+    int yy0 = std::max(0, best_rect.y - pad);
+    int x1b = std::min(w - 1, best_rect.x + best_rect.width + pad);
+    int yy1 = std::min(h - 1, best_rect.y + best_rect.height + pad);
+
     poly->clear();
-    for (int i = 0; i < 4; i++)
-        poly->emplace_back((int)std::round(corners[i].x / scale),
-                           (int)std::round(corners[i].y / scale));
+    poly->emplace_back((int)std::round((double)x0 / scale), (int)std::round((double)yy0 / scale));
+    poly->emplace_back((int)std::round((double)x1b / scale), (int)std::round((double)yy0 / scale));
+    poly->emplace_back((int)std::round((double)x1b / scale), (int)std::round((double)yy1 / scale));
+    poly->emplace_back((int)std::round((double)x0 / scale), (int)std::round((double)yy1 / scale));
     return true;
 }
 
@@ -991,12 +1055,21 @@ static bool detect_road(const cv::Mat &bgr, std::vector<cv::Point> *poly)
     poly->emplace_back((int)std::round(clampx(rx_top) / scale), (int)std::round(y_top / scale));
     poly->emplace_back((int)std::round(clampx(rx_bot) / scale), (int)std::round(y_bot / scale));
     poly->emplace_back((int)std::round(clampx(lx_bot) / scale), (int)std::round(y_bot / scale));
+    if (polygon_area_abs(*poly) > (float)bgr.cols * (float)bgr.rows * 0.55f)
+        return false;
+    if (std::abs(poly->at(1).x - poly->at(0).x) > (int)((float)bgr.cols * 0.85f))
+        return false;
     return true;
 }
 
 static void run_scene_cv(app_ctx *ctx, const cv::Mat &bgr)
 {
     std::vector<cv::Point> poly;
+    if (!frame_has_active_scene(bgr)) {
+        ctx->scene = scene_state{};
+        return;
+    }
+
     update_scene_hold(&ctx->scene, ctx->opt.scene_smooth);
     if (detect_crosswalk(bgr, &poly)) {
         ctx->scene.crosswalk_poly = poly;
@@ -1018,7 +1091,9 @@ static region_state classify_region(const scene_state &scene, const cv::Point &f
         return REGION_CROSSWALK;
     if (scene.road_valid && point_in_poly(scene.road_poly, foot))
         return REGION_ROAD;
-    return REGION_SIDEWALK;
+    if (scene.road_valid)
+        return REGION_SIDEWALK;
+    return REGION_UNKNOWN;
 }
 
 static const char *region_name(region_state r)
