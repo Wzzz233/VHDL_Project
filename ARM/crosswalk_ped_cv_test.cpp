@@ -28,7 +28,8 @@
 
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
-#include <opencv2/opencv.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #include <rknn_api.h>
 
 #include "pcie_fpga_dma.h"

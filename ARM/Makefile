@@ -18,8 +18,8 @@ testapp: fpga_dma_test.c pcie_fpga_dma.h
 GST_PKGS := gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 libdrm
 GST_CFLAGS ?= $(shell pkg-config --cflags $(GST_PKGS))
 GST_LIBS ?= $(shell pkg-config --libs $(GST_PKGS))
-OPENCV_CFLAGS ?= $(shell pkg-config --cflags opencv4)
-OPENCV_LIBS ?= $(shell pkg-config --libs opencv4)
+OPENCV_CFLAGS ?= -I/usr/include/opencv4
+OPENCV_LIBS ?= -lopencv_core -lopencv_imgproc
 
 displayapp: fpga_hdmi_display.c pcie_fpga_dma.h
 	$(CROSS_COMPILE)gcc -Wall -O2 -o fpga_hdmi_display fpga_hdmi_display.c $(GST_CFLAGS) $(GST_LIBS)
