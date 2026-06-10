@@ -2160,6 +2160,59 @@ static bool replace_first_utf8_token(char *text, size_t text_len, const char *fi
     return true;
 }
 
+static bool token_is_green_province(const char *tok)
+{
+    int i;
+
+    if (!tok || tok[0] == '\0')
+        return false;
+    for (i = 0; i < GREEN_FIRSTCHAR_CLASS_COUNT; i++) {
+        if (strcmp(tok, g_province_chars[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool apply_green_firstchar_utf8_token(char *text, size_t text_len,
+                                             const char *first_tok,
+                                             const char **mode_out)
+{
+    char toks[MAX_PLATE_TOKENS][MAX_UTF8_TOKEN_BYTES];
+    char out[64];
+    int n;
+    int i;
+    int start_idx;
+    bool insert_mode;
+
+    if (mode_out)
+        *mode_out = "replace";
+    if (!text || text_len == 0 || !first_tok || first_tok[0] == '\0')
+        return false;
+
+    n = split_utf8_tokens(text, toks, MAX_PLATE_TOKENS);
+    if (n <= 0)
+        return false;
+
+    insert_mode = (n == 7 && !token_is_green_province(toks[0]));
+    if (!insert_mode && n <= 1)
+        return false;
+
+    out[0] = '\0';
+    if (!append_utf8_token(out, sizeof(out), first_tok))
+        return false;
+
+    start_idx = insert_mode ? 0 : 1;
+    for (i = start_idx; i < n; i++) {
+        if (!append_utf8_token(out, sizeof(out), toks[i]))
+            return false;
+    }
+
+    copy_cstr_trunc(text, text_len, out);
+    if (mode_out)
+        *mode_out = insert_mode ? "insert" : "replace";
+    return true;
+}
+
 static bool run_firstchar_model(const struct firstchar_model *m,
                                 const uint8_t *fc_rgb, int fc_w, int fc_h,
                                 char *tok_out, size_t tok_len, float *conf_out)
@@ -2262,6 +2315,7 @@ static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_r
     char pred_tok[MAX_UTF8_TOKEN_BYTES];
     char stable_tok[MAX_UTF8_TOKEN_BYTES];
     char old_text[64];
+    const char *apply_mode = "replace";
     float pred_conf = 0.0f;
     int tr_idx;
     int i, k;
@@ -2341,12 +2395,12 @@ static bool run_green_firstchar_sidecar(struct app_ctx *ctx, const uint8_t *fc_r
     }
 
     copy_cstr_trunc(old_text, sizeof(old_text), text);
-    if (!replace_first_utf8_token(text, text_len, stable_tok))
+    if (!apply_green_firstchar_utf8_token(text, text_len, stable_tok, &apply_mode))
         return false;
     if (strcmp(old_text, text) != 0) {
         fprintf(stderr,
-                "[green-fc] frame=%" PRIu64 " replace raw=%s fused=%s sidecar=%s votes=%d/%d share=%.2f last=%s conf=%.3f\n",
-                frame_seq, old_text, text, stable_tok, best_votes, total_votes, share, pred_tok, pred_conf);
+                "[green-fc] frame=%" PRIu64 " %s raw=%s fused=%s sidecar=%s votes=%d/%d share=%.2f last=%s conf=%.3f\n",
+                frame_seq, apply_mode, old_text, text, stable_tok, best_votes, total_votes, share, pred_tok, pred_conf);
         return true;
     }
     return false;
