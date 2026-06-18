@@ -6,7 +6,7 @@
  *   1. lpr_dma      : FPGA DMA frame capture, BGR565/BGRX8888 -> RGB888
  *   2. lpr_detector : YOLOv8n-pose plate detector with NMS and quad output
  *   3. lpr_warp     : 4-point homography warp from quad to plate crop
- *   4. lpr_color    : RGB-based blue/green/yellow plate color classification
+ *   4. lpr_color    : RGB-based blue/green/yellow/white/black plate color classification
  *   5. lpr_ocr      : PPLCNet RKNN OCR with CTC decode and layout autodetect
  *   6. lpr_display  : DRM/KMS appsrc -> kmssink RGB16 display with overlay
  *   7. lpr_infer    : background inference thread that owns the latest frame
@@ -94,8 +94,9 @@ enum plate_color {
     PLATE_COLOR_UNKNOWN = 0,
     PLATE_COLOR_BLUE,
     PLATE_COLOR_GREEN,
-    PLATE_COLOR_YELLOW,   /* yellow body, treated as police candidate route */
-    PLATE_COLOR_WHITE,    /* white body, treated as police candidate route */
+    PLATE_COLOR_YELLOW,   /* yellow body: yellow plates (taxi/learner/heavy) or police candidate under low light */
+    PLATE_COLOR_WHITE,    /* white body: police plates (and most embassy bodies) */
+    PLATE_COLOR_BLACK,    /* black body: embassy plates */
 };
 
 /* ---------------- Live options (parsed from CLI) ---------------- */
@@ -103,12 +104,20 @@ enum plate_color {
 struct live_options {
     const char *device_path;
     const char *plate_model_path;
+    /* OCR model paths per plate type. blue + green are required;
+     * police, embassy, yellow are optional and silently skipped if NULL. */
     const char *ocr_blue_model_path;
     const char *ocr_green_model_path;
-    const char *ocr_police_model_path;   /* optional; NULL disables police route */
+    const char *ocr_police_model_path;
+    const char *ocr_embassy_model_path;
+    const char *ocr_yellow_model_path;
+    /* Per-route keys files. blue + green can fall back to a shared
+     * --ocr-keys file; police / embassy / yellow each need their own. */
     const char *keys_blue_path;
     const char *keys_green_path;
     const char *keys_police_path;
+    const char *keys_embassy_path;
+    const char *keys_yellow_path;
     const char *drm_card_path;
     int connector_id;
     int frames;
@@ -179,7 +188,7 @@ struct live_result {
     int crop_w;
     int crop_h;
     enum plate_color color;
-    char route_name[8];     /* "blue" / "green" / "police" */
+    char route_name[8];     /* "blue" / "green" / "police" / "embassy" / "yellow" */
     char text[64];
     float conf;
     float blank_ratio;

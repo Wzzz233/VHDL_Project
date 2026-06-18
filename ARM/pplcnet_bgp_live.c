@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Standalone blue/green/police PPLCNet live validation driver.
+ * Standalone blue/green/police/embassy/yellow PPLCNet live validation driver.
  *
  * Pipeline:
  *   FPGA DMA frame -> YOLOv8n-pose plate quad -> color route ->
- *   quad warp crop -> blue / green / police PPLCNet CTC ->
+ *   quad warp crop -> blue / green / police / embassy / yellow PPLCNet CTC ->
  *   HDMI/KMS display overlay.
  *
  * Routing (see lpr_infer.c::pick_route + lpr_color.c):
  *   green body  -> green PPLCNet (8-char new-energy decode family)
- *   yellow body -> police PPLCNet if loaded, else blue
+ *   yellow body -> yellow PPLCNet if loaded, else police, else blue
  *   white body  -> police PPLCNet if loaded, else blue
+ *   black body  -> embassy PPLCNet if loaded, else police, else blue
  *   blue body / unknown -> blue PPLCNet (default base case)
  *
- * The police OCR is optional; if --ocr-police-model is omitted, the driver
- * silently degrades to blue+green only (drop-in replacement for pplcnet_bg_live).
+ * Police, embassy and yellow OCR are optional; if omitted, the driver silently
+ * falls back through the route chain above.
  *
  * Code organization (see lpr_live/):
  *   lpr_common  : shared types and utilities
@@ -65,21 +66,23 @@ static void on_signal(int sig)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s --plate-model yolov8n_pose.rknn \\\n"
-            "          --ocr-blue-model blue.rknn --ocr-green-model green.rknn \\\n"
-            "          [--ocr-police-model police.rknn] [--ocr-police-keys police_keys.txt] \\\n"
-            "          --ocr-keys keys.txt [opts]\n"
+            "Usage: %s --plate-model yolov8n_pose.rknn --ocr-blue-model blue.rknn --ocr-green-model green.rknn [opts]\n"
             "\n"
             "Required:\n"
             "  --plate-model <path>          YOLOv8n pose RKNN plate detector\n"
             "  --ocr-blue-model <path>       Blue PPLCNet OCR RKNN\n"
             "  --ocr-green-model <path>      Green PPLCNet OCR RKNN\n"
-            "  --ocr-keys <path>             OCR keys file (used by blue+green; police uses\n"
-            "                                --ocr-police-keys instead if police is enabled)\n"
+            "  --ocr-keys <path>             Shared fallback OCR keys file for blue+green\n"
+            "  --ocr-blue-keys <path>        Override blue OCR keys file\n"
+            "  --ocr-green-keys <path>       Override green OCR keys file\n"
             "\n"
-            "Optional police route (silent degrade if omitted):\n"
-            "  --ocr-police-model <path>     Police PPLCNet OCR RKNN (e.g. v4 warm-blue)\n"
-            "  --ocr-police-keys <path>      Police keys file (66 chars + blank, with 警)\n"
+            "Optional routes (silent fallback if omitted):\n"
+            "  --ocr-police-model <path>     Police PPLCNet OCR RKNN\n"
+            "  --ocr-police-keys <path>      Police keys file\n"
+            "  --ocr-embassy-model <path>    Embassy PPLCNet OCR RKNN\n"
+            "  --ocr-embassy-keys <path>     Embassy keys file\n"
+            "  --ocr-yellow-model <path>     Yellow PPLCNet OCR RKNN\n"
+            "  --ocr-yellow-keys <path>      Yellow keys file\n"
             "\n"
             "Display / capture options:\n"
             "  --device <path>               FPGA DMA device (default: /dev/fpga_dma0)\n"
@@ -151,6 +154,10 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_OCR_POLICE_KEYS,
         OPT_OCR_BLUE_KEYS,
         OPT_OCR_GREEN_KEYS,
+        OPT_OCR_EMBASSY_MODEL,
+        OPT_OCR_EMBASSY_KEYS,
+        OPT_OCR_YELLOW_MODEL,
+        OPT_OCR_YELLOW_KEYS,
     };
     static const struct option opts[] = {
         {"device",            required_argument, NULL, OPT_DEVICE},
@@ -177,6 +184,10 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"ocr-police-keys",   required_argument, NULL, OPT_OCR_POLICE_KEYS},
         {"ocr-blue-keys",     required_argument, NULL, OPT_OCR_BLUE_KEYS},
         {"ocr-green-keys",    required_argument, NULL, OPT_OCR_GREEN_KEYS},
+        {"ocr-embassy-model", required_argument, NULL, OPT_OCR_EMBASSY_MODEL},
+        {"ocr-embassy-keys",  required_argument, NULL, OPT_OCR_EMBASSY_KEYS},
+        {"ocr-yellow-model",  required_argument, NULL, OPT_OCR_YELLOW_MODEL},
+        {"ocr-yellow-keys",   required_argument, NULL, OPT_OCR_YELLOW_KEYS},
         {"help",              no_argument,       NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -229,10 +240,14 @@ static int parse_options(int argc, char **argv, struct live_options *o)
             o->auto_green_filter = (strcmp(optarg, "1") == 0 || strcmp(optarg, "true") == 0 || strcmp(optarg, "on") == 0);
             break;
         case OPT_OCR_BLUE_MODEL:   o->ocr_blue_model_path = optarg; break;
-        case OPT_OCR_POLICE_MODEL: o->ocr_police_model_path = optarg; break;
-        case OPT_OCR_POLICE_KEYS:  o->keys_police_path = optarg; break;
-        case OPT_OCR_BLUE_KEYS:    o->keys_blue_path = optarg; break;
-        case OPT_OCR_GREEN_KEYS:   o->keys_green_path = optarg; break;
+        case OPT_OCR_POLICE_MODEL:  o->ocr_police_model_path = optarg; break;
+        case OPT_OCR_POLICE_KEYS:   o->keys_police_path = optarg; break;
+        case OPT_OCR_BLUE_KEYS:     o->keys_blue_path = optarg; break;
+        case OPT_OCR_GREEN_KEYS:    o->keys_green_path = optarg; break;
+        case OPT_OCR_EMBASSY_MODEL: o->ocr_embassy_model_path = optarg; break;
+        case OPT_OCR_EMBASSY_KEYS:  o->keys_embassy_path = optarg; break;
+        case OPT_OCR_YELLOW_MODEL:  o->ocr_yellow_model_path = optarg; break;
+        case OPT_OCR_YELLOW_KEYS:   o->keys_yellow_path = optarg; break;
         case 'h': return 1;
         default:  return -1;
         }
@@ -243,6 +258,14 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         return -1;
     if (o->ocr_police_model_path && !o->keys_police_path) {
         fprintf(stderr, "[bgp-live] --ocr-police-model requires --ocr-police-keys\n");
+        return -1;
+    }
+    if (o->ocr_embassy_model_path && !o->keys_embassy_path) {
+        fprintf(stderr, "[bgp-live] --ocr-embassy-model requires --ocr-embassy-keys\n");
+        return -1;
+    }
+    if (o->ocr_yellow_model_path && !o->keys_yellow_path) {
+        fprintf(stderr, "[bgp-live] --ocr-yellow-model requires --ocr-yellow-keys\n");
         return -1;
     }
     if (o->fps <= 0 || o->fps > 120 || o->frames < 0 || o->max_det <= 0 || o->max_det > MAX_DETS)
@@ -258,9 +281,13 @@ int main(int argc, char **argv)
     struct rknn_model ocr_blue_model;
     struct rknn_model ocr_green_model;
     struct rknn_model ocr_police_model;
+    struct rknn_model ocr_embassy_model;
+    struct rknn_model ocr_yellow_model;
     struct ocr_keys keys_blue;
     struct ocr_keys keys_green;
     struct ocr_keys keys_police;
+    struct ocr_keys keys_embassy;
+    struct ocr_keys keys_yellow;
     struct display_state display;
     struct infer_state infer;
     uint8_t *rgb = NULL;
@@ -271,6 +298,8 @@ int main(int argc, char **argv)
     int parsed;
     int64_t target_us;
     bool police_enabled;
+    bool embassy_enabled;
+    bool yellow_enabled;
 
     parsed = parse_options(argc, argv, &opt);
     if (parsed != 0) {
@@ -285,9 +314,13 @@ int main(int argc, char **argv)
     memset(&ocr_blue_model, 0, sizeof(ocr_blue_model));
     memset(&ocr_green_model, 0, sizeof(ocr_green_model));
     memset(&ocr_police_model, 0, sizeof(ocr_police_model));
+    memset(&ocr_embassy_model, 0, sizeof(ocr_embassy_model));
+    memset(&ocr_yellow_model, 0, sizeof(ocr_yellow_model));
     memset(&keys_blue, 0, sizeof(keys_blue));
     memset(&keys_green, 0, sizeof(keys_green));
     memset(&keys_police, 0, sizeof(keys_police));
+    memset(&keys_embassy, 0, sizeof(keys_embassy));
+    memset(&keys_yellow, 0, sizeof(keys_yellow));
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -295,6 +328,8 @@ int main(int argc, char **argv)
         gst_init(NULL, NULL);
 
     police_enabled = (opt.ocr_police_model_path != NULL);
+    embassy_enabled = (opt.ocr_embassy_model_path != NULL);
+    yellow_enabled = (opt.ocr_yellow_model_path != NULL);
 
     if (lpr_load_keys(opt.keys_blue_path, &keys_blue) < 0) {
         fprintf(stderr, "[bgp-live] failed to load blue keys: %s\n", opt.keys_blue_path);
@@ -307,6 +342,18 @@ int main(int argc, char **argv)
     if (police_enabled) {
         if (lpr_load_keys(opt.keys_police_path, &keys_police) < 0) {
             fprintf(stderr, "[bgp-live] failed to load police keys: %s\n", opt.keys_police_path);
+            goto out;
+        }
+    }
+    if (embassy_enabled) {
+        if (lpr_load_keys(opt.keys_embassy_path, &keys_embassy) < 0) {
+            fprintf(stderr, "[bgp-live] failed to load embassy keys: %s\n", opt.keys_embassy_path);
+            goto out;
+        }
+    }
+    if (yellow_enabled) {
+        if (lpr_load_keys(opt.keys_yellow_path, &keys_yellow) < 0) {
+            fprintf(stderr, "[bgp-live] failed to load yellow keys: %s\n", opt.keys_yellow_path);
             goto out;
         }
     }
@@ -338,6 +385,18 @@ int main(int argc, char **argv)
             goto out;
         }
     }
+    if (embassy_enabled) {
+        if (lpr_model_load(&ocr_embassy_model, "pplcnet_embassy", opt.ocr_embassy_model_path) < 0) {
+            fprintf(stderr, "[bgp-live] failed to load embassy OCR: %s\n", opt.ocr_embassy_model_path);
+            goto out;
+        }
+    }
+    if (yellow_enabled) {
+        if (lpr_model_load(&ocr_yellow_model, "pplcnet_yellow", opt.ocr_yellow_model_path) < 0) {
+            fprintf(stderr, "[bgp-live] failed to load yellow OCR: %s\n", opt.ocr_yellow_model_path);
+            goto out;
+        }
+    }
 
     if (det_model.in_w != ALGO_STREAM_SIZE || det_model.in_h != ALGO_STREAM_SIZE || det_model.in_c != 3) {
         fprintf(stderr, "[bgp-live] detector input must be 640x640x3, got %ux%ux%u\n",
@@ -345,10 +404,15 @@ int main(int argc, char **argv)
         goto out;
     }
     if (ocr_blue_model.in_c != 3 || ocr_green_model.in_c != 3 ||
-        (police_enabled && ocr_police_model.in_c != 3)) {
-        fprintf(stderr, "[bgp-live] OCR input must have 3 channels, got blue=%u green=%u police=%u\n",
+        (police_enabled && ocr_police_model.in_c != 3) ||
+        (embassy_enabled && ocr_embassy_model.in_c != 3) ||
+        (yellow_enabled && ocr_yellow_model.in_c != 3)) {
+        fprintf(stderr,
+                "[bgp-live] OCR input must have 3 channels, got blue=%u green=%u police=%u embassy=%u yellow=%u\n",
                 ocr_blue_model.in_c, ocr_green_model.in_c,
-                police_enabled ? ocr_police_model.in_c : 0);
+                police_enabled ? ocr_police_model.in_c : 0,
+                embassy_enabled ? ocr_embassy_model.in_c : 0,
+                yellow_enabled ? ocr_yellow_model.in_c : 0);
         goto out;
     }
 
@@ -356,6 +420,10 @@ int main(int argc, char **argv)
     lpr_ocr_log_contract("green", &ocr_green_model, &keys_green);
     if (police_enabled)
         lpr_ocr_log_contract("police", &ocr_police_model, &keys_police);
+    if (embassy_enabled)
+        lpr_ocr_log_contract("embassy", &ocr_embassy_model, &keys_embassy);
+    if (yellow_enabled)
+        lpr_ocr_log_contract("yellow", &ocr_yellow_model, &keys_yellow);
 
     pose_nc = lpr_detector_pose_nc(&det_model);
     class_filter = opt.class_filter;
@@ -370,14 +438,16 @@ int main(int argc, char **argv)
 
     fprintf(stderr,
             "[bgp-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
-            "det_resize=%s blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s preproc=%s display=%d "
-            "auto_green_filter=%d async_infer=1\n",
+            "det_resize=%s blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
+            "preproc=%s display=%d auto_green_filter=%d async_infer=1\n",
             dma.frame_w, dma.frame_h, dma.src_is_bgrx ? "bgrx8888" : "bgr565",
             opt.frames, opt.fps, pose_nc, class_filter,
             opt.det_resize_mode == DET_RESIZE_LETTERBOX ? "letterbox" : "stretch",
             ocr_blue_model.in_w, ocr_blue_model.in_h,
             ocr_green_model.in_w, ocr_green_model.in_h,
             police_enabled ? "enabled" : "disabled",
+            embassy_enabled ? "enabled" : "disabled",
+            yellow_enabled ? "enabled" : "disabled",
             opt.ocr_preproc_mode == OCR_PREPROC_GRAY ? "gray" :
                 (opt.ocr_preproc_mode == OCR_PREPROC_BIN ? "bin" : "none"),
             opt.display ? 1 : 0, opt.auto_green_filter ? 1 : 0);
@@ -405,7 +475,27 @@ int main(int argc, char **argv)
         routes[LPR_ROUTE_POLICE].display_tag = 'P';
         snprintf(routes[LPR_ROUTE_POLICE].name, sizeof(routes[LPR_ROUTE_POLICE].name), "police");
     } else {
-        routes[LPR_ROUTE_POLICE].model = NULL;     /* signals "fallback to blue" */
+        routes[LPR_ROUTE_POLICE].model = NULL;
+    }
+
+    if (embassy_enabled) {
+        routes[LPR_ROUTE_EMBASSY].model = &ocr_embassy_model;
+        routes[LPR_ROUTE_EMBASSY].keys = &keys_embassy;
+        routes[LPR_ROUTE_EMBASSY].decode_family = OCR_DECODE_FAMILY_NORMAL7;
+        routes[LPR_ROUTE_EMBASSY].display_tag = 'E';
+        snprintf(routes[LPR_ROUTE_EMBASSY].name, sizeof(routes[LPR_ROUTE_EMBASSY].name), "embassy");
+    } else {
+        routes[LPR_ROUTE_EMBASSY].model = NULL;
+    }
+
+    if (yellow_enabled) {
+        routes[LPR_ROUTE_YELLOW].model = &ocr_yellow_model;
+        routes[LPR_ROUTE_YELLOW].keys = &keys_yellow;
+        routes[LPR_ROUTE_YELLOW].decode_family = OCR_DECODE_FAMILY_NORMAL7;
+        routes[LPR_ROUTE_YELLOW].display_tag = 'Y';
+        snprintf(routes[LPR_ROUTE_YELLOW].name, sizeof(routes[LPR_ROUTE_YELLOW].name), "yellow");
+    } else {
+        routes[LPR_ROUTE_YELLOW].model = NULL;
     }
 
     if (lpr_infer_start(&infer, &opt, &det_model, routes,
@@ -436,6 +526,8 @@ int main(int argc, char **argv)
                 char tag = 'B';
                 if (latest.route_name[0] == 'g') tag = 'G';
                 else if (latest.route_name[0] == 'p') tag = 'P';
+                else if (latest.route_name[0] == 'e') tag = 'E';
+                else if (latest.route_name[0] == 'y') tag = 'Y';
                 if (ty < 0) ty = latest.box.y1 + 3;
                 lpr_overlay_ascii_from_text(latest.text, ascii, sizeof(ascii));
                 snprintf(overlay, sizeof(overlay), "%s %c %.2f",
@@ -467,6 +559,10 @@ out:
     lpr_model_release(&ocr_green_model);
     if (police_enabled)
         lpr_model_release(&ocr_police_model);
+    if (embassy_enabled)
+        lpr_model_release(&ocr_embassy_model);
+    if (yellow_enabled)
+        lpr_model_release(&ocr_yellow_model);
     lpr_dma_release(&dma);
     return ret;
 }

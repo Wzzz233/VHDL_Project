@@ -14,12 +14,14 @@
  * Routes can share model/keys (e.g. blue and unknown both use blue), or be
  * disabled by setting `model = NULL`.
  *
- * The route table is small (4 entries) so we just embed it in the infer
+ * The route table is small (5 entries) so we just embed it in the infer
  * state instead of heap-allocating. */
 enum lpr_route_id {
     LPR_ROUTE_BLUE = 0,
     LPR_ROUTE_GREEN,
     LPR_ROUTE_POLICE,
+    LPR_ROUTE_EMBASSY,
+    LPR_ROUTE_YELLOW,
     LPR_ROUTE_COUNT,
 };
 
@@ -27,7 +29,7 @@ struct lpr_route {
     struct rknn_model *model;        /* may be NULL if disabled */
     const struct ocr_keys *keys;
     enum ocr_decode_family decode_family;
-    char display_tag;                /* one-char tag drawn in overlay (e.g. 'B','G','P') */
+    char display_tag;                /* one-char tag drawn in overlay (e.g. 'B','G','P','E','Y') */
     char name[8];                    /* human label "blue" etc */
 };
 

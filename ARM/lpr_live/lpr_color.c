@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0
 /* RGB-based plate body color classification.
  *
- * Routing rules used by the live driver:
+ * Routing rules used by the live driver (see lpr_infer.c::pick_route):
  *   PLATE_COLOR_BLUE   -> blue PPLCNet OCR
- *   PLATE_COLOR_GREEN  -> green PPLCNet OCR
- *   PLATE_COLOR_YELLOW -> police OCR (yellow body, dark ink: also covers
- *                         many police plates that have a yellow-ish tint
- *                         under low light; police is the primary fallback
- *                         for non-blue/non-green bodies)
- *   PLATE_COLOR_WHITE  -> police OCR (white body police plates)
+ *   PLATE_COLOR_GREEN  -> green PPLCNet OCR (8-char new-energy decode)
+ *   PLATE_COLOR_YELLOW -> yellow PPLCNet OCR (taxi/learner/heavy);
+ *                         falls back to police if yellow is disabled
+ *   PLATE_COLOR_WHITE  -> police PPLCNet OCR (most police plates have a
+ *                         white body with red 警 suffix)
+ *   PLATE_COLOR_BLACK  -> embassy PPLCNet OCR (black body, white text)
  *   PLATE_COLOR_UNKNOWN-> blue OCR (most common base case)
  *
- * The actual routing decision lives in pplcnet_bgp_live.c so this module
- * only needs to compute the color label.
+ * The classifier reports the raw color label; the actual route mapping
+ * (and the disabled-route fallback chain) is handled in lpr_infer.c.
  */
 
 #include "lpr_color.h"
@@ -28,7 +28,7 @@ enum plate_color lpr_classify_plate_color(const uint8_t *rgb, int w, int h,
     int y1 = b->y1 + (b->y2 - b->y1) / 6;
     int y2 = b->y2 - (b->y2 - b->y1) / 6;
     int total = 0;
-    int blue_cnt = 0, green_cnt = 0, yellow_cnt = 0, white_cnt = 0, dark_cnt = 0;
+    int blue_cnt = 0, green_cnt = 0, yellow_cnt = 0, white_cnt = 0, black_cnt = 0;
     if (x1 < 0) x1 = 0;
     if (y1 < 0) y1 = 0;
     if (x2 >= w) x2 = w - 1;
@@ -45,7 +45,6 @@ enum plate_color lpr_classify_plate_color(const uint8_t *rgb, int w, int h,
             float h_deg = 0.0f;
             float s = (mx == 0.0f) ? 0.0f : (d / mx);
             float v = mx;
-            if (v < 0.20f) dark_cnt++;
             if (d > 1e-6f) {
                 if (mx == r) h_deg = 60.0f * fmodf((g - bch) / d, 6.0f);
                 else if (mx == g) h_deg = 60.0f * (((bch - r) / d) + 2.0f);
@@ -53,28 +52,38 @@ enum plate_color lpr_classify_plate_color(const uint8_t *rgb, int w, int h,
             }
             if (h_deg < 0.0f) h_deg += 360.0f;
             total++;
-            /* Blue: hue 190-260, fairly saturated. */
+            /* Black: very low value across all channels (embassy body). */
+            if (v < 0.15f) {
+                black_cnt++;
+                continue;
+            }
+            /* Blue: hue 190-260, saturated. */
             if (h_deg >= 190.0f && h_deg <= 260.0f && s > 0.23f && v > 0.16f)
                 blue_cnt++;
             /* Green: hue 75-155. */
             else if (h_deg >= 75.0f && h_deg <= 155.0f && s > 0.20f && v > 0.16f)
                 green_cnt++;
-            /* Yellow: hue 15-55 (taxis, learner plates, some police). */
+            /* Yellow: hue 15-55 (taxis, learner, heavy, some police variants). */
             else if (h_deg >= 15.0f && h_deg <= 55.0f && s > 0.15f && v > 0.16f)
                 yellow_cnt++;
-            /* White: low saturation, high brightness (police white body). */
+            /* White: low saturation, high brightness (police/embassy white body). */
             else if (s < 0.15f && v > 0.55f)
                 white_cnt++;
         }
     }
     if (total == 0) return PLATE_COLOR_UNKNOWN;
+    /* Vote in priority order: black wins if dominant, then chromatic colors,
+     * then white. Embassy plates have a strong black body so we check that
+     * first; otherwise yellow/police/white never trip on a black plate. */
+    if ((float)black_cnt / (float)total >= 0.45f)
+        return PLATE_COLOR_BLACK;
     if ((float)blue_cnt / (float)total >= 0.20f && blue_cnt > green_cnt + (int)(0.05f * total))
         return PLATE_COLOR_BLUE;
     if ((float)green_cnt / (float)total >= 0.20f && green_cnt > blue_cnt + (int)(0.05f * total))
         return PLATE_COLOR_GREEN;
-    if ((float)yellow_cnt / (float)total >= 0.18f && (float)dark_cnt / (float)total < 0.50f)
+    if ((float)yellow_cnt / (float)total >= 0.18f)
         return PLATE_COLOR_YELLOW;
-    if ((float)white_cnt / (float)total >= 0.30f && (float)dark_cnt / (float)total < 0.40f)
+    if ((float)white_cnt / (float)total >= 0.30f)
         return PLATE_COLOR_WHITE;
     return PLATE_COLOR_UNKNOWN;
 }

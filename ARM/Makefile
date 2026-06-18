@@ -36,12 +36,12 @@ pplcnet-green-live: pplcnet_green_live.c ocr_decode.c ocr_decode.h pcie_fpga_dma
 pplcnet-bg-live: pplcnet_bg_live.c ocr_decode.c ocr_decode.h pcie_fpga_dma.h
 	$(CROSS_COMPILE)gcc -Wall -O2 -o pplcnet_bg_live pplcnet_bg_live.c ocr_decode.c $(GST_CFLAGS) $(GST_LIBS) $(RKNN_CFLAGS) $(RKNN_LIBS) -lm
 
-# Three-expert (blue/green/police) PPLCNet live driver. Built from
+# Five-expert (blue/green/police/embassy/yellow) PPLCNet live driver. Built from
 # modular sources under lpr_live/ for maintainability:
 #   lpr_common, lpr_dma, lpr_detector, lpr_warp, lpr_color,
 #   lpr_ocr, lpr_display, lpr_infer
-# Police OCR is optional (--ocr-police-model); if omitted the driver
-# silently degrades to blue+green and behaves like pplcnet-bg-live.
+# Police, embassy and yellow OCR are optional; omitted routes fall back
+# through the color-route chain and preserve blue+green compatibility.
 #
 # Cross-compile environment is provided by the rknn:dev-snapshot Docker
 # image with /home/wzzz/RK3568J_SDK mounted at /home/hjf/SDK. The pkg-config

@@ -12,34 +12,47 @@
 #include <stdlib.h>
 #include <string.h>
 
+static bool route_enabled(const struct lpr_route *routes, enum lpr_route_id id)
+{
+    return id >= 0 && id < LPR_ROUTE_COUNT && routes[id].model != NULL;
+}
+
 /* Choose a route based on classified plate color. The mapping is:
  *   GREEN  -> green route
- *   YELLOW -> police route (if available, else blue)
- *   WHITE  -> police route (if available, else blue)
+ *   YELLOW -> yellow route, else police, else blue
+ *   WHITE  -> police route, else blue
+ *   BLACK  -> embassy route, else police, else blue
  *   BLUE   -> blue route
  *   UNKNOWN-> blue route (most common base plate type)
- *
- * If the requested route's model is NULL we fall back to blue. */
+ */
 static enum lpr_route_id pick_route(const struct lpr_route *routes, enum plate_color color)
 {
-    enum lpr_route_id chosen = LPR_ROUTE_BLUE;
     switch (color) {
     case PLATE_COLOR_GREEN:
-        chosen = LPR_ROUTE_GREEN;
-        break;
+        if (route_enabled(routes, LPR_ROUTE_GREEN))
+            return LPR_ROUTE_GREEN;
+        return LPR_ROUTE_BLUE;
     case PLATE_COLOR_YELLOW:
+        if (route_enabled(routes, LPR_ROUTE_YELLOW))
+            return LPR_ROUTE_YELLOW;
+        if (route_enabled(routes, LPR_ROUTE_POLICE))
+            return LPR_ROUTE_POLICE;
+        return LPR_ROUTE_BLUE;
     case PLATE_COLOR_WHITE:
-        chosen = LPR_ROUTE_POLICE;
-        break;
+        if (route_enabled(routes, LPR_ROUTE_POLICE))
+            return LPR_ROUTE_POLICE;
+        return LPR_ROUTE_BLUE;
+    case PLATE_COLOR_BLACK:
+        if (route_enabled(routes, LPR_ROUTE_EMBASSY))
+            return LPR_ROUTE_EMBASSY;
+        if (route_enabled(routes, LPR_ROUTE_POLICE))
+            return LPR_ROUTE_POLICE;
+        return LPR_ROUTE_BLUE;
     case PLATE_COLOR_BLUE:
     case PLATE_COLOR_UNKNOWN:
     default:
-        chosen = LPR_ROUTE_BLUE;
-        break;
+        return LPR_ROUTE_BLUE;
     }
-    if (chosen >= LPR_ROUTE_COUNT || routes[chosen].model == NULL)
-        chosen = LPR_ROUTE_BLUE;
-    return chosen;
 }
 
 static void publish_result(struct infer_state *st, const struct live_result *res)

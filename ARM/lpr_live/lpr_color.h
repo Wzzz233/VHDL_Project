@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* RGB-based plate body color classification (blue/green/yellow/white). */
+/* RGB-based plate body color classification (blue/green/yellow/white/black). */
 
 #ifndef LPR_LIVE_LPR_COLOR_H
 #define LPR_LIVE_LPR_COLOR_H

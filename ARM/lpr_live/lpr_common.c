@@ -88,6 +88,7 @@ const char *lpr_plate_color_str(enum plate_color c)
     case PLATE_COLOR_GREEN:  return "GREEN";
     case PLATE_COLOR_YELLOW: return "YELLOW";
     case PLATE_COLOR_WHITE:  return "WHITE";
+    case PLATE_COLOR_BLACK:  return "BLACK";
     default:                 return "UNK";
     }
 }
