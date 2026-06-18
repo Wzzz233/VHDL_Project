@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Standalone green PPLCNet live validation driver.
+ * Standalone blue/green PPLCNet live validation driver.
  *
  * Pipeline:
- *   FPGA DMA frame -> YOLOv8n-pose plate quad -> quad warp crop -> green PPLCNet CTC.
- * This program is intentionally separate from fpga_lpr_display.c and loads only one OCR model.
+ *   FPGA DMA frame -> YOLOv8n-pose plate quad -> color route -> quad warp crop
+ *   -> blue or green PPLCNet CTC -> HDMI/KMS display overlay.
  */
 
 #include <errno.h>
@@ -12,6 +12,7 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <math.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -68,10 +69,18 @@ enum ocr_preproc_mode {
     OCR_PREPROC_BIN,
 };
 
+enum plate_color {
+    PLATE_COLOR_UNKNOWN = 0,
+    PLATE_COLOR_BLUE,
+    PLATE_COLOR_GREEN,
+    PLATE_COLOR_YELLOW,
+};
+
 struct live_options {
     const char *device_path;
     const char *plate_model_path;
-    const char *ocr_model_path;
+    const char *ocr_blue_model_path;
+    const char *ocr_green_model_path;
     const char *keys_path;
     const char *drm_card_path;
     int connector_id;
@@ -147,6 +156,14 @@ struct ocr_keys {
     int count;
 };
 
+struct ocr_timing {
+    double prep_ms;
+    double input_ms;
+    double run_ms;
+    double output_ms;
+    double decode_ms;
+};
+
 struct display_state {
     bool enabled;
     int drm_fd;
@@ -162,6 +179,47 @@ struct display_state {
     GstElement *queue;
     GstElement *sink;
     GstBus *bus;
+};
+
+struct live_result {
+    bool valid;
+    uint64_t seq;
+    struct det_box box;
+    int det_count;
+    int best;
+    int crop_w;
+    int crop_h;
+    enum plate_color color;
+    char route_name[8];
+    char text[64];
+    float conf;
+    float blank_ratio;
+};
+
+struct infer_state {
+    pthread_t thread;
+    bool thread_started;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    pthread_mutex_t result_lock;
+    bool running;
+    bool has_new;
+    uint64_t seq;
+    uint64_t overwrite_count;
+    uint64_t infer_count;
+    uint8_t *latest_rgb;
+    size_t rgb_size;
+    int frame_w;
+    int frame_h;
+    struct live_result result;
+
+    const struct live_options *opt;
+    struct rknn_model *det_model;
+    struct rknn_model *ocr_blue_model;
+    struct rknn_model *ocr_green_model;
+    const struct ocr_keys *keys;
+    int pose_nc;
+    int class_filter;
 };
 
 static volatile sig_atomic_t g_stop;
@@ -192,10 +250,11 @@ static float sigmoidf_local(float x)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s --plate-model yolov8n_pos.rknn --ocr-green-model green.rknn --ocr-keys keys.txt [opts]\n"
+            "Usage: %s --plate-model yolov8n_pos.rknn --ocr-blue-model blue.rknn --ocr-green-model green.rknn --ocr-keys keys.txt [opts]\n"
             "\n"
             "Required:\n"
             "  --plate-model <path>       YOLOv8n pose RKNN plate detector\n"
+            "  --ocr-blue-model <path>    Blue PPLCNet OCR RKNN\n"
             "  --ocr-green-model <path>   Green PPLCNet OCR RKNN\n"
             "  --ocr-keys <path>          OCR keys file\n"
             "\n"
@@ -247,6 +306,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"plate-model", required_argument, NULL, 2},
         {"ocr-green-model", required_argument, NULL, 3},
         {"ocr-keys", required_argument, NULL, 4},
+        {"ocr-blue-model", required_argument, NULL, 20},
         {"frames", required_argument, NULL, 5},
         {"fps", required_argument, NULL, 6},
         {"min-plate-conf", required_argument, NULL, 7},
@@ -271,7 +331,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         switch (c) {
         case 1: o->device_path = optarg; break;
         case 2: o->plate_model_path = optarg; break;
-        case 3: o->ocr_model_path = optarg; break;
+        case 3: o->ocr_green_model_path = optarg; break;
         case 4: o->keys_path = optarg; break;
         case 5: o->frames = atoi(optarg); break;
         case 6: o->fps = atoi(optarg); break;
@@ -310,11 +370,12 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         case 19:
             o->auto_green_filter = (strcmp(optarg, "1") == 0 || strcmp(optarg, "true") == 0 || strcmp(optarg, "on") == 0);
             break;
+        case 20: o->ocr_blue_model_path = optarg; break;
         case 'h': return 1;
         default: return -1;
         }
     }
-    if (!o->plate_model_path || !o->ocr_model_path || !o->keys_path)
+    if (!o->plate_model_path || !o->ocr_blue_model_path || !o->ocr_green_model_path || !o->keys_path)
         return -1;
     if (o->fps <= 0 || o->fps > 120 || o->frames < 0 || o->max_det <= 0 || o->max_det > MAX_DETS)
         return -1;
@@ -1425,9 +1486,10 @@ static bool build_ocr_layout(const rknn_tensor_attr *a, int key_count,
 }
 
 static int run_ocr(struct rknn_model *m, const struct ocr_keys *keys,
-                   enum ocr_preproc_mode preproc,
+                   enum ocr_preproc_mode preproc, enum ocr_decode_family family,
                    const uint8_t *crop_rgb, int crop_w, int crop_h,
-                   char *text, size_t text_len, float *conf, struct ocr_decode_diag *diag)
+                   char *text, size_t text_len, float *conf, struct ocr_decode_diag *diag,
+                   struct ocr_timing *timing)
 {
     uint8_t *input;
     rknn_input in;
@@ -1435,6 +1497,10 @@ static int run_ocr(struct rknn_model *m, const struct ocr_keys *keys,
     int ret;
     int t_size = 0, c_size = 0, t_stride = 0, c_stride = 0;
     int blank;
+    int64_t t0, t1, t2, t3, t4, t5;
+    if (timing)
+        memset(timing, 0, sizeof(*timing));
+    t0 = mono_us();
     input = malloc((size_t)m->in_w * m->in_h * 3U);
     if (!input)
         return -1;
@@ -1444,6 +1510,7 @@ static int run_ocr(struct rknn_model *m, const struct ocr_keys *keys,
         apply_gray3(input, (int)m->in_w, (int)m->in_h);
     else if (preproc == OCR_PREPROC_BIN)
         apply_bin(input, (int)m->in_w, (int)m->in_h);
+    t1 = mono_us();
     memset(&in, 0, sizeof(in));
     in.index = 0;
     in.buf = input;
@@ -1451,12 +1518,15 @@ static int run_ocr(struct rknn_model *m, const struct ocr_keys *keys,
     in.type = RKNN_TENSOR_UINT8;
     in.fmt = RKNN_TENSOR_NHWC;
     ret = rknn_inputs_set(m->ctx, 1, &in);
+    t2 = mono_us();
     if (ret < 0) { free(input); return ret; }
     ret = rknn_run(m->ctx, NULL);
+    t3 = mono_us();
     if (ret < 0) { free(input); return ret; }
     memset(&out, 0, sizeof(out));
     out.want_float = 1;
     ret = rknn_outputs_get(m->ctx, 1, &out, NULL);
+    t4 = mono_us();
     free(input);
     if (ret < 0)
         return ret;
@@ -1470,11 +1540,74 @@ static int run_ocr(struct rknn_model *m, const struct ocr_keys *keys,
         for (int i = 0; i < keys->count; i++)
             key_ptrs[i] = keys->keys[i];
         ret = ocr_decode_logits((const float *)out.buf, t_size, c_size, t_stride, c_stride,
-                                key_ptrs, keys->count, blank, OCR_DECODE_FAMILY_GREEN8,
+                                key_ptrs, keys->count, blank, family,
                                 text, text_len, conf, diag);
+    }
+    t5 = mono_us();
+    if (timing) {
+        timing->prep_ms = (double)(t1 - t0) / 1000.0;
+        timing->input_ms = (double)(t2 - t1) / 1000.0;
+        timing->run_ms = (double)(t3 - t2) / 1000.0;
+        timing->output_ms = (double)(t4 - t3) / 1000.0;
+        timing->decode_ms = (double)(t5 - t4) / 1000.0;
     }
     rknn_outputs_release(m->ctx, 1, &out);
     return ret;
+}
+
+
+static enum plate_color classify_plate_color_rgb(const uint8_t *rgb, int w, int h, const struct det_box *b)
+{
+    int x1 = b->x1 + (b->x2 - b->x1) / 6;
+    int x2 = b->x2 - (b->x2 - b->x1) / 6;
+    int y1 = b->y1 + (b->y2 - b->y1) / 6;
+    int y2 = b->y2 - (b->y2 - b->y1) / 6;
+    int total = 0, blue_cnt = 0, green_cnt = 0, yellow_cnt = 0, dark_cnt = 0;
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 >= w) x2 = w - 1;
+    if (y2 >= h) y2 = h - 1;
+    for (int y = y1; y <= y2; y++) {
+        for (int x = x1; x <= x2; x++) {
+            const uint8_t *p = rgb + (y * w + x) * 3;
+            float r = p[0] / 255.0f;
+            float g = p[1] / 255.0f;
+            float bch = p[2] / 255.0f;
+            float mx = fmaxf(r, fmaxf(g, bch));
+            float mn = fminf(r, fminf(g, bch));
+            float d = mx - mn;
+            float h_deg = 0.0f;
+            float s = (mx == 0.0f) ? 0.0f : (d / mx);
+            float v = mx;
+            if (v < 0.20f) dark_cnt++;
+            if (d > 1e-6f) {
+                if (mx == r) h_deg = 60.0f * fmodf((g - bch) / d, 6.0f);
+                else if (mx == g) h_deg = 60.0f * (((bch - r) / d) + 2.0f);
+                else h_deg = 60.0f * (((r - g) / d) + 4.0f);
+            }
+            if (h_deg < 0.0f) h_deg += 360.0f;
+            total++;
+            if (h_deg >= 190.0f && h_deg <= 260.0f && s > 0.23f && v > 0.16f) blue_cnt++;
+            else if (h_deg >= 75.0f && h_deg <= 155.0f && s > 0.20f && v > 0.16f) green_cnt++;
+            else if (h_deg >= 15.0f && h_deg <= 55.0f && s > 0.15f && v > 0.16f) yellow_cnt++;
+        }
+    }
+    if (total == 0) return PLATE_COLOR_UNKNOWN;
+    if ((float)blue_cnt / (float)total >= 0.20f && blue_cnt > green_cnt + (int)(0.05f * total))
+        return PLATE_COLOR_BLUE;
+    if ((float)green_cnt / (float)total >= 0.20f && green_cnt > blue_cnt + (int)(0.05f * total))
+        return PLATE_COLOR_GREEN;
+    if ((float)yellow_cnt / (float)total >= 0.18f && (float)dark_cnt / (float)total < 0.50f)
+        return PLATE_COLOR_YELLOW;
+    return PLATE_COLOR_UNKNOWN;
+}
+
+static const char *plate_color_str(enum plate_color c)
+{
+    if (c == PLATE_COLOR_BLUE) return "BLUE";
+    if (c == PLATE_COLOR_GREEN) return "GREEN";
+    if (c == PLATE_COLOR_YELLOW) return "YELLOW";
+    return "UNK";
 }
 
 static int pick_best(const struct det_box *dets, int count)
@@ -1490,7 +1623,7 @@ static int pick_best(const struct det_box *dets, int count)
     return best;
 }
 
-static void log_ocr_contract(const struct rknn_model *m, const struct ocr_keys *keys)
+static void log_ocr_contract(const char *route_name, const struct rknn_model *m, const struct ocr_keys *keys)
 {
     int t_size = 0, c_size = 0, t_stride = 0, c_stride = 0;
     int blank = -1;
@@ -1501,8 +1634,198 @@ static void log_ocr_contract(const struct rknn_model *m, const struct ocr_keys *
     if (build_ocr_layout(&m->output_attrs[0], keys->count, &t_size, &c_size, &t_stride, &c_stride))
         blank = (c_size == keys->count + 1) ? keys->count : c_size - 1;
     fprintf(stderr,
-            "[green-live] keys=%d first=%s idx12=%s last=%s ocr_layout=t%d c%d t_stride=%d c_stride=%d blank=%d\n",
-            keys->count, k0, k11, klast, t_size, c_size, t_stride, c_stride, blank);
+            "[bg-live] route=%s keys=%d first=%s idx12=%s last=%s ocr_layout=t%d c%d t_stride=%d c_stride=%d blank=%d\n",
+            route_name ? route_name : "?", keys->count, k0, k11, klast, t_size, c_size, t_stride, c_stride, blank);
+}
+
+
+static void infer_publish_result(struct infer_state *st, const struct live_result *res)
+{
+    pthread_mutex_lock(&st->result_lock);
+    st->result = *res;
+    pthread_mutex_unlock(&st->result_lock);
+}
+
+static void infer_get_result(struct infer_state *st, struct live_result *res)
+{
+    pthread_mutex_lock(&st->result_lock);
+    *res = st->result;
+    pthread_mutex_unlock(&st->result_lock);
+}
+
+static void infer_submit_latest(struct infer_state *st, const uint8_t *rgb)
+{
+    pthread_mutex_lock(&st->lock);
+    if (st->has_new)
+        st->overwrite_count++;
+    memcpy(st->latest_rgb, rgb, st->rgb_size);
+    st->seq++;
+    st->has_new = true;
+    pthread_cond_signal(&st->cond);
+    pthread_mutex_unlock(&st->lock);
+}
+
+static void *infer_thread_main(void *arg)
+{
+    struct infer_state *st = (struct infer_state *)arg;
+    uint8_t *rgb = malloc(st->rgb_size);
+    uint8_t *det_input = malloc((size_t)st->det_model->in_w * st->det_model->in_h * 3U);
+    uint8_t *crop = malloc(st->rgb_size);
+    if (!rgb || !det_input || !crop) {
+        fprintf(stderr, "[bg-live] infer thread alloc failed\n");
+        free(rgb); free(det_input); free(crop);
+        return NULL;
+    }
+
+    while (1) {
+        uint64_t seq;
+        struct det_box dets[MAX_DETS];
+        int det_count = 0;
+        int best = -1;
+        int crop_w = 0, crop_h = 0;
+        char text[64] = "";
+        float conf = 0.0f;
+        struct ocr_decode_diag diag;
+        struct ocr_timing ocr_timing;
+        enum plate_color color = PLATE_COLOR_UNKNOWN;
+        const char *route_name = "blue";
+        double warp_ms = 0.0, color_ms = 0.0;
+        int64_t t0, t1, t2;
+        struct live_result res;
+
+        pthread_mutex_lock(&st->lock);
+        while (st->running && !st->has_new)
+            pthread_cond_wait(&st->cond, &st->lock);
+        if (!st->running && !st->has_new) {
+            pthread_mutex_unlock(&st->lock);
+            break;
+        }
+        memcpy(rgb, st->latest_rgb, st->rgb_size);
+        seq = st->seq;
+        st->has_new = false;
+        pthread_mutex_unlock(&st->lock);
+
+        memset(&res, 0, sizeof(res));
+        res.seq = seq;
+        t0 = mono_us();
+        if (run_detector(st->det_model, rgb, st->frame_w, st->frame_h, det_input,
+                         st->opt->det_resize_mode, st->pose_nc, st->class_filter,
+                         st->opt->min_conf, st->opt->nms_iou, st->opt->max_det,
+                         dets, &det_count) < 0) {
+            fprintf(stderr, "[bg-live] infer seq=%" PRIu64 " detector failed\n", seq);
+            continue;
+        }
+        t1 = mono_us();
+        best = pick_best(dets, det_count);
+        res.det_count = det_count;
+        res.best = best;
+        if (best >= 0) {
+            int64_t tw0 = mono_us();
+            bool warp_ok = warp_quad_homography(rgb, st->frame_w, st->frame_h, dets[best].quad,
+                                                crop, st->frame_w, st->frame_h, &crop_w, &crop_h);
+            int64_t tw1 = mono_us();
+            warp_ms = (double)(tw1 - tw0) / 1000.0;
+            if (warp_ok) {
+                struct rknn_model *ocr_route = st->ocr_blue_model;
+                enum ocr_decode_family decode_family = OCR_DECODE_FAMILY_NORMAL7;
+                int64_t tc0 = mono_us();
+                color = classify_plate_color_rgb(rgb, st->frame_w, st->frame_h, &dets[best]);
+                int64_t tc1 = mono_us();
+                color_ms = (double)(tc1 - tc0) / 1000.0;
+                if (color == PLATE_COLOR_GREEN) {
+                    ocr_route = st->ocr_green_model;
+                    decode_family = OCR_DECODE_FAMILY_GREEN8;
+                    route_name = "green";
+                }
+                memset(&diag, 0, sizeof(diag));
+                memset(&ocr_timing, 0, sizeof(ocr_timing));
+                if (run_ocr(ocr_route, st->keys, st->opt->ocr_preproc_mode, decode_family,
+                            crop, crop_w, crop_h, text, sizeof(text), &conf, &diag, &ocr_timing) < 0) {
+                    snprintf(text, sizeof(text), "UNK");
+                    conf = 0.0f;
+                }
+                res.valid = true;
+                res.box = dets[best];
+                res.crop_w = crop_w;
+                res.crop_h = crop_h;
+                res.color = color;
+                snprintf(res.route_name, sizeof(res.route_name), "%s", route_name);
+                snprintf(res.text, sizeof(res.text), "%s", text);
+                res.conf = conf;
+                res.blank_ratio = diag.blank_top1_ratio;
+            }
+        }
+        t2 = mono_us();
+        st->infer_count++;
+        infer_publish_result(st, &res);
+        if (res.valid) {
+            printf("[bg-live] infer_seq=%" PRIu64 " det=%d best=%d cls=%d color=%s route=%s box=[%d,%d,%d,%d] crop=%dx%d "
+                   "text=%s conf=%.3f blank=%.3f detocr_ms=%.1f det_ms=%.1f ocr_ms=%.1f "
+                   "warp_ms=%.1f color_ms=%.1f prep_ms=%.1f in_ms=%.1f run_ms=%.1f out_ms=%.1f dec_ms=%.1f overwritten=%" PRIu64 "\n",
+                   seq, det_count, best, dets[best].cls, plate_color_str(color), route_name,
+                   dets[best].x1, dets[best].y1, dets[best].x2, dets[best].y2,
+                   crop_w, crop_h, text, conf, diag.blank_top1_ratio,
+                   (double)(t2 - t0) / 1000.0,
+                   (double)(t1 - t0) / 1000.0,
+                   (double)(t2 - t1) / 1000.0,
+                   warp_ms, color_ms, ocr_timing.prep_ms, ocr_timing.input_ms,
+                   ocr_timing.run_ms, ocr_timing.output_ms, ocr_timing.decode_ms,
+                   st->overwrite_count);
+        } else {
+            printf("[bg-live] infer_seq=%" PRIu64 " det=%d best=%d det_ms=%.1f overwritten=%" PRIu64 "\n",
+                   seq, det_count, best, (double)(t1 - t0) / 1000.0, st->overwrite_count);
+        }
+        fflush(stdout);
+    }
+
+    free(rgb); free(det_input); free(crop);
+    return NULL;
+}
+
+static int infer_start(struct infer_state *st, const struct live_options *opt,
+                       struct rknn_model *det_model, struct rknn_model *ocr_blue_model,
+                       struct rknn_model *ocr_green_model, const struct ocr_keys *keys,
+                       int pose_nc, int class_filter, int frame_w, int frame_h)
+{
+    memset(st, 0, sizeof(*st));
+    st->opt = opt;
+    st->det_model = det_model;
+    st->ocr_blue_model = ocr_blue_model;
+    st->ocr_green_model = ocr_green_model;
+    st->keys = keys;
+    st->pose_nc = pose_nc;
+    st->class_filter = class_filter;
+    st->frame_w = frame_w;
+    st->frame_h = frame_h;
+    st->rgb_size = (size_t)frame_w * (size_t)frame_h * 3U;
+    st->latest_rgb = malloc(st->rgb_size);
+    if (!st->latest_rgb)
+        return -1;
+    pthread_mutex_init(&st->lock, NULL);
+    pthread_cond_init(&st->cond, NULL);
+    pthread_mutex_init(&st->result_lock, NULL);
+    st->running = true;
+    if (pthread_create(&st->thread, NULL, infer_thread_main, st) != 0)
+        return -1;
+    st->thread_started = true;
+    return 0;
+}
+
+static void infer_stop(struct infer_state *st)
+{
+    if (!st)
+        return;
+    pthread_mutex_lock(&st->lock);
+    st->running = false;
+    pthread_cond_broadcast(&st->cond);
+    pthread_mutex_unlock(&st->lock);
+    if (st->thread_started)
+        pthread_join(st->thread, NULL);
+    free(st->latest_rgb);
+    pthread_mutex_destroy(&st->lock);
+    pthread_cond_destroy(&st->cond);
+    pthread_mutex_destroy(&st->result_lock);
+    memset(st, 0, sizeof(*st));
 }
 
 int main(int argc, char **argv)
@@ -1510,9 +1833,11 @@ int main(int argc, char **argv)
     struct live_options opt;
     struct dma_state dma;
     struct rknn_model det_model;
-    struct rknn_model ocr_model;
+    struct rknn_model ocr_blue_model;
+    struct rknn_model ocr_green_model;
     struct ocr_keys keys;
     struct display_state display;
+    struct infer_state infer;
     uint8_t *rgb = NULL;
     uint8_t *det_input = NULL;
     uint8_t *crop = NULL;
@@ -1531,44 +1856,52 @@ int main(int argc, char **argv)
 
     memset(&dma, 0, sizeof(dma)); dma.fd = -1;
     memset(&display, 0, sizeof(display)); display.drm_fd = -1;
+    memset(&infer, 0, sizeof(infer));
     memset(&det_model, 0, sizeof(det_model));
-    memset(&ocr_model, 0, sizeof(ocr_model));
+    memset(&ocr_blue_model, 0, sizeof(ocr_blue_model));
+    memset(&ocr_green_model, 0, sizeof(ocr_green_model));
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     if (opt.display)
         gst_init(NULL, NULL);
 
     if (load_keys(opt.keys_path, &keys) < 0) {
-        fprintf(stderr, "[green-live] failed to load keys: %s\n", opt.keys_path);
+        fprintf(stderr, "[bg-live] failed to load keys: %s\n", opt.keys_path);
         goto out;
     }
     if (init_dma(&dma, &opt) < 0) {
-        fprintf(stderr, "[green-live] failed to init DMA: %s: %s\n", opt.device_path, strerror(errno));
+        fprintf(stderr, "[bg-live] failed to init DMA: %s: %s\n", opt.device_path, strerror(errno));
         goto out;
     }
     if (display_start(&display, &opt, dma.frame_w, dma.frame_h) < 0) {
-        fprintf(stderr, "[green-live] failed to start display\n");
+        fprintf(stderr, "[bg-live] failed to start display\n");
         goto out;
     }
     if (model_load(&det_model, "yolov8n_pose", opt.plate_model_path) < 0) {
-        fprintf(stderr, "[green-live] failed to load detector: %s\n", opt.plate_model_path);
+        fprintf(stderr, "[bg-live] failed to load detector: %s\n", opt.plate_model_path);
         goto out;
     }
-    if (model_load(&ocr_model, "pplcnet_green", opt.ocr_model_path) < 0) {
-        fprintf(stderr, "[green-live] failed to load OCR: %s\n", opt.ocr_model_path);
+    if (model_load(&ocr_blue_model, "pplcnet_blue", opt.ocr_blue_model_path) < 0) {
+        fprintf(stderr, "[bg-live] failed to load blue OCR: %s\n", opt.ocr_blue_model_path);
+        goto out;
+    }
+    if (model_load(&ocr_green_model, "pplcnet_green", opt.ocr_green_model_path) < 0) {
+        fprintf(stderr, "[bg-live] failed to load green OCR: %s\n", opt.ocr_green_model_path);
         goto out;
     }
     if (det_model.in_w != ALGO_STREAM_SIZE || det_model.in_h != ALGO_STREAM_SIZE || det_model.in_c != 3) {
-        fprintf(stderr, "[green-live] detector input must be 640x640x3, got %ux%ux%u\n",
+        fprintf(stderr, "[bg-live] detector input must be 640x640x3, got %ux%ux%u\n",
                 det_model.in_w, det_model.in_h, det_model.in_c);
         goto out;
     }
-    if (ocr_model.in_c != 3) {
-        fprintf(stderr, "[green-live] OCR input must have 3 channels, got %u\n", ocr_model.in_c);
+    if (ocr_blue_model.in_c != 3 || ocr_green_model.in_c != 3) {
+        fprintf(stderr, "[bg-live] OCR input must have 3 channels, got blue=%u green=%u\n",
+                ocr_blue_model.in_c, ocr_green_model.in_c);
         goto out;
     }
 
-    log_ocr_contract(&ocr_model, &keys);
+    log_ocr_contract("blue", &ocr_blue_model, &keys);
+    log_ocr_contract("green", &ocr_green_model, &keys);
 
     pose_nc = detect_pose_nc_from_attrs(&det_model);
     class_filter = opt.class_filter;
@@ -1576,91 +1909,57 @@ int main(int argc, char **argv)
         class_filter = 1;
 
     rgb = malloc((size_t)dma.frame_w * dma.frame_h * 3U);
-    det_input = malloc((size_t)det_model.in_w * det_model.in_h * 3U);
-    crop = malloc((size_t)dma.frame_w * dma.frame_h * 3U);
     if (opt.display)
         display_frame = malloc((size_t)dma.frame_w * dma.frame_h * 2U);
-    if (!rgb || !det_input || !crop || (opt.display && !display_frame))
+    if (!rgb || (opt.display && !display_frame))
         goto out;
 
     fprintf(stderr,
-            "[green-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
-            "det_resize=%s ocr=%ux%u preproc=%s display=%d auto_green_filter=%d\n",
+            "[bg-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
+            "det_resize=%s blue_ocr=%ux%u green_ocr=%ux%u preproc=%s display=%d auto_green_filter=%d async_infer=1\n",
             dma.frame_w, dma.frame_h, dma.src_is_bgrx ? "bgrx8888" : "bgr565",
             opt.frames, opt.fps, pose_nc, class_filter,
             opt.det_resize_mode == DET_RESIZE_LETTERBOX ? "letterbox" : "stretch",
-            ocr_model.in_w, ocr_model.in_h,
+            ocr_blue_model.in_w, ocr_blue_model.in_h, ocr_green_model.in_w, ocr_green_model.in_h,
             opt.ocr_preproc_mode == OCR_PREPROC_GRAY ? "gray" : (opt.ocr_preproc_mode == OCR_PREPROC_BIN ? "bin" : "none"),
             opt.display ? 1 : 0, opt.auto_green_filter ? 1 : 0);
 
+    if (infer_start(&infer, &opt, &det_model, &ocr_blue_model, &ocr_green_model, &keys,
+                    pose_nc, class_filter, (int)dma.frame_w, (int)dma.frame_h) < 0) {
+        fprintf(stderr, "[bg-live] failed to start infer thread\n");
+        goto out;
+    }
+
     target_us = 1000000LL / opt.fps;
     for (int frame = 0; !g_stop && (opt.frames == 0 || frame < opt.frames); frame++) {
-        struct det_box dets[MAX_DETS];
-        int det_count = 0;
-        int best;
-        int crop_w = 0, crop_h = 0;
-        char text[64] = "";
-        float conf = 0.0f;
-        struct ocr_decode_diag diag;
-        int64_t t0 = mono_us(), t1, t2, t3;
+        struct live_result latest;
+        int64_t t0 = mono_us();
         if (read_frame(&dma) < 0) {
-            fprintf(stderr, "[green-live] DMA frame read failed\n");
+            fprintf(stderr, "[bg-live] DMA frame read failed\n");
             goto out;
         }
         frame_to_rgb888(&dma, &opt, rgb);
-        if (display_frame)
-            rgb888_to_rgb565_frame(rgb, display_frame, (int)dma.frame_w, (int)dma.frame_h);
-        t1 = mono_us();
-        if (run_detector(&det_model, rgb, (int)dma.frame_w, (int)dma.frame_h, det_input,
-                         opt.det_resize_mode, pose_nc, class_filter, opt.min_conf, opt.nms_iou, opt.max_det,
-                         dets, &det_count) < 0) {
-            fprintf(stderr, "[green-live] frame=%d detector failed\n", frame);
-            if (display_frame && display_push(&display, display_frame) < 0)
-                goto out;
-            continue;
-        }
-        t2 = mono_us();
-        best = pick_best(dets, det_count);
-        if (best < 0) {
-            printf("[green-live] frame=%d det=0 dma_ms=%.1f det_ms=%.1f\n",
-                   frame, (double)(t1 - t0) / 1000.0, (double)(t2 - t1) / 1000.0);
-        } else if (!warp_quad_homography(rgb, (int)dma.frame_w, (int)dma.frame_h, dets[best].quad,
-                                          crop, (int)dma.frame_w, (int)dma.frame_h, &crop_w, &crop_h)) {
-            printf("[green-live] frame=%d det=%d best=%d warp=fail\n", frame, det_count, best);
-        } else {
-            memset(&diag, 0, sizeof(diag));
-            if (run_ocr(&ocr_model, &keys, opt.ocr_preproc_mode, crop, crop_w, crop_h,
-                        text, sizeof(text), &conf, &diag) < 0) {
-                snprintf(text, sizeof(text), "UNK");
-                conf = 0.0f;
-            }
-            t3 = mono_us();
-            printf("[green-live] frame=%d det=%d best=%d cls=%d box=[%d,%d,%d,%d] warp=homography crop=%dx%d "
-                   "text=%s conf=%.3f blank=%.3f dma_ms=%.1f det_ms=%.1f ocr_ms=%.1f total_ms=%.1f\n",
-                   frame, det_count, best, dets[best].cls,
-                   dets[best].x1, dets[best].y1, dets[best].x2, dets[best].y2,
-                   crop_w, crop_h, text, conf, diag.blank_top1_ratio,
-                   (double)(t1 - t0) / 1000.0,
-                   (double)(t2 - t1) / 1000.0,
-                   (double)(t3 - t2) / 1000.0,
-                   (double)(t3 - t0) / 1000.0);
-        }
+        infer_submit_latest(&infer, rgb);
+
         if (display_frame) {
-            if (best >= 0) {
+            rgb888_to_rgb565_frame(rgb, display_frame, (int)dma.frame_w, (int)dma.frame_h);
+            infer_get_result(&infer, &latest);
+            if (latest.valid) {
                 char ascii[32];
                 char overlay[64];
-                int ty = dets[best].y1 - (7 * OVERLAY_TEXT_SCALE + 3);
-                if (ty < 0) ty = dets[best].y1 + 3;
-                overlay_ascii_from_text(text, ascii, sizeof(ascii));
-                snprintf(overlay, sizeof(overlay), "%s C%.2f", ascii[0] ? ascii : "OCR", conf);
-                draw_rect_565(display_frame, (int)dma.frame_w, (int)dma.frame_h, &dets[best], COLOR_CYAN_565);
+                int ty = latest.box.y1 - (7 * OVERLAY_TEXT_SCALE + 3);
+                if (ty < 0) ty = latest.box.y1 + 3;
+                overlay_ascii_from_text(latest.text, ascii, sizeof(ascii));
+                snprintf(overlay, sizeof(overlay), "%s %c %.2f", ascii[0] ? ascii : "OCR",
+                         latest.route_name[0] == 'g' ? 'G' : 'B', latest.conf);
+                draw_rect_565(display_frame, (int)dma.frame_w, (int)dma.frame_h,
+                              &latest.box, COLOR_CYAN_565);
                 draw_text_565(display_frame, (int)dma.frame_w, (int)dma.frame_h,
-                              dets[best].x1, ty, overlay, COLOR_CYAN_565, OVERLAY_TEXT_SCALE);
+                              latest.box.x1, ty, overlay, COLOR_CYAN_565, OVERLAY_TEXT_SCALE);
             }
             if (display_push(&display, display_frame) < 0)
                 goto out;
         }
-        fflush(stdout);
         {
             int64_t used = mono_us() - t0;
             if (used < target_us)
@@ -1670,13 +1969,15 @@ int main(int argc, char **argv)
     ret = 0;
 
 out:
+    infer_stop(&infer);
     free(rgb);
     free(det_input);
     free(crop);
     free(display_frame);
     display_stop(&display);
     model_release(&det_model);
-    model_release(&ocr_model);
+    model_release(&ocr_blue_model);
+    model_release(&ocr_green_model);
     release_dma(&dma);
     return ret;
 }

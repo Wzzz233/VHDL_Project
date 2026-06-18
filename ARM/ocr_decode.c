@@ -416,6 +416,8 @@ int ocr_decode_logits(const float *buf, int t_size, int c_size, int t_stride, in
     int prev = -1;
     int emitted = 0;
     int blank_top1_count = 0;
+    int greedy_ids[OCR_DECODE_MAX_TOKENS];
+    int greedy_count = 0;
     double conf_sum = 0.0;
     char greedy_text[OCR_DECODE_MAX_TEXT];
 
@@ -463,6 +465,8 @@ int ocr_decode_logits(const float *buf, int t_size, int c_size, int t_stride, in
         if (best_c >= 0 && best_c < key_count) {
             double prob = exp((double)best_logit - (double)max_logit) / exp_sum;
             if (append_utf8_token_local(greedy_text, sizeof(greedy_text), keys[best_c])) {
+                if (greedy_count < OCR_DECODE_MAX_TOKENS)
+                    greedy_ids[greedy_count++] = best_c;
                 emitted++;
                 conf_sum += prob;
             }
@@ -482,6 +486,8 @@ int ocr_decode_logits(const float *buf, int t_size, int c_size, int t_stride, in
     }
 
     if (family == OCR_DECODE_FAMILY_NONE)
+        return 0;
+    if (family_full_valid(family, greedy_ids, greedy_count, keys, key_count))
         return 0;
     if (constrained_decode(buf, t_size, c_size, t_stride, c_stride,
                            keys, key_count, blank_idx, family,
