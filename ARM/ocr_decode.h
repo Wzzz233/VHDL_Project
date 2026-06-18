@@ -18,6 +18,8 @@ enum ocr_decode_family {
     OCR_DECODE_FAMILY_NONE = 0,
     OCR_DECODE_FAMILY_GREEN8,
     OCR_DECODE_FAMILY_NORMAL7,
+    OCR_DECODE_FAMILY_POLICE7,
+    OCR_DECODE_FAMILY_EMBASSY7,
 };
 
 int ocr_decode_logits(const float *buf, int t_size, int c_size, int t_stride, int c_stride,

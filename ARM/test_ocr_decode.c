@@ -171,11 +171,89 @@ static void test_none_family_falls_back_to_greedy(void)
     expect_str_eq("none_family_greedy", text, "陕AA0222");
 }
 
+static void test_police7_family_forces_jing_tail(void)
+{
+    static const char *const keys[] = {"鲁", "J", "1", "0", "W", "警"};
+    const int blank_idx = ARRAY_LEN(keys);
+    const int c_size = blank_idx + 1;
+    const int t_size = 13;
+    float logits[13 * 7];
+    char greedy_text[64];
+    char family_text[64];
+    float conf = 0.0f;
+    int ret;
+
+    set_row(logits, 0, c_size, 0, 8.0f, -1, 0.0f);
+    set_row(logits, 1, c_size, blank_idx, 8.0f, -1, 0.0f);
+    set_row(logits, 2, c_size, 1, 8.0f, -1, 0.0f);
+    set_row(logits, 3, c_size, blank_idx, 8.0f, -1, 0.0f);
+    set_row(logits, 4, c_size, 2, 8.0f, -1, 0.0f);
+    set_row(logits, 5, c_size, blank_idx, 8.0f, -1, 0.0f);
+    set_row(logits, 6, c_size, 3, 8.0f, -1, 0.0f);
+    set_row(logits, 7, c_size, blank_idx, 8.0f, -1, 0.0f);
+    set_row(logits, 8, c_size, 2, 8.0f, -1, 0.0f);
+    set_row(logits, 9, c_size, blank_idx, 8.0f, -1, 0.0f);
+    set_row(logits, 10, c_size, 3, 8.0f, -1, 0.0f);
+    set_row(logits, 11, c_size, blank_idx, 8.0f, -1, 0.0f);
+    set_row(logits, 12, c_size, 4, 7.2f, 5, 7.0f);
+
+    greedy_decode_local(logits, t_size, c_size, blank_idx, keys, greedy_text, sizeof(greedy_text));
+    expect_str_eq("police7_greedy_wrong_tail", greedy_text, "鲁J1010W");
+
+    ret = ocr_decode_logits(logits, t_size, c_size, c_size, 1,
+                            keys, ARRAY_LEN(keys), blank_idx,
+                            OCR_DECODE_FAMILY_POLICE7,
+                            family_text, sizeof(family_text), &conf, NULL);
+    if (ret != 0)
+        fail("police7 family decode returned non-zero");
+    expect_str_eq("police7_forces_jing", family_text, "鲁J1010警");
+}
+
+static void test_embassy7_family_recovers_blank_greedy(void)
+{
+    static const char *const keys[] = {"0", "1", "2", "3", "4", "5", "6", "使"};
+    const int blank_idx = ARRAY_LEN(keys);
+    const int c_size = blank_idx + 1;
+    const int t_size = 13;
+    float logits[13 * 9];
+    char greedy_text[64];
+    char family_text[64];
+    float conf = 0.0f;
+    int ret;
+
+    set_row(logits, 0, c_size, blank_idx, 7.6f, 7, 7.2f);
+    set_row(logits, 1, c_size, blank_idx, 8.0f, -1, 0.0f);
+    set_row(logits, 2, c_size, blank_idx, 7.6f, 1, 7.2f);
+    set_row(logits, 3, c_size, blank_idx, 8.0f, -1, 0.0f);
+    set_row(logits, 4, c_size, blank_idx, 7.6f, 2, 7.2f);
+    set_row(logits, 5, c_size, blank_idx, 8.0f, -1, 0.0f);
+    set_row(logits, 6, c_size, blank_idx, 7.6f, 3, 7.2f);
+    set_row(logits, 7, c_size, blank_idx, 8.0f, -1, 0.0f);
+    set_row(logits, 8, c_size, blank_idx, 7.6f, 4, 7.2f);
+    set_row(logits, 9, c_size, blank_idx, 8.0f, -1, 0.0f);
+    set_row(logits, 10, c_size, blank_idx, 7.6f, 5, 7.2f);
+    set_row(logits, 11, c_size, blank_idx, 8.0f, -1, 0.0f);
+    set_row(logits, 12, c_size, blank_idx, 7.6f, 6, 7.2f);
+
+    greedy_decode_local(logits, t_size, c_size, blank_idx, keys, greedy_text, sizeof(greedy_text));
+    expect_str_eq("embassy7_greedy_blank", greedy_text, "");
+
+    ret = ocr_decode_logits(logits, t_size, c_size, c_size, 1,
+                            keys, ARRAY_LEN(keys), blank_idx,
+                            OCR_DECODE_FAMILY_EMBASSY7,
+                            family_text, sizeof(family_text), &conf, NULL);
+    if (ret != 0)
+        fail("embassy7 family decode returned non-zero");
+    expect_str_eq("embassy7_recovers_text", family_text, "使123456");
+}
+
 int main(void)
 {
     test_green8_relaxed_allows_aa02222();
     test_green8_family_aware_recovers_short_greedy();
     test_none_family_falls_back_to_greedy();
+    test_police7_family_forces_jing_tail();
+    test_embassy7_family_recovers_blank_greedy();
     printf("[PASS] test_ocr_decode\n");
     return 0;
 }

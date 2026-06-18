@@ -105,6 +105,14 @@ static bool token_is_alnum(const char *token)
     return token_in_list(token, alnum, (int)(sizeof(alnum) / sizeof(alnum[0])));
 }
 
+static bool token_is_digit(const char *token)
+{
+    static const char *const digits[] = {
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"
+    };
+    return token_in_list(token, digits, (int)(sizeof(digits) / sizeof(digits[0])));
+}
+
 static bool family_prefix_valid(enum ocr_decode_family family,
                                 const int *token_ids, int token_count,
                                 const char *const *keys, int key_count)
@@ -117,6 +125,17 @@ static bool family_prefix_valid(enum ocr_decode_family family,
     for (i = 0; i < token_count; i++) {
         if (token_ids[i] < 0 || token_ids[i] >= key_count)
             return false;
+    }
+    if (family == OCR_DECODE_FAMILY_EMBASSY7) {
+        if (token_count > 7)
+            return false;
+        if (!token_equals(keys[token_ids[0]], "使"))
+            return false;
+        for (i = 1; i < token_count; i++) {
+            if (!token_is_digit(keys[token_ids[i]]))
+                return false;
+        }
+        return true;
     }
     if (!token_is_province(keys[token_ids[0]]))
         return false;
@@ -140,7 +159,29 @@ static bool family_prefix_valid(enum ocr_decode_family family,
         }
         return true;
     }
+    if (family == OCR_DECODE_FAMILY_POLICE7) {
+        if (token_count > 7)
+            return false;
+        for (i = 2; i < token_count && i < 6; i++) {
+            if (!token_is_alnum(keys[token_ids[i]]))
+                return false;
+        }
+        if (token_count >= 7 && !token_equals(keys[token_ids[6]], "警"))
+            return false;
+        return true;
+    }
     return true;
+}
+
+static int family_max_token_count(enum ocr_decode_family family)
+{
+    if (family == OCR_DECODE_FAMILY_GREEN8)
+        return 8;
+    if (family == OCR_DECODE_FAMILY_NORMAL7 ||
+        family == OCR_DECODE_FAMILY_POLICE7 ||
+        family == OCR_DECODE_FAMILY_EMBASSY7)
+        return 7;
+    return OCR_DECODE_MAX_TOKENS;
 }
 
 static bool family_full_valid(enum ocr_decode_family family,
@@ -152,6 +193,10 @@ static bool family_full_valid(enum ocr_decode_family family,
     if (family == OCR_DECODE_FAMILY_GREEN8)
         return token_count == 8;
     if (family == OCR_DECODE_FAMILY_NORMAL7)
+        return token_count == 7;
+    if (family == OCR_DECODE_FAMILY_POLICE7)
+        return token_count == 7;
+    if (family == OCR_DECODE_FAMILY_EMBASSY7)
         return token_count == 7;
     return true;
 }
@@ -350,8 +395,31 @@ static int constrained_decode(const float *buf, int t_size, int c_size, int t_st
         }
 
         qsort(next_beams, (size_t)next_count, sizeof(next_beams[0]), compare_beam_desc);
-        beam_count = next_count > OCR_DECODE_BEAM_SIZE ? OCR_DECODE_BEAM_SIZE : next_count;
-        memcpy(beams, next_beams, (size_t)beam_count * sizeof(beams[0]));
+        if (family != OCR_DECODE_FAMILY_NONE) {
+            bool picked[OCR_DECODE_MAX_BEAMS];
+            int selected = 0;
+            int max_tokens = family_max_token_count(family);
+            memset(picked, 0, sizeof(picked));
+            for (int len = 0; len <= max_tokens && selected < OCR_DECODE_BEAM_SIZE; len++) {
+                for (int i = 0; i < next_count; i++) {
+                    if (!picked[i] && next_beams[i].token_count == len) {
+                        beams[selected++] = next_beams[i];
+                        picked[i] = true;
+                        break;
+                    }
+                }
+            }
+            for (int i = 0; i < next_count && selected < OCR_DECODE_BEAM_SIZE; i++) {
+                if (!picked[i]) {
+                    beams[selected++] = next_beams[i];
+                    picked[i] = true;
+                }
+            }
+            beam_count = selected;
+        } else {
+            beam_count = next_count > OCR_DECODE_BEAM_SIZE ? OCR_DECODE_BEAM_SIZE : next_count;
+            memcpy(beams, next_beams, (size_t)beam_count * sizeof(beams[0]));
+        }
     }
 
     for (int i = 0; i < beam_count; i++) {
@@ -378,25 +446,30 @@ static int constrained_decode(const float *buf, int t_size, int c_size, int t_st
         ret = 0;
         goto cleanup;
     }
-    for (int i = 0; i < beam_count; i++) {
-        if (!family_prefix_valid(family, beams[i].token_ids, beams[i].token_count, keys, key_count))
-            continue;
-        {
+    {
+        int best_prefix = -1;
+        for (int i = 0; i < beam_count; i++) {
+            if (!family_prefix_valid(family, beams[i].token_ids, beams[i].token_count, keys, key_count))
+                continue;
+            if (best_prefix < 0 || beams[i].token_count > beams[best_prefix].token_count)
+                best_prefix = i;
+        }
+        if (best_prefix >= 0) {
             /* UTF-8 safe copy (same logic as above) */
             size_t max_copy = text_len - 1;
-            size_t src_len = strlen(beams[i].text);
+            size_t src_len = strlen(beams[best_prefix].text);
             size_t n = src_len < max_copy ? src_len : max_copy;
             if (n > 0 && text_len > 0) {
-                while (n > 0 && (beams[i].text[n] & 0xC0) == 0x80)
+                while (n > 0 && (beams[best_prefix].text[n] & 0xC0) == 0x80)
                     n--;
-                memcpy(text, beams[i].text, n);
+                memcpy(text, beams[best_prefix].text, n);
                 text[n] = '\0';
             } else {
                 text[0] = '\0';
             }
+            ret = 0;
+            goto cleanup;
         }
-        ret = 0;
-        goto cleanup;
     }
 
     ret = -1;
