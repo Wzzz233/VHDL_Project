@@ -39,7 +39,7 @@ pplcnet-bg-live: pplcnet_bg_live.c ocr_decode.c ocr_decode.h pcie_fpga_dma.h
 # Five-expert (blue/green/police/embassy/yellow) PPLCNet live driver. Built from
 # modular sources under lpr_live/ for maintainability:
 #   lpr_common, lpr_dma, lpr_detector, lpr_warp, lpr_color,
-#   lpr_ocr, lpr_display, lpr_infer
+#   lpr_ptype, lpr_ocr, lpr_display, lpr_infer
 # Police, embassy and yellow OCR are optional; omitted routes fall back
 # through the color-route chain and preserve blue+green compatibility.
 #
@@ -66,6 +66,7 @@ LPR_LIVE_SRCS := \
 	lpr_live/lpr_detector.c \
 	lpr_live/lpr_warp.c \
 	lpr_live/lpr_color.c \
+	lpr_live/lpr_ptype.c \
 	lpr_live/lpr_ocr.c \
 	lpr_live/lpr_display.c \
 	lpr_live/lpr_infer.c
@@ -75,6 +76,7 @@ LPR_LIVE_HDRS := \
 	lpr_live/lpr_detector.h \
 	lpr_live/lpr_warp.h \
 	lpr_live/lpr_color.h \
+	lpr_live/lpr_ptype.h \
 	lpr_live/lpr_ocr.h \
 	lpr_live/lpr_display.h \
 	lpr_live/lpr_infer.h

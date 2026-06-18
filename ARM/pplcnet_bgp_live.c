@@ -22,7 +22,8 @@
  *   lpr_dma     : FPGA DMA capture and pixel format conversion
  *   lpr_detector: YOLOv8n-pose decode + NMS
  *   lpr_warp    : 4-point homography crop
- *   lpr_color   : RGB body color classifier
+ *   lpr_color   : RGB body color classifier fallback
+ *   lpr_ptype   : optional RKNN plate-type classifier route override
  *   lpr_ocr     : PPLCNet CTC OCR (input prep, layout autodetect, decode)
  *   lpr_display : DRM/KMS RGB16 output + overlay drawing
  *   lpr_infer   : background inference thread, route selection
@@ -38,6 +39,7 @@
 #include "lpr_live/lpr_dma.h"
 #include "lpr_live/lpr_infer.h"
 #include "lpr_live/lpr_ocr.h"
+#include "lpr_live/lpr_ptype.h"
 #include "lpr_live/lpr_warp.h"
 #include "ocr_decode.h"
 #include "pcie_fpga_dma.h"
@@ -76,6 +78,11 @@ static void usage(const char *prog)
             "  --ocr-blue-keys <path>        Override blue OCR keys file\n"
             "  --ocr-green-keys <path>       Override green OCR keys file\n"
             "\n"
+            "Optional route classifier:\n"
+            "  --plate-type-classifier-model <path|off>  BGPEY classifier RKNN; off disables\n"
+            "  --plate-type-classifier-min-conf <v>      Min confidence for route override (default: 0.80)\n"
+            "  --plate-type-classifier-special-min-conf <v> Min police/embassy confidence (default: 0.70)\n"
+            "\n"
             "Optional routes (silent fallback if omitted):\n"
             "  --ocr-police-model <path>     Police PPLCNet OCR RKNN\n"
             "  --ocr-police-keys <path>      Police keys file\n"
@@ -113,6 +120,8 @@ static void defaults(struct live_options *o)
     o->fps = 10;
     o->min_conf = 0.50f;
     o->nms_iou = 0.45f;
+    o->plate_type_classifier_min_conf = PLATE_TYPE_CLASSIFIER_DEFAULT_MIN_CONF;
+    o->plate_type_classifier_special_min_conf = PLATE_TYPE_CLASSIFIER_DEFAULT_SPECIAL_MIN_CONF;
     o->max_det = 8;
     o->class_filter = -1;
     o->connector_id = -1;
@@ -158,6 +167,9 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_OCR_EMBASSY_KEYS,
         OPT_OCR_YELLOW_MODEL,
         OPT_OCR_YELLOW_KEYS,
+        OPT_PLATE_TYPE_CLASSIFIER_MODEL,
+        OPT_PLATE_TYPE_CLASSIFIER_MIN_CONF,
+        OPT_PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF,
     };
     static const struct option opts[] = {
         {"device",            required_argument, NULL, OPT_DEVICE},
@@ -188,6 +200,9 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"ocr-embassy-keys",  required_argument, NULL, OPT_OCR_EMBASSY_KEYS},
         {"ocr-yellow-model",  required_argument, NULL, OPT_OCR_YELLOW_MODEL},
         {"ocr-yellow-keys",   required_argument, NULL, OPT_OCR_YELLOW_KEYS},
+        {"plate-type-classifier-model", required_argument, NULL, OPT_PLATE_TYPE_CLASSIFIER_MODEL},
+        {"plate-type-classifier-min-conf", required_argument, NULL, OPT_PLATE_TYPE_CLASSIFIER_MIN_CONF},
+        {"plate-type-classifier-special-min-conf", required_argument, NULL, OPT_PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF},
         {"help",              no_argument,       NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -248,6 +263,18 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         case OPT_OCR_EMBASSY_KEYS:  o->keys_embassy_path = optarg; break;
         case OPT_OCR_YELLOW_MODEL:  o->ocr_yellow_model_path = optarg; break;
         case OPT_OCR_YELLOW_KEYS:   o->keys_yellow_path = optarg; break;
+        case OPT_PLATE_TYPE_CLASSIFIER_MODEL:
+            if (strcmp(optarg, "off") == 0 || strcmp(optarg, "none") == 0 || strcmp(optarg, "disable") == 0)
+                o->plate_type_classifier_model_path = NULL;
+            else
+                o->plate_type_classifier_model_path = optarg;
+            break;
+        case OPT_PLATE_TYPE_CLASSIFIER_MIN_CONF:
+            o->plate_type_classifier_min_conf = strtof(optarg, NULL);
+            break;
+        case OPT_PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF:
+            o->plate_type_classifier_special_min_conf = strtof(optarg, NULL);
+            break;
         case 'h': return 1;
         default:  return -1;
         }
@@ -268,6 +295,10 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         fprintf(stderr, "[bgp-live] --ocr-yellow-model requires --ocr-yellow-keys\n");
         return -1;
     }
+    if (o->plate_type_classifier_min_conf < 0.0f || o->plate_type_classifier_min_conf > 1.0f)
+        return -1;
+    if (o->plate_type_classifier_special_min_conf < 0.0f || o->plate_type_classifier_special_min_conf > 1.0f)
+        return -1;
     if (o->fps <= 0 || o->fps > 120 || o->frames < 0 || o->max_det <= 0 || o->max_det > MAX_DETS)
         return -1;
     return 0;
@@ -283,6 +314,7 @@ int main(int argc, char **argv)
     struct rknn_model ocr_police_model;
     struct rknn_model ocr_embassy_model;
     struct rknn_model ocr_yellow_model;
+    struct rknn_model ptype_model;
     struct ocr_keys keys_blue;
     struct ocr_keys keys_green;
     struct ocr_keys keys_police;
@@ -300,6 +332,7 @@ int main(int argc, char **argv)
     bool police_enabled;
     bool embassy_enabled;
     bool yellow_enabled;
+    bool ptype_enabled;
 
     parsed = parse_options(argc, argv, &opt);
     if (parsed != 0) {
@@ -316,6 +349,7 @@ int main(int argc, char **argv)
     memset(&ocr_police_model, 0, sizeof(ocr_police_model));
     memset(&ocr_embassy_model, 0, sizeof(ocr_embassy_model));
     memset(&ocr_yellow_model, 0, sizeof(ocr_yellow_model));
+    memset(&ptype_model, 0, sizeof(ptype_model));
     memset(&keys_blue, 0, sizeof(keys_blue));
     memset(&keys_green, 0, sizeof(keys_green));
     memset(&keys_police, 0, sizeof(keys_police));
@@ -330,6 +364,7 @@ int main(int argc, char **argv)
     police_enabled = (opt.ocr_police_model_path != NULL);
     embassy_enabled = (opt.ocr_embassy_model_path != NULL);
     yellow_enabled = (opt.ocr_yellow_model_path != NULL);
+    ptype_enabled = (opt.plate_type_classifier_model_path != NULL);
 
     if (lpr_load_keys(opt.keys_blue_path, &keys_blue) < 0) {
         fprintf(stderr, "[bgp-live] failed to load blue keys: %s\n", opt.keys_blue_path);
@@ -397,10 +432,21 @@ int main(int argc, char **argv)
             goto out;
         }
     }
+    if (ptype_enabled) {
+        if (lpr_model_load(&ptype_model, "plate_type_classifier", opt.plate_type_classifier_model_path) < 0) {
+            fprintf(stderr, "[bgp-live] failed to load plate type classifier: %s\n",
+                    opt.plate_type_classifier_model_path);
+            goto out;
+        }
+    }
 
     if (det_model.in_w != ALGO_STREAM_SIZE || det_model.in_h != ALGO_STREAM_SIZE || det_model.in_c != 3) {
         fprintf(stderr, "[bgp-live] detector input must be 640x640x3, got %ux%ux%u\n",
                 det_model.in_w, det_model.in_h, det_model.in_c);
+        goto out;
+    }
+    if (ptype_enabled && ptype_model.in_c != 3) {
+        fprintf(stderr, "[bgp-live] plate type classifier input must have 3 channels, got %u\n", ptype_model.in_c);
         goto out;
     }
     if (ocr_blue_model.in_c != 3 || ocr_green_model.in_c != 3 ||
@@ -424,6 +470,14 @@ int main(int argc, char **argv)
         lpr_ocr_log_contract("embassy", &ocr_embassy_model, &keys_embassy);
     if (yellow_enabled)
         lpr_ocr_log_contract("yellow", &ocr_yellow_model, &keys_yellow);
+    if (ptype_enabled) {
+        fprintf(stderr,
+                "[ptype] classifier enabled: model=%s min_conf=%.2f special_min_conf=%.2f input=RGB %ux%u\n",
+                opt.plate_type_classifier_model_path,
+                opt.plate_type_classifier_min_conf,
+                opt.plate_type_classifier_special_min_conf,
+                ptype_model.in_w, ptype_model.in_h);
+    }
 
     pose_nc = lpr_detector_pose_nc(&det_model);
     class_filter = opt.class_filter;
@@ -439,7 +493,7 @@ int main(int argc, char **argv)
     fprintf(stderr,
             "[bgp-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
             "det_resize=%s blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
-            "preproc=%s display=%d auto_green_filter=%d async_infer=1\n",
+            "ptype=%s preproc=%s display=%d auto_green_filter=%d async_infer=1\n",
             dma.frame_w, dma.frame_h, dma.src_is_bgrx ? "bgrx8888" : "bgr565",
             opt.frames, opt.fps, pose_nc, class_filter,
             opt.det_resize_mode == DET_RESIZE_LETTERBOX ? "letterbox" : "stretch",
@@ -448,6 +502,7 @@ int main(int argc, char **argv)
             police_enabled ? "enabled" : "disabled",
             embassy_enabled ? "enabled" : "disabled",
             yellow_enabled ? "enabled" : "disabled",
+            ptype_enabled ? "enabled" : "disabled",
             opt.ocr_preproc_mode == OCR_PREPROC_GRAY ? "gray" :
                 (opt.ocr_preproc_mode == OCR_PREPROC_BIN ? "bin" : "none"),
             opt.display ? 1 : 0, opt.auto_green_filter ? 1 : 0);
@@ -498,7 +553,7 @@ int main(int argc, char **argv)
         routes[LPR_ROUTE_YELLOW].model = NULL;
     }
 
-    if (lpr_infer_start(&infer, &opt, &det_model, routes,
+    if (lpr_infer_start(&infer, &opt, &det_model, ptype_enabled ? &ptype_model : NULL, routes,
                         pose_nc, class_filter,
                         (int)dma.frame_w, (int)dma.frame_h) < 0) {
         fprintf(stderr, "[bgp-live] failed to start infer thread\n");
@@ -563,6 +618,8 @@ out:
         lpr_model_release(&ocr_embassy_model);
     if (yellow_enabled)
         lpr_model_release(&ocr_yellow_model);
+    if (ptype_enabled)
+        lpr_model_release(&ptype_model);
     lpr_dma_release(&dma);
     return ret;
 }

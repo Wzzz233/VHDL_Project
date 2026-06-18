@@ -7,9 +7,10 @@
  *   2. lpr_detector : YOLOv8n-pose plate detector with NMS and quad output
  *   3. lpr_warp     : 4-point homography warp from quad to plate crop
  *   4. lpr_color    : RGB-based blue/green/yellow/white/black plate color classification
- *   5. lpr_ocr      : PPLCNet RKNN OCR with CTC decode and layout autodetect
- *   6. lpr_display  : DRM/KMS appsrc -> kmssink RGB16 display with overlay
- *   7. lpr_infer    : background inference thread that owns the latest frame
+ *   5. lpr_ptype    : optional RKNN plate-type classifier for route override
+ *   6. lpr_ocr      : PPLCNet RKNN OCR with CTC decode and layout autodetect
+ *   7. lpr_display  : DRM/KMS appsrc -> kmssink RGB16 display with overlay
+ *   8. lpr_infer    : background inference thread that owns the latest frame
  *
  * The main() entry point in pplcnet_bgp_live.c only handles option parsing,
  * model loading, DMA pump loop, display push and shutdown. All pipeline logic
@@ -68,6 +69,9 @@
 #define COLOR_YELLOW_565   0xFFE0
 #define COLOR_GREEN_565    0x07E0
 
+#define PLATE_TYPE_CLASSIFIER_DEFAULT_MIN_CONF 0.80f
+#define PLATE_TYPE_CLASSIFIER_DEFAULT_SPECIAL_MIN_CONF 0.70f
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -118,12 +122,15 @@ struct live_options {
     const char *keys_police_path;
     const char *keys_embassy_path;
     const char *keys_yellow_path;
+    const char *plate_type_classifier_model_path;
     const char *drm_card_path;
     int connector_id;
     int frames;
     int fps;
     float min_conf;
     float nms_iou;
+    float plate_type_classifier_min_conf;
+    float plate_type_classifier_special_min_conf;
     int max_det;
     int class_filter;
     bool auto_green_filter;
@@ -188,6 +195,9 @@ struct live_result {
     int crop_w;
     int crop_h;
     enum plate_color color;
+    int ptype_cls;
+    float ptype_conf;
+    bool ptype_applied;
     char route_name[8];     /* "blue" / "green" / "police" / "embassy" / "yellow" */
     char text[64];
     float conf;

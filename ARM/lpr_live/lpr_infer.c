@@ -5,6 +5,7 @@
 #include "lpr_color.h"
 #include "lpr_detector.h"
 #include "lpr_ocr.h"
+#include "lpr_ptype.h"
 #include "lpr_warp.h"
 
 #include <inttypes.h>
@@ -17,14 +18,47 @@ static bool route_enabled(const struct lpr_route *routes, enum lpr_route_id id)
     return id >= 0 && id < LPR_ROUTE_COUNT && routes[id].model != NULL;
 }
 
-/* Choose a route based on classified plate color. The mapping is:
- *   GREEN  -> green route
- *   YELLOW -> yellow route, else police, else blue
- *   WHITE  -> police route, else blue
- *   BLACK  -> embassy route, else police, else blue
- *   BLUE   -> blue route
- *   UNKNOWN-> blue route (most common base plate type)
- */
+/* Choose a route from the optional 6-class plate-type classifier output. */
+static enum lpr_route_id pick_ptype_route(const struct lpr_route *routes, int cls)
+{
+    switch (cls) {
+    case LPR_PTYPE_GREEN:
+        if (route_enabled(routes, LPR_ROUTE_GREEN))
+            return LPR_ROUTE_GREEN;
+        return LPR_ROUTE_BLUE;
+    case LPR_PTYPE_YELLOW:
+        if (route_enabled(routes, LPR_ROUTE_YELLOW))
+            return LPR_ROUTE_YELLOW;
+        if (route_enabled(routes, LPR_ROUTE_POLICE))
+            return LPR_ROUTE_POLICE;
+        return LPR_ROUTE_BLUE;
+    case LPR_PTYPE_POLICE:
+        if (route_enabled(routes, LPR_ROUTE_POLICE))
+            return LPR_ROUTE_POLICE;
+        return LPR_ROUTE_BLUE;
+    case LPR_PTYPE_EMBASSY:
+        if (route_enabled(routes, LPR_ROUTE_EMBASSY))
+            return LPR_ROUTE_EMBASSY;
+        if (route_enabled(routes, LPR_ROUTE_POLICE))
+            return LPR_ROUTE_POLICE;
+        return LPR_ROUTE_BLUE;
+    case LPR_PTYPE_BLUE:
+    default:
+        return LPR_ROUTE_BLUE;
+    }
+}
+
+static bool ptype_should_apply(const struct live_options *opt, int cls, float conf)
+{
+    if (cls < LPR_PTYPE_BLUE || cls > LPR_PTYPE_EMBASSY)
+        return false;
+    if ((cls == LPR_PTYPE_POLICE || cls == LPR_PTYPE_EMBASSY) &&
+        conf >= opt->plate_type_classifier_special_min_conf)
+        return true;
+    return conf >= opt->plate_type_classifier_min_conf;
+}
+
+/* Choose a fallback route based on classified plate body color. */
 static enum lpr_route_id pick_route(const struct lpr_route *routes, enum plate_color color)
 {
     switch (color) {
@@ -106,7 +140,10 @@ static void *thread_main(void *arg)
         enum plate_color color = PLATE_COLOR_UNKNOWN;
         enum lpr_route_id route_id = LPR_ROUTE_BLUE;
         const char *route_name = "blue";
-        double warp_ms = 0.0, color_ms = 0.0;
+        int ptype_cls = LPR_PTYPE_UNKNOWN;
+        float ptype_conf = 0.0f;
+        bool ptype_applied = false;
+        double warp_ms = 0.0, color_ms = 0.0, ptype_ms = 0.0;
         int64_t t0, t1, t2;
         struct live_result res;
 
@@ -148,7 +185,15 @@ static void *thread_main(void *arg)
                 int64_t tc1 = lpr_mono_us();
                 color_ms = (double)(tc1 - tc0) / 1000.0;
 
-                route_id = pick_route(st->routes, color);
+                if (st->ptype_model && st->ptype_model->ctx &&
+                    lpr_ptype_run(st->ptype_model, crop, crop_w, crop_h,
+                                  &ptype_cls, &ptype_conf, &ptype_ms) == 0 &&
+                    ptype_should_apply(st->opt, ptype_cls, ptype_conf)) {
+                    route_id = pick_ptype_route(st->routes, ptype_cls);
+                    ptype_applied = true;
+                } else {
+                    route_id = pick_route(st->routes, color);
+                }
                 const struct lpr_route *route = &st->routes[route_id];
                 route_name = route->name;
 
@@ -165,6 +210,9 @@ static void *thread_main(void *arg)
                 res.crop_w = crop_w;
                 res.crop_h = crop_h;
                 res.color = color;
+                res.ptype_cls = ptype_cls;
+                res.ptype_conf = ptype_conf;
+                res.ptype_applied = ptype_applied;
                 snprintf(res.route_name, sizeof(res.route_name), "%s", route_name);
                 snprintf(res.text, sizeof(res.text), "%s", text);
                 res.conf = conf;
@@ -175,17 +223,19 @@ static void *thread_main(void *arg)
         st->infer_count++;
         publish_result(st, &res);
         if (res.valid) {
-            printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d cls=%d color=%s route=%s box=[%d,%d,%d,%d] crop=%dx%d "
+            printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d cls=%d color=%s "
+                   "ptype=%s ptype_conf=%.3f ptype_apply=%d route=%s box=[%d,%d,%d,%d] crop=%dx%d "
                    "text=%s conf=%.3f blank=%.3f detocr_ms=%.1f det_ms=%.1f ocr_ms=%.1f "
-                   "warp_ms=%.1f color_ms=%.1f prep_ms=%.1f in_ms=%.1f run_ms=%.1f out_ms=%.1f dec_ms=%.1f overwritten=%" PRIu64 "\n",
+                   "warp_ms=%.1f color_ms=%.1f ptype_ms=%.1f prep_ms=%.1f in_ms=%.1f run_ms=%.1f out_ms=%.1f dec_ms=%.1f overwritten=%" PRIu64 "\n",
                    seq, det_count, best, dets[best].cls,
-                   lpr_plate_color_str(color), route_name,
+                   lpr_plate_color_str(color), lpr_ptype_class_str(ptype_cls), ptype_conf,
+                   ptype_applied ? 1 : 0, route_name,
                    dets[best].x1, dets[best].y1, dets[best].x2, dets[best].y2,
                    crop_w, crop_h, text, conf, diag.blank_top1_ratio,
                    (double)(t2 - t0) / 1000.0,
                    (double)(t1 - t0) / 1000.0,
                    (double)(t2 - t1) / 1000.0,
-                   warp_ms, color_ms, ocr_timing.prep_ms, ocr_timing.input_ms,
+                   warp_ms, color_ms, ptype_ms, ocr_timing.prep_ms, ocr_timing.input_ms,
                    ocr_timing.run_ms, ocr_timing.output_ms, ocr_timing.decode_ms,
                    st->overwrite_count);
         } else {
@@ -201,6 +251,7 @@ static void *thread_main(void *arg)
 
 int lpr_infer_start(struct infer_state *st, const struct live_options *opt,
                     struct rknn_model *det_model,
+                    struct rknn_model *ptype_model,
                     const struct lpr_route *routes_in,
                     int pose_nc, int class_filter,
                     int frame_w, int frame_h)
@@ -208,6 +259,7 @@ int lpr_infer_start(struct infer_state *st, const struct live_options *opt,
     memset(st, 0, sizeof(*st));
     st->opt = opt;
     st->det_model = det_model;
+    st->ptype_model = ptype_model;
     for (int i = 0; i < LPR_ROUTE_COUNT; i++)
         st->routes[i] = routes_in[i];
     st->pose_nc = pose_nc;

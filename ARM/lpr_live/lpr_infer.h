@@ -52,6 +52,7 @@ struct infer_state {
 
     const struct live_options *opt;
     struct rknn_model *det_model;
+    struct rknn_model *ptype_model;
     struct lpr_route routes[LPR_ROUTE_COUNT];
     int pose_nc;
     int class_filter;
@@ -59,6 +60,7 @@ struct infer_state {
 
 int lpr_infer_start(struct infer_state *st, const struct live_options *opt,
                     struct rknn_model *det_model,
+                    struct rknn_model *ptype_model,
                     const struct lpr_route *routes_in,  /* array of LPR_ROUTE_COUNT */
                     int pose_nc, int class_filter,
                     int frame_w, int frame_h);
