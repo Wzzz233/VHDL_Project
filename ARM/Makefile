@@ -33,6 +33,11 @@ lprapp: fpga_lpr_display.c ocr_decode.c ocr_decode.h lpr_special_route.h fpga_lp
 pplcnet-green-live: pplcnet_green_live.c ocr_decode.c ocr_decode.h pcie_fpga_dma.h
 	$(CROSS_COMPILE)gcc -Wall -O2 -o pplcnet_green_live pplcnet_green_live.c ocr_decode.c $(RKNN_CFLAGS) $(RKNN_LIBS) -lm
 
+# Standalone PPM-input PPLCNet RKNN tester. Cross-compiled for the board (uses libplcnetrt).
+# Run on board:  ./test_pplcnet_green model.rknn keys.txt image.ppm [...] | @list.txt
+pplcnet-test: test_pplcnet_green.c ocr_decode.c ocr_decode.h
+	$(CROSS_COMPILE)gcc -Wall -O2 -o test_pplcnet_green test_pplcnet_green.c ocr_decode.c $(RKNN_CFLAGS) $(RKNN_LIBS) -lm
+
 decode-test: test_ocr_decode.c ocr_decode.c ocr_decode.h
 	$(HOST_CC) $(HOST_CFLAGS) -o test_ocr_decode test_ocr_decode.c ocr_decode.c -lm
 
@@ -57,6 +62,7 @@ clean:
 	rm -f fpga_hdmi_display
 	rm -f fpga_lpr_display
 	rm -f pplcnet_green_live
+	rm -f test_pplcnet_green
 	rm -f test_ocr_decode
 	rm -f test_ocr_layout
 	rm -f test_lpr_special_route

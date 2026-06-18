@@ -1,0 +1,39 @@
+# Build artifacts (Linux kernel module + userspace)
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+*.symvers
+*.order
+Module.symvers
+modules.order
+.tmp_versions/
+
+# Userspace binaries (built by Makefile)
+fpga_dma_test
+fpga_hdmi_display
+fpga_lpr_display
+pplcnet_green_live
+test_ocr_decode
+test_ocr_layout
+test_lpr_special_route
+test_pose_decoder
+test_pplcnet_green
+
+# Captures / logs
+*.raw
+
+# Python tooling residue (rare)
+__pycache__/
+*.pyc
+
+# Windows / WSL metadata
+*:Zone.Identifier
+
+# Local-only model conversion sandboxes — keep ONNX/RKNN out of the C-driver tree
+# (real model artifacts live in /home/wzzz/LPRNet/artifacts/, not here)
+*.onnx
+*.onnx.data
+*.rknn
