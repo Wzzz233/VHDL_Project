@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Common types and configuration shared across the live LPR pipeline modules.
+ *
+ * Pipeline stages (each with its own .c/.h pair under lpr_live/):
+ *   1. lpr_dma      : FPGA DMA frame capture, BGR565/BGRX8888 -> RGB888
+ *   2. lpr_detector : YOLOv8n-pose plate detector with NMS and quad output
+ *   3. lpr_warp     : 4-point homography warp from quad to plate crop
+ *   4. lpr_color    : RGB-based blue/green/yellow plate color classification
+ *   5. lpr_ocr      : PPLCNet RKNN OCR with CTC decode and layout autodetect
+ *   6. lpr_display  : DRM/KMS appsrc -> kmssink RGB16 display with overlay
+ *   7. lpr_infer    : background inference thread that owns the latest frame
+ *
+ * The main() entry point in pplcnet_bgp_live.c only handles option parsing,
+ * model loading, DMA pump loop, display push and shutdown. All pipeline logic
+ * lives in the modules above for testability and reuse.
+ *
+ * Conventions:
+ *   - All buffers are caller-owned; modules never realloc input pointers.
+ *   - All return codes: 0 on success, negative on failure, with errno-style
+ *     reporting via stderr at the layer where the syscall happens.
+ *   - Image data is always RGB888 packed in module APIs unless explicitly
+ *     stated otherwise (e.g., display takes RGB565).
+ */
+
+#ifndef LPR_LIVE_LPR_COMMON_H
+#define LPR_LIVE_LPR_COMMON_H
+
+/* Required for POSIX features used across the modules:
+ *   _POSIX_C_SOURCE >= 200809  : strnlen, clock_gettime, useconds_t
+ *   _DEFAULT_SOURCE / _GNU_SOURCE : O_CLOEXEC
+ * The original pplcnet_bg_live.c relied on glibc default feature macros
+ * (no -std=c11 -Wextra), so we re-enable them here for the modular build. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
+
+#include <stddef.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+#include <rknn_api.h>
+
+/* Detector input dimensions (YOLOv8n-pose). */
+#define ALGO_STREAM_SIZE 640
+#define OBB_POINT_COUNT  8400
+
+/* Pose head layout: 4 box channels + N class channels + 4 keypoints * (x,y,vis). */
+#define POSE_KPT_COUNT      4
+#define POSE_KPT_DIMS       3
+#define POSE_BOX_CHANNELS   4
+#define POSE_KPT_CHANNELS   (POSE_KPT_COUNT * POSE_KPT_DIMS)
+#define POSE_MIN_CHANNELS   (POSE_BOX_CHANNELS + 1 + POSE_KPT_CHANNELS)
+
+/* Detection ring sizes. */
+#define MAX_DETS         128
+#define MAX_OCR_KEYS     128
+#define MAX_OCR_KEY_LEN  16
+
+/* Overlay rendering. */
+#define OVERLAY_TEXT_SCALE 2
+#define COLOR_CYAN_565     0x07FF
+#define COLOR_RED_565      0xF800
+#define COLOR_WHITE_565    0xFFFF
+#define COLOR_YELLOW_565   0xFFE0
+#define COLOR_GREEN_565    0x07E0
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* ---------------- Enumerations ---------------- */
+
+enum pixel_order {
+    PIXEL_ORDER_BGR565 = 0,
+    PIXEL_ORDER_RGB565,
+};
+
+enum det_resize_mode {
+    DET_RESIZE_STRETCH = 0,
+    DET_RESIZE_LETTERBOX,
+};
+
+enum ocr_preproc_mode {
+    OCR_PREPROC_NONE = 0,
+    OCR_PREPROC_GRAY,
+    OCR_PREPROC_BIN,
+};
+
+enum plate_color {
+    PLATE_COLOR_UNKNOWN = 0,
+    PLATE_COLOR_BLUE,
+    PLATE_COLOR_GREEN,
+    PLATE_COLOR_YELLOW,   /* yellow body, treated as police candidate route */
+    PLATE_COLOR_WHITE,    /* white body, treated as police candidate route */
+};
+
+/* ---------------- Live options (parsed from CLI) ---------------- */
+
+struct live_options {
+    const char *device_path;
+    const char *plate_model_path;
+    const char *ocr_blue_model_path;
+    const char *ocr_green_model_path;
+    const char *ocr_police_model_path;   /* optional; NULL disables police route */
+    const char *keys_blue_path;
+    const char *keys_green_path;
+    const char *keys_police_path;
+    const char *drm_card_path;
+    int connector_id;
+    int frames;
+    int fps;
+    float min_conf;
+    float nms_iou;
+    int max_det;
+    int class_filter;
+    bool auto_green_filter;
+    enum det_resize_mode det_resize_mode;
+    enum ocr_preproc_mode ocr_preproc_mode;
+    enum pixel_order pixel_order;
+    bool swap16;
+    bool display;
+    bool display_sync;
+};
+
+/* ---------------- Detector outputs ---------------- */
+
+struct det_box {
+    int x1;
+    int y1;
+    int x2;
+    int y2;
+    float conf;
+    int cls;
+    float quad[8];   /* TL.x, TL.y, TR.x, TR.y, BR.x, BR.y, BL.x, BL.y */
+};
+
+/* ---------------- RKNN model wrapper ---------------- */
+
+struct rknn_model {
+    const char *name;
+    const char *path;
+    rknn_context ctx;
+    rknn_input_output_num io_num;
+    rknn_tensor_attr input_attr;
+    rknn_tensor_attr output_attrs[8];
+    uint32_t in_w;
+    uint32_t in_h;
+    uint32_t in_c;
+};
+
+/* ---------------- OCR keys table ---------------- */
+
+struct ocr_keys {
+    char keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
+    int count;
+};
+
+/* Per-OCR-call timing breakdown for diagnostics. */
+struct ocr_timing {
+    double prep_ms;
+    double input_ms;
+    double run_ms;
+    double output_ms;
+    double decode_ms;
+};
+
+/* ---------------- Live result published from infer thread ---------------- */
+
+struct live_result {
+    bool valid;
+    uint64_t seq;
+    struct det_box box;
+    int det_count;
+    int best;
+    int crop_w;
+    int crop_h;
+    enum plate_color color;
+    char route_name[8];     /* "blue" / "green" / "police" */
+    char text[64];
+    float conf;
+    float blank_ratio;
+};
+
+/* ---------------- Common helpers ---------------- */
+
+int64_t lpr_mono_us(void);
+float lpr_sigmoidf(float x);
+int lpr_load_file(const char *path, void **data_out, uint32_t *size_out);
+int lpr_load_keys(const char *path, struct ocr_keys *keys);
+const char *lpr_plate_color_str(enum plate_color c);
+
+#endif /* LPR_LIVE_LPR_COMMON_H */

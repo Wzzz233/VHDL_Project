@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: GPL-2.0
+/* Background inference thread orchestration. */
+
+#include "lpr_infer.h"
+#include "lpr_color.h"
+#include "lpr_detector.h"
+#include "lpr_ocr.h"
+#include "lpr_warp.h"
+
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Choose a route based on classified plate color. The mapping is:
+ *   GREEN  -> green route
+ *   YELLOW -> police route (if available, else blue)
+ *   WHITE  -> police route (if available, else blue)
+ *   BLUE   -> blue route
+ *   UNKNOWN-> blue route (most common base plate type)
+ *
+ * If the requested route's model is NULL we fall back to blue. */
+static enum lpr_route_id pick_route(const struct lpr_route *routes, enum plate_color color)
+{
+    enum lpr_route_id chosen = LPR_ROUTE_BLUE;
+    switch (color) {
+    case PLATE_COLOR_GREEN:
+        chosen = LPR_ROUTE_GREEN;
+        break;
+    case PLATE_COLOR_YELLOW:
+    case PLATE_COLOR_WHITE:
+        chosen = LPR_ROUTE_POLICE;
+        break;
+    case PLATE_COLOR_BLUE:
+    case PLATE_COLOR_UNKNOWN:
+    default:
+        chosen = LPR_ROUTE_BLUE;
+        break;
+    }
+    if (chosen >= LPR_ROUTE_COUNT || routes[chosen].model == NULL)
+        chosen = LPR_ROUTE_BLUE;
+    return chosen;
+}
+
+static void publish_result(struct infer_state *st, const struct live_result *res)
+{
+    pthread_mutex_lock(&st->result_lock);
+    st->result = *res;
+    pthread_mutex_unlock(&st->result_lock);
+}
+
+void lpr_infer_get_result(struct infer_state *st, struct live_result *res)
+{
+    pthread_mutex_lock(&st->result_lock);
+    *res = st->result;
+    pthread_mutex_unlock(&st->result_lock);
+}
+
+void lpr_infer_submit_latest(struct infer_state *st, const uint8_t *rgb)
+{
+    pthread_mutex_lock(&st->lock);
+    if (st->has_new)
+        st->overwrite_count++;
+    memcpy(st->latest_rgb, rgb, st->rgb_size);
+    st->seq++;
+    st->has_new = true;
+    pthread_cond_signal(&st->cond);
+    pthread_mutex_unlock(&st->lock);
+}
+
+static void *thread_main(void *arg)
+{
+    struct infer_state *st = (struct infer_state *)arg;
+    uint8_t *rgb = malloc(st->rgb_size);
+    uint8_t *det_input = malloc((size_t)st->det_model->in_w * st->det_model->in_h * 3U);
+    uint8_t *crop = malloc(st->rgb_size);
+    if (!rgb || !det_input || !crop) {
+        fprintf(stderr, "[bgp-live] infer thread alloc failed\n");
+        free(rgb); free(det_input); free(crop);
+        return NULL;
+    }
+
+    while (1) {
+        uint64_t seq;
+        struct det_box dets[MAX_DETS];
+        int det_count = 0;
+        int best = -1;
+        int crop_w = 0, crop_h = 0;
+        char text[64] = "";
+        float conf = 0.0f;
+        struct ocr_decode_diag diag;
+        struct ocr_timing ocr_timing;
+        enum plate_color color = PLATE_COLOR_UNKNOWN;
+        enum lpr_route_id route_id = LPR_ROUTE_BLUE;
+        const char *route_name = "blue";
+        double warp_ms = 0.0, color_ms = 0.0;
+        int64_t t0, t1, t2;
+        struct live_result res;
+
+        pthread_mutex_lock(&st->lock);
+        while (st->running && !st->has_new)
+            pthread_cond_wait(&st->cond, &st->lock);
+        if (!st->running && !st->has_new) {
+            pthread_mutex_unlock(&st->lock);
+            break;
+        }
+        memcpy(rgb, st->latest_rgb, st->rgb_size);
+        seq = st->seq;
+        st->has_new = false;
+        pthread_mutex_unlock(&st->lock);
+
+        memset(&res, 0, sizeof(res));
+        res.seq = seq;
+        t0 = lpr_mono_us();
+        if (lpr_detector_run(st->det_model, rgb, st->frame_w, st->frame_h, det_input,
+                             st->opt->det_resize_mode, st->pose_nc, st->class_filter,
+                             st->opt->min_conf, st->opt->nms_iou, st->opt->max_det,
+                             dets, &det_count) < 0) {
+            fprintf(stderr, "[bgp-live] infer seq=%" PRIu64 " detector failed\n", seq);
+            continue;
+        }
+        t1 = lpr_mono_us();
+        best = lpr_detector_pick_best(dets, det_count);
+        res.det_count = det_count;
+        res.best = best;
+        if (best >= 0) {
+            int64_t tw0 = lpr_mono_us();
+            bool warp_ok = lpr_warp_quad_homography(rgb, st->frame_w, st->frame_h, dets[best].quad,
+                                                    crop, st->frame_w, st->frame_h, &crop_w, &crop_h);
+            int64_t tw1 = lpr_mono_us();
+            warp_ms = (double)(tw1 - tw0) / 1000.0;
+            if (warp_ok) {
+                int64_t tc0 = lpr_mono_us();
+                color = lpr_classify_plate_color(rgb, st->frame_w, st->frame_h, &dets[best]);
+                int64_t tc1 = lpr_mono_us();
+                color_ms = (double)(tc1 - tc0) / 1000.0;
+
+                route_id = pick_route(st->routes, color);
+                const struct lpr_route *route = &st->routes[route_id];
+                route_name = route->name;
+
+                memset(&diag, 0, sizeof(diag));
+                memset(&ocr_timing, 0, sizeof(ocr_timing));
+                if (lpr_ocr_run(route->model, route->keys, st->opt->ocr_preproc_mode,
+                                route->decode_family, crop, crop_w, crop_h,
+                                text, sizeof(text), &conf, &diag, &ocr_timing) < 0) {
+                    snprintf(text, sizeof(text), "UNK");
+                    conf = 0.0f;
+                }
+                res.valid = true;
+                res.box = dets[best];
+                res.crop_w = crop_w;
+                res.crop_h = crop_h;
+                res.color = color;
+                snprintf(res.route_name, sizeof(res.route_name), "%s", route_name);
+                snprintf(res.text, sizeof(res.text), "%s", text);
+                res.conf = conf;
+                res.blank_ratio = diag.blank_top1_ratio;
+            }
+        }
+        t2 = lpr_mono_us();
+        st->infer_count++;
+        publish_result(st, &res);
+        if (res.valid) {
+            printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d cls=%d color=%s route=%s box=[%d,%d,%d,%d] crop=%dx%d "
+                   "text=%s conf=%.3f blank=%.3f detocr_ms=%.1f det_ms=%.1f ocr_ms=%.1f "
+                   "warp_ms=%.1f color_ms=%.1f prep_ms=%.1f in_ms=%.1f run_ms=%.1f out_ms=%.1f dec_ms=%.1f overwritten=%" PRIu64 "\n",
+                   seq, det_count, best, dets[best].cls,
+                   lpr_plate_color_str(color), route_name,
+                   dets[best].x1, dets[best].y1, dets[best].x2, dets[best].y2,
+                   crop_w, crop_h, text, conf, diag.blank_top1_ratio,
+                   (double)(t2 - t0) / 1000.0,
+                   (double)(t1 - t0) / 1000.0,
+                   (double)(t2 - t1) / 1000.0,
+                   warp_ms, color_ms, ocr_timing.prep_ms, ocr_timing.input_ms,
+                   ocr_timing.run_ms, ocr_timing.output_ms, ocr_timing.decode_ms,
+                   st->overwrite_count);
+        } else {
+            printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d det_ms=%.1f overwritten=%" PRIu64 "\n",
+                   seq, det_count, best, (double)(t1 - t0) / 1000.0, st->overwrite_count);
+        }
+        fflush(stdout);
+    }
+
+    free(rgb); free(det_input); free(crop);
+    return NULL;
+}
+
+int lpr_infer_start(struct infer_state *st, const struct live_options *opt,
+                    struct rknn_model *det_model,
+                    const struct lpr_route *routes_in,
+                    int pose_nc, int class_filter,
+                    int frame_w, int frame_h)
+{
+    memset(st, 0, sizeof(*st));
+    st->opt = opt;
+    st->det_model = det_model;
+    for (int i = 0; i < LPR_ROUTE_COUNT; i++)
+        st->routes[i] = routes_in[i];
+    st->pose_nc = pose_nc;
+    st->class_filter = class_filter;
+    st->frame_w = frame_w;
+    st->frame_h = frame_h;
+    st->rgb_size = (size_t)frame_w * (size_t)frame_h * 3U;
+    st->latest_rgb = malloc(st->rgb_size);
+    if (!st->latest_rgb)
+        return -1;
+    pthread_mutex_init(&st->lock, NULL);
+    pthread_cond_init(&st->cond, NULL);
+    pthread_mutex_init(&st->result_lock, NULL);
+    st->running = true;
+    if (pthread_create(&st->thread, NULL, thread_main, st) != 0)
+        return -1;
+    st->thread_started = true;
+    return 0;
+}
+
+void lpr_infer_stop(struct infer_state *st)
+{
+    if (!st)
+        return;
+    pthread_mutex_lock(&st->lock);
+    st->running = false;
+    pthread_cond_broadcast(&st->cond);
+    pthread_mutex_unlock(&st->lock);
+    if (st->thread_started)
+        pthread_join(st->thread, NULL);
+    free(st->latest_rgb);
+    pthread_mutex_destroy(&st->lock);
+    pthread_cond_destroy(&st->cond);
+    pthread_mutex_destroy(&st->result_lock);
+    memset(st, 0, sizeof(*st));
+}
