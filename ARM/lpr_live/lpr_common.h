@@ -194,6 +194,8 @@ struct live_result {
     int best;
     int crop_w;
     int crop_h;
+    int frame_slot;
+    uint64_t frame_generation;
     enum plate_color color;
     int ptype_cls;
     float ptype_conf;
@@ -211,5 +213,21 @@ float lpr_sigmoidf(float x);
 int lpr_load_file(const char *path, void **data_out, uint32_t *size_out);
 int lpr_load_keys(const char *path, struct ocr_keys *keys);
 const char *lpr_plate_color_str(enum plate_color c);
+
+static inline void lpr_bgrx_pixel_rgb(const uint8_t *bgrx, int w, int x, int y, uint8_t p[3])
+{
+    const uint8_t *src = bgrx + ((size_t)y * (size_t)w + (size_t)x) * 4U;
+    p[0] = src[2];
+    p[1] = src[1];
+    p[2] = src[0];
+}
+
+static inline void lpr_bgrx_set_rgb(uint8_t *bgrx, int w, int x, int y, uint8_t r, uint8_t g, uint8_t b)
+{
+    uint8_t *dst = bgrx + ((size_t)y * (size_t)w + (size_t)x) * 4U;
+    dst[0] = b;
+    dst[1] = g;
+    dst[2] = r;
+}
 
 #endif /* LPR_LIVE_LPR_COMMON_H */

@@ -12,5 +12,7 @@
  * PLATE_COLOR_UNKNOWN if no clear vote is cast. */
 enum plate_color lpr_classify_plate_color(const uint8_t *rgb, int w, int h,
                                           const struct det_box *b);
+enum plate_color lpr_classify_plate_color_bgrx(const uint8_t *bgrx, int w, int h,
+                                               const struct det_box *b);
 
 #endif /* LPR_LIVE_LPR_COLOR_H */

@@ -24,6 +24,12 @@ int lpr_detector_run(struct rknn_model *m, const uint8_t *rgb,
                      int pose_nc, int class_filter,
                      float conf_thr, float nms_iou, int max_det,
                      struct det_box *dets, int *det_count);
+int lpr_detector_run_bgrx(struct rknn_model *m, const uint8_t *bgrx,
+                          int img_w, int img_h, uint8_t *input,
+                          enum det_resize_mode resize_mode,
+                          int pose_nc, int class_filter,
+                          float conf_thr, float nms_iou, int max_det,
+                          struct det_box *dets, int *det_count);
 
 /* Pick highest-confidence box index, or -1 if no boxes. */
 int lpr_detector_pick_best(const struct det_box *dets, int count);

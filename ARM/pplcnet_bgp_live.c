@@ -322,8 +322,6 @@ int main(int argc, char **argv)
     struct ocr_keys keys_yellow;
     struct display_state display;
     struct infer_state infer;
-    uint8_t *rgb = NULL;
-    uint16_t *display_frame = NULL;
     int pose_nc;
     int class_filter;
     int ret = 1;
@@ -484,12 +482,6 @@ int main(int argc, char **argv)
     if (opt.auto_green_filter && pose_nc >= 5)
         class_filter = 1;
 
-    rgb = malloc((size_t)dma.frame_w * dma.frame_h * 3U);
-    if (opt.display)
-        display_frame = malloc((size_t)dma.frame_w * dma.frame_h * 2U);
-    if (!rgb || (opt.display && !display_frame))
-        goto out;
-
     fprintf(stderr,
             "[bgp-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
             "det_resize=%s blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
@@ -553,7 +545,7 @@ int main(int argc, char **argv)
         routes[LPR_ROUTE_YELLOW].model = NULL;
     }
 
-    if (lpr_infer_start(&infer, &opt, &det_model, ptype_enabled ? &ptype_model : NULL, routes,
+    if (lpr_infer_start(&infer, &opt, &dma, &det_model, ptype_enabled ? &ptype_model : NULL, routes,
                         pose_nc, class_filter,
                         (int)dma.frame_w, (int)dma.frame_h) < 0) {
         fprintf(stderr, "[bgp-live] failed to start infer thread\n");
@@ -563,18 +555,23 @@ int main(int argc, char **argv)
     target_us = 1000000LL / opt.fps;
     for (int frame = 0; !g_stop && (opt.frames == 0 || frame < opt.frames); frame++) {
         struct live_result latest;
+        bool latest_owned;
+        int slot;
+        uint8_t *slot_frame;
         int64_t t0 = lpr_mono_us();
-        if (lpr_dma_read_frame(&dma) < 0) {
+
+        slot = lpr_dma_acquire_slot(&dma);
+        if (lpr_dma_read_frame_slot(&dma, slot) < 0) {
+            lpr_dma_slot_release(&dma, slot);
             fprintf(stderr, "[bgp-live] DMA frame read failed\n");
             goto out;
         }
-        lpr_frame_to_rgb888(&dma, &opt, rgb);
-        lpr_infer_submit_latest(&infer, rgb);
+        lpr_infer_submit_latest(&infer, slot, lpr_dma_slot_generation(&dma, slot));
 
-        if (display_frame) {
-            lpr_rgb888_to_rgb565(rgb, display_frame, (int)dma.frame_w, (int)dma.frame_h);
-            lpr_infer_get_result(&infer, &latest);
-            if (latest.valid) {
+        latest_owned = lpr_infer_take_result(&infer, &latest);
+        if (latest_owned && opt.display) {
+            slot_frame = lpr_dma_slot_data(&dma, latest.frame_slot);
+            if (slot_frame && latest.valid) {
                 char overlay[96];
                 int ty = latest.box.y1 - (16 * OVERLAY_TEXT_SCALE + 3);
                 char tag = 'B';
@@ -585,15 +582,22 @@ int main(int argc, char **argv)
                 if (ty < 0) ty = latest.box.y1 + 3;
                 snprintf(overlay, sizeof(overlay), "%s %c %.2f",
                          latest.text[0] ? latest.text : "OCR", tag, latest.conf);
-                lpr_draw_rect_565(display_frame, (int)dma.frame_w, (int)dma.frame_h,
-                                  &latest.box, COLOR_CYAN_565);
-                lpr_draw_text_565(display_frame, (int)dma.frame_w, (int)dma.frame_h,
-                                  latest.box.x1, ty, overlay, COLOR_CYAN_565,
-                                  OVERLAY_TEXT_SCALE);
+                lpr_draw_rect_bgrx(slot_frame, (int)dma.frame_w, (int)dma.frame_h,
+                                   &latest.box, 0, 255, 255);
+                lpr_draw_text_bgrx(slot_frame, (int)dma.frame_w, (int)dma.frame_h,
+                                   latest.box.x1, ty, overlay, 0, 255, 255,
+                                   OVERLAY_TEXT_SCALE);
             }
-            if (lpr_display_push(&display, display_frame) < 0)
+            if (lpr_display_push_bgrx_slot(&display, &dma, latest.frame_slot) < 0) {
+                lpr_infer_release_result_slot(&infer, &latest);
                 goto out;
+            }
+            lpr_infer_release_result_slot(&infer, &latest);
+        } else if (latest_owned) {
+            lpr_infer_release_result_slot(&infer, &latest);
         }
+
+        lpr_dma_slot_release(&dma, slot);
         {
             int64_t used = lpr_mono_us() - t0;
             if (used < target_us)
@@ -604,8 +608,6 @@ int main(int argc, char **argv)
 
 out:
     lpr_infer_stop(&infer);
-    free(rgb);
-    free(display_frame);
     lpr_display_stop(&display);
     lpr_model_release(&det_model);
     lpr_model_release(&ocr_blue_model);

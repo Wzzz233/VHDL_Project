@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Display module: HDMI/KMS RGB16 output and overlay drawing. */
+/* Display module: HDMI/KMS BGRx output and overlay drawing. */
 
 #include "lpr_display.h"
 
@@ -222,6 +222,88 @@ void lpr_draw_text_565(uint16_t *pix, int w, int h, int x, int y, const char *s,
     }
 }
 
+void lpr_draw_rect_bgrx(uint8_t *pix, int w, int h, const struct det_box *b, uint8_t r, uint8_t g, uint8_t bl)
+{
+    for (int t = 0; t < 2; t++) {
+        for (int x = b->x1; x <= b->x2; x++) {
+            if (x >= 0 && x < w) {
+                if (b->y1 + t >= 0 && b->y1 + t < h) lpr_bgrx_set_rgb(pix, w, x, b->y1 + t, r, g, bl);
+                if (b->y2 - t >= 0 && b->y2 - t < h) lpr_bgrx_set_rgb(pix, w, x, b->y2 - t, r, g, bl);
+            }
+        }
+        for (int y = b->y1; y <= b->y2; y++) {
+            if (y >= 0 && y < h) {
+                if (b->x1 + t >= 0 && b->x1 + t < w) lpr_bgrx_set_rgb(pix, w, b->x1 + t, y, r, g, bl);
+                if (b->x2 - t >= 0 && b->x2 - t < w) lpr_bgrx_set_rgb(pix, w, b->x2 - t, y, r, g, bl);
+            }
+        }
+    }
+}
+
+static void draw_ascii_char_bgrx(uint8_t *pix, int w, int h, int x, int y, char ch,
+                                 uint8_t r, uint8_t g, uint8_t bl, int scale)
+{
+    for (int row = 0; row < 7; row++) {
+        uint8_t bits = glyph5x7(ch, row);
+        for (int col = 0; col < 5; col++) {
+            if (!(bits & (1U << (4 - col)))) continue;
+            for (int sy = 0; sy < scale; sy++) {
+                int py = y + row * scale + sy;
+                if (py < 0 || py >= h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int px = x + col * scale + sx;
+                    if (px >= 0 && px < w) lpr_bgrx_set_rgb(pix, w, px, py, r, g, bl);
+                }
+            }
+        }
+    }
+}
+
+static void draw_hanzi16_bgrx(uint8_t *pix, int w, int h, int x, int y,
+                              const uint16_t rows[16], uint8_t r, uint8_t g, uint8_t bl, int scale)
+{
+    for (int row = 0; row < 16; row++) {
+        uint16_t bits = rows[row];
+        for (int col = 0; col < 16; col++) {
+            if (!(bits & (uint16_t)(1U << (15 - col)))) continue;
+            for (int sy = 0; sy < scale; sy++) {
+                int py = y + row * scale + sy;
+                if (py < 0 || py >= h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int px = x + col * scale + sx;
+                    if (px >= 0 && px < w) lpr_bgrx_set_rgb(pix, w, px, py, r, g, bl);
+                }
+            }
+        }
+    }
+}
+
+void lpr_draw_text_bgrx(uint8_t *pix, int w, int h, int x, int y, const char *s,
+                        uint8_t r, uint8_t g, uint8_t bl, int scale)
+{
+    int pen_x = x;
+    if (!s || scale < 1) return;
+    for (size_t i = 0; s[i] != '\0'; ) {
+        unsigned char ch = (unsigned char)s[i];
+        if (ch < 0x80) {
+            draw_ascii_char_bgrx(pix, w, h, pen_x, y, s[i], r, g, bl, scale);
+            pen_x += 6 * scale;
+            i++;
+        } else {
+            size_t len = utf8_codepoint_len(s + i);
+            const uint16_t *glyph = find_hanzi16_glyph(s + i, len);
+            if (glyph) {
+                draw_hanzi16_bgrx(pix, w, h, pen_x, y, glyph, r, g, bl, scale);
+                pen_x += 17 * scale;
+            } else {
+                draw_ascii_char_bgrx(pix, w, h, pen_x, y, '?', r, g, bl, scale);
+                pen_x += 6 * scale;
+            }
+            i += len;
+        }
+    }
+}
+
 void lpr_overlay_ascii_from_text(const char *text, char *out, size_t out_len)
 {
     size_t j = 0;
@@ -247,7 +329,7 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
     d->drm_fd = -1;
     if (!d->enabled) return 0;
     d->w = w; d->h = h; d->fps = opt->fps; d->connector_id = opt->connector_id; d->sync = opt->display_sync;
-    d->frame_size = (size_t)w * (size_t)h * 2U;
+    d->frame_size = (size_t)w * (size_t)h * 4U;
     if (opt->drm_card_path && opt->drm_card_path[0]) {
         d->drm_fd = open(opt->drm_card_path, O_RDWR | O_CLOEXEC);
         if (d->drm_fd < 0)
@@ -266,7 +348,7 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
         fprintf(stderr, "[display] failed to link appsrc -> queue -> kmssink\n");
         return -1;
     }
-    caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "RGB16",
+    caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRx",
                                "width", G_TYPE_INT, (int)w, "height", G_TYPE_INT, (int)h,
                                "framerate", GST_TYPE_FRACTION, opt->fps, 1, NULL);
     if (!caps) return -1;
@@ -284,7 +366,7 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
     if (sret == GST_STATE_CHANGE_FAILURE) return -1;
     sret = gst_element_get_state(d->pipeline, NULL, NULL, 5 * GST_SECOND);
     if (sret == GST_STATE_CHANGE_FAILURE) return -1;
-    fprintf(stderr, "[display] started appsrc RGB16 %ux%u -> kmssink sync=%d connector=%d\n",
+    fprintf(stderr, "[display] started appsrc BGRx %ux%u -> kmssink sync=%d connector=%d\n",
             w, h, d->sync ? 1 : 0, d->connector_id);
     return 0;
 }
@@ -320,18 +402,40 @@ static int handle_bus(struct display_state *d)
     return 0;
 }
 
-int lpr_display_push(struct display_state *d, const uint16_t *frame)
+struct display_slot_cookie {
+    struct dma_state *dma;
+    int slot;
+};
+
+static void display_slot_release(gpointer user_data)
 {
-    uint8_t *copy;
+    struct display_slot_cookie *cookie = (struct display_slot_cookie *)user_data;
+    if (cookie) {
+        lpr_dma_slot_release(cookie->dma, cookie->slot);
+        g_free(cookie);
+    }
+}
+
+int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, int slot)
+{
     GstBuffer *buf;
     GstFlowReturn flow;
+    struct display_slot_cookie *cookie;
+    uint8_t *frame;
     if (!d || !d->enabled) return 0;
     if (handle_bus(d) < 0) return -1;
-    copy = g_malloc(d->frame_size);
-    if (!copy) return -1;
-    memcpy(copy, frame, d->frame_size);
-    buf = gst_buffer_new_wrapped_full((GstMemoryFlags)0, copy, d->frame_size, 0, d->frame_size, copy, g_free);
-    if (!buf) { g_free(copy); return -1; }
+    frame = lpr_dma_slot_data(dma, slot);
+    if (!frame) return -1;
+    cookie = g_new0(struct display_slot_cookie, 1);
+    if (!cookie) return -1;
+    cookie->dma = dma;
+    cookie->slot = slot;
+    lpr_dma_slot_addref(dma, slot);
+    buf = gst_buffer_new_wrapped_full((GstMemoryFlags)0, frame, d->frame_size, 0, d->frame_size, cookie, display_slot_release);
+    if (!buf) {
+        display_slot_release(cookie);
+        return -1;
+    }
     GST_BUFFER_PTS(buf) = d->next_pts_ns;
     GST_BUFFER_DURATION(buf) = (guint64)(GST_SECOND / d->fps);
     d->next_pts_ns += GST_BUFFER_DURATION(buf);

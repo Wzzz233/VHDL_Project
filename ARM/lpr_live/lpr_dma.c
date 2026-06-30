@@ -15,8 +15,8 @@
 int lpr_dma_init(struct dma_state *d, const struct live_options *opt)
 {
     struct fpga_info info;
-    struct buffer_map map;
     uint32_t fmt;
+    int requested = LPR_DMA_DEFAULT_SLOTS;
     memset(d, 0, sizeof(*d));
     d->fd = -1;
     d->fd = open(opt->device_path, O_RDWR | O_CLOEXEC);
@@ -33,42 +33,133 @@ int lpr_dma_init(struct dma_state *d, const struct live_options *opt)
     d->frame_bpp = info.frame_bpp;
     d->src_is_bgrx = fmt == FPGA_PIXEL_FORMAT_BGRX8888;
     d->frame_size = (size_t)d->frame_w * d->frame_h * d->frame_bpp;
-    memset(&map, 0, sizeof(map));
-    map.index = 0;
-    if (ioctl(d->fd, FPGA_DMA_MAP_BUFFER, &map) < 0)
-        return -1;
-    if (map.size < d->frame_size)
-        return -1;
-    d->map_size = map.size;
-    d->map = mmap(NULL, d->map_size, PROT_READ, MAP_SHARED, d->fd, 0);
-    if (d->map == MAP_FAILED) {
-        d->map = NULL;
+    d->zero_copy = d->src_is_bgrx;
+    if (!d->zero_copy) {
+        fprintf(stderr, "[dma] BGRX8888 source is required for live zero-copy path\n");
         return -1;
     }
-    d->copy = malloc(d->frame_size);
-    if (!d->copy)
+    pthread_mutex_init(&d->lock, NULL);
+    pthread_cond_init(&d->cond, NULL);
+    d->lock_init = true;
+    if (requested > LPR_DMA_MAX_SLOTS)
+        requested = LPR_DMA_MAX_SLOTS;
+    for (int i = 0; i < requested; i++) {
+        struct buffer_map map;
+        memset(&map, 0, sizeof(map));
+        map.index = (uint32_t)i;
+        if (ioctl(d->fd, FPGA_DMA_MAP_BUFFER, &map) < 0) {
+            if (i >= 3)
+                break;
+            fprintf(stderr, "[dma] failed to map DMA slot %d: %s\n", i, strerror(errno));
+            return -1;
+        }
+        if (map.size < d->frame_size) {
+            fprintf(stderr, "[dma] mapped slot %d too small: %u < %zu\n", i, map.size, d->frame_size);
+            return -1;
+        }
+        d->slots[i].data = mmap(NULL, map.size, PROT_READ | PROT_WRITE, MAP_SHARED, d->fd, (off_t)map.offset);
+        if (d->slots[i].data == MAP_FAILED) {
+            d->slots[i].data = NULL;
+            fprintf(stderr, "[dma] mmap DMA slot %d failed: %s\n", i, strerror(errno));
+            return -1;
+        }
+        d->slots[i].size = map.size;
+        d->slots[i].index = (uint32_t)i;
+        d->slots[i].generation = 0;
+        d->slots[i].refs = 0;
+        d->slot_count++;
+    }
+    if (d->slot_count < 3) {
+        fprintf(stderr, "[dma] zero-copy live path needs at least 3 DMA slots, got %d\n", d->slot_count);
         return -1;
+    }
+    fprintf(stderr, "[dma] BGRX zero-copy slots=%d frame=%ux%u bpp=%u size=%zu\n",
+            d->slot_count, d->frame_w, d->frame_h, d->frame_bpp, d->frame_size);
     return 0;
 }
 
 void lpr_dma_release(struct dma_state *d)
 {
     if (!d) return;
-    if (d->map)
-        munmap(d->map, d->map_size);
-    free(d->copy);
+    for (int i = 0; i < d->slot_count; i++) {
+        if (d->slots[i].data)
+            munmap(d->slots[i].data, d->slots[i].size);
+        d->slots[i].data = NULL;
+    }
     if (d->fd >= 0)
         close(d->fd);
+    if (d->lock_init) {
+        pthread_mutex_destroy(&d->lock);
+        pthread_cond_destroy(&d->cond);
+    }
     memset(d, 0, sizeof(*d));
     d->fd = -1;
 }
 
-int lpr_dma_read_frame(struct dma_state *d)
+int lpr_dma_acquire_slot(struct dma_state *d)
+{
+    int best = -1;
+    pthread_mutex_lock(&d->lock);
+    while (best < 0) {
+        for (int i = 0; i < d->slot_count; i++) {
+            if (d->slots[i].refs == 0) {
+                best = i;
+                d->slots[i].refs = 1;
+                d->slots[i].generation++;
+                break;
+            }
+        }
+        if (best < 0)
+            pthread_cond_wait(&d->cond, &d->lock);
+    }
+    pthread_mutex_unlock(&d->lock);
+    return best;
+}
+
+void lpr_dma_slot_addref(struct dma_state *d, int slot)
+{
+    if (!d || slot < 0 || slot >= d->slot_count)
+        return;
+    pthread_mutex_lock(&d->lock);
+    d->slots[slot].refs++;
+    pthread_mutex_unlock(&d->lock);
+}
+
+void lpr_dma_slot_release(struct dma_state *d, int slot)
+{
+    if (!d || slot < 0 || slot >= d->slot_count)
+        return;
+    pthread_mutex_lock(&d->lock);
+    if (d->slots[slot].refs > 0)
+        d->slots[slot].refs--;
+    if (d->slots[slot].refs == 0)
+        pthread_cond_signal(&d->cond);
+    pthread_mutex_unlock(&d->lock);
+}
+
+uint8_t *lpr_dma_slot_data(struct dma_state *d, int slot)
+{
+    if (!d || slot < 0 || slot >= d->slot_count)
+        return NULL;
+    return d->slots[slot].data;
+}
+
+uint64_t lpr_dma_slot_generation(struct dma_state *d, int slot)
+{
+    if (!d || slot < 0 || slot >= d->slot_count)
+        return 0;
+    return d->slots[slot].generation;
+}
+
+int lpr_dma_read_frame_slot(struct dma_state *d, int slot)
 {
     struct dma_transfer t;
+    if (!d || slot < 0 || slot >= d->slot_count)
+        return -1;
     memset(&t, 0, sizeof(t));
     t.size = (uint32_t)d->frame_size;
-    t.user_buf = (uint64_t)(uintptr_t)d->copy;
+    t.offset = d->slots[slot].index;
+    t.user_buf = 0;
     if (ioctl(d->fd, FPGA_DMA_READ_FRAME, &t) < 0)
         return -1;
     return t.result == 0 ? 0 : -1;
@@ -92,43 +183,5 @@ void lpr_decode_pixel565(enum pixel_order order, bool swap16,
         *r = (uint8_t)((c0 << 3) | (c0 >> 2));
         *g = (uint8_t)((c1 << 2) | (c1 >> 4));
         *b = (uint8_t)((c2 << 3) | (c2 >> 2));
-    }
-}
-
-void lpr_frame_to_rgb888(const struct dma_state *d,
-                         const struct live_options *opt,
-                         uint8_t *rgb)
-{
-    size_t pixels = (size_t)d->frame_w * d->frame_h;
-    size_t i;
-    if (d->src_is_bgrx) {
-        for (i = 0; i < pixels; i++) {
-            const uint8_t *p = d->copy + i * 4U;
-            rgb[i * 3U + 0] = p[2];
-            rgb[i * 3U + 1] = p[1];
-            rgb[i * 3U + 2] = p[0];
-        }
-        return;
-    }
-    for (i = 0; i < pixels; i++) {
-        uint8_t r, g, b;
-        lpr_decode_pixel565(opt->pixel_order, opt->swap16,
-                            d->copy[i * 2U], d->copy[i * 2U + 1], &r, &g, &b);
-        rgb[i * 3U + 0] = r;
-        rgb[i * 3U + 1] = g;
-        rgb[i * 3U + 2] = b;
-    }
-}
-
-void lpr_rgb888_to_rgb565(const uint8_t *rgb, uint16_t *dst, int w, int h)
-{
-    size_t n = (size_t)w * (size_t)h;
-    for (size_t i = 0; i < n; i++) {
-        uint8_t r = rgb[i * 3U + 0];
-        uint8_t g = rgb[i * 3U + 1];
-        uint8_t b = rgb[i * 3U + 2];
-        dst[i] = (uint16_t)(((uint16_t)(r >> 3) << 11) |
-                            ((uint16_t)(g >> 2) << 5) |
-                            ((uint16_t)(b >> 3)));
     }
 }

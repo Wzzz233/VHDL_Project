@@ -5,6 +5,7 @@
 #define LPR_LIVE_LPR_DISPLAY_H
 
 #include "lpr_common.h"
+#include "lpr_dma.h"
 
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
@@ -29,9 +30,12 @@ struct display_state {
 int lpr_display_start(struct display_state *d, const struct live_options *opt,
                       uint32_t w, uint32_t h);
 void lpr_display_stop(struct display_state *d);
-int lpr_display_push(struct display_state *d, const uint16_t *frame);
+int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, int slot);
 
-/* Drawing primitives operate directly on RGB565 frames. */
+/* Drawing primitives operate directly on BGRX8888 or RGB565 frames. */
+void lpr_draw_rect_bgrx(uint8_t *pix, int w, int h, const struct det_box *b, uint8_t r, uint8_t g, uint8_t bl);
+void lpr_draw_text_bgrx(uint8_t *pix, int w, int h, int x, int y, const char *s,
+                        uint8_t r, uint8_t g, uint8_t bl, int scale);
 void lpr_draw_rect_565(uint16_t *pix, int w, int h, const struct det_box *b, uint16_t c);
 void lpr_draw_text_565(uint16_t *pix, int w, int h, int x, int y, const char *s,
                        uint16_t c, int scale);

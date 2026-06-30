@@ -40,6 +40,59 @@ static void resize_nn(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, 
     }
 }
 
+static void resize_nn_bgrx(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh)
+{
+    int x, y;
+    for (y = 0; y < dh; y++) {
+        int sy = y * sh / dh;
+        for (x = 0; x < dw; x++) {
+            int sx = x * sw / dw;
+            lpr_bgrx_pixel_rgb(src, sw, sx, sy, dst + ((size_t)y * dw + x) * 3U);
+        }
+    }
+}
+
+static void prepare_detect_input_bgrx(const uint8_t *src, int sw, int sh, uint8_t *dst,
+                                      enum det_resize_mode mode, struct letterbox_meta *meta)
+{
+    memset(meta, 0, sizeof(*meta));
+    meta->src_w = sw;
+    meta->src_h = sh;
+    meta->dst_w = ALGO_STREAM_SIZE;
+    meta->dst_h = ALGO_STREAM_SIZE;
+    if (mode == DET_RESIZE_STRETCH) {
+        resize_nn_bgrx(src, sw, sh, dst, ALGO_STREAM_SIZE, ALGO_STREAM_SIZE);
+        meta->scale = 1.0f;
+        meta->valid = false;
+        return;
+    }
+    {
+        float sx = (float)ALGO_STREAM_SIZE / (float)sw;
+        float sy = (float)ALGO_STREAM_SIZE / (float)sh;
+        float scale = sx < sy ? sx : sy;
+        int nw = (int)((float)sw * scale + 0.5f);
+        int nh = (int)((float)sh * scale + 0.5f);
+        int off_x = (ALGO_STREAM_SIZE - nw) / 2;
+        int off_y = (ALGO_STREAM_SIZE - nh) / 2;
+        uint8_t *tmp;
+        memset(dst, 114, (size_t)ALGO_STREAM_SIZE * ALGO_STREAM_SIZE * 3U);
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
+        tmp = malloc((size_t)nw * nh * 3U);
+        if (!tmp)
+            return;
+        resize_nn_bgrx(src, sw, sh, tmp, nw, nh);
+        for (int y = 0; y < nh; y++)
+            memcpy(dst + ((size_t)(off_y + y) * ALGO_STREAM_SIZE + off_x) * 3U,
+                   tmp + (size_t)y * nw * 3U, (size_t)nw * 3U);
+        free(tmp);
+        meta->scale = scale;
+        meta->pad_x = off_x;
+        meta->pad_y = off_y;
+        meta->valid = true;
+    }
+}
+
 static void prepare_detect_input(const uint8_t *src, int sw, int sh, uint8_t *dst,
                                  enum det_resize_mode mode, struct letterbox_meta *meta)
 {
@@ -330,4 +383,39 @@ int lpr_detector_pick_best(const struct det_box *dets, int count)
         }
     }
     return best;
+}
+
+int lpr_detector_run_bgrx(struct rknn_model *m, const uint8_t *bgrx,
+                          int img_w, int img_h, uint8_t *input,
+                          enum det_resize_mode resize_mode,
+                          int pose_nc, int class_filter,
+                          float conf_thr, float nms_iou, int max_det,
+                          struct det_box *dets, int *det_count)
+{
+    struct letterbox_meta lb;
+    rknn_input in;
+    rknn_output outs[8];
+    int ret;
+    prepare_detect_input_bgrx(bgrx, img_w, img_h, input, resize_mode, &lb);
+    memset(&in, 0, sizeof(in));
+    in.index = 0;
+    in.buf = input;
+    in.size = m->in_w * m->in_h * 3U;
+    in.type = RKNN_TENSOR_UINT8;
+    in.fmt = RKNN_TENSOR_NHWC;
+    ret = rknn_inputs_set(m->ctx, 1, &in);
+    if (ret < 0) return ret;
+    ret = rknn_run(m->ctx, NULL);
+    if (ret < 0) return ret;
+    memset(outs, 0, sizeof(outs));
+    for (uint32_t i = 0; i < m->io_num.n_output; i++)
+        outs[i].want_float = 1;
+    ret = rknn_outputs_get(m->ctx, m->io_num.n_output, outs, NULL);
+    if (ret < 0) return ret;
+    ret = decode_pose_outputs(m, outs, pose_nc, class_filter, conf_thr, img_w, img_h,
+                              resize_mode, &lb, dets, det_count);
+    rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
+    if (ret == 0)
+        nms(dets, det_count, nms_iou, max_det);
+    return ret;
 }

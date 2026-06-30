@@ -87,3 +87,53 @@ enum plate_color lpr_classify_plate_color(const uint8_t *rgb, int w, int h,
         return PLATE_COLOR_WHITE;
     return PLATE_COLOR_UNKNOWN;
 }
+
+
+enum plate_color lpr_classify_plate_color_bgrx(const uint8_t *bgrx, int w, int h,
+                                               const struct det_box *b)
+{
+    int x1 = b->x1 + (b->x2 - b->x1) / 6;
+    int x2 = b->x2 - (b->x2 - b->x1) / 6;
+    int y1 = b->y1 + (b->y2 - b->y1) / 6;
+    int y2 = b->y2 - (b->y2 - b->y1) / 6;
+    int total = 0;
+    int blue_cnt = 0, green_cnt = 0, yellow_cnt = 0, white_cnt = 0, black_cnt = 0;
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 >= w) x2 = w - 1;
+    if (y2 >= h) y2 = h - 1;
+    for (int y = y1; y <= y2; y++) {
+        for (int x = x1; x <= x2; x++) {
+            uint8_t pix[3];
+            lpr_bgrx_pixel_rgb(bgrx, w, x, y, pix);
+            float r = pix[0] / 255.0f;
+            float g = pix[1] / 255.0f;
+            float bch = pix[2] / 255.0f;
+            float mx = fmaxf(r, fmaxf(g, bch));
+            float mn = fminf(r, fminf(g, bch));
+            float d = mx - mn;
+            float h_deg = 0.0f;
+            float s = (mx == 0.0f) ? 0.0f : (d / mx);
+            float v = mx;
+            if (d > 1e-6f) {
+                if (mx == r) h_deg = 60.0f * fmodf((g - bch) / d, 6.0f);
+                else if (mx == g) h_deg = 60.0f * (((bch - r) / d) + 2.0f);
+                else h_deg = 60.0f * (((r - g) / d) + 4.0f);
+            }
+            if (h_deg < 0.0f) h_deg += 360.0f;
+            total++;
+            if (v < 0.15f) { black_cnt++; continue; }
+            if (h_deg >= 190.0f && h_deg <= 260.0f && s > 0.23f && v > 0.16f) blue_cnt++;
+            else if (h_deg >= 75.0f && h_deg <= 155.0f && s > 0.20f && v > 0.16f) green_cnt++;
+            else if (h_deg >= 15.0f && h_deg <= 55.0f && s > 0.15f && v > 0.16f) yellow_cnt++;
+            else if (s < 0.15f && v > 0.55f) white_cnt++;
+        }
+    }
+    if (total == 0) return PLATE_COLOR_UNKNOWN;
+    if ((float)black_cnt / (float)total >= 0.45f) return PLATE_COLOR_BLACK;
+    if ((float)blue_cnt / (float)total >= 0.20f && blue_cnt > green_cnt + (int)(0.05f * total)) return PLATE_COLOR_BLUE;
+    if ((float)green_cnt / (float)total >= 0.20f && green_cnt > blue_cnt + (int)(0.05f * total)) return PLATE_COLOR_GREEN;
+    if ((float)yellow_cnt / (float)total >= 0.18f) return PLATE_COLOR_YELLOW;
+    if ((float)white_cnt / (float)total >= 0.30f) return PLATE_COLOR_WHITE;
+    return PLATE_COLOR_UNKNOWN;
+}

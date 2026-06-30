@@ -20,5 +20,9 @@ bool lpr_warp_quad_homography(const uint8_t *rgb, int img_w, int img_h,
                               const float quad_in[8],
                               uint8_t *dst, int cap_w, int cap_h,
                               int *out_w, int *out_h);
+bool lpr_warp_quad_homography_bgrx(const uint8_t *bgrx, int img_w, int img_h,
+                                   const float quad_in[8],
+                                   uint8_t *dst, int cap_w, int cap_h,
+                                   int *out_w, int *out_h);
 
 #endif /* LPR_LIVE_LPR_WARP_H */

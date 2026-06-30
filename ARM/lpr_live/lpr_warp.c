@@ -111,6 +111,34 @@ static void sample_bilinear(const uint8_t *rgb, int w, int h, float x, float y, 
     }
 }
 
+static void sample_bilinear_bgrx(const uint8_t *bgrx, int w, int h, float x, float y, uint8_t p[3])
+{
+    int x0, y0, x1, y1;
+    float wx, wy;
+    if (x < 0.0f) x = 0.0f;
+    if (y < 0.0f) y = 0.0f;
+    if (x > (float)(w - 1)) x = (float)(w - 1);
+    if (y > (float)(h - 1)) y = (float)(h - 1);
+    x0 = (int)floorf(x); y0 = (int)floorf(y);
+    x1 = x0 + 1; y1 = y0 + 1;
+    if (x1 >= w) x1 = w - 1;
+    if (y1 >= h) y1 = h - 1;
+    wx = x - (float)x0; wy = y - (float)y0;
+    uint8_t p00[3], p01[3], p10[3], p11[3];
+    lpr_bgrx_pixel_rgb(bgrx, w, x0, y0, p00);
+    lpr_bgrx_pixel_rgb(bgrx, w, x1, y0, p01);
+    lpr_bgrx_pixel_rgb(bgrx, w, x0, y1, p10);
+    lpr_bgrx_pixel_rgb(bgrx, w, x1, y1, p11);
+    for (int c = 0; c < 3; c++) {
+        float v0 = p00[c] * (1.0f - wx) + p01[c] * wx;
+        float v1 = p10[c] * (1.0f - wx) + p11[c] * wx;
+        int iv = (int)(v0 * (1.0f - wy) + v1 * wy + 0.5f);
+        if (iv < 0) iv = 0;
+        if (iv > 255) iv = 255;
+        p[c] = (uint8_t)iv;
+    }
+}
+
 /* Solve a 8x9 augmented system in place via Gauss-Jordan. */
 static bool solve_linear_8x8(float a[8][9], float x[8])
 {
@@ -213,6 +241,51 @@ bool lpr_warp_quad_homography(const uint8_t *rgb, int img_w, int img_h,
             sx = (inv_h[0] * fx + inv_h[1] * fy + inv_h[2]) / den;
             sy = (inv_h[3] * fx + inv_h[4] * fy + inv_h[5]) / den;
             sample_bilinear(rgb, img_w, img_h, sx, sy, pix);
+            memcpy(dst + ((size_t)y * dw + x) * 3U, pix, 3);
+        }
+    }
+    *out_w = dw;
+    *out_h = dh;
+    return true;
+}
+
+
+bool lpr_warp_quad_homography_bgrx(const uint8_t *bgrx, int img_w, int img_h,
+                                   const float quad_in[8],
+                                   uint8_t *dst, int cap_w, int cap_h,
+                                   int *out_w, int *out_h)
+{
+    float q[8], dst_quad[8], h[9], inv_h[9];
+    float top_w, bot_w, left_h, right_h;
+    int dw, dh;
+    order_quad(quad_in, q);
+    top_w = hypotf(q[2] - q[0], q[3] - q[1]);
+    bot_w = hypotf(q[4] - q[6], q[5] - q[7]);
+    left_h = hypotf(q[6] - q[0], q[7] - q[1]);
+    right_h = hypotf(q[4] - q[2], q[5] - q[3]);
+    dw = (int)(fmaxf(top_w, bot_w) + 0.5f);
+    dh = (int)(fmaxf(left_h, right_h) + 0.5f);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    if (dw > cap_w) dw = cap_w;
+    if (dh > cap_h) dh = cap_h;
+    if (dw <= 0 || dh <= 0) return false;
+    dst_quad[0] = 0.0f;             dst_quad[1] = 0.0f;
+    dst_quad[2] = (float)dw - 1.0f; dst_quad[3] = 0.0f;
+    dst_quad[4] = (float)dw - 1.0f; dst_quad[5] = (float)dh - 1.0f;
+    dst_quad[6] = 0.0f;             dst_quad[7] = (float)dh - 1.0f;
+    if (!get_homography_4pt(q, dst_quad, h)) return false;
+    if (!invert_homography(h, inv_h)) return false;
+    for (int y = 0; y < dh; y++) {
+        for (int x = 0; x < dw; x++) {
+            float fx = (float)x, fy = (float)y;
+            float den = inv_h[6] * fx + inv_h[7] * fy + inv_h[8];
+            float sx, sy;
+            uint8_t pix[3];
+            if (fabsf(den) < 1e-8f) den = den >= 0.0f ? 1e-8f : -1e-8f;
+            sx = (inv_h[0] * fx + inv_h[1] * fy + inv_h[2]) / den;
+            sy = (inv_h[3] * fx + inv_h[4] * fy + inv_h[5]) / den;
+            sample_bilinear_bgrx(bgrx, img_w, img_h, sx, sy, pix);
             memcpy(dst + ((size_t)y * dw + x) * 3U, pix, 3);
         }
     }
