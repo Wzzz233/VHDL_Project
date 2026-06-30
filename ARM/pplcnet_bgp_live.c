@@ -575,18 +575,16 @@ int main(int argc, char **argv)
             lpr_rgb888_to_rgb565(rgb, display_frame, (int)dma.frame_w, (int)dma.frame_h);
             lpr_infer_get_result(&infer, &latest);
             if (latest.valid) {
-                char ascii[32];
-                char overlay[64];
-                int ty = latest.box.y1 - (7 * OVERLAY_TEXT_SCALE + 3);
+                char overlay[96];
+                int ty = latest.box.y1 - (16 * OVERLAY_TEXT_SCALE + 3);
                 char tag = 'B';
                 if (latest.route_name[0] == 'g') tag = 'G';
                 else if (latest.route_name[0] == 'p') tag = 'P';
                 else if (latest.route_name[0] == 'e') tag = 'E';
                 else if (latest.route_name[0] == 'y') tag = 'Y';
                 if (ty < 0) ty = latest.box.y1 + 3;
-                lpr_overlay_ascii_from_text(latest.text, ascii, sizeof(ascii));
                 snprintf(overlay, sizeof(overlay), "%s %c %.2f",
-                         ascii[0] ? ascii : "OCR", tag, latest.conf);
+                         latest.text[0] ? latest.text : "OCR", tag, latest.conf);
                 lpr_draw_rect_565(display_frame, (int)dma.frame_w, (int)dma.frame_h,
                                   &latest.box, COLOR_CYAN_565);
                 lpr_draw_text_565(display_frame, (int)dma.frame_w, (int)dma.frame_h,
