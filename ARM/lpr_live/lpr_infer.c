@@ -148,6 +148,7 @@ static void *thread_main(void *arg)
         float conf = 0.0f;
         struct ocr_decode_diag diag;
         struct ocr_timing ocr_timing;
+        struct det_timing det_timing;
         enum plate_color color = PLATE_COLOR_UNKNOWN;
         enum lpr_route_id route_id = LPR_ROUTE_BLUE;
         const char *route_name = "blue";
@@ -180,10 +181,11 @@ static void *thread_main(void *arg)
         res.frame_generation = generation;
         res.seq = seq;
         t0 = lpr_mono_us();
-        if (lpr_detector_run_bgrx(st->det_model, bgrx, st->frame_w, st->frame_h, det_input,
-                                  st->opt->det_resize_mode, st->pose_nc, st->class_filter,
-                                  st->opt->min_conf, st->opt->nms_iou, st->opt->max_det,
-                                  dets, &det_count) < 0) {
+        memset(&det_timing, 0, sizeof(det_timing));
+        if (lpr_detector_run_bgrx_timed(st->det_model, bgrx, st->frame_w, st->frame_h, det_input,
+                                        st->opt->det_resize_mode, st->pose_nc, st->class_filter,
+                                        st->opt->min_conf, st->opt->nms_iou, st->opt->max_det,
+                                        dets, &det_count, &det_timing) < 0) {
             fprintf(stderr, "[bgp-live] infer seq=%" PRIu64 " detector failed\n", seq);
             continue;
         }
@@ -243,7 +245,8 @@ static void *thread_main(void *arg)
         if (res.valid) {
             printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d cls=%d color=%s "
                    "ptype=%s ptype_conf=%.3f ptype_apply=%d route=%s box=[%d,%d,%d,%d] crop=%dx%d "
-                   "text=%s conf=%.3f blank=%.3f copy_ms=%.1f detocr_ms=%.1f det_ms=%.1f ocr_ms=%.1f "
+                   "text=%s conf=%.3f blank=%.3f copy_ms=%.1f detocr_ms=%.1f det_ms=%.1f "
+                   "det_prep_ms=%.1f det_in_ms=%.1f det_run_ms=%.1f det_out_ms=%.1f det_dec_ms=%.1f det_nms_ms=%.1f ocr_ms=%.1f "
                    "warp_ms=%.1f color_ms=%.1f ptype_ms=%.1f prep_ms=%.1f in_ms=%.1f run_ms=%.1f out_ms=%.1f dec_ms=%.1f overwritten=%" PRIu64 "\n",
                    seq, det_count, best, dets[best].cls,
                    lpr_plate_color_str(color), lpr_ptype_class_str(ptype_cls), ptype_conf,
@@ -252,13 +255,19 @@ static void *thread_main(void *arg)
                    crop_w, crop_h, text, conf, diag.blank_top1_ratio, copy_ms,
                    (double)(t2 - t0) / 1000.0,
                    (double)(t1 - t0) / 1000.0,
+                   det_timing.prep_ms, det_timing.input_ms, det_timing.run_ms,
+                   det_timing.output_ms, det_timing.decode_ms, det_timing.nms_ms,
                    (double)(t2 - t1) / 1000.0,
                    warp_ms, color_ms, ptype_ms, ocr_timing.prep_ms, ocr_timing.input_ms,
                    ocr_timing.run_ms, ocr_timing.output_ms, ocr_timing.decode_ms,
                    st->overwrite_count);
         } else {
-            printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d copy_ms=%.1f det_ms=%.1f overwritten=%" PRIu64 "\n",
-                   seq, det_count, best, copy_ms, (double)(t1 - t0) / 1000.0, st->overwrite_count);
+            printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d copy_ms=%.1f det_ms=%.1f "
+                   "det_prep_ms=%.1f det_in_ms=%.1f det_run_ms=%.1f det_out_ms=%.1f det_dec_ms=%.1f det_nms_ms=%.1f overwritten=%" PRIu64 "\n",
+                   seq, det_count, best, copy_ms, (double)(t1 - t0) / 1000.0,
+                   det_timing.prep_ms, det_timing.input_ms, det_timing.run_ms,
+                   det_timing.output_ms, det_timing.decode_ms, det_timing.nms_ms,
+                   st->overwrite_count);
         }
         fflush(stdout);
     }

@@ -184,6 +184,16 @@ struct ocr_timing {
     double decode_ms;
 };
 
+/* Per-detector-call timing breakdown for diagnostics. */
+struct det_timing {
+    double prep_ms;
+    double input_ms;
+    double run_ms;
+    double output_ms;
+    double decode_ms;
+    double nms_ms;
+};
+
 /* ---------------- Live result published from infer thread ---------------- */
 
 struct live_result {
