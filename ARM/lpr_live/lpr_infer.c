@@ -92,42 +92,33 @@ static enum lpr_route_id pick_route(const struct lpr_route *routes, enum plate_c
 static void publish_result(struct infer_state *st, const struct live_result *res)
 {
     pthread_mutex_lock(&st->result_lock);
-    if (st->result_owned)
-        lpr_dma_slot_release(st->dma, st->result.frame_slot);
     st->result = *res;
-    st->result_owned = res->frame_slot >= 0;
     pthread_mutex_unlock(&st->result_lock);
 }
 
-bool lpr_infer_take_result(struct infer_state *st, struct live_result *res)
+bool lpr_infer_get_result(struct infer_state *st, struct live_result *res)
 {
-    bool owned;
+    bool valid;
     pthread_mutex_lock(&st->result_lock);
     *res = st->result;
-    owned = st->result_owned;
-    st->result_owned = false;
-    st->result.valid = false;
-    st->result.frame_slot = -1;
+    valid = st->result.valid;
     pthread_mutex_unlock(&st->result_lock);
-    return owned;
+    return valid;
 }
 
-void lpr_infer_release_result_slot(struct infer_state *st, const struct live_result *res)
-{
-    if (res && res->frame_slot >= 0)
-        lpr_dma_slot_release(st->dma, res->frame_slot);
-}
-
-void lpr_infer_submit_latest(struct infer_state *st, int slot, uint64_t generation)
+void lpr_infer_submit_latest(struct infer_state *st, const uint8_t *bgrx, uint64_t generation)
 {
     pthread_mutex_lock(&st->lock);
     if (st->has_new) {
-        lpr_dma_slot_release(st->dma, st->latest_slot);
         st->overwrite_count++;
+        pthread_mutex_unlock(&st->lock);
+        return;
     }
-    lpr_dma_slot_addref(st->dma, slot);
-    st->latest_slot = slot;
+    int64_t t0 = lpr_mono_us();
+    memcpy(st->pending_bgrx, bgrx, st->bgrx_size);
+    int64_t t1 = lpr_mono_us();
     st->latest_generation = generation;
+    st->latest_copy_ms = (double)(t1 - t0) / 1000.0;
     st->seq++;
     st->has_new = true;
     pthread_cond_signal(&st->cond);
@@ -137,21 +128,17 @@ void lpr_infer_submit_latest(struct infer_state *st, int slot, uint64_t generati
 static void *thread_main(void *arg)
 {
     struct infer_state *st = (struct infer_state *)arg;
-    size_t bgrx_size = (size_t)st->frame_w * (size_t)st->frame_h * 4U;
-    uint8_t *cached_bgrx = malloc(bgrx_size);
     uint8_t *det_input = malloc((size_t)st->det_model->in_w * st->det_model->in_h * 3U);
     uint8_t *crop = malloc((size_t)st->frame_w * (size_t)st->frame_h * 3U);
-    if (!cached_bgrx || !det_input || !crop) {
+    if (!det_input || !crop) {
         fprintf(stderr, "[bgp-live] infer thread alloc failed\n");
-        free(cached_bgrx); free(det_input); free(crop);
+        free(det_input); free(crop);
         return NULL;
     }
 
     while (1) {
         uint64_t seq;
         uint64_t generation;
-        int slot;
-        uint8_t *slot_bgrx;
         const uint8_t *bgrx;
         struct det_box dets[MAX_DETS];
         int det_count = 0;
@@ -178,33 +165,26 @@ static void *thread_main(void *arg)
             pthread_mutex_unlock(&st->lock);
             break;
         }
-        slot = st->latest_slot;
         generation = st->latest_generation;
         seq = st->seq;
+        copy_ms = st->latest_copy_ms;
+        uint8_t *tmp = st->processing_bgrx;
+        st->processing_bgrx = st->pending_bgrx;
+        st->pending_bgrx = tmp;
         st->has_new = false;
+        bgrx = st->processing_bgrx;
         pthread_mutex_unlock(&st->lock);
-        slot_bgrx = lpr_dma_slot_data(st->dma, slot);
-        if (!slot_bgrx) {
-            lpr_dma_slot_release(st->dma, slot);
-            continue;
-        }
 
         memset(&res, 0, sizeof(res));
-        res.frame_slot = slot;
+        res.frame_slot = -1;
         res.frame_generation = generation;
         res.seq = seq;
         t0 = lpr_mono_us();
-        memcpy(cached_bgrx, slot_bgrx, bgrx_size);
-        t1 = lpr_mono_us();
-        copy_ms = (double)(t1 - t0) / 1000.0;
-        bgrx = cached_bgrx;
-        t0 = t1;
         if (lpr_detector_run_bgrx(st->det_model, bgrx, st->frame_w, st->frame_h, det_input,
                                   st->opt->det_resize_mode, st->pose_nc, st->class_filter,
                                   st->opt->min_conf, st->opt->nms_iou, st->opt->max_det,
                                   dets, &det_count) < 0) {
             fprintf(stderr, "[bgp-live] infer seq=%" PRIu64 " detector failed\n", seq);
-            lpr_dma_slot_release(st->dma, slot);
             continue;
         }
         t1 = lpr_mono_us();
@@ -259,9 +239,7 @@ static void *thread_main(void *arg)
         }
         t2 = lpr_mono_us();
         st->infer_count++;
-        lpr_dma_slot_addref(st->dma, slot);
         publish_result(st, &res);
-        lpr_dma_slot_release(st->dma, slot);
         if (res.valid) {
             printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d cls=%d color=%s "
                    "ptype=%s ptype_conf=%.3f ptype_apply=%d route=%s box=[%d,%d,%d,%d] crop=%dx%d "
@@ -285,7 +263,7 @@ static void *thread_main(void *arg)
         fflush(stdout);
     }
 
-    free(cached_bgrx); free(det_input); free(crop);
+    free(det_input); free(crop);
     return NULL;
 }
 
@@ -300,8 +278,16 @@ int lpr_infer_start(struct infer_state *st, const struct live_options *opt,
     memset(st, 0, sizeof(*st));
     st->opt = opt;
     st->dma = dma;
-    st->latest_slot = -1;
+    st->bgrx_size = (size_t)frame_w * (size_t)frame_h * 4U;
+    st->pending_bgrx = malloc(st->bgrx_size);
+    st->processing_bgrx = malloc(st->bgrx_size);
     st->result.frame_slot = -1;
+    if (!st->pending_bgrx || !st->processing_bgrx) {
+        free(st->pending_bgrx);
+        free(st->processing_bgrx);
+        memset(st, 0, sizeof(*st));
+        return -1;
+    }
     st->det_model = det_model;
     st->ptype_model = ptype_model;
     for (int i = 0; i < LPR_ROUTE_COUNT; i++)
@@ -330,8 +316,8 @@ void lpr_infer_stop(struct infer_state *st)
     pthread_mutex_unlock(&st->lock);
     if (st->thread_started)
         pthread_join(st->thread, NULL);
-    if (st->result_owned)
-        lpr_dma_slot_release(st->dma, st->result.frame_slot);
+    free(st->pending_bgrx);
+    free(st->processing_bgrx);
     pthread_mutex_destroy(&st->lock);
     pthread_cond_destroy(&st->cond);
     pthread_mutex_destroy(&st->result_lock);

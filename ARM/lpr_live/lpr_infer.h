@@ -42,9 +42,11 @@ struct infer_state {
     pthread_mutex_t result_lock;
     bool running;
     bool has_new;
-    int latest_slot;
+    uint8_t *pending_bgrx;
+    uint8_t *processing_bgrx;
+    size_t bgrx_size;
     uint64_t latest_generation;
-    bool result_owned;
+    double latest_copy_ms;
     uint64_t seq;
     uint64_t overwrite_count;
     uint64_t infer_count;
@@ -71,13 +73,12 @@ int lpr_infer_start(struct infer_state *st, const struct live_options *opt,
 
 void lpr_infer_stop(struct infer_state *st);
 
-/* Submit a freshly DMA-filled BGRX slot. The inference thread takes its own
- * slot reference; the caller still releases its capture reference. */
-void lpr_infer_submit_latest(struct infer_state *st, int slot, uint64_t generation);
+/* Submit a freshly DMA-filled BGRX slot. This copies the slot into cached
+ * inference memory immediately, so display may reuse or annotate the DMA slot. */
+void lpr_infer_submit_latest(struct infer_state *st, const uint8_t *bgrx, uint64_t generation);
 
-/* Move the most recent published result to the caller. If the result owns a
- * frame slot, the caller must eventually call lpr_infer_release_result_slot(). */
-bool lpr_infer_take_result(struct infer_state *st, struct live_result *res);
-void lpr_infer_release_result_slot(struct infer_state *st, const struct live_result *res);
+/* Snapshot the most recent published result. Returns true if a valid OCR result
+ * is available for overlay. The result does not own a DMA slot. */
+bool lpr_infer_get_result(struct infer_state *st, struct live_result *res);
 
 #endif /* LPR_LIVE_LPR_INFER_H */

@@ -555,7 +555,7 @@ int main(int argc, char **argv)
     target_us = 1000000LL / opt.fps;
     for (int frame = 0; !g_stop && (opt.frames == 0 || frame < opt.frames); frame++) {
         struct live_result latest;
-        bool latest_owned;
+        bool has_overlay;
         int slot;
         uint8_t *slot_frame;
         int64_t t0 = lpr_mono_us();
@@ -566,12 +566,18 @@ int main(int argc, char **argv)
             fprintf(stderr, "[bgp-live] DMA frame read failed\n");
             goto out;
         }
-        lpr_infer_submit_latest(&infer, slot, lpr_dma_slot_generation(&dma, slot));
+        slot_frame = lpr_dma_slot_data(&dma, slot);
+        if (!slot_frame) {
+            lpr_dma_slot_release(&dma, slot);
+            fprintf(stderr, "[bgp-live] DMA slot data missing\n");
+            goto out;
+        }
 
-        latest_owned = lpr_infer_take_result(&infer, &latest);
-        if (latest_owned && opt.display) {
-            slot_frame = lpr_dma_slot_data(&dma, latest.frame_slot);
-            if (slot_frame && latest.valid) {
+        lpr_infer_submit_latest(&infer, slot_frame, lpr_dma_slot_generation(&dma, slot));
+        has_overlay = lpr_infer_get_result(&infer, &latest);
+
+        if (opt.display) {
+            if (has_overlay) {
                 char overlay[96];
                 int ty = latest.box.y1 - (16 * OVERLAY_TEXT_SCALE + 3);
                 char tag = 'B';
@@ -588,13 +594,8 @@ int main(int argc, char **argv)
                                    latest.box.x1, ty, overlay, 0, 255, 255,
                                    OVERLAY_TEXT_SCALE);
             }
-            if (lpr_display_push_bgrx_slot(&display, &dma, latest.frame_slot) < 0) {
-                lpr_infer_release_result_slot(&infer, &latest);
+            if (lpr_display_push_bgrx_slot(&display, &dma, slot) < 0)
                 goto out;
-            }
-            lpr_infer_release_result_slot(&infer, &latest);
-        } else if (latest_owned) {
-            lpr_infer_release_result_slot(&infer, &latest);
         }
 
         lpr_dma_slot_release(&dma, slot);
