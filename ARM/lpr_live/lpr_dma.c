@@ -4,6 +4,7 @@
 #include "lpr_dma.h"
 #include "../pcie_fpga_dma.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
