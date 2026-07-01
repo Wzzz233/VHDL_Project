@@ -137,11 +137,13 @@ void lpr_infer_submit_latest(struct infer_state *st, int slot, uint64_t generati
 static void *thread_main(void *arg)
 {
     struct infer_state *st = (struct infer_state *)arg;
+    size_t bgrx_size = (size_t)st->frame_w * (size_t)st->frame_h * 4U;
+    uint8_t *cached_bgrx = malloc(bgrx_size);
     uint8_t *det_input = malloc((size_t)st->det_model->in_w * st->det_model->in_h * 3U);
     uint8_t *crop = malloc((size_t)st->frame_w * (size_t)st->frame_h * 3U);
-    if (!det_input || !crop) {
+    if (!cached_bgrx || !det_input || !crop) {
         fprintf(stderr, "[bgp-live] infer thread alloc failed\n");
-        free(det_input); free(crop);
+        free(cached_bgrx); free(det_input); free(crop);
         return NULL;
     }
 
@@ -149,7 +151,8 @@ static void *thread_main(void *arg)
         uint64_t seq;
         uint64_t generation;
         int slot;
-        uint8_t *bgrx;
+        uint8_t *slot_bgrx;
+        const uint8_t *bgrx;
         struct det_box dets[MAX_DETS];
         int det_count = 0;
         int best = -1;
@@ -164,7 +167,7 @@ static void *thread_main(void *arg)
         int ptype_cls = LPR_PTYPE_UNKNOWN;
         float ptype_conf = 0.0f;
         bool ptype_applied = false;
-        double warp_ms = 0.0, color_ms = 0.0, ptype_ms = 0.0;
+        double copy_ms = 0.0, warp_ms = 0.0, color_ms = 0.0, ptype_ms = 0.0;
         int64_t t0, t1, t2;
         struct live_result res;
 
@@ -180,8 +183,8 @@ static void *thread_main(void *arg)
         seq = st->seq;
         st->has_new = false;
         pthread_mutex_unlock(&st->lock);
-        bgrx = lpr_dma_slot_data(st->dma, slot);
-        if (!bgrx) {
+        slot_bgrx = lpr_dma_slot_data(st->dma, slot);
+        if (!slot_bgrx) {
             lpr_dma_slot_release(st->dma, slot);
             continue;
         }
@@ -191,6 +194,11 @@ static void *thread_main(void *arg)
         res.frame_generation = generation;
         res.seq = seq;
         t0 = lpr_mono_us();
+        memcpy(cached_bgrx, slot_bgrx, bgrx_size);
+        t1 = lpr_mono_us();
+        copy_ms = (double)(t1 - t0) / 1000.0;
+        bgrx = cached_bgrx;
+        t0 = t1;
         if (lpr_detector_run_bgrx(st->det_model, bgrx, st->frame_w, st->frame_h, det_input,
                                   st->opt->det_resize_mode, st->pose_nc, st->class_filter,
                                   st->opt->min_conf, st->opt->nms_iou, st->opt->max_det,
@@ -257,13 +265,13 @@ static void *thread_main(void *arg)
         if (res.valid) {
             printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d cls=%d color=%s "
                    "ptype=%s ptype_conf=%.3f ptype_apply=%d route=%s box=[%d,%d,%d,%d] crop=%dx%d "
-                   "text=%s conf=%.3f blank=%.3f detocr_ms=%.1f det_ms=%.1f ocr_ms=%.1f "
+                   "text=%s conf=%.3f blank=%.3f copy_ms=%.1f detocr_ms=%.1f det_ms=%.1f ocr_ms=%.1f "
                    "warp_ms=%.1f color_ms=%.1f ptype_ms=%.1f prep_ms=%.1f in_ms=%.1f run_ms=%.1f out_ms=%.1f dec_ms=%.1f overwritten=%" PRIu64 "\n",
                    seq, det_count, best, dets[best].cls,
                    lpr_plate_color_str(color), lpr_ptype_class_str(ptype_cls), ptype_conf,
                    ptype_applied ? 1 : 0, route_name,
                    dets[best].x1, dets[best].y1, dets[best].x2, dets[best].y2,
-                   crop_w, crop_h, text, conf, diag.blank_top1_ratio,
+                   crop_w, crop_h, text, conf, diag.blank_top1_ratio, copy_ms,
                    (double)(t2 - t0) / 1000.0,
                    (double)(t1 - t0) / 1000.0,
                    (double)(t2 - t1) / 1000.0,
@@ -271,13 +279,13 @@ static void *thread_main(void *arg)
                    ocr_timing.run_ms, ocr_timing.output_ms, ocr_timing.decode_ms,
                    st->overwrite_count);
         } else {
-            printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d det_ms=%.1f overwritten=%" PRIu64 "\n",
-                   seq, det_count, best, (double)(t1 - t0) / 1000.0, st->overwrite_count);
+            printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d copy_ms=%.1f det_ms=%.1f overwritten=%" PRIu64 "\n",
+                   seq, det_count, best, copy_ms, (double)(t1 - t0) / 1000.0, st->overwrite_count);
         }
         fflush(stdout);
     }
 
-    free(det_input); free(crop);
+    free(cached_bgrx); free(det_input); free(crop);
     return NULL;
 }
 
