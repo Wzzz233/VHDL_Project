@@ -99,7 +99,7 @@ static void usage(const char *prog)
             "  --drm-card <path>             DRM card (default: /dev/dri/card0)\n"
             "  --connector-id <id>           Optional KMS connector id\n"
             "  --no-display                  Disable HDMI/KMS display\n"
-            "  --display-sync <0|1>          kmssink sync (default: 1)\n"
+            "  --display-sync <0|1>          kmssink sync (default: 0)\n"
             "  --frames <n>                  Frame budget; 0 = forever (default: 0)\n"
             "  --fps <n>                     Capture throttle FPS (default: 10)\n"
             "  --min-plate-conf <v>          Detector threshold (default: 0.50)\n"
@@ -139,11 +139,13 @@ static void defaults(struct live_options *o)
     o->pixel_order = PIXEL_ORDER_BGR565;
     o->swap16 = false;
     o->display = true;
-    /* Default to vblank-synced presentation: kmssink sync=TRUE gates buffer
-     * pushes on the display clock, which is what eliminates the horizontal
-     * tearing seen when pushing 30fps BGRx into a 60fps HDMI mode. The sibling
-     * fpga_hdmi_display.c also defaults sync on. */
-    o->display_sync = true;
+    /* sync=FALSE: on this board kmssink sync=TRUE only page-flips a handful of
+     * frames per second (30fps PTS does not divide evenly into the 60Hz vblank,
+     * so most frames wait for an alignment that never comes). sync=FALSE lets
+     * kmssink flip as buffers arrive, which is what gives a smooth 30fps. The
+     * sibling fpga_hdmi_display.c defaults sync on but only proved stable at
+     * 15fps; at 30fps we must default off. */
+    o->display_sync = false;
     o->det_zero_copy = false;
     o->dump_frames = 0;
     o->dump_path = NULL;

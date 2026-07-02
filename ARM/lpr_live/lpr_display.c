@@ -353,11 +353,13 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
                                "width", G_TYPE_INT, (int)w, "height", G_TYPE_INT, (int)h,
                                "framerate", GST_TYPE_FRACTION, opt->fps, 1, NULL);
     if (!caps) return -1;
-    /* do-timestamp is intentionally FALSE: we stamp PTS ourselves from the
-     * real monotonic capture clock. With do-timestamp on, GStreamer would
-     * overwrite PTS at push time, racing our value and producing the uneven
-     * presentation that kmssink sync turns into visible stutter. */
-    g_object_set(d->appsrc, "caps", caps, "is-live", TRUE, "do-timestamp", FALSE,
+    /* do-timestamp must be TRUE for is-live appsrc: it stamps buffers with the
+     * pipeline clock so the live source throttles correctly. Disabling it (as
+     * an earlier attempt did) left is-live without a valid time base and the
+     * display stuttered at sync=0 even though cadence logs showed 30fps push.
+     * Matches the proven fpga_hdmi_display.c config. The incrementing PTS we
+     * also set is simply overwritten by the timestamp. */
+    g_object_set(d->appsrc, "caps", caps, "is-live", TRUE, "do-timestamp", TRUE,
                  "format", GST_FORMAT_TIME, "block", FALSE,
                  "max-bytes", (guint64)d->frame_size * 2U, NULL);
     gst_caps_unref(caps);
