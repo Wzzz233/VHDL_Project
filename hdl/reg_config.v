@@ -477,9 +477,9 @@ always@(reg_index)
 	                    (OV5640_NOISE_PRESET == OV5640_NOISE_PRESET_LOW_NOISE_BALANCED) ? 24'h530c04 : 24'h530c06 ;//
 	 306  :reg_data <=24'h502500 ;//        
 	 307  :reg_data <=24'h300802 ;//       
-  //720 30帧/秒, night mode 5fps ;//
-  //input clock=24Mhz,PCLK=84Mhz ;//         
-	 308  :reg_data <=24'h303521 ;//PLL      
+  //720 60帧/秒 (原30fps; 改 0x3035 SysDiv 2->1 使 SYSCLK 翻倍) ;//
+  //input clock=24Mhz, 0x3035=0x11 -> PCLK≈168Mhz (超 DVP 96Mhz 上限, 需 FPGA 验证) ;//         
+	 308  :reg_data <=24'h303511 ;//PLL 60fps: SysDiv=1 (30fps was 0x21=SysDiv=2)      
 	 309  :reg_data <=24'h303669 ;//PLL     
      310  :reg_data <=24'h3c0708 ;//        
 	 311  :reg_data <=24'h382047 ;//        
