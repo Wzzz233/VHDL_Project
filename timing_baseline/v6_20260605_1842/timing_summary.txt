@@ -1,0 +1,50 @@
+=== V6 Baseline Timing Summary (2026-06-05 18:42) ===
+Source: report_timing/pcie_dma_ddr3_cam1.rtr
+Tool: Fabric Compiler 2022.2-SP6.4 (build 146967)
+Top module: pcie_dma_ddr3_cam1
+Device: Logos2 PG2L50H FBG484 -6
+Convergence: OK (single seed, 100% pass)
+
+=== Performance Summary (Setup, Slow Corner) ===
+Clock            Freq(MHz)   Est(MHz)    Period(ns)  Est(ns)  Slack(ns)
+ pclk            250.00      332.34      4.000       3.009    0.991
+ pclk_div2       125.00      136.30      8.000       7.337    0.663
+ ref_clk         100.00      229.57      10.000      4.356    5.644
+ cmos1_pclk      84.03       116.71      11.900      8.568    3.332
+ cfg_clk         37.13       369.69      26.936      2.705    24.231
+ ddr_rst_clk     25.00       303.40      40.000      3.296    36.704
+ ddrphy_sysclk   131.25      175.44      7.619       5.700    1.919
+
+=== Setup WNS per Clock Domain (Slow Corner) ===
+Launch          Capture         WNS(ns)    TNS(ns)    Failing  Total
+pclk           pclk           0.991      0.000      0        1027
+pclk_div2      pclk           1.440      0.000      0        2
+pclk_div2      pclk_div2      0.663      0.000      0        18830
+ref_clk        ref_clk        5.644      0.000      0        2019
+cmos1_pclk     cmos1_pclk     3.332      0.000      0        489
+cfg_clk        cfg_clk        24.231     0.000      0        25
+ddr_rst_clk    ddr_rst_clk    36.704     0.000      0        437
+ddrphy_sysclk  ddrphy_sysclk  1.919      0.000      0        11698
+
+=== Hold WHS per Clock Domain (Slow Corner) ===
+Launch          Capture         WHS(ns)    THS(ns)    Failing  Total
+pclk           pclk           0.241      0.000      0        1027
+pclk_div2      pclk           0.897      0.000      0        2
+pclk_div2      pclk_div2      0.143      0.000      0        18830
+ref_clk        ref_clk        0.148      0.000      0        2019
+cmos1_pclk     cmos1_pclk     0.105      0.000      0        489
+cfg_clk        cfg_clk        0.342      0.000      0        25
+ddr_rst_clk    ddr_rst_clk    0.220      0.000      0        437
+ddrphy_sysclk  ddrphy_sysclk  0.144      0.000      0        11698
+
+=== Resource Utilization ===
+LUT:    6,130 / 26,300  (24%)
+FF:     6,793 / 52,600  (13%)
+LUT-FF: 3,482 / 26,300  (14%)
+
+=== Hold ===
+No hold violation. Hold WHS all positive (min 0.105ns), THS=0.
+
+=== Warnings ===
+Timing-4086 (unconstrained input):  19   (DDR3 mem_dq PHY pins, normal)
+Timing-4087 (unconstrained output): 58   (DDR3 mem_*/cmos1_scl PHY pins, normal)

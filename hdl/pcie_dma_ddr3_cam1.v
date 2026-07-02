@@ -191,6 +191,11 @@ wire	[127:0]	mwr_rd_data;
 wire			mwr_cmd_start;
 wire			frame_done_pulse;
 
+// BAR1 passthrough for I2C control (OV5640 register write)
+wire			bar1_pt_wr_en;
+wire	[11:0]	bar1_pt_wr_addr;
+wire	[127:0]	bar1_pt_wr_data;
+
 wire			cfg_msi_en;
 wire			ven_msi_grant;
 wire			ven_msi_req;
@@ -414,7 +419,7 @@ ips2l_pcie_dma #(
     .o_axis_slave1_tuser	(axis_slave1_tuser),		
 
 	// AXI4-Stream slave2 interface
-	// Stability hotfix: keep raw ready to avoid frame-mode deadlock on long run.
+	// Keep raw ready here; gating this path can deadlock frame-mode MWR.
     .i_axis_slave2_trdy		(axis_slave2_tready_raw),
     .o_axis_slave2_tvld		(axis_slave2_tvalid),		
     .o_axis_slave2_tdata	(axis_slave2_tdata),		
@@ -447,7 +452,12 @@ ips2l_pcie_dma #(
     .o_bar2_rd_clk_en_ext	(mwr_rd_clk_en),
     .o_bar2_rd_addr_ext		(mwr_rd_addr),
     .i_ext_bar2_rd_data		(mwr_rd_data),
-    .i_ext_bar2_rd_sel		(1'b1)				// Always use external frame data
+    .i_ext_bar2_rd_sel		(1'b1),				// Always use external frame data
+
+	// BAR1 passthrough interface
+    .o_bar1_pt_wr_en	(bar1_pt_wr_en),
+    .o_bar1_pt_wr_addr	(bar1_pt_wr_addr),
+    .o_bar1_pt_wr_data	(bar1_pt_wr_data)
 );
 
 // CFG CTRL
@@ -704,7 +714,13 @@ reg_config #(
     .i2c_sdat       (cmos1_sda),        // I2C data bidirectional
     .reg_conf_done  (cmos1_init_done),  // Configuration done flag
     .reg_index      (),                 // Debug: current register index
-    .clock_20k      ()                  // Debug: I2C clock
+    .clock_20k      (),                 // Debug: I2C clock
+
+	// Passthrough I2C interface (from BAR1 write)
+    .pt_sys_clk         (sys_clk),
+    .pt_bar1_wr_en      (bar1_pt_wr_en),
+    .pt_bar1_wr_addr    (bar1_pt_wr_addr),
+    .pt_bar1_wr_data    (bar1_pt_wr_data[31:0])
 );
 
 hsst_rst_sync_v1_0 u_cmos1_init_done_sync (

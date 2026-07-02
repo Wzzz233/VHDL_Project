@@ -1184,3 +1184,244 @@ gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {4
 remove_design -verilog "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/i2c_com.v"
 set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
 compile -top_module pcie_dma_ddr3_cam1
+add_design "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/i2c_com.v"
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+synthesize -ads -selected_syn_tool_opt 2 
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+add_design "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/pcie_dma_ddr3_cam1.v"
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module {pcie_dma_ddr3_cam1} -top_module pcie_dma_ddr3_cam1
+add_design "C:/Users/Wzzz2/OneDrive/Desktop/project_test/hdl/pcie_dma_ddr3_cam1.v"
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module {pcie_dma_ddr3_cam1} -top_module pcie_dma_ddr3_cam1
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+report_timing -force_to_run 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 
+set_arch -family Logos2 -device PG2L50H -speedgrade -6 -package FBG484
+compile -top_module pcie_dma_ddr3_cam1
+synthesize -ads -selected_syn_tool_opt 2 
+dev_map 
+pnr 
+report_timing 
+gen_bit_stream -compress_bitstream true -master_configuration_clock_frequency {40M} 

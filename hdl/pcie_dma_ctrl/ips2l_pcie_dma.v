@@ -83,7 +83,12 @@ module ips2l_pcie_dma #(
     output  wire                        o_bar2_rd_clk_en_ext    ,
     output  wire    [ADDR_WIDTH-1:0]    o_bar2_rd_addr_ext      ,
     input           [127:0]             i_ext_bar2_rd_data      ,
-    input                               i_ext_bar2_rd_sel           // 1=use external data
+    input                               i_ext_bar2_rd_sel,          // 1=use external data
+    //**********************************************************************
+    //bar1 passthrough interface (for I2C passthrough to OV5640)
+    output  wire                        o_bar1_pt_wr_en         ,
+    output  wire    [ADDR_WIDTH-1:0]    o_bar1_pt_wr_addr       ,
+    output  wire    [127:0]             o_bar1_pt_wr_data
     //debug
     //output  wire    [159:0]             o_dbg_bus
 );
@@ -509,5 +514,13 @@ generate
         assign o_axis_slave2_tuser  = dma_axis_slave2_tuser ;
     end
 endgenerate
+
+//**********************************************************************
+// BAR1 passthrough output assignments
+// Expose internal bar1_wr_en/addr/data to top-level for I2C passthrough
+//**********************************************************************
+assign o_bar1_pt_wr_en   = bar1_wr_en;
+assign o_bar1_pt_wr_addr = bar1_wr_addr;
+assign o_bar1_pt_wr_data = bar1_wr_data;
 
 endmodule

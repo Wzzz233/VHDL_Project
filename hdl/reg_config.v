@@ -32,7 +32,12 @@
 		  output reg [8:0]reg_index,
 		  output reg ack_fail_sticky,
 		  output reg [8:0]ack_fail_first_index,
-		  output reg [8:0]ack_fail_count
+		  output reg [8:0]ack_fail_count,
+	  // Passthrough I2C interface (from BAR1 write, synchronised to pt_sys_clk)
+	  input               pt_sys_clk,
+	  input               pt_bar1_wr_en,
+	  input      [11:0]   pt_bar1_wr_addr,
+	  input      [31:0]   pt_bar1_wr_data
 	  );
 
      reg [15:0]clock_20k_cnt;
@@ -44,6 +49,36 @@
 	 reg reg_conf_done_reg;
 	 wire ack;
 	 wire tr_end;
+
+	 // Passthrough CDC signals
+	 reg [1:0] pt_req_sync;
+	 reg       pt_req_prev;
+	 reg       pt_pending;
+	 reg [23:0] pt_cmd_hold;
+	 reg       pt_ack_from_20k;
+	 reg       pt_ack_prev;
+
+// synopsys translate_off
+initial begin
+    clock_20k_cnt       = 16'd0;
+    post_reset_wait_cnt = 16'd0;
+    config_step         = 2'd0;
+    i2c_data            = 32'd0;
+    reg_data            = 24'd0;
+    start               = 1'd0;
+    reg_conf_done_reg   = 1'd0;
+    reg_index           = 9'd0;
+    ack_fail_sticky     = 1'd0;
+    ack_fail_first_index= 9'd0;
+    ack_fail_count      = 9'd0;
+    pt_req_sync         = 2'd0;
+    pt_req_prev         = 1'd0;
+    pt_pending          = 1'd0;
+    pt_cmd_hold         = 24'd0;
+    pt_ack_from_20k     = 1'd0;
+    pt_ack_prev         = 1'd0;
+end
+// synopsys translate_on
 
 	 localparam [8:0] REG_INDEX_START        = 9'd0;
 	 localparam [8:0] REG_INDEX_SOFT_RESET   = 9'd1;
@@ -87,6 +122,38 @@ begin
    else begin
          clock_20k<=!clock_20k;
          clock_20k_cnt<=0;
+   end
+end
+
+//=============================================================================
+// Passthrough CDC: synchronise BAR1 write from pclk_div2 domain to clk_25M
+// Captures write to BAR1+0x200 and holds pt_pending until processed
+//=============================================================================
+always@(posedge pt_sys_clk or negedge camera_rstn)
+begin
+   if(!camera_rstn) begin
+       pt_req_sync     <= 2'b00;
+       pt_req_prev     <= 1'b0;
+       pt_pending      <= 1'b0;
+       pt_cmd_hold     <= 24'b0;
+   end
+   else begin
+       // 2-flop synchroniser for BAR1 write enable
+       pt_req_sync[0] <= pt_bar1_wr_en;
+       pt_req_sync[1] <= pt_req_sync[0];
+
+       // Rising edge detect on synchronised write strobe
+       pt_req_prev <= pt_req_sync[1];
+       // Guard !pt_pending prevents re-triggering while a passthrough write
+       // is in progress (CDC runs at 25MHz, I2C state machine at 20kHz).
+       if(pt_req_sync[1] && !pt_req_prev && !pt_pending && pt_bar1_wr_addr[11:0] == 12'h200) begin
+           pt_pending  <= 1'b1;
+           pt_cmd_hold <= pt_bar1_wr_data[23:0];  // {regH, regL, data}
+       end
+       // Clear when passthrough write completes (edge-detect: ack is 100us wide)
+       pt_ack_prev <= pt_ack_from_20k;
+       if(pt_ack_from_20k && !pt_ack_prev)
+           pt_pending <= 1'b0;
    end
 end
 
@@ -154,8 +221,38 @@ begin
 			 else 
 				reg_conf_done_reg<=1'b1;                //OV5640鐎靛嫬鐡ㄩ崳銊ュ灥婵瀵茬€瑰本鍨?
       end
+      // === Passthrough mode: inject I2C write when pt_pending asserted after init ===
+      else if(reg_conf_done_reg==1'b1) begin
+          case(config_step)
+          0: if(pt_pending) begin
+                 i2c_data   <= {8'h78, pt_cmd_hold};  // {dev_addr, regH, regL, data}
+                 start      <= 1;
+                 config_step <= 1;
+             end
+          1: if(tr_end) begin
+                 start      <= 0;
+                 config_step <= 2;
+             end
+          2: begin
+                 config_step <= 0;
+             end
+          endcase
+      end
    end
  end
+
+//=============================================================================
+// Passthrough ack: single-cycle pulse when passthrough I2C write completes
+//=============================================================================
+always@(posedge clock_20k or negedge camera_rstn)
+begin
+   if(!camera_rstn)
+       pt_ack_from_20k <= 1'b0;
+   else if((config_step == 2) && pt_pending)
+       pt_ack_from_20k <= 1'b1;
+   else
+       pt_ack_from_20k <= 1'b0;
+end
 
 ////iic闇€瑕侀厤缃殑瀵勫瓨鍣ㄥ€?
 always@(reg_index)

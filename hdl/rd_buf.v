@@ -247,7 +247,9 @@ module rd_buf #(
             locked_frame_idx <= 2'd0;
         else if(wr_rst)
         begin
-            // 3-bank mode: read the previously completed frame bank.
+            // 3-bank mode: read the previously completed frame bank. Reading
+            // two banks behind adds a full frame of latency and did not address
+            // the observed HDMI scanout tear.
             case (i_wr_frame_idx)
                 2'd0: locked_frame_idx <= 2'd2;
                 2'd1: locked_frame_idx <= 2'd0;
