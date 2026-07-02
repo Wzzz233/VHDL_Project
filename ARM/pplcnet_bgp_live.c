@@ -598,12 +598,19 @@ int main(int argc, char **argv)
      * when moving objects were sampled at irregular intervals. Mirrors the
      * pacing used by fpga_hdmi_display.c. */
     int64_t next_frame_us = lpr_mono_us() + target_us;
+    /* Per-stage timing accumulators for a 1s cadence dump, to localize where
+     * wall-clock time goes when the display appears to drop frames. */
+    int64_t stat_last_us = lpr_mono_us();
+    int64_t stat_dma_us = 0, stat_overlay_us = 0, stat_push_us = 0, stat_sleep_us = 0;
+    int stat_frames = 0;
     for (int frame = 0; !g_stop && (opt.frames == 0 || frame < opt.frames); frame++) {
         struct live_result latest;
         bool has_overlay;
         int slot;
         uint8_t *slot_frame;
+        int64_t ts_a, ts_b, ts_c, ts_d;
 
+        ts_a = lpr_mono_us();
         slot = lpr_dma_acquire_slot(&dma);
         if (lpr_dma_read_frame_slot(&dma, slot) < 0) {
             lpr_dma_slot_release(&dma, slot);
@@ -616,6 +623,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "[bgp-live] DMA slot data missing\n");
             goto out;
         }
+        ts_b = lpr_mono_us();
 
         /* Optional raw-frame dump: write the captured BGRX frame verbatim,
          * before any overlay drawing, so a stored frame reflects exactly what
@@ -643,6 +651,9 @@ int main(int argc, char **argv)
 
         lpr_infer_submit_latest(&infer, slot_frame, lpr_dma_slot_generation(&dma, slot));
         has_overlay = lpr_infer_get_result(&infer, &latest);
+        ts_c = lpr_mono_us();
+        stat_dma_us += ts_b - ts_a;
+        stat_overlay_us += ts_c - ts_b;
 
         if (opt.display) {
             if (has_overlay) {
@@ -668,9 +679,14 @@ int main(int argc, char **argv)
             }
             if (lpr_display_push_bgrx_slot(&display, &dma, slot) < 0)
                 goto out;
+            ts_d = lpr_mono_us();
+            stat_push_us += ts_d - ts_c;
+        } else {
+            ts_d = ts_c;
         }
 
         lpr_dma_slot_release(&dma, slot);
+        stat_frames++;
         {
             /* Advance the grid by exactly one frame period; if we fell behind
              * by more than a whole period (slow frame), resync to now to avoid
@@ -680,11 +696,28 @@ int main(int argc, char **argv)
             if (now > next_frame_us + target_us)
                 next_frame_us = now + target_us;
             if (next_frame_us > now) {
+                int64_t pre = lpr_mono_us();
                 struct timespec ts;
                 ts.tv_sec = (time_t)(next_frame_us / 1000000LL);
                 ts.tv_nsec = (long)((next_frame_us % 1000000LL) * 1000LL);
                 clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+                stat_sleep_us += lpr_mono_us() - pre;
             }
+        }
+        int64_t now = lpr_mono_us();
+        if (now - stat_last_us >= 1000000LL) {
+            int64_t total = now - stat_last_us;
+            fprintf(stderr,
+                    "[bgp-live] cadence: frames=%d total=%.0fms dma=%.1fms overlay=%.1fms "
+                    "push=%.1fms sleep=%.1fms (per-frame avg)\n",
+                    stat_frames, total / 1000.0,
+                    (double)stat_dma_us / stat_frames / 1000.0,
+                    (double)stat_overlay_us / stat_frames / 1000.0,
+                    (double)stat_push_us / stat_frames / 1000.0,
+                    (double)stat_sleep_us / stat_frames / 1000.0);
+            stat_last_us = now;
+            stat_dma_us = stat_overlay_us = stat_push_us = stat_sleep_us = 0;
+            stat_frames = 0;
         }
     }
     ret = 0;
