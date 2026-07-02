@@ -441,16 +441,15 @@ int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, i
         display_slot_release(cookie);
         return -1;
     }
-    /* Stamp with the real capture instant so kmssink sync aligns presentation
-     * to when this frame was actually grabbed, not a synthetic匀速 grid. Base
-     * the pipeline clock on the monotonic clock the capture loop uses. */
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    guint64 pts_ns = (guint64)ts.tv_sec * GST_SECOND +
-                     (guint64)ts.tv_nsec;
-    GST_BUFFER_PTS(buf) = pts_ns;
+    /* PTS must be on the GStreamer pipeline time base, which starts at 0 when
+     * the pipeline goes PLAYING — NOT the raw monotonic clock. Using raw
+     * clock_gettime ns as PTS made kmssink (sync=TRUE) think frames were far
+     * in the future and freeze the display while capture/inference kept
+     * running. A uniform incrementing PTS from 0 is what fpga_hdmi_display
+     * uses and is what kmssink sync expects. */
+    GST_BUFFER_PTS(buf) = d->next_pts_ns;
     GST_BUFFER_DURATION(buf) = (guint64)(GST_SECOND / d->fps);
-    d->next_pts_ns = pts_ns;
+    d->next_pts_ns += GST_BUFFER_DURATION(buf);
     flow = gst_app_src_push_buffer(GST_APP_SRC(d->appsrc), buf);
     return flow == GST_FLOW_OK ? 0 : -1;
 }
