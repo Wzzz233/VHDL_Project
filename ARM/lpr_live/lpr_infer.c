@@ -106,19 +106,26 @@ bool lpr_infer_get_result(struct infer_state *st, struct live_result *res)
     return valid;
 }
 
-void lpr_infer_submit_latest(struct infer_state *st, const uint8_t *bgrx, uint64_t generation)
+void lpr_infer_submit_latest(struct infer_state *st, int slot, uint64_t generation)
 {
     pthread_mutex_lock(&st->lock);
     if (st->has_new) {
+        /* Infer thread still busy with the previous submission; drop this one.
+         * Release the addref we are about to skip. */
         st->overwrite_count++;
+        if (slot >= 0)
+            lpr_dma_slot_release(st->dma, slot);
         pthread_mutex_unlock(&st->lock);
         return;
     }
-    int64_t t0 = lpr_mono_us();
-    memcpy(st->pending_bgrx, bgrx, st->bgrx_size);
-    int64_t t1 = lpr_mono_us();
+    /* Addref the slot so the infer thread can copy it asynchronously without
+     * the display loop reclaiming it. No memcpy here — that is the whole point
+     * of keeping it off the display critical path. */
+    if (slot >= 0)
+        lpr_dma_slot_addref(st->dma, slot);
+    st->pending_slot = slot;
     st->latest_generation = generation;
-    st->latest_copy_ms = (double)(t1 - t0) / 1000.0;
+    st->latest_copy_ms = 0.0;
     st->seq++;
     st->has_new = true;
     pthread_cond_signal(&st->cond);
@@ -159,13 +166,23 @@ static void *thread_main(void *arg)
         }
         generation = st->latest_generation;
         seq = st->seq;
-        copy_ms = st->latest_copy_ms;
-        uint8_t *tmp = st->processing_bgrx;
-        st->processing_bgrx = st->pending_bgrx;
-        st->pending_bgrx = tmp;
+        int pending_slot = st->pending_slot;
+        st->pending_slot = -1;
         st->has_new = false;
-        bgrx = st->processing_bgrx;
         pthread_mutex_unlock(&st->lock);
+
+        /* Copy the submitted DMA slot into our private buffer OUTSIDE the lock
+         * so the display loop is never blocked by this 3.6MB memcpy. The slot
+         * was addref'd at submit time; release it once the copy is done. */
+        const uint8_t *src = (pending_slot >= 0) ? lpr_dma_slot_data(st->dma, pending_slot) : NULL;
+        int64_t tc0 = lpr_mono_us();
+        if (src)
+            memcpy(st->processing_bgrx, src, st->bgrx_size);
+        int64_t tc1 = lpr_mono_us();
+        copy_ms = (double)(tc1 - tc0) / 1000.0;
+        if (pending_slot >= 0)
+            lpr_dma_slot_release(st->dma, pending_slot);
+        bgrx = st->processing_bgrx;
 
         memset(&res, 0, sizeof(res));
         res.frame_slot = -1;
@@ -308,6 +325,7 @@ int lpr_infer_start(struct infer_state *st, const struct live_options *opt,
     st->bgrx_size = (size_t)frame_w * (size_t)frame_h * 4U;
     st->pending_bgrx = malloc(st->bgrx_size);
     st->processing_bgrx = malloc(st->bgrx_size);
+    st->pending_slot = -1;
     st->result.frame_slot = -1;
     if (!st->pending_bgrx || !st->processing_bgrx) {
         free(st->pending_bgrx);

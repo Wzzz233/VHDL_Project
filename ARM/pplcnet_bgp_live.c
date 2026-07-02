@@ -651,7 +651,7 @@ int main(int argc, char **argv)
             }
         }
 
-        lpr_infer_submit_latest(&infer, slot_frame, lpr_dma_slot_generation(&dma, slot));
+        lpr_infer_submit_latest(&infer, slot, lpr_dma_slot_generation(&dma, slot));
         has_overlay = lpr_infer_get_result(&infer, &latest);
         ts_c = lpr_mono_us();
         stat_dma_us += ts_b - ts_a;

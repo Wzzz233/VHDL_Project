@@ -51,6 +51,10 @@ struct infer_state {
     uint64_t overwrite_count;
     uint64_t infer_count;
     struct dma_state *dma;
+    /* Pending slot awaiting async copy by the infer thread. The main loop
+     * addrefs this slot and hands it off without copying; the infer thread
+     * memcpy's it into processing_bgrx and releases it. -1 = none pending. */
+    int pending_slot;
     int frame_w;
     int frame_h;
     struct live_result result;
@@ -73,9 +77,11 @@ int lpr_infer_start(struct infer_state *st, const struct live_options *opt,
 
 void lpr_infer_stop(struct infer_state *st);
 
-/* Submit a freshly DMA-filled BGRX slot. This copies the slot into cached
- * inference memory immediately, so display may reuse or annotate the DMA slot. */
-void lpr_infer_submit_latest(struct infer_state *st, const uint8_t *bgrx, uint64_t generation);
+/* Submit a freshly DMA-filled BGRX slot for background inference. Does NOT
+ * copy: the slot is addref'd and handed to the infer thread, which copies it
+ * asynchronously. This keeps the 3.6MB memcpy off the display critical path.
+ * The caller must NOT release the slot on behalf of the infer thread. */
+void lpr_infer_submit_latest(struct infer_state *st, int slot, uint64_t generation);
 
 /* Snapshot the most recent published result. Returns true if a valid OCR result
  * is available for overlay. The result does not own a DMA slot. */
