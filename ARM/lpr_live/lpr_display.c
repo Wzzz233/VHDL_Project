@@ -475,39 +475,29 @@ static int display_acquire_slot(struct display_state *d, struct display_slot_tic
     memset(ticket, 0, sizeof(*ticket));
     ticket->idx = -1;
     pthread_mutex_lock(&d->slots_lock);
-    for (;;) {
-        int64_t now = display_mono_us();
-        for (int i = 0; i < LPR_DISPLAY_COPY_SLOTS; i++) {
-            if (d->copy_slots[i].in_use && d->copy_slots[i].release_pending &&
-                now >= d->copy_slots[i].release_at_us) {
-                d->copy_slots[i].in_use = false;
-                d->copy_slots[i].release_pending = false;
-                d->copy_slots[i].release_at_us = 0;
-            }
-        }
-        for (int i = 0; i < LPR_DISPLAY_COPY_SLOTS; i++) {
-            if (!d->copy_slots[i].in_use) {
-                d->copy_slots[i].in_use = true;
-                d->copy_slots[i].release_pending = false;
-                d->copy_slots[i].release_at_us = 0;
-                d->copy_slots[i].generation++;
-                ticket->idx = i;
-                ticket->generation = d->copy_slots[i].generation;
-                pthread_mutex_unlock(&d->slots_lock);
-                return 0;
-            }
-        }
-        {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 20L * 1000L * 1000L;
-            if (ts.tv_nsec >= 1000000000L) {
-                ts.tv_sec++;
-                ts.tv_nsec -= 1000000000L;
-            }
-            pthread_cond_timedwait(&d->slots_cond, &d->slots_lock, &ts);
+    int64_t now = display_mono_us();
+    for (int i = 0; i < LPR_DISPLAY_COPY_SLOTS; i++) {
+        if (d->copy_slots[i].in_use && d->copy_slots[i].release_pending &&
+            now >= d->copy_slots[i].release_at_us) {
+            d->copy_slots[i].in_use = false;
+            d->copy_slots[i].release_pending = false;
+            d->copy_slots[i].release_at_us = 0;
         }
     }
+    for (int i = 0; i < LPR_DISPLAY_COPY_SLOTS; i++) {
+        if (!d->copy_slots[i].in_use) {
+            d->copy_slots[i].in_use = true;
+            d->copy_slots[i].release_pending = false;
+            d->copy_slots[i].release_at_us = 0;
+            d->copy_slots[i].generation++;
+            ticket->idx = i;
+            ticket->generation = d->copy_slots[i].generation;
+            pthread_mutex_unlock(&d->slots_lock);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&d->slots_lock);
+    return 1;
 }
 
 int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, int slot)
@@ -523,8 +513,15 @@ int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, i
     frame = lpr_dma_slot_data(dma, slot);
     if (!frame) return -1;
 
-    if (display_acquire_slot(d, &ticket) < 0)
-        return -1;
+    {
+        int ar = display_acquire_slot(d, &ticket);
+        if (ar < 0)
+            return -1;
+        if (ar > 0) {
+            d->dropped_frames++;
+            return 0;
+        }
+    }
     memcpy(d->copy_slots[ticket.idx].data, frame, d->frame_size);
 
     cookie = g_new0(struct display_frame_cookie, 1);

@@ -617,6 +617,7 @@ infer_ready:
      * wall-clock time goes when the display appears to drop frames. */
     int64_t stat_last_us = lpr_mono_us();
     int64_t stat_dma_us = 0, stat_overlay_us = 0, stat_push_us = 0, stat_sleep_us = 0;
+    uint64_t stat_display_drop = display.dropped_frames;
     int stat_frames = 0;
     for (int frame = 0; !g_stop && (opt.frames == 0 || frame < opt.frames); frame++) {
         struct live_result latest;
@@ -728,13 +729,15 @@ infer_ready:
             int64_t total = now - stat_last_us;
             fprintf(stderr,
                     "[bgp-live] cadence: frames=%d total=%.0fms dma=%.1fms overlay=%.1fms "
-                    "push=%.1fms sleep=%.1fms (per-frame avg)\n",
+                    "push=%.1fms sleep=%.1fms display_drop=%llu (per-frame avg)\n",
                     stat_frames, total / 1000.0,
                     (double)stat_dma_us / stat_frames / 1000.0,
                     (double)stat_overlay_us / stat_frames / 1000.0,
                     (double)stat_push_us / stat_frames / 1000.0,
-                    (double)stat_sleep_us / stat_frames / 1000.0);
+                    (double)stat_sleep_us / stat_frames / 1000.0,
+                    (unsigned long long)(display.dropped_frames - stat_display_drop));
             stat_last_us = now;
+            stat_display_drop = display.dropped_frames;
             stat_dma_us = stat_overlay_us = stat_push_us = stat_sleep_us = 0;
             stat_frames = 0;
         }
