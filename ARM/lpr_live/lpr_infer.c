@@ -143,19 +143,10 @@ static void *thread_main(void *arg)
         struct det_box dets[MAX_DETS];
         int det_count = 0;
         int best = -1;
-        int crop_w = 0, crop_h = 0;
-        char text[64] = "";
-        float conf = 0.0f;
-        struct ocr_decode_diag diag;
-        struct ocr_timing ocr_timing;
+        int processed = 0;
         struct det_timing det_timing;
-        enum plate_color color = PLATE_COLOR_UNKNOWN;
-        enum lpr_route_id route_id = LPR_ROUTE_BLUE;
-        const char *route_name = "blue";
-        int ptype_cls = LPR_PTYPE_UNKNOWN;
-        float ptype_conf = 0.0f;
-        bool ptype_applied = false;
-        double copy_ms = 0.0, warp_ms = 0.0, color_ms = 0.0, ptype_ms = 0.0;
+        double copy_ms = 0.0;
+        double total_ocr_ms = 0.0, total_warp_ms = 0.0, total_color_ms = 0.0, total_ptype_ms = 0.0;
         int64_t t0, t1, t2;
         struct live_result res;
 
@@ -184,7 +175,8 @@ static void *thread_main(void *arg)
         memset(&det_timing, 0, sizeof(det_timing));
         if (lpr_detector_run_bgrx_timed(st->det_model, bgrx, st->frame_w, st->frame_h, det_input,
                                         st->opt->det_resize_mode, st->pose_nc, st->class_filter,
-                                        st->opt->min_conf, st->opt->nms_iou, st->opt->max_det,
+                                        st->opt->min_conf, st->opt->det_score_scale,
+                                        st->opt->nms_iou, st->opt->max_det,
                                         dets, &det_count, &det_timing) < 0) {
             fprintf(stderr, "[bgp-live] infer seq=%" PRIu64 " detector failed\n", seq);
             continue;
@@ -193,78 +185,104 @@ static void *thread_main(void *arg)
         best = lpr_detector_pick_best(dets, det_count);
         res.det_count = det_count;
         res.best = best;
-        if (best >= 0) {
+
+        for (int i = 0; i < det_count && processed < MAX_LIVE_PLATES; i++) {
+            int crop_w = 0, crop_h = 0;
+            char text[64] = "";
+            float conf = 0.0f;
+            struct ocr_decode_diag diag;
+            struct ocr_timing ocr_timing;
+            enum plate_color color = PLATE_COLOR_UNKNOWN;
+            enum lpr_route_id route_id = LPR_ROUTE_BLUE;
+            const char *route_name = "blue";
+            int ptype_cls = LPR_PTYPE_UNKNOWN;
+            float ptype_conf = 0.0f;
+            bool ptype_applied = false;
+            double warp_ms = 0.0, color_ms = 0.0, ptype_ms = 0.0;
             int64_t tw0 = lpr_mono_us();
-            bool warp_ok = lpr_warp_quad_homography_bgrx(bgrx, st->frame_w, st->frame_h, dets[best].quad,
+            bool warp_ok = lpr_warp_quad_homography_bgrx(bgrx, st->frame_w, st->frame_h, dets[i].quad,
                                                          crop, st->frame_w, st->frame_h, &crop_w, &crop_h);
             int64_t tw1 = lpr_mono_us();
             warp_ms = (double)(tw1 - tw0) / 1000.0;
-            if (warp_ok) {
-                int64_t tc0 = lpr_mono_us();
-                color = lpr_classify_plate_color_bgrx(bgrx, st->frame_w, st->frame_h, &dets[best]);
-                int64_t tc1 = lpr_mono_us();
-                color_ms = (double)(tc1 - tc0) / 1000.0;
+            total_warp_ms += warp_ms;
+            if (!warp_ok)
+                continue;
 
-                if (st->ptype_model && st->ptype_model->ctx &&
-                    lpr_ptype_run(st->ptype_model, crop, crop_w, crop_h,
-                                  &ptype_cls, &ptype_conf, &ptype_ms) == 0 &&
-                    ptype_should_apply(st->opt, ptype_cls, ptype_conf)) {
-                    route_id = pick_ptype_route(st->routes, ptype_cls);
-                    ptype_applied = true;
-                } else {
-                    route_id = pick_route(st->routes, color);
-                }
-                const struct lpr_route *route = &st->routes[route_id];
-                route_name = route->name;
+            int64_t tc0 = lpr_mono_us();
+            color = lpr_classify_plate_color_bgrx(bgrx, st->frame_w, st->frame_h, &dets[i]);
+            int64_t tc1 = lpr_mono_us();
+            color_ms = (double)(tc1 - tc0) / 1000.0;
+            total_color_ms += color_ms;
 
-                memset(&diag, 0, sizeof(diag));
-                memset(&ocr_timing, 0, sizeof(ocr_timing));
-                if (lpr_ocr_run(route->model, route->keys, st->opt->ocr_preproc_mode,
-                                route->decode_family, crop, crop_w, crop_h,
-                                text, sizeof(text), &conf, &diag, &ocr_timing) < 0) {
-                    snprintf(text, sizeof(text), "UNK");
-                    conf = 0.0f;
-                }
-                res.valid = true;
-                res.box = dets[best];
-                res.crop_w = crop_w;
-                res.crop_h = crop_h;
-                res.color = color;
-                res.ptype_cls = ptype_cls;
-                res.ptype_conf = ptype_conf;
-                res.ptype_applied = ptype_applied;
-                snprintf(res.route_name, sizeof(res.route_name), "%s", route_name);
-                snprintf(res.text, sizeof(res.text), "%s", text);
-                res.conf = conf;
-                res.blank_ratio = diag.blank_top1_ratio;
+            if (st->ptype_model && st->ptype_model->ctx &&
+                lpr_ptype_run(st->ptype_model, crop, crop_w, crop_h,
+                              &ptype_cls, &ptype_conf, &ptype_ms) == 0 &&
+                ptype_should_apply(st->opt, ptype_cls, ptype_conf)) {
+                route_id = pick_ptype_route(st->routes, ptype_cls);
+                ptype_applied = true;
+            } else {
+                route_id = pick_route(st->routes, color);
             }
+            total_ptype_ms += ptype_ms;
+            const struct lpr_route *route = &st->routes[route_id];
+            route_name = route->name;
+
+            memset(&diag, 0, sizeof(diag));
+            memset(&ocr_timing, 0, sizeof(ocr_timing));
+            if (lpr_ocr_run(route->model, route->keys, st->opt->ocr_preproc_mode,
+                            route->decode_family, crop, crop_w, crop_h,
+                            text, sizeof(text), &conf, &diag, &ocr_timing) < 0) {
+                snprintf(text, sizeof(text), "UNK");
+                conf = 0.0f;
+            }
+            total_ocr_ms += ocr_timing.prep_ms + ocr_timing.input_ms + ocr_timing.run_ms +
+                            ocr_timing.output_ms + ocr_timing.decode_ms;
+
+            struct live_plate_result *plate = &res.plates[processed++];
+            plate->box = dets[i];
+            plate->crop_w = crop_w;
+            plate->crop_h = crop_h;
+            plate->color = color;
+            plate->ptype_cls = ptype_cls;
+            plate->ptype_conf = ptype_conf;
+            plate->ptype_applied = ptype_applied;
+            snprintf(plate->route_name, sizeof(plate->route_name), "%s", route_name);
+            snprintf(plate->text, sizeof(plate->text), "%s", text);
+            plate->conf = conf;
+            plate->blank_ratio = diag.blank_top1_ratio;
+
+            printf("[bgp-live] plate_seq=%" PRIu64 " idx=%d cls=%d det_conf=%.3f color=%s "
+                   "ptype=%s ptype_conf=%.3f ptype_apply=%d route=%s box=[%d,%d,%d,%d] crop=%dx%d "
+                   "text=%s conf=%.3f blank=%.3f warp_ms=%.1f color_ms=%.1f ptype_ms=%.1f "
+                   "prep_ms=%.1f in_ms=%.1f run_ms=%.1f out_ms=%.1f dec_ms=%.1f\n",
+                   seq, i, dets[i].cls, dets[i].conf, lpr_plate_color_str(color), lpr_ptype_class_str(ptype_cls),
+                   ptype_conf, ptype_applied ? 1 : 0, route_name,
+                   dets[i].x1, dets[i].y1, dets[i].x2, dets[i].y2,
+                   crop_w, crop_h, text, conf, diag.blank_top1_ratio,
+                   warp_ms, color_ms, ptype_ms, ocr_timing.prep_ms, ocr_timing.input_ms,
+                   ocr_timing.run_ms, ocr_timing.output_ms, ocr_timing.decode_ms);
         }
+
+        res.result_count = processed;
+        res.valid = processed > 0;
         t2 = lpr_mono_us();
         st->infer_count++;
         publish_result(st, &res);
         if (res.valid) {
-            printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d cls=%d color=%s "
-                   "ptype=%s ptype_conf=%.3f ptype_apply=%d route=%s box=[%d,%d,%d,%d] crop=%dx%d "
-                   "text=%s conf=%.3f blank=%.3f copy_ms=%.1f detocr_ms=%.1f det_ms=%.1f "
-                   "det_prep_ms=%.1f det_in_ms=%.1f det_run_ms=%.1f det_out_ms=%.1f det_dec_ms=%.1f det_nms_ms=%.1f ocr_ms=%.1f "
-                   "warp_ms=%.1f color_ms=%.1f ptype_ms=%.1f prep_ms=%.1f in_ms=%.1f run_ms=%.1f out_ms=%.1f dec_ms=%.1f overwritten=%" PRIu64 "\n",
-                   seq, det_count, best, dets[best].cls,
-                   lpr_plate_color_str(color), lpr_ptype_class_str(ptype_cls), ptype_conf,
-                   ptype_applied ? 1 : 0, route_name,
-                   dets[best].x1, dets[best].y1, dets[best].x2, dets[best].y2,
-                   crop_w, crop_h, text, conf, diag.blank_top1_ratio, copy_ms,
+            printf("[bgp-live] infer_seq=%" PRIu64 " det=%d results=%d best=%d copy_ms=%.1f detocr_ms=%.1f det_ms=%.1f "
+                   "det_prep_ms=%.1f det_in_ms=%.1f det_run_ms=%.1f det_out_ms=%.1f det_dec_ms=%.1f det_nms_ms=%.1f "
+                   "ocr_total_ms=%.1f warp_total_ms=%.1f color_total_ms=%.1f ptype_total_ms=%.1f overwritten=%" PRIu64 "\n",
+                   seq, det_count, processed, best, copy_ms,
                    (double)(t2 - t0) / 1000.0,
                    (double)(t1 - t0) / 1000.0,
                    det_timing.prep_ms, det_timing.input_ms, det_timing.run_ms,
                    det_timing.output_ms, det_timing.decode_ms, det_timing.nms_ms,
-                   (double)(t2 - t1) / 1000.0,
-                   warp_ms, color_ms, ptype_ms, ocr_timing.prep_ms, ocr_timing.input_ms,
-                   ocr_timing.run_ms, ocr_timing.output_ms, ocr_timing.decode_ms,
+                   total_ocr_ms, total_warp_ms, total_color_ms, total_ptype_ms,
                    st->overwrite_count);
         } else {
-            printf("[bgp-live] infer_seq=%" PRIu64 " det=%d best=%d copy_ms=%.1f det_ms=%.1f "
+            printf("[bgp-live] infer_seq=%" PRIu64 " det=%d results=%d best=%d copy_ms=%.1f det_ms=%.1f "
                    "det_prep_ms=%.1f det_in_ms=%.1f det_run_ms=%.1f det_out_ms=%.1f det_dec_ms=%.1f det_nms_ms=%.1f overwritten=%" PRIu64 "\n",
-                   seq, det_count, best, copy_ms, (double)(t1 - t0) / 1000.0,
+                   seq, det_count, processed, best, copy_ms, (double)(t1 - t0) / 1000.0,
                    det_timing.prep_ms, det_timing.input_ms, det_timing.run_ms,
                    det_timing.output_ms, det_timing.decode_ms, det_timing.nms_ms,
                    st->overwrite_count);

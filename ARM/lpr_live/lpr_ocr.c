@@ -15,6 +15,20 @@ static const char *tensor_fmt_name(int fmt)
     return fmt == RKNN_TENSOR_NCHW ? "NCHW" : (fmt == RKNN_TENSOR_NHWC ? "NHWC" : "OTHER");
 }
 
+static const char *tensor_type_name(int type)
+{
+    switch (type) {
+    case RKNN_TENSOR_FLOAT32: return "FLOAT32";
+    case RKNN_TENSOR_FLOAT16: return "FLOAT16";
+    case RKNN_TENSOR_INT8:    return "INT8";
+    case RKNN_TENSOR_UINT8:   return "UINT8";
+    case RKNN_TENSOR_INT16:   return "INT16";
+    case RKNN_TENSOR_UINT16:  return "UINT16";
+    case RKNN_TENSOR_INT32:   return "INT32";
+    default: return "OTHER";
+    }
+}
+
 int lpr_model_load(struct rknn_model *m, const char *name, const char *path)
 {
     void *data = NULL;
@@ -53,21 +67,64 @@ int lpr_model_load(struct rknn_model *m, const char *name, const char *path)
         if (rknn_query(m->ctx, RKNN_QUERY_OUTPUT_ATTR, &m->output_attrs[i], sizeof(m->output_attrs[i])) < 0)
             return -1;
     }
-    fprintf(stderr, "[%s] input=%ux%ux%u fmt=%s outputs=%u\n", name, m->in_w, m->in_h, m->in_c,
-            tensor_fmt_name(m->input_attr.fmt), m->io_num.n_output);
+    fprintf(stderr, "[%s] input=%ux%ux%u fmt=%s type=%s qnt=%d scale=%.6f zp=%d size=%u sw_stride=%u outputs=%u\n",
+            name, m->in_w, m->in_h, m->in_c,
+            tensor_fmt_name(m->input_attr.fmt), tensor_type_name(m->input_attr.type),
+            m->input_attr.qnt_type, m->input_attr.scale, m->input_attr.zp,
+            m->input_attr.size, m->input_attr.size_with_stride, m->io_num.n_output);
     for (i = 0; i < m->io_num.n_output; i++) {
         const rknn_tensor_attr *a = &m->output_attrs[i];
         fprintf(stderr, "[%s] out[%u] n_dims=%u dims=[%u,%u,%u,%u] fmt=%s type=%d\n",
                 name, i, a->n_dims, a->dims[0], a->dims[1], a->dims[2], a->dims[3],
                 tensor_fmt_name(a->fmt), a->type);
     }
+
+    /* Optional zero-copy input tensor: bind an NPU-visible input buffer once so
+     * the detector can write letterboxed pixels directly into it and feed the
+     * model with pass_through (no rknn_inputs_set UINT8->internal conversion).
+     * Only the UINT8+NHWC native layout is supported; anything else falls back
+     * to the legacy rknn_inputs_set path at run time. */
+    if (m->input_zero_copy) {
+        if (m->input_attr.type == RKNN_TENSOR_UINT8 && m->input_attr.fmt == RKNN_TENSOR_NHWC) {
+            m->input_native_supported = true;
+        } else {
+            fprintf(stderr, "[%s] zero-copy input requested but native input type=%s fmt=%s unsupported; falling back to rknn_inputs_set\n",
+                    name, tensor_type_name(m->input_attr.type), tensor_fmt_name(m->input_attr.fmt));
+            m->input_native_supported = false;
+        }
+        if (m->input_native_supported) {
+            uint32_t mem_size = m->input_attr.size_with_stride;
+            if (mem_size < m->input_attr.size)
+                mem_size = m->input_attr.size;
+            m->input_mem = rknn_create_mem(m->ctx, mem_size);
+            if (!m->input_mem) {
+                fprintf(stderr, "[%s] rknn_create_mem(input, %u) failed; falling back to rknn_inputs_set\n",
+                        name, mem_size);
+                m->input_native_supported = false;
+            } else {
+                rknn_tensor_attr attr = m->input_attr;
+                attr.pass_through = 1;
+                if (rknn_set_io_mem(m->ctx, m->input_mem, &attr) < 0) {
+                    fprintf(stderr, "[%s] rknn_set_io_mem(input) failed; falling back to rknn_inputs_set\n", name);
+                    rknn_destroy_mem(m->ctx, m->input_mem);
+                    m->input_mem = NULL;
+                    m->input_native_supported = false;
+                } else {
+                    fprintf(stderr, "[%s] zero-copy input enabled (pass_through, %u bytes)\n", name, mem_size);
+                }
+            }
+        }
+    }
     return 0;
 }
 
 void lpr_model_release(struct rknn_model *m)
 {
-    if (m && m->ctx)
+    if (m && m->ctx) {
+        if (m->input_mem)
+            rknn_destroy_mem(m->ctx, m->input_mem);
         rknn_destroy(m->ctx);
+    }
     if (m)
         memset(m, 0, sizeof(*m));
 }

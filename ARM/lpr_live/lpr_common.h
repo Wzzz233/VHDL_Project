@@ -57,7 +57,8 @@
 #define POSE_MIN_CHANNELS   (POSE_BOX_CHANNELS + 1 + POSE_KPT_CHANNELS)
 
 /* Detection ring sizes. */
-#define MAX_DETS         128
+#define MAX_DETS         1024
+#define MAX_LIVE_PLATES  8
 #define MAX_OCR_KEYS     128
 #define MAX_OCR_KEY_LEN  16
 
@@ -128,6 +129,7 @@ struct live_options {
     int frames;
     int fps;
     float min_conf;
+    float det_score_scale;
     float nms_iou;
     float plate_type_classifier_min_conf;
     float plate_type_classifier_special_min_conf;
@@ -140,6 +142,15 @@ struct live_options {
     bool swap16;
     bool display;
     bool display_sync;
+    bool det_zero_copy;
+    /* Raw-frame dump for display-vs-capture diagnostics. When dump_frames > 0,
+     * the first dump_frames BGRX frames captured from DMA are written verbatim
+     * (frame_w*frame_h*4 bytes) to <dump_path>/frame_NNNN.bgrx, before any
+     * overlay drawing or display push. Lets you inspect whether a visual
+     * artifact (green lines, tearing) is already present in the captured
+     * frame or introduced downstream by the display path. */
+    int dump_frames;
+    const char *dump_path;
 };
 
 /* ---------------- Detector outputs ---------------- */
@@ -166,6 +177,14 @@ struct rknn_model {
     uint32_t in_w;
     uint32_t in_h;
     uint32_t in_c;
+    /* Zero-copy input tensor memory (NULL when disabled or allocation failed).
+     * When input_zero_copy is set and input_native_supported is true, the
+     * detector writes its letterboxed input directly into input_mem->virt_addr
+     * and binds it via rknn_set_io_mem with pass_through, skipping the costly
+     * rknn_inputs_set UINT8->internal conversion. */
+    rknn_tensor_mem *input_mem;
+    bool input_zero_copy;
+    bool input_native_supported;
 };
 
 /* ---------------- OCR keys table ---------------- */
@@ -196,16 +215,10 @@ struct det_timing {
 
 /* ---------------- Live result published from infer thread ---------------- */
 
-struct live_result {
-    bool valid;
-    uint64_t seq;
+struct live_plate_result {
     struct det_box box;
-    int det_count;
-    int best;
     int crop_w;
     int crop_h;
-    int frame_slot;
-    uint64_t frame_generation;
     enum plate_color color;
     int ptype_cls;
     float ptype_conf;
@@ -214,6 +227,17 @@ struct live_result {
     char text[64];
     float conf;
     float blank_ratio;
+};
+
+struct live_result {
+    bool valid;
+    uint64_t seq;
+    int det_count;
+    int result_count;
+    int best;
+    int frame_slot;
+    uint64_t frame_generation;
+    struct live_plate_result plates[MAX_LIVE_PLATES];
 };
 
 /* ---------------- Common helpers ---------------- */

@@ -268,6 +268,7 @@ int lpr_detector_pose_nc(const struct rknn_model *m)
 
 static int decode_pose_outputs(const struct rknn_model *m, const rknn_output *outs,
                                int pose_nc, int class_filter, float conf_thr,
+                               float score_scale,
                                int img_w, int img_h, enum det_resize_mode resize_mode,
                                const struct letterbox_meta *lb,
                                struct det_box *out, int *out_count)
@@ -289,7 +290,9 @@ static int decode_pose_outputs(const struct rknn_model *m, const rknn_output *ou
     (void)out_idx;
     if (pose_nc <= 0)
         pose_nc = tv.c - POSE_BOX_CHANNELS - POSE_KPT_CHANNELS;
-    for (int i = 0; i < tv.n && count < MAX_DETS; i++) {
+    if (score_scale <= 0.0f || !isfinite(score_scale))
+        score_scale = 1.0f;
+    for (int i = 0; i < tv.n; i++) {
         int best_cls = 0;
         float best_score;
         int kpt_base;
@@ -305,6 +308,7 @@ static int decode_pose_outputs(const struct rknn_model *m, const rknn_output *ou
         }
         if (!isfinite(best_score))
             continue;
+        best_score /= score_scale;
         if (best_score < 0.0f || best_score > 1.0f)
             best_score = lpr_sigmoidf(best_score);
         if (best_score < conf_thr)
@@ -330,9 +334,22 @@ static int decode_pose_outputs(const struct rknn_model *m, const rknn_output *ou
         bbox_from_quad(&d, img_w, img_h);
         if (d.x2 <= d.x1 || d.y2 <= d.y1)
             continue;
-        out[count++] = d;
+        if (count < MAX_DETS) {
+            out[count++] = d;
+        } else {
+            int min_i = 0;
+            float min_conf = out[0].conf;
+            for (int j = 1; j < MAX_DETS; j++) {
+                if (out[j].conf < min_conf) {
+                    min_conf = out[j].conf;
+                    min_i = j;
+                }
+            }
+            if (d.conf > min_conf)
+                out[min_i] = d;
+        }
     }
-    nms(out, &count, 0.45f, MAX_DETS);
+    qsort(out, (size_t)count, sizeof(out[0]), compare_det_desc);
     *out_count = count;
     return 0;
 }
@@ -341,7 +358,7 @@ int lpr_detector_run(struct rknn_model *m, const uint8_t *rgb,
                      int img_w, int img_h, uint8_t *input,
                      enum det_resize_mode resize_mode,
                      int pose_nc, int class_filter,
-                     float conf_thr, float nms_iou, int max_det,
+                     float conf_thr, float score_scale, float nms_iou, int max_det,
                      struct det_box *dets, int *det_count)
 {
     struct letterbox_meta lb;
@@ -364,7 +381,7 @@ int lpr_detector_run(struct rknn_model *m, const uint8_t *rgb,
         outs[i].want_float = 1;
     ret = rknn_outputs_get(m->ctx, m->io_num.n_output, outs, NULL);
     if (ret < 0) return ret;
-    ret = decode_pose_outputs(m, outs, pose_nc, class_filter, conf_thr, img_w, img_h,
+    ret = decode_pose_outputs(m, outs, pose_nc, class_filter, conf_thr, score_scale, img_w, img_h,
                               resize_mode, &lb, dets, det_count);
     rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
     if (ret == 0)
@@ -389,7 +406,7 @@ int lpr_detector_run_bgrx_timed(struct rknn_model *m, const uint8_t *bgrx,
                                 int img_w, int img_h, uint8_t *input,
                                 enum det_resize_mode resize_mode,
                                 int pose_nc, int class_filter,
-                                float conf_thr, float nms_iou, int max_det,
+                                float conf_thr, float score_scale, float nms_iou, int max_det,
                                 struct det_box *dets, int *det_count,
                                 struct det_timing *timing)
 {
@@ -398,22 +415,34 @@ int lpr_detector_run_bgrx_timed(struct rknn_model *m, const uint8_t *bgrx,
     rknn_output outs[8];
     int64_t t0, t1, t2, t3, t4, t5, t6;
     int ret;
+    bool zc = m->input_zero_copy && m->input_native_supported && m->input_mem;
     if (timing)
         memset(timing, 0, sizeof(*timing));
     t0 = lpr_mono_us();
-    prepare_detect_input_bgrx(bgrx, img_w, img_h, input, resize_mode, &lb);
+    prepare_detect_input_bgrx(bgrx, img_w, img_h, zc ? (uint8_t *)m->input_mem->virt_addr : input,
+                              resize_mode, &lb);
     t1 = lpr_mono_us();
-    memset(&in, 0, sizeof(in));
-    in.index = 0;
-    in.buf = input;
-    in.size = m->in_w * m->in_h * 3U;
-    in.type = RKNN_TENSOR_UINT8;
-    in.fmt = RKNN_TENSOR_NHWC;
-    ret = rknn_inputs_set(m->ctx, 1, &in);
-    t2 = lpr_mono_us();
-    if (ret < 0) return ret;
-    ret = rknn_run(m->ctx, NULL);
-    t3 = lpr_mono_us();
+    if (zc) {
+        /* Buffer already bound at load with pass_through; just flush the CPU
+         * writes to device-visible memory and run. det_in_ms now measures only
+         * the cache sync instead of the UINT8->internal conversion+copy. */
+        rknn_mem_sync(m->ctx, m->input_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+        t2 = lpr_mono_us();
+        ret = rknn_run(m->ctx, NULL);
+        t3 = lpr_mono_us();
+    } else {
+        memset(&in, 0, sizeof(in));
+        in.index = 0;
+        in.buf = input;
+        in.size = m->in_w * m->in_h * 3U;
+        in.type = RKNN_TENSOR_UINT8;
+        in.fmt = RKNN_TENSOR_NHWC;
+        ret = rknn_inputs_set(m->ctx, 1, &in);
+        t2 = lpr_mono_us();
+        if (ret < 0) return ret;
+        ret = rknn_run(m->ctx, NULL);
+        t3 = lpr_mono_us();
+    }
     if (ret < 0) return ret;
     memset(outs, 0, sizeof(outs));
     for (uint32_t i = 0; i < m->io_num.n_output; i++)
@@ -421,7 +450,7 @@ int lpr_detector_run_bgrx_timed(struct rknn_model *m, const uint8_t *bgrx,
     ret = rknn_outputs_get(m->ctx, m->io_num.n_output, outs, NULL);
     t4 = lpr_mono_us();
     if (ret < 0) return ret;
-    ret = decode_pose_outputs(m, outs, pose_nc, class_filter, conf_thr, img_w, img_h,
+    ret = decode_pose_outputs(m, outs, pose_nc, class_filter, conf_thr, score_scale, img_w, img_h,
                               resize_mode, &lb, dets, det_count);
     t5 = lpr_mono_us();
     rknn_outputs_release(m->ctx, m->io_num.n_output, outs);
@@ -443,10 +472,10 @@ int lpr_detector_run_bgrx(struct rknn_model *m, const uint8_t *bgrx,
                           int img_w, int img_h, uint8_t *input,
                           enum det_resize_mode resize_mode,
                           int pose_nc, int class_filter,
-                          float conf_thr, float nms_iou, int max_det,
+                          float conf_thr, float score_scale, float nms_iou, int max_det,
                           struct det_box *dets, int *det_count)
 {
     return lpr_detector_run_bgrx_timed(m, bgrx, img_w, img_h, input, resize_mode,
-                                       pose_nc, class_filter, conf_thr, nms_iou,
+                                       pose_nc, class_filter, conf_thr, score_scale, nms_iou,
                                        max_det, dets, det_count, NULL);
 }

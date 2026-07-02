@@ -45,11 +45,14 @@
 #include "pcie_fpga_dma.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <gst/gst.h>
@@ -96,18 +99,22 @@ static void usage(const char *prog)
             "  --drm-card <path>             DRM card (default: /dev/dri/card0)\n"
             "  --connector-id <id>           Optional KMS connector id\n"
             "  --no-display                  Disable HDMI/KMS display\n"
-            "  --display-sync <0|1>          kmssink sync (default: 0)\n"
+            "  --display-sync <0|1>          kmssink sync (default: 1)\n"
             "  --frames <n>                  Frame budget; 0 = forever (default: 0)\n"
             "  --fps <n>                     Capture throttle FPS (default: 10)\n"
             "  --min-plate-conf <v>          Detector threshold (default: 0.50)\n"
+            "  --det-score-scale <v>         Divide detector class scores by v (default: 1)\n"
             "  --plate-nms-iou <v>           NMS IoU (default: 0.45)\n"
             "  --plate-max-det <n>           Max dets per frame (default: 8)\n"
             "  --class-filter <id>           Filter detector class; -1 disables (default: -1)\n"
             "  --auto-green-filter <0|1>     Auto-set class 1 when pose_nc>=5 (default: 0)\n"
             "  --det-resize <stretch|letterbox>  Detector mapping (default: stretch)\n"
+            "  --det-zerocopy                Zero-copy detector input (pass_through; default: off)\n"
             "  --ocr-preproc <none|gray|bin> OCR preprocess (default: gray)\n"
             "  --pixel-order <bgr565|rgb565> Raw 565 byte order (default: bgr565)\n"
-            "  --swap16 <0|1>                Swap raw 565 byte halves (default: 0)\n",
+            "  --swap16 <0|1>                Swap raw 565 byte halves (default: 0)\n"
+            "  --dump-frames <n>             Dump first n raw BGRX frames to disk for diagnostics (default: 0)\n"
+            "  --dump-path <dir>             Directory for dumped frames (default: ./dump)\n",
             prog);
 }
 
@@ -119,6 +126,7 @@ static void defaults(struct live_options *o)
     o->frames = 0;
     o->fps = 10;
     o->min_conf = 0.50f;
+    o->det_score_scale = 1.0f;
     o->nms_iou = 0.45f;
     o->plate_type_classifier_min_conf = PLATE_TYPE_CLASSIFIER_DEFAULT_MIN_CONF;
     o->plate_type_classifier_special_min_conf = PLATE_TYPE_CLASSIFIER_DEFAULT_SPECIAL_MIN_CONF;
@@ -131,7 +139,14 @@ static void defaults(struct live_options *o)
     o->pixel_order = PIXEL_ORDER_BGR565;
     o->swap16 = false;
     o->display = true;
-    o->display_sync = false;
+    /* Default to vblank-synced presentation: kmssink sync=TRUE gates buffer
+     * pushes on the display clock, which is what eliminates the horizontal
+     * tearing seen when pushing 30fps BGRx into a 60fps HDMI mode. The sibling
+     * fpga_hdmi_display.c also defaults sync on. */
+    o->display_sync = true;
+    o->det_zero_copy = false;
+    o->dump_frames = 0;
+    o->dump_path = NULL;
 }
 
 static int parse_options(int argc, char **argv, struct live_options *o)
@@ -150,6 +165,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_MAX_DET,
         OPT_CLASS_FILTER,
         OPT_DET_RESIZE,
+        OPT_DET_ZEROCOPY,
         OPT_OCR_PREPROC,
         OPT_PIXEL_ORDER,
         OPT_SWAP16,
@@ -170,6 +186,9 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_PLATE_TYPE_CLASSIFIER_MODEL,
         OPT_PLATE_TYPE_CLASSIFIER_MIN_CONF,
         OPT_PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF,
+        OPT_DET_SCORE_SCALE,
+        OPT_DUMP_FRAMES,
+        OPT_DUMP_PATH,
     };
     static const struct option opts[] = {
         {"device",            required_argument, NULL, OPT_DEVICE},
@@ -179,10 +198,12 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"frames",            required_argument, NULL, OPT_FRAMES},
         {"fps",               required_argument, NULL, OPT_FPS},
         {"min-plate-conf",    required_argument, NULL, OPT_MIN_CONF},
+        {"det-score-scale",   required_argument, NULL, OPT_DET_SCORE_SCALE},
         {"plate-nms-iou",     required_argument, NULL, OPT_NMS_IOU},
         {"plate-max-det",     required_argument, NULL, OPT_MAX_DET},
         {"class-filter",      required_argument, NULL, OPT_CLASS_FILTER},
         {"det-resize",        required_argument, NULL, OPT_DET_RESIZE},
+        {"det-zerocopy",      no_argument,       NULL, OPT_DET_ZEROCOPY},
         {"ocr-preproc",       required_argument, NULL, OPT_OCR_PREPROC},
         {"pixel-order",       required_argument, NULL, OPT_PIXEL_ORDER},
         {"swap16",            required_argument, NULL, OPT_SWAP16},
@@ -203,6 +224,8 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"plate-type-classifier-model", required_argument, NULL, OPT_PLATE_TYPE_CLASSIFIER_MODEL},
         {"plate-type-classifier-min-conf", required_argument, NULL, OPT_PLATE_TYPE_CLASSIFIER_MIN_CONF},
         {"plate-type-classifier-special-min-conf", required_argument, NULL, OPT_PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF},
+        {"dump-frames",      required_argument, NULL, OPT_DUMP_FRAMES},
+        {"dump-path",        required_argument, NULL, OPT_DUMP_PATH},
         {"help",              no_argument,       NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -220,6 +243,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         case OPT_FRAMES:           o->frames = atoi(optarg); break;
         case OPT_FPS:              o->fps = atoi(optarg); break;
         case OPT_MIN_CONF:         o->min_conf = strtof(optarg, NULL); break;
+        case OPT_DET_SCORE_SCALE:  o->det_score_scale = strtof(optarg, NULL); break;
         case OPT_NMS_IOU:          o->nms_iou = strtof(optarg, NULL); break;
         case OPT_MAX_DET:          o->max_det = atoi(optarg); break;
         case OPT_CLASS_FILTER:
@@ -230,6 +254,9 @@ static int parse_options(int argc, char **argv, struct live_options *o)
             if (strcmp(optarg, "stretch") == 0) o->det_resize_mode = DET_RESIZE_STRETCH;
             else if (strcmp(optarg, "letterbox") == 0) o->det_resize_mode = DET_RESIZE_LETTERBOX;
             else return -1;
+            break;
+        case OPT_DET_ZEROCOPY:
+            o->det_zero_copy = true;
             break;
         case OPT_OCR_PREPROC:
             if (strcmp(optarg, "none") == 0) o->ocr_preproc_mode = OCR_PREPROC_NONE;
@@ -275,6 +302,13 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         case OPT_PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF:
             o->plate_type_classifier_special_min_conf = strtof(optarg, NULL);
             break;
+        case OPT_DUMP_FRAMES:
+            o->dump_frames = atoi(optarg);
+            if (o->dump_frames < 0) return -1;
+            break;
+        case OPT_DUMP_PATH:
+            o->dump_path = optarg;
+            break;
         case 'h': return 1;
         default:  return -1;
         }
@@ -298,6 +332,8 @@ static int parse_options(int argc, char **argv, struct live_options *o)
     if (o->plate_type_classifier_min_conf < 0.0f || o->plate_type_classifier_min_conf > 1.0f)
         return -1;
     if (o->plate_type_classifier_special_min_conf < 0.0f || o->plate_type_classifier_special_min_conf > 1.0f)
+        return -1;
+    if (o->det_score_scale <= 0.0f)
         return -1;
     if (o->fps <= 0 || o->fps > 120 || o->frames < 0 || o->max_det <= 0 || o->max_det > MAX_DETS)
         return -1;
@@ -400,6 +436,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "[bgp-live] failed to start display\n");
         goto out;
     }
+    det_model.input_zero_copy = opt.det_zero_copy;
     if (lpr_model_load(&det_model, "yolov8n_pose", opt.plate_model_path) < 0) {
         fprintf(stderr, "[bgp-live] failed to load detector: %s\n", opt.plate_model_path);
         goto out;
@@ -484,11 +521,12 @@ int main(int argc, char **argv)
 
     fprintf(stderr,
             "[bgp-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
-            "det_resize=%s blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
+            "det_resize=%s det_score_scale=%.1f blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
             "ptype=%s preproc=%s display=%d auto_green_filter=%d async_infer=1\n",
             dma.frame_w, dma.frame_h, dma.src_is_bgrx ? "bgrx8888" : "bgr565",
             opt.frames, opt.fps, pose_nc, class_filter,
             opt.det_resize_mode == DET_RESIZE_LETTERBOX ? "letterbox" : "stretch",
+            opt.det_score_scale,
             ocr_blue_model.in_w, ocr_blue_model.in_h,
             ocr_green_model.in_w, ocr_green_model.in_h,
             police_enabled ? "enabled" : "disabled",
@@ -553,12 +591,18 @@ int main(int argc, char **argv)
     }
 
     target_us = 1000000LL / opt.fps;
+    /* Absolute-deadline pacing: each capture starts at a fixed grid point
+     * (now + k*target_us), not "previous end + remaining". This keeps the
+     * capture cadence phase-locked to a steady clock instead of drifting with
+     * per-frame processing jitter, which is what produced the visible stutter
+     * when moving objects were sampled at irregular intervals. Mirrors the
+     * pacing used by fpga_hdmi_display.c. */
+    int64_t next_frame_us = lpr_mono_us() + target_us;
     for (int frame = 0; !g_stop && (opt.frames == 0 || frame < opt.frames); frame++) {
         struct live_result latest;
         bool has_overlay;
         int slot;
         uint8_t *slot_frame;
-        int64_t t0 = lpr_mono_us();
 
         slot = lpr_dma_acquire_slot(&dma);
         if (lpr_dma_read_frame_slot(&dma, slot) < 0) {
@@ -573,26 +617,54 @@ int main(int argc, char **argv)
             goto out;
         }
 
+        /* Optional raw-frame dump: write the captured BGRX frame verbatim,
+         * before any overlay drawing, so a stored frame reflects exactly what
+         * DMA delivered. Used to tell capture-side artifacts from display-side. */
+        if (opt.dump_frames > 0 && frame < opt.dump_frames) {
+            const char *dp = opt.dump_path ? opt.dump_path : "dump";
+            char path[512];
+            int dfd;
+            mkdir(dp, 0755); /* best-effort; ignore EEXIST */
+            snprintf(path, sizeof(path), "%s/frame_%04d.bgrx", dp, frame);
+            dfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (dfd < 0) {
+                fprintf(stderr, "[bgp-live] dump open failed: %s: %s\n", path, strerror(errno));
+            } else {
+                size_t off = 0;
+                while (off < dma.frame_size) {
+                    ssize_t w = write(dfd, slot_frame + off, dma.frame_size - off);
+                    if (w <= 0) break;
+                    off += (size_t)w;
+                }
+                close(dfd);
+                fprintf(stderr, "[bgp-live] dumped %s (%zu bytes)\n", path, off);
+            }
+        }
+
         lpr_infer_submit_latest(&infer, slot_frame, lpr_dma_slot_generation(&dma, slot));
         has_overlay = lpr_infer_get_result(&infer, &latest);
 
         if (opt.display) {
             if (has_overlay) {
-                char overlay[96];
-                int ty = latest.box.y1 - (16 * OVERLAY_TEXT_SCALE + 3);
-                char tag = 'B';
-                if (latest.route_name[0] == 'g') tag = 'G';
-                else if (latest.route_name[0] == 'p') tag = 'P';
-                else if (latest.route_name[0] == 'e') tag = 'E';
-                else if (latest.route_name[0] == 'y') tag = 'Y';
-                if (ty < 0) ty = latest.box.y1 + 3;
-                snprintf(overlay, sizeof(overlay), "%s %c %.2f",
-                         latest.text[0] ? latest.text : "OCR", tag, latest.conf);
-                lpr_draw_rect_bgrx(slot_frame, (int)dma.frame_w, (int)dma.frame_h,
-                                   &latest.box, 0, 255, 255);
-                lpr_draw_text_bgrx(slot_frame, (int)dma.frame_w, (int)dma.frame_h,
-                                   latest.box.x1, ty, overlay, 0, 255, 255,
-                                   OVERLAY_TEXT_SCALE);
+                for (int i = 0; i < latest.result_count && i < MAX_LIVE_PLATES; i++) {
+                    const struct live_plate_result *plate = &latest.plates[i];
+                    char overlay[96];
+                    int ty = plate->box.y1 - (16 * OVERLAY_TEXT_SCALE + 3);
+                    char tag = 'B';
+                    uint8_t r = 0, g = 255, bl = 255;
+                    if (plate->route_name[0] == 'g') { tag = 'G'; r = 0; g = 255; bl = 0; }
+                    else if (plate->route_name[0] == 'p') { tag = 'P'; r = 255; g = 255; bl = 255; }
+                    else if (plate->route_name[0] == 'e') { tag = 'E'; r = 255; g = 255; bl = 0; }
+                    else if (plate->route_name[0] == 'y') { tag = 'Y'; r = 255; g = 255; bl = 0; }
+                    if (ty < 0) ty = plate->box.y1 + 3;
+                    snprintf(overlay, sizeof(overlay), "%s %c %.2f",
+                             plate->text[0] ? plate->text : "OCR", tag, plate->conf);
+                    lpr_draw_rect_bgrx(slot_frame, (int)dma.frame_w, (int)dma.frame_h,
+                                       &plate->box, r, g, bl);
+                    lpr_draw_text_bgrx(slot_frame, (int)dma.frame_w, (int)dma.frame_h,
+                                       plate->box.x1, ty, overlay, r, g, bl,
+                                       OVERLAY_TEXT_SCALE);
+                }
             }
             if (lpr_display_push_bgrx_slot(&display, &dma, slot) < 0)
                 goto out;
@@ -600,9 +672,19 @@ int main(int argc, char **argv)
 
         lpr_dma_slot_release(&dma, slot);
         {
-            int64_t used = lpr_mono_us() - t0;
-            if (used < target_us)
-                usleep((useconds_t)(target_us - used));
+            /* Advance the grid by exactly one frame period; if we fell behind
+             * by more than a whole period (slow frame), resync to now to avoid
+             * unbounded catch-up bursts. */
+            next_frame_us += target_us;
+            int64_t now = lpr_mono_us();
+            if (now > next_frame_us + target_us)
+                next_frame_us = now + target_us;
+            if (next_frame_us > now) {
+                struct timespec ts;
+                ts.tv_sec = (time_t)(next_frame_us / 1000000LL);
+                ts.tv_nsec = (long)((next_frame_us % 1000000LL) * 1000LL);
+                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+            }
         }
     }
     ret = 0;

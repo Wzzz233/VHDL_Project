@@ -16,6 +16,8 @@ fpga_dma_test
 fpga_hdmi_display
 fpga_lpr_display
 pplcnet_green_live
+pplcnet_bgp_live
+pplcnet_bg_live
 test_ocr_decode
 test_ocr_layout
 test_lpr_special_route

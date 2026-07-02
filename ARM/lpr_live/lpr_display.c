@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ---------------- Drawing primitives ---------------- */
@@ -352,7 +353,11 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
                                "width", G_TYPE_INT, (int)w, "height", G_TYPE_INT, (int)h,
                                "framerate", GST_TYPE_FRACTION, opt->fps, 1, NULL);
     if (!caps) return -1;
-    g_object_set(d->appsrc, "caps", caps, "is-live", TRUE, "do-timestamp", TRUE,
+    /* do-timestamp is intentionally FALSE: we stamp PTS ourselves from the
+     * real monotonic capture clock. With do-timestamp on, GStreamer would
+     * overwrite PTS at push time, racing our value and producing the uneven
+     * presentation that kmssink sync turns into visible stutter. */
+    g_object_set(d->appsrc, "caps", caps, "is-live", TRUE, "do-timestamp", FALSE,
                  "format", GST_FORMAT_TIME, "block", FALSE,
                  "max-bytes", (guint64)d->frame_size * 2U, NULL);
     gst_caps_unref(caps);
@@ -436,9 +441,16 @@ int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, i
         display_slot_release(cookie);
         return -1;
     }
-    GST_BUFFER_PTS(buf) = d->next_pts_ns;
+    /* Stamp with the real capture instant so kmssink sync aligns presentation
+     * to when this frame was actually grabbed, not a synthetic匀速 grid. Base
+     * the pipeline clock on the monotonic clock the capture loop uses. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    guint64 pts_ns = (guint64)ts.tv_sec * GST_SECOND +
+                     (guint64)ts.tv_nsec;
+    GST_BUFFER_PTS(buf) = pts_ns;
     GST_BUFFER_DURATION(buf) = (guint64)(GST_SECOND / d->fps);
-    d->next_pts_ns += GST_BUFFER_DURATION(buf);
+    d->next_pts_ns = pts_ns;
     flow = gst_app_src_push_buffer(GST_APP_SRC(d->appsrc), buf);
     return flow == GST_FLOW_OK ? 0 : -1;
 }
