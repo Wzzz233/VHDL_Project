@@ -13,7 +13,7 @@
 #include <pthread.h>
 
 #define LPR_DISPLAY_COPY_SLOTS 6
-#define LPR_DISPLAY_RELEASE_DELAY_MS 20
+#define LPR_DISPLAY_RELEASE_DELAY_MS 0
 
 struct display_copy_slot {
     uint8_t *data;
