@@ -115,7 +115,9 @@ static void usage(const char *prog)
             "  --pixel-order <bgr565|rgb565> Raw 565 byte order (default: bgr565)\n"
             "  --swap16 <0|1>                Swap raw 565 byte halves (default: 0)\n"
             "  --dump-frames <n>             Dump first n raw BGRX frames to disk for diagnostics (default: 0)\n"
-            "  --dump-path <dir>             Directory for dumped frames (default: ./dump)\n",
+            "  --dump-path <dir>             Directory for dumped frames (default: ./dump)\n"
+            "  --dma-pre-delay-us <n>       Sleep before each DMA read, for phase diagnostics (default: 0)\n"
+            "  --display-every <n>          Display one of every n captured frames (default: 1)\n",
             prog);
 }
 
@@ -148,6 +150,8 @@ static void defaults(struct live_options *o)
     o->no_infer = false;
     o->dump_frames = 0;
     o->dump_path = NULL;
+    o->dma_pre_delay_us = 0;
+    o->display_every = 1;
 }
 
 static int parse_options(int argc, char **argv, struct live_options *o)
@@ -191,6 +195,8 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_DUMP_FRAMES,
         OPT_DUMP_PATH,
         OPT_NO_INFER,
+        OPT_DMA_PRE_DELAY_US,
+        OPT_DISPLAY_EVERY,
     };
     static const struct option opts[] = {
         {"device",            required_argument, NULL, OPT_DEVICE},
@@ -229,6 +235,8 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"plate-type-classifier-special-min-conf", required_argument, NULL, OPT_PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF},
         {"dump-frames",      required_argument, NULL, OPT_DUMP_FRAMES},
         {"dump-path",        required_argument, NULL, OPT_DUMP_PATH},
+        {"dma-pre-delay-us", required_argument, NULL, OPT_DMA_PRE_DELAY_US},
+        {"display-every",    required_argument, NULL, OPT_DISPLAY_EVERY},
         {"help",              no_argument,       NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -313,6 +321,14 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         case OPT_DUMP_PATH:
             o->dump_path = optarg;
             break;
+        case OPT_DMA_PRE_DELAY_US:
+            o->dma_pre_delay_us = atoi(optarg);
+            if (o->dma_pre_delay_us < 0) return -1;
+            break;
+        case OPT_DISPLAY_EVERY:
+            o->display_every = atoi(optarg);
+            if (o->display_every <= 0) return -1;
+            break;
         case 'h': return 1;
         default:  return -1;
         }
@@ -342,6 +358,10 @@ static int parse_options(int argc, char **argv, struct live_options *o)
     if (o->det_score_scale <= 0.0f)
         return -1;
     if (o->fps <= 0 || o->fps > 120 || o->frames < 0 || o->max_det <= 0 || o->max_det > MAX_DETS)
+        return -1;
+    if (o->dma_pre_delay_us < 0 || o->dma_pre_delay_us > 1000000)
+        return -1;
+    if (o->display_every <= 0 || o->display_every > 120)
         return -1;
     return 0;
 }
@@ -533,7 +553,7 @@ infer_ready:
     fprintf(stderr,
             "[bgp-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
             "det_resize=%s det_score_scale=%.1f blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
-            "ptype=%s preproc=%s display=%d auto_green_filter=%d no_infer=%d async_infer=%d\n",
+            "ptype=%s preproc=%s display=%d auto_green_filter=%d no_infer=%d async_infer=%d dma_pre_delay_us=%d display_every=%d\n",
             dma.frame_w, dma.frame_h, dma.src_is_bgrx ? "bgrx8888" : "bgr565",
             opt.frames, opt.fps, pose_nc, class_filter,
             opt.det_resize_mode == DET_RESIZE_LETTERBOX ? "letterbox" : "stretch",
@@ -547,7 +567,8 @@ infer_ready:
             opt.ocr_preproc_mode == OCR_PREPROC_GRAY ? "gray" :
                 (opt.ocr_preproc_mode == OCR_PREPROC_BIN ? "bin" : "none"),
             opt.display ? 1 : 0, opt.auto_green_filter ? 1 : 0,
-            opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1);
+            opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1,
+            opt.dma_pre_delay_us, opt.display_every);
 
     if (!opt.no_infer) {
     /* Build the per-route binding table for the inference thread. */
@@ -628,6 +649,8 @@ infer_ready:
 
         ts_a = lpr_mono_us();
         slot = lpr_dma_acquire_slot(&dma);
+        if (opt.dma_pre_delay_us > 0)
+            usleep((useconds_t)opt.dma_pre_delay_us);
         if (lpr_dma_read_frame_slot(&dma, slot) < 0) {
             lpr_dma_slot_release(&dma, slot);
             fprintf(stderr, "[bgp-live] DMA frame read failed\n");
@@ -675,7 +698,7 @@ infer_ready:
         stat_dma_us += ts_b - ts_a;
         stat_overlay_us += ts_c - ts_b;
 
-        if (opt.display) {
+        if (opt.display && (frame % opt.display_every) == 0) {
             if (has_overlay) {
                 for (int i = 0; i < latest.result_count && i < MAX_LIVE_PLATES; i++) {
                     const struct live_plate_result *plate = &latest.plates[i];
