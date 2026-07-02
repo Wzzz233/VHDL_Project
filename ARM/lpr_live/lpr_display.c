@@ -320,6 +320,8 @@ void lpr_overlay_ascii_from_text(const char *text, char *out, size_t out_len)
 
 /* ---------------- KMS pipeline lifecycle ---------------- */
 
+static void *display_thread_main(void *arg);
+
 int lpr_display_start(struct display_state *d, const struct live_options *opt,
                       uint32_t w, uint32_t h)
 {
@@ -331,6 +333,7 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
     if (!d->enabled) return 0;
     d->w = w; d->h = h; d->fps = opt->fps; d->connector_id = opt->connector_id; d->sync = opt->display_sync;
     d->frame_size = (size_t)w * (size_t)h * 4U;
+    d->pending_slot = -1;
     if (opt->drm_card_path && opt->drm_card_path[0]) {
         d->drm_fd = open(opt->drm_card_path, O_RDWR | O_CLOEXEC);
         if (d->drm_fd < 0)
@@ -385,6 +388,13 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
     if (sret == GST_STATE_CHANGE_FAILURE) return -1;
     sret = gst_element_get_state(d->pipeline, NULL, NULL, 5 * GST_SECOND);
     if (sret == GST_STATE_CHANGE_FAILURE) return -1;
+    d->running = true;
+    if (pthread_create(&d->thread, NULL, display_thread_main, d) != 0) {
+        d->running = false;
+        fprintf(stderr, "[display] failed to start display thread\n");
+        return -1;
+    }
+    d->thread_started = true;
     fprintf(stderr, "[display] started appsrc BGRx %ux%u -> kmssink sync=%d connector=%d copy_slots=%d release_delay_ms=%d\n",
             w, h, d->sync ? 1 : 0, d->connector_id,
             LPR_DISPLAY_COPY_SLOTS, LPR_DISPLAY_RELEASE_DELAY_MS);
@@ -394,6 +404,22 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
 void lpr_display_stop(struct display_state *d)
 {
     if (!d || !d->enabled) return;
+
+    if (d->slots_lock_init) {
+        pthread_mutex_lock(&d->slots_lock);
+        d->running = false;
+        pthread_cond_broadcast(&d->slots_cond);
+        pthread_mutex_unlock(&d->slots_lock);
+        if (d->thread_started) {
+            pthread_join(d->thread, NULL);
+            d->thread_started = false;
+        }
+        if (d->has_new && d->pending_slot >= 0 && d->dma) {
+            lpr_dma_slot_release(d->dma, d->pending_slot);
+            d->pending_slot = -1;
+            d->has_new = false;
+        }
+    }
 
     if (d->appsrc) gst_app_src_end_of_stream(GST_APP_SRC(d->appsrc));
     if (d->pipeline) gst_element_set_state(d->pipeline, GST_STATE_NULL);
@@ -500,7 +526,7 @@ static int display_acquire_slot(struct display_state *d, struct display_slot_tic
     return 1;
 }
 
-int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, int slot)
+static int display_copy_push_slot(struct display_state *d, int slot)
 {
     struct display_slot_ticket ticket;
     struct display_frame_cookie *cookie;
@@ -508,9 +534,9 @@ int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, i
     GstFlowReturn flow;
     uint8_t *frame;
 
-    if (!d || !d->enabled) return 0;
+    if (!d || !d->enabled || !d->dma) return 0;
     if (handle_bus(d) < 0) return -1;
-    frame = lpr_dma_slot_data(dma, slot);
+    frame = lpr_dma_slot_data(d->dma, slot);
     if (!frame) return -1;
 
     {
@@ -546,5 +572,64 @@ int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, i
     flow = gst_app_src_push_buffer(GST_APP_SRC(d->appsrc), buf);
     if (flow != GST_FLOW_OK)
         return -1;
+    return 0;
+}
+
+static void *display_thread_main(void *arg)
+{
+    struct display_state *d = (struct display_state *)arg;
+
+    for (;;) {
+        int slot;
+
+        pthread_mutex_lock(&d->slots_lock);
+        while (d->running && !d->has_new)
+            pthread_cond_wait(&d->slots_cond, &d->slots_lock);
+        if (!d->running && !d->has_new) {
+            pthread_mutex_unlock(&d->slots_lock);
+            break;
+        }
+        slot = d->pending_slot;
+        d->pending_slot = -1;
+        d->has_new = false;
+        pthread_mutex_unlock(&d->slots_lock);
+
+        if (slot >= 0) {
+            if (display_copy_push_slot(d, slot) < 0) {
+                pthread_mutex_lock(&d->slots_lock);
+                d->display_error = true;
+                pthread_mutex_unlock(&d->slots_lock);
+            }
+            lpr_dma_slot_release(d->dma, slot);
+        }
+    }
+    return NULL;
+}
+
+int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, int slot)
+{
+    if (!d || !d->enabled) return 0;
+    if (!dma || slot < 0) return -1;
+
+    pthread_mutex_lock(&d->slots_lock);
+    if (d->display_error) {
+        pthread_mutex_unlock(&d->slots_lock);
+        return -1;
+    }
+    if (!d->thread_started) {
+        pthread_mutex_unlock(&d->slots_lock);
+        return -1;
+    }
+    if (d->has_new && d->pending_slot >= 0) {
+        d->dropped_frames++;
+        lpr_dma_slot_release(d->dma, d->pending_slot);
+    }
+    lpr_dma_slot_addref(dma, slot);
+    d->dma = dma;
+    d->pending_slot = slot;
+    d->pending_generation = lpr_dma_slot_generation(dma, slot);
+    d->has_new = true;
+    pthread_cond_signal(&d->slots_cond);
+    pthread_mutex_unlock(&d->slots_lock);
     return 0;
 }

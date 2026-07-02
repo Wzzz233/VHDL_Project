@@ -38,6 +38,14 @@ struct display_state {
     GstElement *queue;
     GstElement *sink;
     GstBus *bus;
+    pthread_t thread;
+    bool thread_started;
+    bool running;
+    bool has_new;
+    bool display_error;
+    struct dma_state *dma;
+    int pending_slot;
+    uint64_t pending_generation;
     struct display_copy_slot copy_slots[LPR_DISPLAY_COPY_SLOTS];
     pthread_mutex_t slots_lock;
     pthread_cond_t slots_cond;
