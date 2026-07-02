@@ -143,6 +143,7 @@ struct live_options {
     bool display;
     bool display_sync;
     bool det_zero_copy;
+    bool no_infer;
     /* Raw-frame dump for display-vs-capture diagnostics. When dump_frames > 0,
      * the first dump_frames BGRX frames captured from DMA are written verbatim
      * (frame_w*frame_h*4 bytes) to <dump_path>/frame_NNNN.bgrx, before any

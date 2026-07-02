@@ -99,6 +99,7 @@ static void usage(const char *prog)
             "  --drm-card <path>             DRM card (default: /dev/dri/card0)\n"
             "  --connector-id <id>           Optional KMS connector id\n"
             "  --no-display                  Disable HDMI/KMS display\n"
+            "  --no-infer                    Disable RKNN inference for display-only diagnostics\n"
             "  --display-sync <0|1>          kmssink sync (default: 1)\n"
             "  --frames <n>                  Frame budget; 0 = forever (default: 0)\n"
             "  --fps <n>                     Capture throttle FPS (default: 10)\n"
@@ -144,6 +145,7 @@ static void defaults(struct live_options *o)
      * dropped sync=1 to single-digit fps. See lpr_display.c. */
     o->display_sync = true;
     o->det_zero_copy = false;
+    o->no_infer = false;
     o->dump_frames = 0;
     o->dump_path = NULL;
 }
@@ -188,6 +190,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_DET_SCORE_SCALE,
         OPT_DUMP_FRAMES,
         OPT_DUMP_PATH,
+        OPT_NO_INFER,
     };
     static const struct option opts[] = {
         {"device",            required_argument, NULL, OPT_DEVICE},
@@ -209,6 +212,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"drm-card",          required_argument, NULL, OPT_DRM_CARD},
         {"connector-id",      required_argument, NULL, OPT_CONNECTOR_ID},
         {"no-display",        no_argument,       NULL, OPT_NO_DISPLAY},
+        {"no-infer",          no_argument,       NULL, OPT_NO_INFER},
         {"display-sync",      required_argument, NULL, OPT_DISPLAY_SYNC},
         {"auto-green-filter", required_argument, NULL, OPT_AUTO_GREEN},
         {"ocr-blue-model",    required_argument, NULL, OPT_OCR_BLUE_MODEL},
@@ -274,6 +278,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         case OPT_DRM_CARD:        o->drm_card_path = optarg; break;
         case OPT_CONNECTOR_ID:    o->connector_id = atoi(optarg); break;
         case OPT_NO_DISPLAY:      o->display = false; break;
+        case OPT_NO_INFER:        o->no_infer = true; break;
         case OPT_DISPLAY_SYNC:
             o->display_sync = (strcmp(optarg, "1") == 0 || strcmp(optarg, "true") == 0 || strcmp(optarg, "on") == 0);
             break;
@@ -312,10 +317,12 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         default:  return -1;
         }
     }
-    if (!o->plate_model_path || !o->ocr_blue_model_path || !o->ocr_green_model_path)
-        return -1;
-    if (!o->keys_blue_path || !o->keys_green_path)
-        return -1;
+    if (!o->no_infer) {
+        if (!o->plate_model_path || !o->ocr_blue_model_path || !o->ocr_green_model_path)
+            return -1;
+        if (!o->keys_blue_path || !o->keys_green_path)
+            return -1;
+    }
     if (o->ocr_police_model_path && !o->keys_police_path) {
         fprintf(stderr, "[bgp-live] --ocr-police-model requires --ocr-police-keys\n");
         return -1;
@@ -399,27 +406,27 @@ int main(int argc, char **argv)
     yellow_enabled = (opt.ocr_yellow_model_path != NULL);
     ptype_enabled = (opt.plate_type_classifier_model_path != NULL);
 
-    if (lpr_load_keys(opt.keys_blue_path, &keys_blue) < 0) {
+    if (!opt.no_infer && lpr_load_keys(opt.keys_blue_path, &keys_blue) < 0) {
         fprintf(stderr, "[bgp-live] failed to load blue keys: %s\n", opt.keys_blue_path);
         goto out;
     }
-    if (lpr_load_keys(opt.keys_green_path, &keys_green) < 0) {
+    if (!opt.no_infer && lpr_load_keys(opt.keys_green_path, &keys_green) < 0) {
         fprintf(stderr, "[bgp-live] failed to load green keys: %s\n", opt.keys_green_path);
         goto out;
     }
-    if (police_enabled) {
+    if (!opt.no_infer && police_enabled) {
         if (lpr_load_keys(opt.keys_police_path, &keys_police) < 0) {
             fprintf(stderr, "[bgp-live] failed to load police keys: %s\n", opt.keys_police_path);
             goto out;
         }
     }
-    if (embassy_enabled) {
+    if (!opt.no_infer && embassy_enabled) {
         if (lpr_load_keys(opt.keys_embassy_path, &keys_embassy) < 0) {
             fprintf(stderr, "[bgp-live] failed to load embassy keys: %s\n", opt.keys_embassy_path);
             goto out;
         }
     }
-    if (yellow_enabled) {
+    if (!opt.no_infer && yellow_enabled) {
         if (lpr_load_keys(opt.keys_yellow_path, &keys_yellow) < 0) {
             fprintf(stderr, "[bgp-live] failed to load yellow keys: %s\n", opt.keys_yellow_path);
             goto out;
@@ -435,6 +442,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "[bgp-live] failed to start display\n");
         goto out;
     }
+    if (opt.no_infer)
+        goto infer_ready;
     det_model.input_zero_copy = opt.det_zero_copy;
     if (lpr_model_load(&det_model, "yolov8n_pose", opt.plate_model_path) < 0) {
         fprintf(stderr, "[bgp-live] failed to load detector: %s\n", opt.plate_model_path);
@@ -448,25 +457,25 @@ int main(int argc, char **argv)
         fprintf(stderr, "[bgp-live] failed to load green OCR: %s\n", opt.ocr_green_model_path);
         goto out;
     }
-    if (police_enabled) {
+    if (!opt.no_infer && police_enabled) {
         if (lpr_model_load(&ocr_police_model, "pplcnet_police", opt.ocr_police_model_path) < 0) {
             fprintf(stderr, "[bgp-live] failed to load police OCR: %s\n", opt.ocr_police_model_path);
             goto out;
         }
     }
-    if (embassy_enabled) {
+    if (!opt.no_infer && embassy_enabled) {
         if (lpr_model_load(&ocr_embassy_model, "pplcnet_embassy", opt.ocr_embassy_model_path) < 0) {
             fprintf(stderr, "[bgp-live] failed to load embassy OCR: %s\n", opt.ocr_embassy_model_path);
             goto out;
         }
     }
-    if (yellow_enabled) {
+    if (!opt.no_infer && yellow_enabled) {
         if (lpr_model_load(&ocr_yellow_model, "pplcnet_yellow", opt.ocr_yellow_model_path) < 0) {
             fprintf(stderr, "[bgp-live] failed to load yellow OCR: %s\n", opt.ocr_yellow_model_path);
             goto out;
         }
     }
-    if (ptype_enabled) {
+    if (!opt.no_infer && ptype_enabled) {
         if (lpr_model_load(&ptype_model, "plate_type_classifier", opt.plate_type_classifier_model_path) < 0) {
             fprintf(stderr, "[bgp-live] failed to load plate type classifier: %s\n",
                     opt.plate_type_classifier_model_path);
@@ -474,19 +483,20 @@ int main(int argc, char **argv)
         }
     }
 
-    if (det_model.in_w != ALGO_STREAM_SIZE || det_model.in_h != ALGO_STREAM_SIZE || det_model.in_c != 3) {
+infer_ready:
+    if (!opt.no_infer && (det_model.in_w != ALGO_STREAM_SIZE || det_model.in_h != ALGO_STREAM_SIZE || det_model.in_c != 3)) {
         fprintf(stderr, "[bgp-live] detector input must be 640x640x3, got %ux%ux%u\n",
                 det_model.in_w, det_model.in_h, det_model.in_c);
         goto out;
     }
-    if (ptype_enabled && ptype_model.in_c != 3) {
+    if (!opt.no_infer && ptype_enabled && ptype_model.in_c != 3) {
         fprintf(stderr, "[bgp-live] plate type classifier input must have 3 channels, got %u\n", ptype_model.in_c);
         goto out;
     }
-    if (ocr_blue_model.in_c != 3 || ocr_green_model.in_c != 3 ||
+    if (!opt.no_infer && (ocr_blue_model.in_c != 3 || ocr_green_model.in_c != 3 ||
         (police_enabled && ocr_police_model.in_c != 3) ||
         (embassy_enabled && ocr_embassy_model.in_c != 3) ||
-        (yellow_enabled && ocr_yellow_model.in_c != 3)) {
+        (yellow_enabled && ocr_yellow_model.in_c != 3))) {
         fprintf(stderr,
                 "[bgp-live] OCR input must have 3 channels, got blue=%u green=%u police=%u embassy=%u yellow=%u\n",
                 ocr_blue_model.in_c, ocr_green_model.in_c,
@@ -496,7 +506,8 @@ int main(int argc, char **argv)
         goto out;
     }
 
-    lpr_ocr_log_contract("blue",  &ocr_blue_model,  &keys_blue);
+    if (!opt.no_infer) {
+        lpr_ocr_log_contract("blue",  &ocr_blue_model,  &keys_blue);
     lpr_ocr_log_contract("green", &ocr_green_model, &keys_green);
     if (police_enabled)
         lpr_ocr_log_contract("police", &ocr_police_model, &keys_police);
@@ -512,8 +523,9 @@ int main(int argc, char **argv)
                 opt.plate_type_classifier_special_min_conf,
                 ptype_model.in_w, ptype_model.in_h);
     }
+    }
 
-    pose_nc = lpr_detector_pose_nc(&det_model);
+    pose_nc = opt.no_infer ? 0 : lpr_detector_pose_nc(&det_model);
     class_filter = opt.class_filter;
     if (opt.auto_green_filter && pose_nc >= 5)
         class_filter = 1;
@@ -521,7 +533,7 @@ int main(int argc, char **argv)
     fprintf(stderr,
             "[bgp-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
             "det_resize=%s det_score_scale=%.1f blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
-            "ptype=%s preproc=%s display=%d auto_green_filter=%d async_infer=1\n",
+            "ptype=%s preproc=%s display=%d auto_green_filter=%d no_infer=%d async_infer=%d\n",
             dma.frame_w, dma.frame_h, dma.src_is_bgrx ? "bgrx8888" : "bgr565",
             opt.frames, opt.fps, pose_nc, class_filter,
             opt.det_resize_mode == DET_RESIZE_LETTERBOX ? "letterbox" : "stretch",
@@ -534,8 +546,10 @@ int main(int argc, char **argv)
             ptype_enabled ? "enabled" : "disabled",
             opt.ocr_preproc_mode == OCR_PREPROC_GRAY ? "gray" :
                 (opt.ocr_preproc_mode == OCR_PREPROC_BIN ? "bin" : "none"),
-            opt.display ? 1 : 0, opt.auto_green_filter ? 1 : 0);
+            opt.display ? 1 : 0, opt.auto_green_filter ? 1 : 0,
+            opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1);
 
+    if (!opt.no_infer) {
     /* Build the per-route binding table for the inference thread. */
     struct lpr_route routes[LPR_ROUTE_COUNT];
     memset(routes, 0, sizeof(routes));
@@ -552,7 +566,7 @@ int main(int argc, char **argv)
     routes[LPR_ROUTE_GREEN].display_tag = 'G';
     snprintf(routes[LPR_ROUTE_GREEN].name, sizeof(routes[LPR_ROUTE_GREEN].name), "green");
 
-    if (police_enabled) {
+    if (!opt.no_infer && police_enabled) {
         routes[LPR_ROUTE_POLICE].model = &ocr_police_model;
         routes[LPR_ROUTE_POLICE].keys = &keys_police;
         routes[LPR_ROUTE_POLICE].decode_family = OCR_DECODE_FAMILY_POLICE7;
@@ -562,7 +576,7 @@ int main(int argc, char **argv)
         routes[LPR_ROUTE_POLICE].model = NULL;
     }
 
-    if (embassy_enabled) {
+    if (!opt.no_infer && embassy_enabled) {
         routes[LPR_ROUTE_EMBASSY].model = &ocr_embassy_model;
         routes[LPR_ROUTE_EMBASSY].keys = &keys_embassy;
         routes[LPR_ROUTE_EMBASSY].decode_family = OCR_DECODE_FAMILY_EMBASSY7;
@@ -572,7 +586,7 @@ int main(int argc, char **argv)
         routes[LPR_ROUTE_EMBASSY].model = NULL;
     }
 
-    if (yellow_enabled) {
+    if (!opt.no_infer && yellow_enabled) {
         routes[LPR_ROUTE_YELLOW].model = &ocr_yellow_model;
         routes[LPR_ROUTE_YELLOW].keys = &keys_yellow;
         routes[LPR_ROUTE_YELLOW].decode_family = OCR_DECODE_FAMILY_NORMAL7;
@@ -587,6 +601,8 @@ int main(int argc, char **argv)
                         (int)dma.frame_w, (int)dma.frame_h) < 0) {
         fprintf(stderr, "[bgp-live] failed to start infer thread\n");
         goto out;
+    }
+
     }
 
     target_us = 1000000LL / opt.fps;
@@ -648,8 +664,12 @@ int main(int argc, char **argv)
             }
         }
 
-        lpr_infer_submit_latest(&infer, slot, lpr_dma_slot_generation(&dma, slot));
-        has_overlay = lpr_infer_get_result(&infer, &latest);
+        if (!opt.no_infer) {
+            lpr_infer_submit_latest(&infer, slot, lpr_dma_slot_generation(&dma, slot));
+            has_overlay = lpr_infer_get_result(&infer, &latest);
+        } else {
+            has_overlay = false;
+        }
         ts_c = lpr_mono_us();
         stat_dma_us += ts_b - ts_a;
         stat_overlay_us += ts_c - ts_b;
@@ -722,18 +742,21 @@ int main(int argc, char **argv)
     ret = 0;
 
 out:
-    lpr_infer_stop(&infer);
+    if (!opt.no_infer)
+        lpr_infer_stop(&infer);
     lpr_display_stop(&display);
-    lpr_model_release(&det_model);
-    lpr_model_release(&ocr_blue_model);
-    lpr_model_release(&ocr_green_model);
-    if (police_enabled)
+    if (!opt.no_infer) {
+        lpr_model_release(&det_model);
+        lpr_model_release(&ocr_blue_model);
+        lpr_model_release(&ocr_green_model);
+    }
+    if (!opt.no_infer && police_enabled)
         lpr_model_release(&ocr_police_model);
-    if (embassy_enabled)
+    if (!opt.no_infer && embassy_enabled)
         lpr_model_release(&ocr_embassy_model);
-    if (yellow_enabled)
+    if (!opt.no_infer && yellow_enabled)
         lpr_model_release(&ocr_yellow_model);
-    if (ptype_enabled)
+    if (!opt.no_infer && ptype_enabled)
         lpr_model_release(&ptype_model);
     lpr_dma_release(&dma);
     return ret;

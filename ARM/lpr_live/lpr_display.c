@@ -366,34 +366,47 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
     g_object_set(d->queue, "max-size-buffers", 1, "max-size-bytes", 0,
                  "max-size-time", (guint64)0, "leaky", 2, NULL);
     g_object_set(d->sink, "sync", d->sync ? TRUE : FALSE, NULL);
-    /* Force atomic page-flip synchronization. With the default sync-mode=auto
-     * the RK3568 kmssink falls back to a non-atomic legacy flip on zero-copy
-     * wrapped buffers, which tears (top/bottom of screen show different frames
-     * at the vblank boundary). sync-mode=flip waits for the page-flip event so
-     * the flip is atomic and tear-free. skip-vsync=true avoids the double
-     * vsync wait on atomic drivers (sync=1 already gates on the clock), which
-     * is what previously dropped sync=1 to single-digit fps. */
-    g_object_set(d->sink, "sync-mode", 1, NULL);   /* 1 = flip (page-flip event) */
-    g_object_set(d->sink, "skip-vsync", TRUE, NULL);
+    /* Match the proven fpga_hdmi_display path: let kmssink choose its default
+     * KMS synchronization mode and only control the public sync property. */
     if (d->connector_id >= 0) g_object_set(d->sink, "connector-id", d->connector_id, NULL);
     if (d->drm_fd >= 0) g_object_set(d->sink, "fd", d->drm_fd, NULL);
+    pthread_mutex_init(&d->slots_lock, NULL);
+    pthread_cond_init(&d->slots_cond, NULL);
+    d->slots_lock_init = true;
+    for (int i = 0; i < LPR_DISPLAY_COPY_SLOTS; i++) {
+        d->copy_slots[i].data = malloc(d->frame_size);
+        if (!d->copy_slots[i].data) {
+            fprintf(stderr, "[display] failed to allocate copy slot %d\n", i);
+            return -1;
+        }
+    }
     d->bus = gst_element_get_bus(d->pipeline);
     sret = gst_element_set_state(d->pipeline, GST_STATE_PLAYING);
     if (sret == GST_STATE_CHANGE_FAILURE) return -1;
     sret = gst_element_get_state(d->pipeline, NULL, NULL, 5 * GST_SECOND);
     if (sret == GST_STATE_CHANGE_FAILURE) return -1;
-    fprintf(stderr, "[display] started appsrc BGRx %ux%u -> kmssink sync=%d connector=%d\n",
-            w, h, d->sync ? 1 : 0, d->connector_id);
+    fprintf(stderr, "[display] started appsrc BGRx %ux%u -> kmssink sync=%d connector=%d copy_slots=%d release_delay_ms=%d\n",
+            w, h, d->sync ? 1 : 0, d->connector_id,
+            LPR_DISPLAY_COPY_SLOTS, LPR_DISPLAY_RELEASE_DELAY_MS);
     return 0;
 }
 
 void lpr_display_stop(struct display_state *d)
 {
     if (!d || !d->enabled) return;
+
     if (d->appsrc) gst_app_src_end_of_stream(GST_APP_SRC(d->appsrc));
     if (d->pipeline) gst_element_set_state(d->pipeline, GST_STATE_NULL);
     if (d->bus) gst_object_unref(d->bus);
     if (d->pipeline) gst_object_unref(d->pipeline);
+    for (int i = 0; i < LPR_DISPLAY_COPY_SLOTS; i++) {
+        free(d->copy_slots[i].data);
+        d->copy_slots[i].data = NULL;
+    }
+    if (d->slots_lock_init) {
+        pthread_cond_destroy(&d->slots_cond);
+        pthread_mutex_destroy(&d->slots_lock);
+    }
     if (d->drm_fd >= 0) close(d->drm_fd);
     memset(d, 0, sizeof(*d));
     d->drm_fd = -1;
@@ -418,49 +431,123 @@ static int handle_bus(struct display_state *d)
     return 0;
 }
 
-struct display_slot_cookie {
-    struct dma_state *dma;
-    int slot;
+struct display_slot_ticket {
+    int idx;
+    uint64_t generation;
 };
 
-static void display_slot_release(gpointer user_data)
+struct display_frame_cookie {
+    struct display_state *display;
+    struct display_slot_ticket ticket;
+};
+
+static int64_t display_mono_us(void)
 {
-    struct display_slot_cookie *cookie = (struct display_slot_cookie *)user_data;
+    return g_get_monotonic_time();
+}
+
+static void display_release_slot(struct display_state *d, const struct display_slot_ticket *ticket)
+{
+    if (!d || !ticket || ticket->idx < 0 || ticket->idx >= LPR_DISPLAY_COPY_SLOTS)
+        return;
+    pthread_mutex_lock(&d->slots_lock);
+    if (d->copy_slots[ticket->idx].in_use &&
+        d->copy_slots[ticket->idx].generation == ticket->generation) {
+        d->copy_slots[ticket->idx].release_pending = true;
+        d->copy_slots[ticket->idx].release_at_us = display_mono_us() +
+            (int64_t)LPR_DISPLAY_RELEASE_DELAY_MS * 1000LL;
+        pthread_cond_signal(&d->slots_cond);
+    }
+    pthread_mutex_unlock(&d->slots_lock);
+}
+
+static void display_frame_release(gpointer user_data)
+{
+    struct display_frame_cookie *cookie = (struct display_frame_cookie *)user_data;
     if (cookie) {
-        lpr_dma_slot_release(cookie->dma, cookie->slot);
+        display_release_slot(cookie->display, &cookie->ticket);
         g_free(cookie);
+    }
+}
+
+static int display_acquire_slot(struct display_state *d, struct display_slot_ticket *ticket)
+{
+    memset(ticket, 0, sizeof(*ticket));
+    ticket->idx = -1;
+    pthread_mutex_lock(&d->slots_lock);
+    for (;;) {
+        int64_t now = display_mono_us();
+        for (int i = 0; i < LPR_DISPLAY_COPY_SLOTS; i++) {
+            if (d->copy_slots[i].in_use && d->copy_slots[i].release_pending &&
+                now >= d->copy_slots[i].release_at_us) {
+                d->copy_slots[i].in_use = false;
+                d->copy_slots[i].release_pending = false;
+                d->copy_slots[i].release_at_us = 0;
+            }
+        }
+        for (int i = 0; i < LPR_DISPLAY_COPY_SLOTS; i++) {
+            if (!d->copy_slots[i].in_use) {
+                d->copy_slots[i].in_use = true;
+                d->copy_slots[i].release_pending = false;
+                d->copy_slots[i].release_at_us = 0;
+                d->copy_slots[i].generation++;
+                ticket->idx = i;
+                ticket->generation = d->copy_slots[i].generation;
+                pthread_mutex_unlock(&d->slots_lock);
+                return 0;
+            }
+        }
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 20L * 1000L * 1000L;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec++;
+                ts.tv_nsec -= 1000000000L;
+            }
+            pthread_cond_timedwait(&d->slots_cond, &d->slots_lock, &ts);
+        }
     }
 }
 
 int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, int slot)
 {
+    struct display_slot_ticket ticket;
+    struct display_frame_cookie *cookie;
     GstBuffer *buf;
     GstFlowReturn flow;
-    struct display_slot_cookie *cookie;
     uint8_t *frame;
+
     if (!d || !d->enabled) return 0;
     if (handle_bus(d) < 0) return -1;
     frame = lpr_dma_slot_data(dma, slot);
     if (!frame) return -1;
-    cookie = g_new0(struct display_slot_cookie, 1);
-    if (!cookie) return -1;
-    cookie->dma = dma;
-    cookie->slot = slot;
-    lpr_dma_slot_addref(dma, slot);
-    buf = gst_buffer_new_wrapped_full((GstMemoryFlags)0, frame, d->frame_size, 0, d->frame_size, cookie, display_slot_release);
-    if (!buf) {
-        display_slot_release(cookie);
+
+    if (display_acquire_slot(d, &ticket) < 0)
+        return -1;
+    memcpy(d->copy_slots[ticket.idx].data, frame, d->frame_size);
+
+    cookie = g_new0(struct display_frame_cookie, 1);
+    if (!cookie) {
+        display_release_slot(d, &ticket);
         return -1;
     }
-    /* PTS must be on the GStreamer pipeline time base, which starts at 0 when
-     * the pipeline goes PLAYING — NOT the raw monotonic clock. Using raw
-     * clock_gettime ns as PTS made kmssink (sync=TRUE) think frames were far
-     * in the future and freeze the display while capture/inference kept
-     * running. A uniform incrementing PTS from 0 is what fpga_hdmi_display
-     * uses and is what kmssink sync expects. */
+    cookie->display = d;
+    cookie->ticket = ticket;
+    buf = gst_buffer_new_wrapped_full((GstMemoryFlags)0,
+                                      d->copy_slots[ticket.idx].data,
+                                      d->frame_size, 0, d->frame_size,
+                                      cookie, display_frame_release);
+    if (!buf) {
+        display_release_slot(d, &ticket);
+        g_free(cookie);
+        return -1;
+    }
     GST_BUFFER_PTS(buf) = d->next_pts_ns;
     GST_BUFFER_DURATION(buf) = (guint64)(GST_SECOND / d->fps);
     d->next_pts_ns += GST_BUFFER_DURATION(buf);
     flow = gst_app_src_push_buffer(GST_APP_SRC(d->appsrc), buf);
-    return flow == GST_FLOW_OK ? 0 : -1;
+    if (flow != GST_FLOW_OK)
+        return -1;
+    return 0;
 }

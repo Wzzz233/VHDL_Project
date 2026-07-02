@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Display module: DRM/KMS appsrc -> kmssink RGB16 + drawing primitives. */
+/* Display module: DRM/KMS appsrc -> kmssink BGRx + drawing primitives. */
 
 #ifndef LPR_LIVE_LPR_DISPLAY_H
 #define LPR_LIVE_LPR_DISPLAY_H
@@ -9,6 +9,19 @@
 
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
+
+#include <pthread.h>
+
+#define LPR_DISPLAY_COPY_SLOTS 6
+#define LPR_DISPLAY_RELEASE_DELAY_MS 20
+
+struct display_copy_slot {
+    uint8_t *data;
+    bool in_use;
+    bool release_pending;
+    int64_t release_at_us;
+    uint64_t generation;
+};
 
 struct display_state {
     bool enabled;
@@ -25,6 +38,11 @@ struct display_state {
     GstElement *queue;
     GstElement *sink;
     GstBus *bus;
+    struct display_copy_slot copy_slots[LPR_DISPLAY_COPY_SLOTS];
+    pthread_mutex_t slots_lock;
+    pthread_cond_t slots_cond;
+    bool slots_lock_init;
+    uint64_t dropped_frames;
 };
 
 int lpr_display_start(struct display_state *d, const struct live_options *opt,

@@ -353,7 +353,7 @@ int lpr_infer_start(struct infer_state *st, const struct live_options *opt,
 
 void lpr_infer_stop(struct infer_state *st)
 {
-    if (!st)
+    if (!st || !st->thread_started)
         return;
     pthread_mutex_lock(&st->lock);
     st->running = false;
