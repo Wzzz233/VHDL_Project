@@ -366,6 +366,15 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
     g_object_set(d->queue, "max-size-buffers", 1, "max-size-bytes", 0,
                  "max-size-time", (guint64)0, "leaky", 2, NULL);
     g_object_set(d->sink, "sync", d->sync ? TRUE : FALSE, NULL);
+    /* Force atomic page-flip synchronization. With the default sync-mode=auto
+     * the RK3568 kmssink falls back to a non-atomic legacy flip on zero-copy
+     * wrapped buffers, which tears (top/bottom of screen show different frames
+     * at the vblank boundary). sync-mode=flip waits for the page-flip event so
+     * the flip is atomic and tear-free. skip-vsync=true avoids the double
+     * vsync wait on atomic drivers (sync=1 already gates on the clock), which
+     * is what previously dropped sync=1 to single-digit fps. */
+    g_object_set(d->sink, "sync-mode", 1, NULL);   /* 1 = flip (page-flip event) */
+    g_object_set(d->sink, "skip-vsync", TRUE, NULL);
     if (d->connector_id >= 0) g_object_set(d->sink, "connector-id", d->connector_id, NULL);
     if (d->drm_fd >= 0) g_object_set(d->sink, "fd", d->drm_fd, NULL);
     d->bus = gst_element_get_bus(d->pipeline);

@@ -99,7 +99,7 @@ static void usage(const char *prog)
             "  --drm-card <path>             DRM card (default: /dev/dri/card0)\n"
             "  --connector-id <id>           Optional KMS connector id\n"
             "  --no-display                  Disable HDMI/KMS display\n"
-            "  --display-sync <0|1>          kmssink sync (default: 0)\n"
+            "  --display-sync <0|1>          kmssink sync (default: 1)\n"
             "  --frames <n>                  Frame budget; 0 = forever (default: 0)\n"
             "  --fps <n>                     Capture throttle FPS (default: 10)\n"
             "  --min-plate-conf <v>          Detector threshold (default: 0.50)\n"
@@ -139,13 +139,10 @@ static void defaults(struct live_options *o)
     o->pixel_order = PIXEL_ORDER_BGR565;
     o->swap16 = false;
     o->display = true;
-    /* sync=FALSE: on this board kmssink sync=TRUE only page-flips a handful of
-     * frames per second (30fps PTS does not divide evenly into the 60Hz vblank,
-     * so most frames wait for an alignment that never comes). sync=FALSE lets
-     * kmssink flip as buffers arrive, which is what gives a smooth 30fps. The
-     * sibling fpga_hdmi_display.c defaults sync on but only proved stable at
-     * 15fps; at 30fps we must default off. */
-    o->display_sync = false;
+    /* sync=TRUE + sync-mode=flip + skip-vsync on the kmssink gives atomic
+     * page-flip (tear-free) without the double-vsync wait that previously
+     * dropped sync=1 to single-digit fps. See lpr_display.c. */
+    o->display_sync = true;
     o->det_zero_copy = false;
     o->dump_frames = 0;
     o->dump_path = NULL;
