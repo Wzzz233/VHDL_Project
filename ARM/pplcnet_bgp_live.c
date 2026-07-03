@@ -710,6 +710,7 @@ infer_ready:
                     else if (plate->route_name[0] == 'p') { tag = 'P'; r = 255; g = 255; bl = 255; }
                     else if (plate->route_name[0] == 'e') { tag = 'E'; r = 255; g = 255; bl = 0; }
                     else if (plate->route_name[0] == 'y') { tag = 'Y'; r = 255; g = 255; bl = 0; }
+                    else if (plate->route_name[0] == 'd') { tag = 'D'; r = 255; g = 0; bl = 255; }
                     if (ty < 0) ty = plate->box.y1 + 3;
                     snprintf(overlay, sizeof(overlay), "%s %c %.2f",
                              plate->text[0] ? plate->text : "OCR", tag, plate->conf);

@@ -216,47 +216,52 @@ static void *thread_main(void *arg)
             float ptype_conf = 0.0f;
             bool ptype_applied = false;
             double warp_ms = 0.0, color_ms = 0.0, ptype_ms = 0.0;
+            memset(&diag, 0, sizeof(diag));
+            memset(&ocr_timing, 0, sizeof(ocr_timing));
+
+            struct live_plate_result *plate = &res.plates[processed++];
+            plate->box = dets[i];
+
             int64_t tw0 = lpr_mono_us();
             bool warp_ok = lpr_warp_quad_homography_bgrx(bgrx, st->frame_w, st->frame_h, dets[i].quad,
                                                          crop, st->frame_w, st->frame_h, &crop_w, &crop_h);
             int64_t tw1 = lpr_mono_us();
             warp_ms = (double)(tw1 - tw0) / 1000.0;
             total_warp_ms += warp_ms;
-            if (!warp_ok)
-                continue;
 
-            int64_t tc0 = lpr_mono_us();
-            color = lpr_classify_plate_color_bgrx(bgrx, st->frame_w, st->frame_h, &dets[i]);
-            int64_t tc1 = lpr_mono_us();
-            color_ms = (double)(tc1 - tc0) / 1000.0;
-            total_color_ms += color_ms;
+            if (warp_ok) {
+                int64_t tc0 = lpr_mono_us();
+                color = lpr_classify_plate_color_bgrx(bgrx, st->frame_w, st->frame_h, &dets[i]);
+                int64_t tc1 = lpr_mono_us();
+                color_ms = (double)(tc1 - tc0) / 1000.0;
+                total_color_ms += color_ms;
 
-            if (st->ptype_model && st->ptype_model->ctx &&
-                lpr_ptype_run(st->ptype_model, crop, crop_w, crop_h,
-                              &ptype_cls, &ptype_conf, &ptype_ms) == 0 &&
-                ptype_should_apply(st->opt, ptype_cls, ptype_conf)) {
-                route_id = pick_ptype_route(st->routes, ptype_cls);
-                ptype_applied = true;
+                if (st->ptype_model && st->ptype_model->ctx &&
+                    lpr_ptype_run(st->ptype_model, crop, crop_w, crop_h,
+                                  &ptype_cls, &ptype_conf, &ptype_ms) == 0 &&
+                    ptype_should_apply(st->opt, ptype_cls, ptype_conf)) {
+                    route_id = pick_ptype_route(st->routes, ptype_cls);
+                    ptype_applied = true;
+                } else {
+                    route_id = pick_route(st->routes, color);
+                }
+                total_ptype_ms += ptype_ms;
+                const struct lpr_route *route = &st->routes[route_id];
+                route_name = route->name;
+
+                if (lpr_ocr_run(route->model, route->keys, st->opt->ocr_preproc_mode,
+                                route->decode_family, crop, crop_w, crop_h,
+                                text, sizeof(text), &conf, &diag, &ocr_timing) < 0) {
+                    snprintf(text, sizeof(text), "UNK");
+                    conf = 0.0f;
+                }
             } else {
-                route_id = pick_route(st->routes, color);
-            }
-            total_ptype_ms += ptype_ms;
-            const struct lpr_route *route = &st->routes[route_id];
-            route_name = route->name;
-
-            memset(&diag, 0, sizeof(diag));
-            memset(&ocr_timing, 0, sizeof(ocr_timing));
-            if (lpr_ocr_run(route->model, route->keys, st->opt->ocr_preproc_mode,
-                            route->decode_family, crop, crop_w, crop_h,
-                            text, sizeof(text), &conf, &diag, &ocr_timing) < 0) {
-                snprintf(text, sizeof(text), "UNK");
-                conf = 0.0f;
+                route_name = "det";
+                snprintf(text, sizeof(text), "DET");
+                conf = dets[i].conf;
             }
             total_ocr_ms += ocr_timing.prep_ms + ocr_timing.input_ms + ocr_timing.run_ms +
                             ocr_timing.output_ms + ocr_timing.decode_ms;
-
-            struct live_plate_result *plate = &res.plates[processed++];
-            plate->box = dets[i];
             plate->crop_w = crop_w;
             plate->crop_h = crop_h;
             plate->color = color;
@@ -269,13 +274,13 @@ static void *thread_main(void *arg)
             plate->blank_ratio = diag.blank_top1_ratio;
 
             printf("[bgp-live] plate_seq=%" PRIu64 " idx=%d cls=%d det_conf=%.3f color=%s "
-                   "ptype=%s ptype_conf=%.3f ptype_apply=%d route=%s box=[%d,%d,%d,%d] crop=%dx%d "
+                   "ptype=%s ptype_conf=%.3f ptype_apply=%d route=%s box=[%d,%d,%d,%d] crop=%dx%d warp_ok=%d "
                    "text=%s conf=%.3f blank=%.3f warp_ms=%.1f color_ms=%.1f ptype_ms=%.1f "
                    "prep_ms=%.1f in_ms=%.1f run_ms=%.1f out_ms=%.1f dec_ms=%.1f\n",
                    seq, i, dets[i].cls, dets[i].conf, lpr_plate_color_str(color), lpr_ptype_class_str(ptype_cls),
                    ptype_conf, ptype_applied ? 1 : 0, route_name,
                    dets[i].x1, dets[i].y1, dets[i].x2, dets[i].y2,
-                   crop_w, crop_h, text, conf, diag.blank_top1_ratio,
+                   crop_w, crop_h, warp_ok ? 1 : 0, text, conf, diag.blank_top1_ratio,
                    warp_ms, color_ms, ptype_ms, ocr_timing.prep_ms, ocr_timing.input_ms,
                    ocr_timing.run_ms, ocr_timing.output_ms, ocr_timing.decode_ms);
         }
