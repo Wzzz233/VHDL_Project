@@ -66,11 +66,6 @@
 #define POSE_OUTPUT_CHANNELS POSE_MIN_CHANNELS
 #define OCR_TRACK_MAX 24
 #define OCR_TRACK_HIST 8
-#define PLATE_TRACK_MAX 24
-#define PLATE_TRACK_TTL 3
-#define PLATE_TRACK_MIN_HITS 2
-#define PLATE_TRACK_MATCH_IOU 0.20f
-#define PLATE_TRACK_SMOOTH_ALPHA 0.40f
 #define FIRSTCHAR_TRACK_HIST 8
 #define GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES 5
 #define GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE 0.60f
@@ -414,14 +409,6 @@ struct firstchar_model {
 
 struct app_ctx;
 
-struct plate_track {
-    bool used;
-    bool shown;
-    int ttl;
-    int hits;
-    struct det_box box;
-};
-
 static bool run_quad_refiner(const struct app_ctx *ctx,
                               const uint8_t *rgb, int img_w, int img_h,
                               const float coarse_quad[8],
@@ -517,7 +504,6 @@ struct app_ctx {
     int plate_hist1_count;
     struct det_box plate_hist2[MAX_DETS];
     int plate_hist2_count;
-    struct plate_track plate_tracks[PLATE_TRACK_MAX];
 
     uint64_t pred_rows_total;
     uint64_t gate_plate_raw_positive_frames;
@@ -692,7 +678,7 @@ static void print_usage(const char *prog)
             "  --copy-buffers <num>    Copy ring size (default: %d)\n"
             "  --queue-depth <num>     appsrc max frame queue (default: %d)\n"
             "  --min-car-conf <v>      Car confidence threshold (default: 0.35)\n"
-            "  --min-plate-conf <v>    Plate confidence threshold (default: 0.15)\n"
+            "  --min-plate-conf <v>    Plate confidence threshold (default: 0.45)\n"
             "  --plate-on-car-only <0|1>  Reserve switch (default: 0)\n"
             "  --plate-only <0|1>      Disable vehicle dependency for plate output (default: 1)\n"
             "  --sw-preproc <0|1>      Enable software preproc A/B path (default: 0)\n"
@@ -706,7 +692,7 @@ static void print_usage(const char *prog)
             "  --det-resize-mode <m>   Detect resize: stretch|letterbox (default: letterbox)\n"
             "  --plate-refine <0|1>    Enable local high-res plate refine (default: 1)\n"
             "  --plate-detector-type <m> Plate detector: yolov5|yolov8_obb_rknn|yolov8_pose_rknn (default: yolov5)\n"
-            "  --plate-nms-iou <v>     Plate NMS IoU threshold (default: 0.70)\n"
+            "  --plate-nms-iou <v>     Plate NMS IoU threshold (default: 0.45)\n"
             "  --plate-max-det <n>     Plate max detections after NMS (default: 128)\n"
             "  --plate-class-id <n>    Optional class filter for plate model (-1: disabled)\n"
             "  --ocr-channel-order <m> OCR input order: rgb|bgr (default: rgb)\n"
@@ -822,7 +808,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->copy_buffers = DEFAULT_COPY_BUFFERS;
     opt->queue_depth = DEFAULT_QUEUE_DEPTH;
     opt->min_car_conf = 0.35f;
-    opt->min_plate_conf = 0.15f;
+    opt->min_plate_conf = 0.45f;
     opt->plate_on_car_only = 0;
     opt->plate_only = 1;
     opt->sw_preproc = 0;
@@ -836,7 +822,7 @@ static int parse_options(int argc, char **argv, struct options *opt)
     opt->det_resize_mode = DET_RESIZE_LETTERBOX;
     opt->plate_refine = 1;
     opt->plate_detector_type = DETECTOR_YOLOV8_OBB_RKNN;
-    opt->plate_nms_iou = 0.70f;
+    opt->plate_nms_iou = 0.45f;
     opt->plate_max_det = MAX_DETS;
     opt->plate_class_id = -1;
     opt->ocr_channel_order = OCR_CH_RGB;
@@ -6628,74 +6614,14 @@ static bool plate_box_pass_rules_for_detector(int detector_type, const struct de
     return false;
 }
 
-static int det_lerp_i(int old_v, int new_v, float alpha)
-{
-    return (int)lroundf((float)old_v * (1.0f - alpha) + (float)new_v * alpha);
-}
-
-static float det_lerp_f(float old_v, float new_v, float alpha)
-{
-    return old_v * (1.0f - alpha) + new_v * alpha;
-}
-
-static void smooth_plate_box(struct det_box *dst, const struct det_box *old_box,
-                             const struct det_box *new_box, float alpha)
+static bool has_iou_match(const struct det_box *cur, const struct det_box *hist, int hist_count, float iou_thr)
 {
     int i;
-    *dst = *new_box;
-    dst->x1 = det_lerp_i(old_box->x1, new_box->x1, alpha);
-    dst->y1 = det_lerp_i(old_box->y1, new_box->y1, alpha);
-    dst->x2 = det_lerp_i(old_box->x2, new_box->x2, alpha);
-    dst->y2 = det_lerp_i(old_box->y2, new_box->y2, alpha);
-    dst->cx = det_lerp_f(old_box->cx, new_box->cx, alpha);
-    dst->cy = det_lerp_f(old_box->cy, new_box->cy, alpha);
-    dst->w = det_lerp_f(old_box->w, new_box->w, alpha);
-    dst->h = det_lerp_f(old_box->h, new_box->h, alpha);
-    dst->angle = det_lerp_f(old_box->angle, new_box->angle, alpha);
-    if (old_box->has_obb && new_box->has_obb) {
-        dst->has_obb = true;
-        for (i = 0; i < 4; i++) {
-            dst->quad[i].x = det_lerp_f(old_box->quad[i].x, new_box->quad[i].x, alpha);
-            dst->quad[i].y = det_lerp_f(old_box->quad[i].y, new_box->quad[i].y, alpha);
-        }
+    for (i = 0; i < hist_count; i++) {
+        if (box_iou(cur, &hist[i]) >= iou_thr)
+            return true;
     }
-}
-
-static int find_plate_track_match(struct app_ctx *ctx, const struct det_box *box)
-{
-    int i;
-    int best = -1;
-    float best_iou = PLATE_TRACK_MATCH_IOU;
-    for (i = 0; i < PLATE_TRACK_MAX; i++) {
-        float iou;
-        if (!ctx->plate_tracks[i].used)
-            continue;
-        iou = box_iou(box, &ctx->plate_tracks[i].box);
-        if (iou > best_iou) {
-            best_iou = iou;
-            best = i;
-        }
-    }
-    return best;
-}
-
-static int alloc_plate_track(struct app_ctx *ctx, const bool *track_seen)
-{
-    int i;
-    int weakest = -1;
-    for (i = 0; i < PLATE_TRACK_MAX; i++) {
-        if (!ctx->plate_tracks[i].used)
-            return i;
-    }
-    for (i = 0; i < PLATE_TRACK_MAX; i++) {
-        if (track_seen[i])
-            continue;
-        if (weakest < 0 || ctx->plate_tracks[i].ttl < ctx->plate_tracks[weakest].ttl ||
-            (ctx->plate_tracks[i].ttl == ctx->plate_tracks[weakest].ttl &&
-             ctx->plate_tracks[i].box.conf < ctx->plate_tracks[weakest].box.conf))
-            weakest = i;
-    }
-    return weakest >= 0 ? weakest : 0;
+    return false;
 }
 
 static void temporal_confirm_and_update(struct app_ctx *ctx,
@@ -6703,52 +6629,30 @@ static void temporal_confirm_and_update(struct app_ctx *ctx,
                                         struct det_box *confirmed, int *confirmed_count)
 {
     int i;
-    bool track_seen[PLATE_TRACK_MAX] = { false };
+    float iou_thr_hist1 = 0.35f;
+    float iou_thr_hist2 = 0.30f;
     float direct_keep_thr = 0.55f;
-
     *confirmed_count = 0;
-    if (detector_type_uses_quad(ctx->opt.plate_detector_type))
+    if (detector_type_uses_quad(ctx->opt.plate_detector_type)) {
+        iou_thr_hist1 = 0.30f;
+        iou_thr_hist2 = 0.22f;
         direct_keep_thr = fmaxf(0.55f, ctx->opt.min_plate_conf + 0.08f);
-
-    for (i = 0; i < filtered_count; i++) {
-        int idx = find_plate_track_match(ctx, &filtered[i]);
-        if (idx >= 0 && track_seen[idx])
-            continue;
-        if (idx < 0) {
-            idx = alloc_plate_track(ctx, track_seen);
-            memset(&ctx->plate_tracks[idx], 0, sizeof(ctx->plate_tracks[idx]));
-            ctx->plate_tracks[idx].used = true;
-            ctx->plate_tracks[idx].box = filtered[i];
-        } else {
-            struct det_box smoothed;
-            smooth_plate_box(&smoothed, &ctx->plate_tracks[idx].box,
-                             &filtered[i], PLATE_TRACK_SMOOTH_ALPHA);
-            ctx->plate_tracks[idx].box = smoothed;
-        }
-        ctx->plate_tracks[idx].ttl = PLATE_TRACK_TTL;
-        if (ctx->plate_tracks[idx].hits < 1000)
-            ctx->plate_tracks[idx].hits++;
-        if (ctx->plate_tracks[idx].hits >= PLATE_TRACK_MIN_HITS ||
-            ctx->plate_tracks[idx].box.conf >= direct_keep_thr)
-            ctx->plate_tracks[idx].shown = true;
-        track_seen[idx] = true;
     }
-
-    for (i = 0; i < PLATE_TRACK_MAX; i++) {
-        if (!ctx->plate_tracks[i].used)
-            continue;
-        if (!track_seen[i]) {
-            ctx->plate_tracks[i].ttl--;
-            ctx->plate_tracks[i].box.conf *= 0.85f;
-            if (ctx->plate_tracks[i].ttl <= 0) {
-                memset(&ctx->plate_tracks[i], 0, sizeof(ctx->plate_tracks[i]));
-                continue;
+    if (ctx->plate_hist1_count > 0 && ctx->plate_hist2_count > 0) {
+        for (i = 0; i < filtered_count && *confirmed_count < MAX_DETS; i++) {
+            if (has_iou_match(&filtered[i], ctx->plate_hist1, ctx->plate_hist1_count, iou_thr_hist1) &&
+                has_iou_match(&filtered[i], ctx->plate_hist2, ctx->plate_hist2_count, iou_thr_hist2)) {
+                confirmed[(*confirmed_count)++] = filtered[i];
             }
         }
-        if (ctx->plate_tracks[i].shown && *confirmed_count < MAX_DETS)
-            confirmed[(*confirmed_count)++] = ctx->plate_tracks[i].box;
     }
-
+    if (*confirmed_count == 0 &&
+        detector_type_uses_quad(ctx->opt.plate_detector_type)) {
+        for (i = 0; i < filtered_count && *confirmed_count < MAX_DETS; i++) {
+            if (filtered[i].conf >= direct_keep_thr)
+                confirmed[(*confirmed_count)++] = filtered[i];
+        }
+    }
     memcpy(ctx->plate_hist2, ctx->plate_hist1, sizeof(ctx->plate_hist1));
     ctx->plate_hist2_count = ctx->plate_hist1_count;
     memcpy(ctx->plate_hist1, filtered, (size_t)filtered_count * sizeof(filtered[0]));

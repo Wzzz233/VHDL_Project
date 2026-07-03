@@ -53,11 +53,6 @@
 #define POSE_OUTPUT_CHANNELS POSE_MIN_CHANNELS
 #define OCR_TRACK_MAX 24
 #define OCR_TRACK_HIST 8
-#define PLATE_TRACK_MAX 24
-#define PLATE_TRACK_TTL 3
-#define PLATE_TRACK_MIN_HITS 2
-#define PLATE_TRACK_MATCH_IOU 0.20f
-#define PLATE_TRACK_SMOOTH_ALPHA 0.40f
 #define FIRSTCHAR_TRACK_HIST 8
 #define GREEN_FIRSTCHAR_DEFAULT_MIN_VOTES 5
 #define GREEN_FIRSTCHAR_DEFAULT_MIN_SHARE 0.60f
@@ -405,14 +400,6 @@ struct tensor_cn_view {
     bool c_major;
 };
 
-struct plate_track {
-    bool used;
-    bool shown;
-    int ttl;
-    int hits;
-    struct det_box box;
-};
-
 struct app_ctx {
     struct options opt;
     int dev_fd;
@@ -490,7 +477,6 @@ struct app_ctx {
     int plate_hist1_count;
     struct det_box plate_hist2[MAX_DETS];
     int plate_hist2_count;
-    struct plate_track plate_tracks[PLATE_TRACK_MAX];
 
     uint64_t pred_rows_total;
     uint64_t gate_plate_raw_positive_frames;
