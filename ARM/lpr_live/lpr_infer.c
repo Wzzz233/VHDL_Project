@@ -9,7 +9,6 @@
 #include "lpr_warp.h"
 
 #include <inttypes.h>
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,140 +87,6 @@ static enum lpr_route_id pick_route(const struct lpr_route *routes, enum plate_c
     default:
         return LPR_ROUTE_BLUE;
     }
-}
-
-static float infer_box_iou(const struct det_box *a, const struct det_box *b)
-{
-    int x1 = a->x1 > b->x1 ? a->x1 : b->x1;
-    int y1 = a->y1 > b->y1 ? a->y1 : b->y1;
-    int x2 = a->x2 < b->x2 ? a->x2 : b->x2;
-    int y2 = a->y2 < b->y2 ? a->y2 : b->y2;
-    int iw = x2 - x1 + 1;
-    int ih = y2 - y1 + 1;
-    float inter, aa, bb;
-    if (iw <= 0 || ih <= 0)
-        return 0.0f;
-    inter = (float)iw * (float)ih;
-    aa = (float)(a->x2 - a->x1 + 1) * (float)(a->y2 - a->y1 + 1);
-    bb = (float)(b->x2 - b->x1 + 1) * (float)(b->y2 - b->y1 + 1);
-    return inter / fmaxf(1.0f, aa + bb - inter);
-}
-
-static int infer_lerp_i(int old_v, int new_v, float alpha)
-{
-    return (int)lroundf((float)old_v * (1.0f - alpha) + (float)new_v * alpha);
-}
-
-static float infer_lerp_f(float old_v, float new_v, float alpha)
-{
-    return old_v * (1.0f - alpha) + new_v * alpha;
-}
-
-static void smooth_plate_det(struct det_box *dst, const struct det_box *old_box,
-                             const struct det_box *new_box, float alpha)
-{
-    *dst = *new_box;
-    dst->x1 = infer_lerp_i(old_box->x1, new_box->x1, alpha);
-    dst->y1 = infer_lerp_i(old_box->y1, new_box->y1, alpha);
-    dst->x2 = infer_lerp_i(old_box->x2, new_box->x2, alpha);
-    dst->y2 = infer_lerp_i(old_box->y2, new_box->y2, alpha);
-    for (int i = 0; i < 8; i++)
-        dst->quad[i] = infer_lerp_f(old_box->quad[i], new_box->quad[i], alpha);
-}
-
-static int find_plate_track_match(struct infer_state *st, const struct det_box *box)
-{
-    int best = -1;
-    float best_iou = LPR_PLATE_TRACK_MATCH_IOU;
-    for (int i = 0; i < LPR_PLATE_TRACK_MAX; i++) {
-        float iou;
-        if (!st->plate_tracks[i].used)
-            continue;
-        iou = infer_box_iou(box, &st->plate_tracks[i].box);
-        if (iou > best_iou) {
-            best_iou = iou;
-            best = i;
-        }
-    }
-    return best;
-}
-
-static int alloc_plate_track(struct infer_state *st, const bool *track_seen)
-{
-    int weakest = -1;
-    for (int i = 0; i < LPR_PLATE_TRACK_MAX; i++) {
-        if (!st->plate_tracks[i].used)
-            return i;
-    }
-    for (int i = 0; i < LPR_PLATE_TRACK_MAX; i++) {
-        if (track_seen[i])
-            continue;
-        if (weakest < 0 || st->plate_tracks[i].ttl < st->plate_tracks[weakest].ttl ||
-            (st->plate_tracks[i].ttl == st->plate_tracks[weakest].ttl &&
-             st->plate_tracks[i].box.conf < st->plate_tracks[weakest].box.conf))
-            weakest = i;
-    }
-    return weakest >= 0 ? weakest : 0;
-}
-
-static int compare_plate_track_desc(const void *pa, const void *pb)
-{
-    const struct det_box *a = (const struct det_box *)pa;
-    const struct det_box *b = (const struct det_box *)pb;
-    if (a->conf < b->conf) return 1;
-    if (a->conf > b->conf) return -1;
-    return 0;
-}
-
-static void stabilize_plate_detections(struct infer_state *st,
-                                       const struct det_box *input, int input_count,
-                                       struct det_box *out, int *out_count)
-{
-    bool track_seen[LPR_PLATE_TRACK_MAX] = { false };
-    int cap = st->opt->max_det;
-    if (cap <= 0 || cap > MAX_LIVE_PLATES)
-        cap = MAX_LIVE_PLATES;
-    *out_count = 0;
-
-    for (int i = 0; i < input_count; i++) {
-        int idx = find_plate_track_match(st, &input[i]);
-        if (idx >= 0 && track_seen[idx])
-            continue;
-        if (idx < 0) {
-            idx = alloc_plate_track(st, track_seen);
-            memset(&st->plate_tracks[idx], 0, sizeof(st->plate_tracks[idx]));
-            st->plate_tracks[idx].used = true;
-            st->plate_tracks[idx].box = input[i];
-        } else {
-            struct det_box smoothed;
-            smooth_plate_det(&smoothed, &st->plate_tracks[idx].box,
-                             &input[i], LPR_PLATE_TRACK_SMOOTH_ALPHA);
-            st->plate_tracks[idx].box = smoothed;
-        }
-        st->plate_tracks[idx].ttl = LPR_PLATE_TRACK_TTL;
-        if (st->plate_tracks[idx].hits < 1000)
-            st->plate_tracks[idx].hits++;
-        /* Current-frame detections should appear immediately; tracking only
-         * smooths motion and bridges short detector dropouts. */
-        st->plate_tracks[idx].shown = true;
-        track_seen[idx] = true;
-    }
-
-    for (int i = 0; i < LPR_PLATE_TRACK_MAX; i++) {
-        if (!st->plate_tracks[i].used)
-            continue;
-        if (!track_seen[i]) {
-            st->plate_tracks[i].ttl--;
-            st->plate_tracks[i].box.conf *= 0.85f;
-            if (st->plate_tracks[i].ttl <= 0) {
-                memset(&st->plate_tracks[i], 0, sizeof(st->plate_tracks[i]));
-                continue;
-            }
-        }
-        if (st->plate_tracks[i].shown && *out_count < cap)
-            out[(*out_count)++] = st->plate_tracks[i].box;
-    }
-    qsort(out, (size_t)*out_count, sizeof(out[0]), compare_plate_track_desc);
 }
 
 static void publish_result(struct infer_state *st, const struct live_result *res)
@@ -334,38 +199,51 @@ static void *thread_main(void *arg)
             continue;
         }
         t1 = lpr_mono_us();
-        {
-            struct det_box stable_dets[MAX_LIVE_PLATES];
-            int stable_count = 0;
-            stabilize_plate_detections(st, dets, det_count, stable_dets, &stable_count);
-            memcpy(dets, stable_dets, (size_t)stable_count * sizeof(dets[0]));
-            det_count = stable_count;
-        }
         best = lpr_detector_pick_best(dets, det_count);
         res.det_count = det_count;
         res.best = best;
 
         for (int i = 0; i < det_count && processed < MAX_LIVE_PLATES; i++) {
             int crop_w = 0, crop_h = 0;
-            char text[64] = "";
-            float conf = 0.0f;
+            char text[64] = "DET";
+            float conf = dets[i].conf;
             struct ocr_decode_diag diag;
             struct ocr_timing ocr_timing;
             enum plate_color color = PLATE_COLOR_UNKNOWN;
             enum lpr_route_id route_id = LPR_ROUTE_BLUE;
-            const char *route_name = "blue";
+            const char *route_name = "det";
             int ptype_cls = LPR_PTYPE_UNKNOWN;
             float ptype_conf = 0.0f;
             bool ptype_applied = false;
             double warp_ms = 0.0, color_ms = 0.0, ptype_ms = 0.0;
+            struct live_plate_result *plate = &res.plates[processed++];
+
+            memset(&diag, 0, sizeof(diag));
+            memset(&ocr_timing, 0, sizeof(ocr_timing));
+            plate->box = dets[i];
+            plate->crop_w = 0;
+            plate->crop_h = 0;
+            plate->color = color;
+            plate->ptype_cls = ptype_cls;
+            plate->ptype_conf = ptype_conf;
+            plate->ptype_applied = ptype_applied;
+            snprintf(plate->route_name, sizeof(plate->route_name), "%s", route_name);
+            snprintf(plate->text, sizeof(plate->text), "%s", text);
+            plate->conf = conf;
+            plate->blank_ratio = 0.0f;
+
             int64_t tw0 = lpr_mono_us();
             bool warp_ok = lpr_warp_quad_homography_bgrx(bgrx, st->frame_w, st->frame_h, dets[i].quad,
                                                          crop, st->frame_w, st->frame_h, &crop_w, &crop_h);
             int64_t tw1 = lpr_mono_us();
             warp_ms = (double)(tw1 - tw0) / 1000.0;
             total_warp_ms += warp_ms;
-            if (!warp_ok)
+            if (!warp_ok) {
+                printf("[bgp-live] plate_seq=%" PRIu64 " idx=%d cls=%d det_conf=%.3f route=det box=[%d,%d,%d,%d] warp=fail\n",
+                       seq, i, dets[i].cls, dets[i].conf,
+                       dets[i].x1, dets[i].y1, dets[i].x2, dets[i].y2);
                 continue;
+            }
 
             int64_t tc0 = lpr_mono_us();
             color = lpr_classify_plate_color_bgrx(bgrx, st->frame_w, st->frame_h, &dets[i]);
@@ -386,8 +264,6 @@ static void *thread_main(void *arg)
             const struct lpr_route *route = &st->routes[route_id];
             route_name = route->name;
 
-            memset(&diag, 0, sizeof(diag));
-            memset(&ocr_timing, 0, sizeof(ocr_timing));
             if (lpr_ocr_run(route->model, route->keys, st->opt->ocr_preproc_mode,
                             route->decode_family, crop, crop_w, crop_h,
                             text, sizeof(text), &conf, &diag, &ocr_timing) < 0) {
@@ -397,7 +273,6 @@ static void *thread_main(void *arg)
             total_ocr_ms += ocr_timing.prep_ms + ocr_timing.input_ms + ocr_timing.run_ms +
                             ocr_timing.output_ms + ocr_timing.decode_ms;
 
-            struct live_plate_result *plate = &res.plates[processed++];
             plate->box = dets[i];
             plate->crop_w = crop_w;
             plate->crop_h = crop_h;

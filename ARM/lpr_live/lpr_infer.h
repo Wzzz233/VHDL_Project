@@ -34,20 +34,6 @@ struct lpr_route {
     char name[8];                    /* human label "blue" etc */
 };
 
-#define LPR_PLATE_TRACK_MAX 8
-#define LPR_PLATE_TRACK_TTL 3
-#define LPR_PLATE_TRACK_MIN_HITS 2
-#define LPR_PLATE_TRACK_MATCH_IOU 0.20f
-#define LPR_PLATE_TRACK_SMOOTH_ALPHA 0.40f
-
-struct lpr_plate_track {
-    bool used;
-    bool shown;
-    int ttl;
-    int hits;
-    struct det_box box;
-};
-
 struct infer_state {
     pthread_t thread;
     bool thread_started;
@@ -72,7 +58,6 @@ struct infer_state {
     int frame_w;
     int frame_h;
     struct live_result result;
-    struct lpr_plate_track plate_tracks[LPR_PLATE_TRACK_MAX];
 
     const struct live_options *opt;
     struct rknn_model *det_model;
