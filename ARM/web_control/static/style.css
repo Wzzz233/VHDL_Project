@@ -1,0 +1,160 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #111418;
+  color: #eef3f8;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #111418;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px;
+  border-bottom: 1px solid #27313b;
+  background: #171c22;
+}
+
+h1, h2, p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 20px;
+  font-weight: 650;
+}
+
+h2 {
+  font-size: 15px;
+  margin-bottom: 12px;
+}
+
+#summary {
+  color: #9eadba;
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 14px;
+  padding: 14px;
+}
+
+.preview {
+  grid-row: span 3;
+  min-width: 0;
+}
+
+.stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #050607;
+  border: 1px solid #27313b;
+  overflow: hidden;
+}
+
+#frame, #overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+#frame {
+  object-fit: contain;
+}
+
+#overlay {
+  pointer-events: none;
+}
+
+.panel {
+  border: 1px solid #27313b;
+  background: #171c22;
+  padding: 14px;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+button, select, input {
+  height: 36px;
+  border: 1px solid #3a4652;
+  background: #222a33;
+  color: #eef3f8;
+  font: inherit;
+}
+
+button {
+  padding: 0 14px;
+  cursor: pointer;
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+label {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  color: #c3ced8;
+  font-size: 14px;
+}
+
+.checkbox {
+  grid-template-columns: 20px 1fr;
+}
+
+.checkbox input {
+  height: auto;
+}
+
+#results {
+  display: grid;
+  gap: 8px;
+  font-size: 14px;
+  color: #d7e0e8;
+}
+
+.plate {
+  border-left: 3px solid #4cc9f0;
+  padding-left: 8px;
+}
+
+pre {
+  margin: 0;
+  max-height: 280px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 12px;
+  color: #c9d3dc;
+}
+
+@media (max-width: 900px) {
+  header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  main {
+    grid-template-columns: 1fr;
+  }
+
+  .preview {
+    grid-row: auto;
+  }
+}
