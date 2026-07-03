@@ -201,9 +201,9 @@ static void stabilize_plate_detections(struct infer_state *st,
         st->plate_tracks[idx].ttl = LPR_PLATE_TRACK_TTL;
         if (st->plate_tracks[idx].hits < 1000)
             st->plate_tracks[idx].hits++;
-        if (st->plate_tracks[idx].hits >= LPR_PLATE_TRACK_MIN_HITS ||
-            st->plate_tracks[idx].box.conf >= 0.55f)
-            st->plate_tracks[idx].shown = true;
+        /* Current-frame detections should appear immediately; tracking only
+         * smooths motion and bridges short detector dropouts. */
+        st->plate_tracks[idx].shown = true;
         track_seen[idx] = true;
     }
 
