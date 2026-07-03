@@ -103,10 +103,10 @@ static void usage(const char *prog)
             "  --display-sync <0|1>          kmssink sync (default: 1)\n"
             "  --frames <n>                  Frame budget; 0 = forever (default: 0)\n"
             "  --fps <n>                     Capture throttle FPS (default: 10)\n"
-            "  --min-plate-conf <v>          Detector threshold (default: 0.15)\n"
+            "  --min-plate-conf <v>          Detector threshold (default: 0.50)\n"
             "  --det-score-scale <v>         Divide detector class scores by v (default: 1)\n"
-            "  --plate-nms-iou <v>           NMS IoU (default: 0.65)\n"
-            "  --plate-max-det <n>           Max dets per frame (default: 4)\n"
+            "  --plate-nms-iou <v>           NMS IoU (default: 0.45)\n"
+            "  --plate-max-det <n>           Max dets per frame (default: 8)\n"
             "  --class-filter <id>           Filter detector class; -1 disables (default: -1)\n"
             "  --auto-green-filter <0|1>     Auto-set class 1 when pose_nc>=5 (default: 0)\n"
             "  --det-resize <stretch|letterbox>  Detector mapping (default: stretch)\n"
@@ -117,9 +117,7 @@ static void usage(const char *prog)
             "  --dump-frames <n>             Dump first n raw BGRX frames to disk for diagnostics (default: 0)\n"
             "  --dump-path <dir>             Directory for dumped frames (default: ./dump)\n"
             "  --dma-pre-delay-us <n>       Sleep before each DMA read, for phase diagnostics (default: 0)\n"
-            "  --display-every <n>          Display one of every n captured frames (default: 1)\n"
-            "  --web-preview-dir <dir>      Write latest.bmp/results.json/status.json for web UI\n"
-            "  --web-preview-fps <n>        Preview file output FPS; 0 disables frames (default: 0)\n",
+            "  --display-every <n>          Display one of every n captured frames (default: 1)\n",
             prog);
 }
 
@@ -130,12 +128,12 @@ static void defaults(struct live_options *o)
     o->drm_card_path = DEFAULT_DRM_CARD;
     o->frames = 0;
     o->fps = 10;
-    o->min_conf = 0.15f;
+    o->min_conf = 0.50f;
     o->det_score_scale = 1.0f;
-    o->nms_iou = 0.65f;
+    o->nms_iou = 0.45f;
     o->plate_type_classifier_min_conf = PLATE_TYPE_CLASSIFIER_DEFAULT_MIN_CONF;
     o->plate_type_classifier_special_min_conf = PLATE_TYPE_CLASSIFIER_DEFAULT_SPECIAL_MIN_CONF;
-    o->max_det = 4;
+    o->max_det = 8;
     o->class_filter = -1;
     o->connector_id = -1;
     o->auto_green_filter = false;
@@ -154,128 +152,6 @@ static void defaults(struct live_options *o)
     o->dump_path = NULL;
     o->dma_pre_delay_us = 0;
     o->display_every = 1;
-    o->web_preview_dir = NULL;
-    o->web_preview_fps = 0;
-}
-
-
-static int write_preview_bmp(const char *dir, const uint8_t *bgrx, int src_w, int src_h,
-                             int out_w, int out_h)
-{
-    char tmp[512], path[512];
-    FILE *fp;
-    int row_stride = (out_w * 3 + 3) & ~3;
-    int pixel_size = row_stride * out_h;
-    int file_size = 54 + pixel_size;
-    uint8_t header[54];
-    uint8_t *row;
-
-    if (!dir || !bgrx || src_w <= 0 || src_h <= 0 || out_w <= 0 || out_h <= 0)
-        return 0;
-    mkdir(dir, 0755);
-    snprintf(tmp, sizeof(tmp), "%s/latest.tmp", dir);
-    snprintf(path, sizeof(path), "%s/latest.bmp", dir);
-    fp = fopen(tmp, "wb");
-    if (!fp) return -1;
-
-    memset(header, 0, sizeof(header));
-    header[0] = 'B'; header[1] = 'M';
-    header[2] = (uint8_t)file_size; header[3] = (uint8_t)(file_size >> 8);
-    header[4] = (uint8_t)(file_size >> 16); header[5] = (uint8_t)(file_size >> 24);
-    header[10] = 54; header[14] = 40;
-    header[18] = (uint8_t)out_w; header[19] = (uint8_t)(out_w >> 8);
-    header[20] = (uint8_t)(out_w >> 16); header[21] = (uint8_t)(out_w >> 24);
-    header[22] = (uint8_t)out_h; header[23] = (uint8_t)(out_h >> 8);
-    header[24] = (uint8_t)(out_h >> 16); header[25] = (uint8_t)(out_h >> 24);
-    header[26] = 1; header[28] = 24;
-    header[34] = (uint8_t)pixel_size; header[35] = (uint8_t)(pixel_size >> 8);
-    header[36] = (uint8_t)(pixel_size >> 16); header[37] = (uint8_t)(pixel_size >> 24);
-    if (fwrite(header, 1, sizeof(header), fp) != sizeof(header)) { fclose(fp); return -1; }
-
-    row = (uint8_t *)calloc(1, (size_t)row_stride);
-    if (!row) { fclose(fp); return -1; }
-    for (int y = out_h - 1; y >= 0; y--) {
-        int sy = y * src_h / out_h;
-        for (int x = 0; x < out_w; x++) {
-            int sx = x * src_w / out_w;
-            const uint8_t *pix = bgrx + ((size_t)sy * (size_t)src_w + (size_t)sx) * 4U;
-            row[x * 3 + 0] = pix[0];
-            row[x * 3 + 1] = pix[1];
-            row[x * 3 + 2] = pix[2];
-        }
-        if (fwrite(row, 1, (size_t)row_stride, fp) != (size_t)row_stride) {
-            free(row); fclose(fp); return -1;
-        }
-    }
-    free(row);
-    fclose(fp);
-    rename(tmp, path);
-    return 0;
-}
-
-static void json_escape(FILE *fp, const char *s)
-{
-    fputc('"', fp);
-    if (s) {
-        for (; *s; s++) {
-            unsigned char c = (unsigned char)*s;
-            if (c == '"' || c == '\\') { fputc('\\', fp); fputc(c, fp); }
-            else if (c >= 0x20) fputc(c, fp);
-        }
-    }
-    fputc('"', fp);
-}
-
-static int write_preview_results(const char *dir, const struct live_result *res,
-                                 int frame_w, int frame_h, int frame)
-{
-    char tmp[512], path[512];
-    FILE *fp;
-    if (!dir) return 0;
-    mkdir(dir, 0755);
-    snprintf(tmp, sizeof(tmp), "%s/results.tmp", dir);
-    snprintf(path, sizeof(path), "%s/results.json", dir);
-    fp = fopen(tmp, "w");
-    if (!fp) return -1;
-    fprintf(fp, "{\n  \"frame\": %d,\n  \"frame_w\": %d,\n  \"frame_h\": %d,\n  \"valid\": %s,\n  \"seq\": %llu,\n  \"plates\": [",
-            frame, frame_w, frame_h, (res && res->valid) ? "true" : "false",
-            (unsigned long long)(res ? res->seq : 0));
-    if (res && res->valid) {
-        for (int i = 0; i < res->result_count && i < MAX_LIVE_PLATES; i++) {
-            const struct live_plate_result *plate = &res->plates[i];
-            if (i) fprintf(fp, ",");
-            fprintf(fp, "\n    {\"x1\":%d,\"y1\":%d,\"x2\":%d,\"y2\":%d,\"conf\":%.4f,\"route\":",
-                    plate->box.x1, plate->box.y1, plate->box.x2, plate->box.y2, plate->conf);
-            json_escape(fp, plate->route_name);
-            fprintf(fp, ",\"text\":");
-            json_escape(fp, plate->text);
-            fprintf(fp, "}");
-        }
-        fprintf(fp, "\n  ");
-    }
-    fprintf(fp, "]\n}\n");
-    fclose(fp);
-    rename(tmp, path);
-    return 0;
-}
-
-static int write_preview_status(const char *dir, const struct live_options *opt,
-                                int frame, uint64_t drops)
-{
-    char tmp[512], path[512];
-    FILE *fp;
-    if (!dir) return 0;
-    mkdir(dir, 0755);
-    snprintf(tmp, sizeof(tmp), "%s/status.tmp", dir);
-    snprintf(path, sizeof(path), "%s/status.json", dir);
-    fp = fopen(tmp, "w");
-    if (!fp) return -1;
-    fprintf(fp, "{\n  \"frame\": %d,\n  \"fps\": %d,\n  \"display_every\": %d,\n  \"no_infer\": %s,\n  \"dma_pre_delay_us\": %d,\n  \"display_drop_total\": %llu\n}\n",
-            frame, opt->fps, opt->display_every, opt->no_infer ? "true" : "false",
-            opt->dma_pre_delay_us, (unsigned long long)drops);
-    fclose(fp);
-    rename(tmp, path);
-    return 0;
 }
 
 static int parse_options(int argc, char **argv, struct live_options *o)
@@ -321,8 +197,6 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_NO_INFER,
         OPT_DMA_PRE_DELAY_US,
         OPT_DISPLAY_EVERY,
-        OPT_WEB_PREVIEW_DIR,
-        OPT_WEB_PREVIEW_FPS,
     };
     static const struct option opts[] = {
         {"device",            required_argument, NULL, OPT_DEVICE},
@@ -363,8 +237,6 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"dump-path",        required_argument, NULL, OPT_DUMP_PATH},
         {"dma-pre-delay-us", required_argument, NULL, OPT_DMA_PRE_DELAY_US},
         {"display-every",    required_argument, NULL, OPT_DISPLAY_EVERY},
-        {"web-preview-dir", required_argument, NULL, OPT_WEB_PREVIEW_DIR},
-        {"web-preview-fps", required_argument, NULL, OPT_WEB_PREVIEW_FPS},
         {"help",              no_argument,       NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -457,13 +329,6 @@ static int parse_options(int argc, char **argv, struct live_options *o)
             o->display_every = atoi(optarg);
             if (o->display_every <= 0) return -1;
             break;
-        case OPT_WEB_PREVIEW_DIR:
-            o->web_preview_dir = optarg;
-            break;
-        case OPT_WEB_PREVIEW_FPS:
-            o->web_preview_fps = atoi(optarg);
-            if (o->web_preview_fps < 0) return -1;
-            break;
         case 'h': return 1;
         default:  return -1;
         }
@@ -497,8 +362,6 @@ static int parse_options(int argc, char **argv, struct live_options *o)
     if (o->dma_pre_delay_us < 0 || o->dma_pre_delay_us > 1000000)
         return -1;
     if (o->display_every <= 0 || o->display_every > 120)
-        return -1;
-    if (o->web_preview_fps < 0 || o->web_preview_fps > 30)
         return -1;
     return 0;
 }
@@ -690,7 +553,7 @@ infer_ready:
     fprintf(stderr,
             "[bgp-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
             "det_resize=%s det_score_scale=%.1f blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
-            "ptype=%s preproc=%s display=%d auto_green_filter=%d no_infer=%d async_infer=%d dma_pre_delay_us=%d display_every=%d web_preview_dir=%s web_preview_fps=%d\n",
+            "ptype=%s preproc=%s display=%d auto_green_filter=%d no_infer=%d async_infer=%d dma_pre_delay_us=%d display_every=%d\n",
             dma.frame_w, dma.frame_h, dma.src_is_bgrx ? "bgrx8888" : "bgr565",
             opt.frames, opt.fps, pose_nc, class_filter,
             opt.det_resize_mode == DET_RESIZE_LETTERBOX ? "letterbox" : "stretch",
@@ -705,8 +568,7 @@ infer_ready:
                 (opt.ocr_preproc_mode == OCR_PREPROC_BIN ? "bin" : "none"),
             opt.display ? 1 : 0, opt.auto_green_filter ? 1 : 0,
             opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1,
-            opt.dma_pre_delay_us, opt.display_every,
-            opt.web_preview_dir ? opt.web_preview_dir : "off", opt.web_preview_fps);
+            opt.dma_pre_delay_us, opt.display_every);
 
     if (!opt.no_infer) {
     /* Build the per-route binding table for the inference thread. */
@@ -777,9 +639,6 @@ infer_ready:
     int64_t stat_last_us = lpr_mono_us();
     int64_t stat_dma_us = 0, stat_overlay_us = 0, stat_push_us = 0, stat_sleep_us = 0;
     uint64_t stat_display_drop = display.dropped_frames;
-    int64_t next_preview_us = lpr_mono_us();
-    struct live_result web_latest;
-    memset(&web_latest, 0, sizeof(web_latest));
     int stat_frames = 0;
     for (int frame = 0; !g_stop && (opt.frames == 0 || frame < opt.frames); frame++) {
         struct live_result latest;
@@ -832,22 +691,8 @@ infer_ready:
         if (!opt.no_infer) {
             lpr_infer_submit_latest(&infer, slot, lpr_dma_slot_generation(&dma, slot));
             has_overlay = lpr_infer_get_result(&infer, &latest);
-            if (has_overlay)
-                web_latest = latest;
         } else {
             has_overlay = false;
-        }
-        if (opt.web_preview_dir) {
-            int64_t now_preview = lpr_mono_us();
-            bool write_frame = opt.web_preview_fps > 0 && now_preview >= next_preview_us;
-            if (write_frame) {
-                int out_w = (dma.frame_w > 640) ? 640 : (int)dma.frame_w;
-                int out_h = (int)((int64_t)out_w * (int64_t)dma.frame_h / (int64_t)dma.frame_w);
-                write_preview_bmp(opt.web_preview_dir, slot_frame, (int)dma.frame_w, (int)dma.frame_h, out_w, out_h);
-                next_preview_us = now_preview + 1000000LL / opt.web_preview_fps;
-            }
-            write_preview_results(opt.web_preview_dir, &web_latest, (int)dma.frame_w, (int)dma.frame_h, frame);
-            write_preview_status(opt.web_preview_dir, &opt, frame, display.dropped_frames);
         }
         ts_c = lpr_mono_us();
         stat_dma_us += ts_b - ts_a;

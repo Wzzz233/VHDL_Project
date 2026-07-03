@@ -154,8 +154,6 @@ struct live_options {
     const char *dump_path;
     int dma_pre_delay_us;
     int display_every;
-    const char *web_preview_dir;
-    int web_preview_fps;
 };
 
 /* ---------------- Detector outputs ---------------- */
