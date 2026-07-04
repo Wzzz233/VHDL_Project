@@ -110,11 +110,10 @@ void lpr_infer_submit_latest(struct infer_state *st, int slot, uint64_t generati
 {
     pthread_mutex_lock(&st->lock);
     if (st->has_new) {
-        /* Infer thread still busy with the previous submission; drop this one.
-         * Release the addref we are about to skip. */
+        /* Infer thread still has a pending submission. Drop this frame for
+         * inference only; the caller still owns the DMA slot and will release
+         * it after overlay/display work is done. */
         st->overwrite_count++;
-        if (slot >= 0)
-            lpr_dma_slot_release(st->dma, slot);
         pthread_mutex_unlock(&st->lock);
         return;
     }

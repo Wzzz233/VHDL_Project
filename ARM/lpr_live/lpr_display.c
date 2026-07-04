@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -587,7 +588,7 @@ static int display_acquire_slot(struct display_state *d, struct display_slot_tic
     return 1;
 }
 
-static int display_copy_push_slot(struct display_state *d, int slot)
+static int display_copy_push_slot(struct display_state *d, int slot, uint64_t generation)
 {
     struct display_slot_ticket ticket;
     struct display_frame_cookie *cookie;
@@ -601,6 +602,15 @@ static int display_copy_push_slot(struct display_state *d, int slot)
     if (!frame) return -1;
 
     {
+        uint64_t actual_generation = lpr_dma_slot_generation(d->dma, slot);
+        if (actual_generation != generation) {
+            fprintf(stderr, "[display] DMA slot %d generation changed before copy: queued=%" PRIu64 " actual=%" PRIu64 "\n",
+                    slot, generation, actual_generation);
+            return -1;
+        }
+    }
+
+    {
         int ar = display_acquire_slot(d, &ticket);
         if (ar < 0)
             return -1;
@@ -610,6 +620,15 @@ static int display_copy_push_slot(struct display_state *d, int slot)
         }
     }
     memcpy(d->copy_slots[ticket.idx].data, frame, d->frame_size);
+    {
+        uint64_t actual_generation = lpr_dma_slot_generation(d->dma, slot);
+        if (actual_generation != generation) {
+            fprintf(stderr, "[display] DMA slot %d generation changed during copy: queued=%" PRIu64 " actual=%" PRIu64 "\n",
+                    slot, generation, actual_generation);
+            display_release_slot(d, &ticket);
+            return -1;
+        }
+    }
 
     cookie = g_new0(struct display_frame_cookie, 1);
     if (!cookie) {
@@ -642,6 +661,7 @@ static void *display_thread_main(void *arg)
 
     for (;;) {
         int slot;
+        uint64_t generation;
 
         pthread_mutex_lock(&d->slots_lock);
         while (d->running && !d->has_new)
@@ -651,12 +671,14 @@ static void *display_thread_main(void *arg)
             break;
         }
         slot = d->pending_slot;
+        generation = d->pending_generation;
         d->pending_slot = -1;
+        d->pending_generation = 0;
         d->has_new = false;
         pthread_mutex_unlock(&d->slots_lock);
 
         if (slot >= 0) {
-            if (display_copy_push_slot(d, slot) < 0) {
+            if (display_copy_push_slot(d, slot, generation) < 0) {
                 pthread_mutex_lock(&d->slots_lock);
                 d->display_error = true;
                 pthread_mutex_unlock(&d->slots_lock);
