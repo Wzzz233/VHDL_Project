@@ -714,8 +714,8 @@ infer_ready:
                     if (ty < 0) ty = plate->box.y1 + 3;
                     snprintf(overlay, sizeof(overlay), "%s %c %.2f",
                              plate->text[0] ? plate->text : "OCR", tag, plate->conf);
-                    lpr_draw_rect_bgrx(slot_frame, (int)dma.frame_w, (int)dma.frame_h,
-                                       &plate->box, r, g, bl);
+                    lpr_draw_quad_bgrx(slot_frame, (int)dma.frame_w, (int)dma.frame_h,
+                                       plate->box.quad, r, g, bl);
                     lpr_draw_text_bgrx(slot_frame, (int)dma.frame_w, (int)dma.frame_h,
                                        plate->box.x1, ty, overlay, r, g, bl,
                                        OVERLAY_TEXT_SCALE);

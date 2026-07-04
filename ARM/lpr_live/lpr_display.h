@@ -60,6 +60,10 @@ int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, i
 
 /* Drawing primitives operate directly on BGRX8888 or RGB565 frames. */
 void lpr_draw_rect_bgrx(uint8_t *pix, int w, int h, const struct det_box *b, uint8_t r, uint8_t g, uint8_t bl);
+/* Draw the 4-point perspective quadrilateral (quad[0..7] = TL.x,TL.y, TR.x,TR.y,
+ * BR.x,BR.y, BL.x,BL.y) plus 3x3 corner markers. Replaces the axis-aligned rect
+ * for plates so adjacent tilted plates no longer overlap as bounding boxes. */
+void lpr_draw_quad_bgrx(uint8_t *pix, int w, int h, const float quad[8], uint8_t r, uint8_t g, uint8_t bl);
 void lpr_draw_text_bgrx(uint8_t *pix, int w, int h, int x, int y, const char *s,
                         uint8_t r, uint8_t g, uint8_t bl, int scale);
 void lpr_draw_rect_565(uint16_t *pix, int w, int h, const struct det_box *b, uint16_t c);

@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -236,6 +237,56 @@ void lpr_draw_rect_bgrx(uint8_t *pix, int w, int h, const struct det_box *b, uin
             if (y >= 0 && y < h) {
                 if (b->x1 + t >= 0 && b->x1 + t < w) lpr_bgrx_set_rgb(pix, w, b->x1 + t, y, r, g, bl);
                 if (b->x2 - t >= 0 && b->x2 - t < w) lpr_bgrx_set_rgb(pix, w, b->x2 - t, y, r, g, bl);
+            }
+        }
+    }
+}
+
+/* Bresenham line in BGRX, 2px thick by also lighting the neighbour pixel along
+ * the minor axis. Used only by lpr_draw_quad_bgrx for perspective edges. */
+static void draw_line_bgrx(uint8_t *pix, int w, int h, int x0, int y0, int x1, int y1,
+                           uint8_t r, uint8_t g, uint8_t bl)
+{
+    int dx = abs(x1 - x0);
+    int dy = abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx - dy;
+    for (;;) {
+        if (x0 >= 0 && x0 < w && y0 >= 0 && y0 < h) {
+            lpr_bgrx_set_rgb(pix, w, x0, y0, r, g, bl);
+            if (dx >= dy) {
+                if (y0 + 1 < h) lpr_bgrx_set_rgb(pix, w, x0, y0 + 1, r, g, bl);
+            } else {
+                if (x0 + 1 < w) lpr_bgrx_set_rgb(pix, w, x0 + 1, y0, r, g, bl);
+            }
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 < dx) { err += dx; y0 += sy; }
+    }
+}
+
+void lpr_draw_quad_bgrx(uint8_t *pix, int w, int h, const float quad[8],
+                        uint8_t r, uint8_t g, uint8_t bl)
+{
+    int px[4], py[4];
+    for (int i = 0; i < 4; i++) {
+        px[i] = (int)lroundf(quad[i * 2]);
+        py[i] = (int)lroundf(quad[i * 2 + 1]);
+    }
+    draw_line_bgrx(pix, w, h, px[0], py[0], px[1], py[1], r, g, bl);
+    draw_line_bgrx(pix, w, h, px[1], py[1], px[2], py[2], r, g, bl);
+    draw_line_bgrx(pix, w, h, px[2], py[2], px[3], py[3], r, g, bl);
+    draw_line_bgrx(pix, w, h, px[3], py[3], px[0], py[0], r, g, bl);
+    /* 3x3 corner markers keep keypoints visible even on thin edges. */
+    for (int i = 0; i < 4; i++) {
+        for (int oy = -1; oy <= 1; oy++) {
+            for (int ox = -1; ox <= 1; ox++) {
+                int x = px[i] + ox, y = py[i] + oy;
+                if (x >= 0 && x < w && y >= 0 && y < h)
+                    lpr_bgrx_set_rgb(pix, w, x, y, r, g, bl);
             }
         }
     }
