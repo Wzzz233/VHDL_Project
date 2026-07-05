@@ -383,7 +383,9 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
     d->enabled = opt->display;
     d->drm_fd = -1;
     if (!d->enabled) return 0;
-    d->w = w; d->h = h; d->fps = opt->fps; d->connector_id = opt->connector_id; d->sync = opt->display_sync;
+    d->w = w; d->h = h; d->fps = opt->fps; d->connector_id = opt->connector_id;
+    d->sync = opt->display_sync;
+    d->atomic_flip = opt->display_atomic_flip;
     d->frame_size = (size_t)w * (size_t)h * 4U;
     d->pending_slot = -1;
     if (opt->drm_card_path && opt->drm_card_path[0]) {
@@ -421,18 +423,13 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
     g_object_set(d->queue, "max-size-buffers", 1, "max-size-bytes", 0,
                  "max-size-time", (guint64)0, "leaky", 2, NULL);
     g_object_set(d->sink, "sync", d->sync ? TRUE : FALSE, NULL);
-    /* Force atomic page-flip. With the default sync-mode=auto the RK3568 kmssink
-     * falls back to a non-atomic legacy flip that tears at the screen midline
-     * (top/bottom show different frames at the vblank) — the exact b2d4763
-     * symptom, which 83da1e0 reintroduced when it dropped this block assuming
-     * copy-slot buffering would not need it. Copy-slot does not make sync-mode
-     * auto atomic, so tearing still surfaces when overlay timing shifts (the
-     * quad overlay change shifted push cadence enough to expose it). sync-mode
-     * =flip waits on the page-flip event for an atomic tear-free flip;
-     * skip-vsync avoids the double vsync wait on the atomic RK3568 driver (sync
-     * already gates on the clock), which is what previously dropped fps. */
-    g_object_set(d->sink, "sync-mode", 1, NULL);   /* 1 = flip (page-flip event) */
-    g_object_set(d->sink, "skip-vsync", TRUE, NULL);
+    if (d->atomic_flip) {
+        /* Atomic flip is useful when diagnosing true scanout tearing, but on
+         * this RK3568 path it can make 30fps motion cadence visibly uneven.
+         * Keep it opt-in so the default path favors steady motion. */
+        g_object_set(d->sink, "sync-mode", 1, NULL);   /* 1 = flip */
+        g_object_set(d->sink, "skip-vsync", TRUE, NULL);
+    }
     if (d->connector_id >= 0) g_object_set(d->sink, "connector-id", d->connector_id, NULL);
     if (d->drm_fd >= 0) g_object_set(d->sink, "fd", d->drm_fd, NULL);
     pthread_mutex_init(&d->slots_lock, NULL);
@@ -457,8 +454,8 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
         return -1;
     }
     d->thread_started = true;
-    fprintf(stderr, "[display] started appsrc BGRx %ux%u -> kmssink sync=%d connector=%d copy_slots=%d release_delay_ms=%d\n",
-            w, h, d->sync ? 1 : 0, d->connector_id,
+    fprintf(stderr, "[display] started appsrc BGRx %ux%u -> kmssink sync=%d atomic_flip=%d connector=%d copy_slots=%d release_delay_ms=%d\n",
+            w, h, d->sync ? 1 : 0, d->atomic_flip ? 1 : 0, d->connector_id,
             LPR_DISPLAY_COPY_SLOTS, LPR_DISPLAY_RELEASE_DELAY_MS);
     return 0;
 }

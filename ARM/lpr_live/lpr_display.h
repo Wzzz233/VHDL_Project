@@ -31,6 +31,7 @@ struct display_state {
     int fps;
     int connector_id;
     bool sync;
+    bool atomic_flip;
     size_t frame_size;
     uint64_t next_pts_ns;
     GstElement *pipeline;

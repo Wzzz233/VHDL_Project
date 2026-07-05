@@ -100,7 +100,8 @@ static void usage(const char *prog)
             "  --connector-id <id>           Optional KMS connector id\n"
             "  --no-display                  Disable HDMI/KMS display\n"
             "  --no-infer                    Disable RKNN inference for display-only diagnostics\n"
-            "  --display-sync <0|1>          kmssink sync (default: 1)\n"
+            "  --display-sync <0|1>          kmssink sync (default: 0)\n"
+            "  --display-atomic-flip <0|1>   Force kmssink sync-mode=flip (default: 0)\n"
             "  --frames <n>                  Frame budget; 0 = forever (default: 0)\n"
             "  --fps <n>                     Capture throttle FPS (default: 10)\n"
             "  --min-plate-conf <v>          Detector threshold (default: 0.50)\n"
@@ -142,10 +143,11 @@ static void defaults(struct live_options *o)
     o->pixel_order = PIXEL_ORDER_BGR565;
     o->swap16 = false;
     o->display = true;
-    /* sync=TRUE + sync-mode=flip + skip-vsync on the kmssink gives atomic
-     * page-flip (tear-free) without the double-vsync wait that previously
-     * dropped sync=1 to single-digit fps. See lpr_display.c. */
-    o->display_sync = true;
+    /* Favor steady 30fps motion by default. Atomic flip is available as an
+     * explicit diagnostic mode for true scanout tearing, but forcing it made
+     * moving objects visibly stutter on this path. */
+    o->display_sync = false;
+    o->display_atomic_flip = false;
     o->det_zero_copy = false;
     o->no_infer = false;
     o->dump_frames = 0;
@@ -178,6 +180,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_CONNECTOR_ID,
         OPT_NO_DISPLAY,
         OPT_DISPLAY_SYNC,
+        OPT_DISPLAY_ATOMIC_FLIP,
         OPT_AUTO_GREEN,
         OPT_OCR_BLUE_MODEL,
         OPT_OCR_POLICE_MODEL,
@@ -220,6 +223,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"no-display",        no_argument,       NULL, OPT_NO_DISPLAY},
         {"no-infer",          no_argument,       NULL, OPT_NO_INFER},
         {"display-sync",      required_argument, NULL, OPT_DISPLAY_SYNC},
+        {"display-atomic-flip", required_argument, NULL, OPT_DISPLAY_ATOMIC_FLIP},
         {"auto-green-filter", required_argument, NULL, OPT_AUTO_GREEN},
         {"ocr-blue-model",    required_argument, NULL, OPT_OCR_BLUE_MODEL},
         {"ocr-police-model",  required_argument, NULL, OPT_OCR_POLICE_MODEL},
@@ -289,6 +293,9 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         case OPT_NO_INFER:        o->no_infer = true; break;
         case OPT_DISPLAY_SYNC:
             o->display_sync = (strcmp(optarg, "1") == 0 || strcmp(optarg, "true") == 0 || strcmp(optarg, "on") == 0);
+            break;
+        case OPT_DISPLAY_ATOMIC_FLIP:
+            o->display_atomic_flip = (strcmp(optarg, "1") == 0 || strcmp(optarg, "true") == 0 || strcmp(optarg, "on") == 0);
             break;
         case OPT_AUTO_GREEN:
             o->auto_green_filter = (strcmp(optarg, "1") == 0 || strcmp(optarg, "true") == 0 || strcmp(optarg, "on") == 0);
@@ -553,7 +560,7 @@ infer_ready:
     fprintf(stderr,
             "[bgp-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
             "det_resize=%s det_score_scale=%.1f blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
-            "ptype=%s preproc=%s display=%d auto_green_filter=%d no_infer=%d async_infer=%d dma_pre_delay_us=%d display_every=%d\n",
+            "ptype=%s preproc=%s display=%d display_sync=%d display_atomic_flip=%d auto_green_filter=%d no_infer=%d async_infer=%d dma_pre_delay_us=%d display_every=%d\n",
             dma.frame_w, dma.frame_h, dma.src_is_bgrx ? "bgrx8888" : "bgr565",
             opt.frames, opt.fps, pose_nc, class_filter,
             opt.det_resize_mode == DET_RESIZE_LETTERBOX ? "letterbox" : "stretch",
@@ -566,8 +573,8 @@ infer_ready:
             ptype_enabled ? "enabled" : "disabled",
             opt.ocr_preproc_mode == OCR_PREPROC_GRAY ? "gray" :
                 (opt.ocr_preproc_mode == OCR_PREPROC_BIN ? "bin" : "none"),
-            opt.display ? 1 : 0, opt.auto_green_filter ? 1 : 0,
-            opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1,
+            opt.display ? 1 : 0, opt.display_sync ? 1 : 0, opt.display_atomic_flip ? 1 : 0,
+            opt.auto_green_filter ? 1 : 0, opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1,
             opt.dma_pre_delay_us, opt.display_every);
 
     if (!opt.no_infer) {
