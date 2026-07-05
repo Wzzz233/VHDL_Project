@@ -240,8 +240,8 @@ static void usage(const char *prog)
             "  --swap16 <0|1>                Swap raw 565 byte halves (default: 0)\n"
             "  --dump-frames <n>             Dump first n raw BGRX frames to disk for diagnostics (default: 0)\n"
             "  --dump-path <dir>             Directory for dumped frames (default: ./dump)\n"
-            "  --hash-frames <n>             Order-sensitive fingerprint first n raw frames and report adjacent duplicates (default: 0)\n"
-            "  --hash-full                   Use stronger byte-mix hash instead of xxh64-full fingerprint\n"
+            "  --hash-frames <n>             Check first n raw frames for exact adjacent duplicates (default: 0)\n"
+            "  --hash-full                   Use slower full-frame hash comparison instead of exact frame copy\n"
             "  --dma-pre-delay-us <n>       Sleep before each DMA read, for phase diagnostics (default: 0)\n"
             "  --display-every <n>          Display one of every n captured frames (default: 1)\n",
             prog);
@@ -547,6 +547,7 @@ int main(int argc, char **argv)
     int hash_longest_run = 0;
     int64_t hash_first_us = 0;
     int64_t hash_last_us = 0;
+    uint8_t *hash_prev_frame = NULL;
     uint64_t hash_prev = 0;
 
     parsed = parse_options(argc, argv, &opt);
@@ -612,6 +613,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "[bgp-live] failed to init DMA: %s: %s\n",
                 opt.device_path, strerror(errno));
         goto out;
+    }
+    if (opt.hash_frames > 0 && !opt.hash_full) {
+        hash_prev_frame = malloc(dma.frame_size);
+        if (!hash_prev_frame) {
+            fprintf(stderr, "[bgp-live] failed to allocate exact duplicate buffer (%zu bytes)\n", dma.frame_size);
+            goto out;
+        }
     }
     if (lpr_display_start(&display, &opt, dma.frame_w, dma.frame_h) < 0) {
         fprintf(stderr, "[bgp-live] failed to start display\n");
@@ -724,7 +732,7 @@ infer_ready:
             opt.display ? 1 : 0, opt.display_sync ? 1 : 0, opt.display_atomic_flip ? 1 : 0,
             opt.auto_green_filter ? 1 : 0, opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1,
             opt.dma_pre_delay_us, opt.display_every, opt.hash_frames,
-            opt.hash_full ? "strong-full" : "xxh64-full");
+            opt.hash_full ? "strong-full" : "exact-adjacent");
 
     if (!opt.no_infer) {
     /* Build the per-route binding table for the inference thread. */
@@ -821,27 +829,40 @@ infer_ready:
         ts_b = lpr_mono_us();
 
         if (opt.hash_frames > 0 && frame < opt.hash_frames) {
-            uint64_t h = opt.hash_full ?
-                lpr_frame_hash64_full(slot_frame, dma.frame_size) :
-                lpr_frame_fingerprint64_fast(slot_frame, dma.frame_size);
+            uint64_t h = 0;
+            bool duplicate = false;
+            if (opt.hash_full)
+                h = lpr_frame_hash64_full(slot_frame, dma.frame_size);
+
             hash_seen++;
             if (hash_seen == 1) {
                 hash_first_us = ts_b;
-                hash_last_us = ts_b;
                 hash_current_run = 1;
-            } else if (h == hash_prev) {
-                hash_adjacent_dups++;
-                hash_current_run++;
-                fprintf(stderr,
-                        "[bgp-live] frame-hash duplicate mode=%s prev=%d frame=%d hash=0x%016llx\n",
-                        opt.hash_full ? "strong-full" : "xxh64-full", frame - 1, frame, (unsigned long long)h);
             } else {
-                if (hash_current_run > hash_longest_run)
-                    hash_longest_run = hash_current_run;
-                hash_current_run = 1;
+                if (opt.hash_full)
+                    duplicate = (h == hash_prev);
+                else
+                    duplicate = (memcmp(hash_prev_frame, slot_frame, dma.frame_size) == 0);
+
+                if (duplicate) {
+                    hash_adjacent_dups++;
+                    hash_current_run++;
+                    if (!opt.hash_full)
+                        h = lpr_frame_fingerprint64_fast(slot_frame, dma.frame_size);
+                    fprintf(stderr,
+                            "[bgp-live] frame-hash duplicate mode=%s prev=%d frame=%d hash=0x%016llx\n",
+                            opt.hash_full ? "strong-full" : "exact-adjacent", frame - 1, frame, (unsigned long long)h);
+                } else {
+                    if (hash_current_run > hash_longest_run)
+                        hash_longest_run = hash_current_run;
+                    hash_current_run = 1;
+                }
             }
+            if (opt.hash_full)
+                hash_prev = h;
+            else
+                memcpy(hash_prev_frame, slot_frame, dma.frame_size);
             hash_last_us = ts_b;
-            hash_prev = h;
         }
 
         /* Optional raw-frame dump: write the captured BGRX frame verbatim,
@@ -994,9 +1015,10 @@ out:
         }
         fprintf(stderr,
                 "[bgp-live] frame-hash summary: mode=%s frames=%d adjacent_duplicates=%d longest_run=%d effective_unique_min=%d elapsed_ms=%.1f read_fps=%.2f effective_unique_fps=%.2f duplicate_ratio=%.1f%%\n",
-                opt.hash_full ? "strong-full" : "xxh64-full", hash_seen, hash_adjacent_dups, hash_longest_run,
+                opt.hash_full ? "strong-full" : "exact-adjacent", hash_seen, hash_adjacent_dups, hash_longest_run,
                 hash_unique_min, hash_elapsed_ms, hash_read_fps, hash_unique_fps, hash_dup_pct);
     }
+    free(hash_prev_frame);
     if (!opt.no_infer)
         lpr_infer_stop(&infer);
     lpr_display_stop(&display);
