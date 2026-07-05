@@ -39,6 +39,10 @@
 #define FPGA_PIXEL_FORMAT_BGR565    0U
 #define FPGA_PIXEL_FORMAT_BGRX8888  1U
 
+/* BAR0 lightweight status register exported by the FPGA fabric. */
+#define BAR0_FRAME_STATUS_OFFSET 0x0FF0U
+#define FPGA_FRAME_STATUS_MAGIC  0x46505331U /* "FPS1" */
+
 /* BAR1 DMA Control Register Offsets (from ips2l_pcie_dma_controller.v) */
 #define BAR1_DMA_CMD_REG     0x100  /* DMA command register */
 #define BAR1_DMA_L_ADDR      0x110  /* Lower 32-bit target address */
@@ -68,6 +72,7 @@
 #define FPGA_DMA_GET_INFO    _IOR(FPGA_DMA_IOC_MAGIC, 1, struct fpga_info)
 #define FPGA_DMA_READ_FRAME  _IOWR(FPGA_DMA_IOC_MAGIC, 2, struct dma_transfer)
 #define FPGA_DMA_MAP_BUFFER  _IOWR(FPGA_DMA_IOC_MAGIC, 3, struct buffer_map)
+#define FPGA_DMA_GET_FRAME_STATUS _IOR(FPGA_DMA_IOC_MAGIC, 4, struct fpga_frame_status)
 
 /**
  * struct fpga_info - FPGA device information
@@ -122,6 +127,20 @@ struct buffer_map {
     __u32 index;
     __u32 size;
     __u64 offset;
+};
+
+/**
+ * struct fpga_frame_status - Low-overhead FPGA frame timing status
+ * @frame_counter: synchronized fram_buf write-frame counter (low 8 bits)
+ * @frame_change_count: host-clock-domain count of observed frame counter changes
+ * @flags: bit0=camera init done, bit1=DMA session active, bit2=frame read data ready
+ * @magic: FPGA_FRAME_STATUS_MAGIC when the bitstream exposes this register
+ */
+struct fpga_frame_status {
+    __u32 frame_counter;
+    __u32 frame_change_count;
+    __u32 flags;
+    __u32 magic;
 };
 
 #endif /* _PCIE_FPGA_DMA_H */

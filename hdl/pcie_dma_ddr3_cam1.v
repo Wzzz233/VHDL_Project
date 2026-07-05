@@ -196,6 +196,15 @@ wire			bar1_pt_wr_en;
 wire	[11:0]	bar1_pt_wr_addr;
 wire	[127:0]	bar1_pt_wr_data;
 
+// BAR0 lightweight frame-status register exposed to the host.
+localparam [11:0]          BAR0_STATUS_ADDR = 12'h0ff;
+localparam [31:0]          BAR0_STATUS_MAGIC = 32'h46505331; // "FPS1"
+wire [31:0]                bar0_status_word0;
+wire [31:0]                bar0_status_word1;
+wire [31:0]                bar0_status_word2;
+wire [31:0]                bar0_status_word3;
+wire [127:0]               bar0_status_data;
+
 wire			cfg_msi_en;
 wire			ven_msi_grant;
 wire			ven_msi_req;
@@ -457,7 +466,9 @@ ips2l_pcie_dma #(
 	// BAR1 passthrough interface
     .o_bar1_pt_wr_en	(bar1_pt_wr_en),
     .o_bar1_pt_wr_addr	(bar1_pt_wr_addr),
-    .o_bar1_pt_wr_data	(bar1_pt_wr_data)
+    .o_bar1_pt_wr_data	(bar1_pt_wr_data),
+    .i_bar0_status_addr	(BAR0_STATUS_ADDR),
+    .i_bar0_status_data	(bar0_status_data)
 );
 
 // CFG CTRL
@@ -853,6 +864,14 @@ wire                       core_clk_ddr;
 wire                       fram_buf_init_done /*synthesis PAP_MARK_DEBUG="1"*/;
 wire [127:0]               frame_rd_data;
 wire                       frame_rd_data_ready;
+wire [7:0]                 frame_wcnt_dbg_ddr;
+wire                       frame_wirq_dbg_ddr;
+reg  [7:0]                 frame_wcnt_dbg_meta;
+reg  [7:0]                 frame_wcnt_dbg_pclk;
+reg                        frame_wirq_dbg_meta;
+reg                        frame_wirq_dbg_pclk;
+reg                        frame_wirq_dbg_pclk_d;
+reg  [31:0]                frame_wcnt_change_count;
 
 //=============================================================================
 // MWR Data Source (frame data for DMA transfer to host)
@@ -1165,6 +1184,30 @@ end
 assign dma_session_start = mwr_cmd_start & ~dma_session_active;
 assign rd_fsync_pclk_div2 = (rd_fsync_stretch_cnt != 6'd0);
 assign mwr_rd_data = FORCE_PATTERN_POST_DDR ? post_ddr_pattern_data : frame_dma_data;
+assign bar0_status_word0 = {24'd0, frame_wcnt_dbg_pclk};
+assign bar0_status_word1 = frame_wcnt_change_count;
+assign bar0_status_word2 = {29'd0, frame_rd_data_ready, dma_session_active, cmos1_init_done_pclk};
+assign bar0_status_word3 = BAR0_STATUS_MAGIC;
+assign bar0_status_data = {bar0_status_word3, bar0_status_word2, bar0_status_word1, bar0_status_word0};
+
+always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
+    if (!pclk_div2_core_rst_n) begin
+        frame_wcnt_dbg_meta <= 8'd0;
+        frame_wcnt_dbg_pclk <= 8'd0;
+        frame_wirq_dbg_meta <= 1'b0;
+        frame_wirq_dbg_pclk <= 1'b0;
+        frame_wirq_dbg_pclk_d <= 1'b0;
+        frame_wcnt_change_count <= 32'd0;
+    end else begin
+        frame_wcnt_dbg_meta <= frame_wcnt_dbg_ddr;
+        frame_wcnt_dbg_pclk <= frame_wcnt_dbg_meta;
+        frame_wirq_dbg_meta <= frame_wirq_dbg_ddr;
+        frame_wirq_dbg_pclk <= frame_wirq_dbg_meta;
+        frame_wirq_dbg_pclk_d <= frame_wirq_dbg_pclk;
+        if (frame_wirq_dbg_pclk && !frame_wirq_dbg_pclk_d)
+            frame_wcnt_change_count <= frame_wcnt_change_count + 32'd1;
+    end
+end
 
 // Post-DDR pattern coordinate counters (only used when FORCE_PATTERN_POST_DDR=1)
 always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
@@ -1217,6 +1260,8 @@ fram_buf #(
     .vout_de            (),
     .vout_data          (frame_rd_data),
     .rd_data_ready      (frame_rd_data_ready),
+    .frame_wcnt_dbg     (frame_wcnt_dbg_ddr),
+    .frame_wirq_dbg     (frame_wirq_dbg_ddr),
     
     // AXI Write channel
     .axi_awaddr         (axi_awaddr),

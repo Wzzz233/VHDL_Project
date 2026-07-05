@@ -533,6 +533,19 @@ static long fpga_dma_ioctl(struct file *file, unsigned int cmd, unsigned long ar
         break;
     }
 
+    case FPGA_DMA_GET_FRAME_STATUS: {
+        struct fpga_frame_status status;
+
+        status.frame_counter = ioread32(dev->bar0 + BAR0_FRAME_STATUS_OFFSET);
+        status.frame_change_count = ioread32(dev->bar0 + BAR0_FRAME_STATUS_OFFSET + 4U);
+        status.flags = ioread32(dev->bar0 + BAR0_FRAME_STATUS_OFFSET + 8U);
+        status.magic = ioread32(dev->bar0 + BAR0_FRAME_STATUS_OFFSET + 12U);
+
+        if (copy_to_user(argp, &status, sizeof(status)))
+            ret = -EFAULT;
+        break;
+    }
+
     case FPGA_DMA_MAP_BUFFER: {
         struct buffer_map map;
 

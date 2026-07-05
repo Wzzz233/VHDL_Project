@@ -243,7 +243,8 @@ static void usage(const char *prog)
             "  --hash-frames <n>             Check first n raw frames for exact adjacent duplicates (default: 0)\n"
             "  --hash-full                   Use slower full-frame hash comparison instead of exact frame copy\n"
             "  --dma-pre-delay-us <n>       Sleep before each DMA read, for phase diagnostics (default: 0)\n"
-            "  --display-every <n>          Display one of every n captured frames (default: 1)\n",
+            "  --display-every <n>          Display one of every n captured frames (default: 1)\n"
+            "  --wait-new-frame <0|1>       Wait for FPGA frame counter before each DMA read (default: 0)\n",
             prog);
 }
 
@@ -281,6 +282,7 @@ static void defaults(struct live_options *o)
     o->hash_full = false;
     o->dma_pre_delay_us = 0;
     o->display_every = 1;
+    o->wait_new_frame = false;
 }
 
 static int parse_options(int argc, char **argv, struct live_options *o)
@@ -329,6 +331,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_NO_INFER,
         OPT_DMA_PRE_DELAY_US,
         OPT_DISPLAY_EVERY,
+        OPT_WAIT_NEW_FRAME,
     };
     static const struct option opts[] = {
         {"device",            required_argument, NULL, OPT_DEVICE},
@@ -372,6 +375,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"hash-full",        no_argument,       NULL, OPT_HASH_FULL},
         {"dma-pre-delay-us", required_argument, NULL, OPT_DMA_PRE_DELAY_US},
         {"display-every",    required_argument, NULL, OPT_DISPLAY_EVERY},
+        {"wait-new-frame",   required_argument, NULL, OPT_WAIT_NEW_FRAME},
         {"help",              no_argument,       NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -474,6 +478,9 @@ static int parse_options(int argc, char **argv, struct live_options *o)
             o->display_every = atoi(optarg);
             if (o->display_every <= 0) return -1;
             break;
+        case OPT_WAIT_NEW_FRAME:
+            o->wait_new_frame = (strcmp(optarg, "1") == 0 || strcmp(optarg, "true") == 0 || strcmp(optarg, "on") == 0);
+            break;
         case 'h': return 1;
         default:  return -1;
         }
@@ -547,6 +554,7 @@ int main(int argc, char **argv)
     int hash_longest_run = 0;
     int64_t hash_first_us = 0;
     int64_t hash_last_us = 0;
+    uint32_t frame_status_change_count = 0;
     uint8_t *hash_prev_frame = NULL;
     uint64_t hash_prev = 0;
 
@@ -620,6 +628,19 @@ int main(int argc, char **argv)
             fprintf(stderr, "[bgp-live] failed to allocate exact duplicate buffer (%zu bytes)\n", dma.frame_size);
             goto out;
         }
+    }
+    if (opt.wait_new_frame) {
+        struct fpga_frame_status status;
+        if (lpr_dma_get_frame_status(&dma, &status) < 0) {
+            fprintf(stderr,
+                    "[bgp-live] --wait-new-frame requested but FPGA frame status is unavailable; "
+                    "rebuild/reload the updated bitstream and pcie_fpga_dma.ko\n");
+            goto out;
+        }
+        frame_status_change_count = status.frame_change_count;
+        fprintf(stderr,
+                "[bgp-live] frame-status counter=%u changes=%u flags=0x%08x magic=0x%08x\n",
+                status.frame_counter, status.frame_change_count, status.flags, status.magic);
     }
     if (lpr_display_start(&display, &opt, dma.frame_w, dma.frame_h) < 0) {
         fprintf(stderr, "[bgp-live] failed to start display\n");
@@ -716,7 +737,7 @@ infer_ready:
     fprintf(stderr,
             "[bgp-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
             "det_resize=%s det_score_scale=%.1f blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
-            "ptype=%s preproc=%s display=%d display_sync=%d display_atomic_flip=%d auto_green_filter=%d no_infer=%d async_infer=%d dma_pre_delay_us=%d display_every=%d hash_frames=%d hash_mode=%s\n",
+            "ptype=%s preproc=%s display=%d display_sync=%d display_atomic_flip=%d auto_green_filter=%d no_infer=%d async_infer=%d dma_pre_delay_us=%d display_every=%d wait_new_frame=%d hash_frames=%d hash_mode=%s\n",
             dma.frame_w, dma.frame_h, dma.src_is_bgrx ? "bgrx8888" : "bgr565",
             opt.frames, opt.fps, pose_nc, class_filter,
             opt.det_resize_mode == DET_RESIZE_LETTERBOX ? "letterbox" : "stretch",
@@ -731,7 +752,7 @@ infer_ready:
                 (opt.ocr_preproc_mode == OCR_PREPROC_BIN ? "bin" : "none"),
             opt.display ? 1 : 0, opt.display_sync ? 1 : 0, opt.display_atomic_flip ? 1 : 0,
             opt.auto_green_filter ? 1 : 0, opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1,
-            opt.dma_pre_delay_us, opt.display_every, opt.hash_frames,
+            opt.dma_pre_delay_us, opt.display_every, opt.wait_new_frame ? 1 : 0, opt.hash_frames,
             opt.hash_full ? "strong-full" : "exact-adjacent");
 
     if (!opt.no_infer) {
@@ -812,6 +833,12 @@ infer_ready:
         int64_t ts_a, ts_b, ts_c, ts_d;
 
         ts_a = lpr_mono_us();
+        if (opt.wait_new_frame) {
+            if (lpr_dma_wait_new_frame(&dma, &frame_status_change_count, 1000) < 0) {
+                fprintf(stderr, "[bgp-live] wait for new FPGA frame failed\n");
+                goto out;
+            }
+        }
         slot = lpr_dma_acquire_slot(&dma);
         if (opt.dma_pre_delay_us > 0)
             usleep((useconds_t)opt.dma_pre_delay_us);

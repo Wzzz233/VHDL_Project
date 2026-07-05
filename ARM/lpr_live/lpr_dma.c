@@ -152,6 +152,36 @@ uint64_t lpr_dma_slot_generation(struct dma_state *d, int slot)
     return d->slots[slot].generation;
 }
 
+int lpr_dma_get_frame_status(struct dma_state *d, struct fpga_frame_status *status)
+{
+    if (!d || d->fd < 0 || !status)
+        return -1;
+    memset(status, 0, sizeof(*status));
+    if (ioctl(d->fd, FPGA_DMA_GET_FRAME_STATUS, status) < 0)
+        return -1;
+    return status->magic == FPGA_FRAME_STATUS_MAGIC ? 0 : -1;
+}
+
+int lpr_dma_wait_new_frame(struct dma_state *d, uint32_t *last_change_count, int timeout_ms)
+{
+    struct fpga_frame_status status;
+    int waited_ms = 0;
+
+    if (!last_change_count)
+        return -1;
+    while (timeout_ms <= 0 || waited_ms < timeout_ms) {
+        if (lpr_dma_get_frame_status(d, &status) < 0)
+            return -1;
+        if (status.frame_change_count != *last_change_count) {
+            *last_change_count = status.frame_change_count;
+            return 0;
+        }
+        usleep(1000);
+        waited_ms++;
+    }
+    return -1;
+}
+
 int lpr_dma_read_frame_slot(struct dma_state *d, int slot)
 {
     struct dma_transfer t;

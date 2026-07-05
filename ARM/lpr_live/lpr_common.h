@@ -157,6 +157,7 @@ struct live_options {
     bool hash_full;
     int dma_pre_delay_us;
     int display_every;
+    bool wait_new_frame;
 };
 
 /* ---------------- Detector outputs ---------------- */

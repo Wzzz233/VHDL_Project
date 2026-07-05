@@ -47,6 +47,8 @@ module fram_buf #(
     output                        vout_de,
     output [127 : 0]              vout_data, // Changed from [PIX_WIDTH-1:0]
     output                        rd_data_ready,
+    output [7:0]                  frame_wcnt_dbg,
+    output                        frame_wirq_dbg,
     
     output [CTRL_ADDR_WIDTH-1:0]  axi_awaddr     ,
     output [3:0]                  axi_awid       ,
@@ -167,6 +169,9 @@ module fram_buf #(
             init_done <= init_done;
     end 
     
+    assign frame_wcnt_dbg = {{(8-FRAME_CNT_WIDTH){1'b0}}, frame_wcnt};
+    assign frame_wirq_dbg = frame_wirq;
+
     rd_buf #(
         .ADDR_WIDTH       (  CTRL_ADDR_WIDTH  ),//parameter                     ADDR_WIDTH      = 6'd27,
         .ADDR_OFFSET      (  32'h0000_0000    ),//parameter                     ADDR_OFFSET     = 32'h0000_0000,
