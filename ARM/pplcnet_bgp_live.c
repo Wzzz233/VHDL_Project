@@ -98,41 +98,97 @@ static uint64_t lpr_rotl64(uint64_t v, unsigned int r)
     return (v << r) | (v >> (64U - r));
 }
 
+#define LPR_XXH64_PRIME1 11400714785074694791ULL
+#define LPR_XXH64_PRIME2 14029467366897019727ULL
+#define LPR_XXH64_PRIME3 1609587929392839161ULL
+#define LPR_XXH64_PRIME4 9650029242287828579ULL
+#define LPR_XXH64_PRIME5 2870177450012600261ULL
+
+static uint64_t lpr_read64_unaligned(const uint8_t *data)
+{
+    uint64_t v;
+    memcpy(&v, data, sizeof(v));
+    return v;
+}
+
+static uint32_t lpr_read32_unaligned(const uint8_t *data)
+{
+    uint32_t v;
+    memcpy(&v, data, sizeof(v));
+    return v;
+}
+
+static uint64_t lpr_xxh64_round(uint64_t acc, uint64_t input)
+{
+    acc += input * LPR_XXH64_PRIME2;
+    acc = lpr_rotl64(acc, 31);
+    acc *= LPR_XXH64_PRIME1;
+    return acc;
+}
+
+static uint64_t lpr_xxh64_merge_round(uint64_t acc, uint64_t val)
+{
+    val = lpr_xxh64_round(0, val);
+    acc ^= val;
+    acc = acc * LPR_XXH64_PRIME1 + LPR_XXH64_PRIME4;
+    return acc;
+}
+
 static uint64_t lpr_frame_fingerprint64_fast(const uint8_t *data, size_t size)
 {
-    uint64_t a = 0x9e3779b97f4a7c15ULL ^ (uint64_t)size;
-    uint64_t b = 0xc2b2ae3d27d4eb4fULL + (uint64_t)size;
-    uint64_t c = 0x165667b19e3779f9ULL;
-    size_t i = 0;
+    const uint8_t *p = data;
+    const uint8_t *end = data + size;
+    uint64_t h;
 
-    while (i + 4U * sizeof(uint64_t) <= size) {
-        uint64_t v0, v1, v2, v3;
-        memcpy(&v0, data + i, sizeof(v0));
-        memcpy(&v1, data + i + 8U, sizeof(v1));
-        memcpy(&v2, data + i + 16U, sizeof(v2));
-        memcpy(&v3, data + i + 24U, sizeof(v3));
-        a += v0;
-        b ^= lpr_rotl64(v1, 17);
-        c += v2 * 0x100000001b3ULL;
-        a ^= lpr_rotl64(v3, 31);
-        i += 4U * sizeof(uint64_t);
-    }
-    while (i + sizeof(uint64_t) <= size) {
-        uint64_t v;
-        memcpy(&v, data + i, sizeof(v));
-        a += v;
-        b ^= lpr_rotl64(v, 23);
-        i += sizeof(uint64_t);
-    }
-    while (i < size) {
-        c += (uint64_t)data[i] << ((i & 7U) * 8U);
-        i++;
+    if (size >= 32U) {
+        const uint8_t *limit = end - 32U;
+        uint64_t v1 = LPR_XXH64_PRIME1 + LPR_XXH64_PRIME2;
+        uint64_t v2 = LPR_XXH64_PRIME2;
+        uint64_t v3 = 0;
+        uint64_t v4 = 0 - LPR_XXH64_PRIME1;
+
+        do {
+            v1 = lpr_xxh64_round(v1, lpr_read64_unaligned(p)); p += 8U;
+            v2 = lpr_xxh64_round(v2, lpr_read64_unaligned(p)); p += 8U;
+            v3 = lpr_xxh64_round(v3, lpr_read64_unaligned(p)); p += 8U;
+            v4 = lpr_xxh64_round(v4, lpr_read64_unaligned(p)); p += 8U;
+        } while (p <= limit);
+
+        h = lpr_rotl64(v1, 1) + lpr_rotl64(v2, 7) +
+            lpr_rotl64(v3, 12) + lpr_rotl64(v4, 18);
+        h = lpr_xxh64_merge_round(h, v1);
+        h = lpr_xxh64_merge_round(h, v2);
+        h = lpr_xxh64_merge_round(h, v3);
+        h = lpr_xxh64_merge_round(h, v4);
+    } else {
+        h = LPR_XXH64_PRIME5;
     }
 
-    a = lpr_hash_mix64(a, b);
-    b = lpr_hash_mix64(b, c);
-    c = lpr_hash_mix64(c, a);
-    return a ^ lpr_rotl64(b, 21) ^ lpr_rotl64(c, 42);
+    h += (uint64_t)size;
+
+    while ((size_t)(end - p) >= 8U) {
+        uint64_t k1 = lpr_xxh64_round(0, lpr_read64_unaligned(p));
+        h ^= k1;
+        h = lpr_rotl64(h, 27) * LPR_XXH64_PRIME1 + LPR_XXH64_PRIME4;
+        p += 8U;
+    }
+    if ((size_t)(end - p) >= 4U) {
+        h ^= (uint64_t)lpr_read32_unaligned(p) * LPR_XXH64_PRIME1;
+        h = lpr_rotl64(h, 23) * LPR_XXH64_PRIME2 + LPR_XXH64_PRIME3;
+        p += 4U;
+    }
+    while (p < end) {
+        h ^= (uint64_t)(*p) * LPR_XXH64_PRIME5;
+        h = lpr_rotl64(h, 11) * LPR_XXH64_PRIME1;
+        p++;
+    }
+
+    h ^= h >> 33;
+    h *= LPR_XXH64_PRIME2;
+    h ^= h >> 29;
+    h *= LPR_XXH64_PRIME3;
+    h ^= h >> 32;
+    return h;
 }
 
 static void usage(const char *prog)
@@ -184,8 +240,8 @@ static void usage(const char *prog)
             "  --swap16 <0|1>                Swap raw 565 byte halves (default: 0)\n"
             "  --dump-frames <n>             Dump first n raw BGRX frames to disk for diagnostics (default: 0)\n"
             "  --dump-path <dir>             Directory for dumped frames (default: ./dump)\n"
-            "  --hash-frames <n>             Fingerprint first n raw frames and report adjacent duplicates (default: 0)\n"
-            "  --hash-full                   Use stronger full-frame hash instead of fast fingerprint\n"
+            "  --hash-frames <n>             Order-sensitive fingerprint first n raw frames and report adjacent duplicates (default: 0)\n"
+            "  --hash-full                   Use stronger byte-mix hash instead of xxh64-full fingerprint\n"
             "  --dma-pre-delay-us <n>       Sleep before each DMA read, for phase diagnostics (default: 0)\n"
             "  --display-every <n>          Display one of every n captured frames (default: 1)\n",
             prog);
@@ -666,7 +722,7 @@ infer_ready:
             opt.display ? 1 : 0, opt.display_sync ? 1 : 0, opt.display_atomic_flip ? 1 : 0,
             opt.auto_green_filter ? 1 : 0, opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1,
             opt.dma_pre_delay_us, opt.display_every, opt.hash_frames,
-            opt.hash_full ? "strong-full" : "fast-full");
+            opt.hash_full ? "strong-full" : "xxh64-full");
 
     if (!opt.no_infer) {
     /* Build the per-route binding table for the inference thread. */
@@ -774,7 +830,7 @@ infer_ready:
                 hash_current_run++;
                 fprintf(stderr,
                         "[bgp-live] frame-hash duplicate mode=%s prev=%d frame=%d hash=0x%016llx\n",
-                        opt.hash_full ? "strong-full" : "fast-full", frame - 1, frame, (unsigned long long)h);
+                        opt.hash_full ? "strong-full" : "xxh64-full", frame - 1, frame, (unsigned long long)h);
             } else {
                 if (hash_current_run > hash_longest_run)
                     hash_longest_run = hash_current_run;
@@ -921,7 +977,7 @@ out:
             hash_longest_run = hash_current_run;
         fprintf(stderr,
                 "[bgp-live] frame-hash summary: mode=%s frames=%d adjacent_duplicates=%d longest_run=%d effective_unique_min=%d\n",
-                opt.hash_full ? "strong-full" : "fast-full", hash_seen, hash_adjacent_dups, hash_longest_run,
+                opt.hash_full ? "strong-full" : "xxh64-full", hash_seen, hash_adjacent_dups, hash_longest_run,
                 hash_seen - hash_adjacent_dups);
     }
     if (!opt.no_infer)
