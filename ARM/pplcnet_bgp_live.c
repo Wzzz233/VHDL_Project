@@ -68,12 +68,46 @@ static void on_signal(int sig)
     g_stop = 1;
 }
 
-static uint64_t lpr_frame_hash64(const uint8_t *data, size_t size)
+static uint64_t lpr_hash_mix64(uint64_t h, uint64_t v)
 {
-    uint64_t h = 1469598103934665603ULL;
-    for (size_t i = 0; i < size; i++) {
-        h ^= (uint64_t)data[i];
-        h *= 1099511628211ULL;
+    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    h *= 1099511628211ULL;
+    return h;
+}
+
+static uint64_t lpr_frame_hash64_full(const uint8_t *data, size_t size)
+{
+    uint64_t h = lpr_hash_mix64(1469598103934665603ULL, (uint64_t)size);
+    size_t i = 0;
+
+    while (i + sizeof(uint64_t) <= size) {
+        uint64_t v;
+        memcpy(&v, data + i, sizeof(v));
+        h = lpr_hash_mix64(h, v);
+        i += sizeof(uint64_t);
+    }
+    while (i < size) {
+        h = lpr_hash_mix64(h, (uint64_t)data[i]);
+        i++;
+    }
+    return h;
+}
+
+static uint64_t lpr_frame_hash64_sampled(const uint8_t *data, size_t size)
+{
+    const size_t step = 64;
+    uint64_t h = lpr_hash_mix64(1469598103934665603ULL, (uint64_t)size);
+    size_t i;
+
+    for (i = 0; i + sizeof(uint64_t) <= size; i += step) {
+        uint64_t v;
+        memcpy(&v, data + i, sizeof(v));
+        h = lpr_hash_mix64(h, v);
+    }
+    if (size >= sizeof(uint64_t)) {
+        uint64_t v;
+        memcpy(&v, data + size - sizeof(v), sizeof(v));
+        h = lpr_hash_mix64(h, v);
     }
     return h;
 }
@@ -128,6 +162,7 @@ static void usage(const char *prog)
             "  --dump-frames <n>             Dump first n raw BGRX frames to disk for diagnostics (default: 0)\n"
             "  --dump-path <dir>             Directory for dumped frames (default: ./dump)\n"
             "  --hash-frames <n>             Hash first n raw frames and report adjacent duplicates (default: 0)\n"
+            "  --hash-full                   Hash every byte; use only with --no-display diagnostics\n"
             "  --dma-pre-delay-us <n>       Sleep before each DMA read, for phase diagnostics (default: 0)\n"
             "  --display-every <n>          Display one of every n captured frames (default: 1)\n",
             prog);
@@ -164,6 +199,7 @@ static void defaults(struct live_options *o)
     o->dump_frames = 0;
     o->dump_path = NULL;
     o->hash_frames = 0;
+    o->hash_full = false;
     o->dma_pre_delay_us = 0;
     o->display_every = 1;
 }
@@ -210,6 +246,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_DUMP_FRAMES,
         OPT_DUMP_PATH,
         OPT_HASH_FRAMES,
+        OPT_HASH_FULL,
         OPT_NO_INFER,
         OPT_DMA_PRE_DELAY_US,
         OPT_DISPLAY_EVERY,
@@ -253,6 +290,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"dump-frames",      required_argument, NULL, OPT_DUMP_FRAMES},
         {"dump-path",        required_argument, NULL, OPT_DUMP_PATH},
         {"hash-frames",      required_argument, NULL, OPT_HASH_FRAMES},
+        {"hash-full",        no_argument,       NULL, OPT_HASH_FULL},
         {"dma-pre-delay-us", required_argument, NULL, OPT_DMA_PRE_DELAY_US},
         {"display-every",    required_argument, NULL, OPT_DISPLAY_EVERY},
         {"help",              no_argument,       NULL, 'h'},
@@ -345,6 +383,9 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         case OPT_HASH_FRAMES:
             o->hash_frames = atoi(optarg);
             if (o->hash_frames < 0) return -1;
+            break;
+        case OPT_HASH_FULL:
+            o->hash_full = true;
             break;
         case OPT_DMA_PRE_DELAY_US:
             o->dma_pre_delay_us = atoi(optarg);
@@ -586,7 +627,7 @@ infer_ready:
     fprintf(stderr,
             "[bgp-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
             "det_resize=%s det_score_scale=%.1f blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
-            "ptype=%s preproc=%s display=%d display_sync=%d display_atomic_flip=%d auto_green_filter=%d no_infer=%d async_infer=%d dma_pre_delay_us=%d display_every=%d hash_frames=%d\n",
+            "ptype=%s preproc=%s display=%d display_sync=%d display_atomic_flip=%d auto_green_filter=%d no_infer=%d async_infer=%d dma_pre_delay_us=%d display_every=%d hash_frames=%d hash_mode=%s\n",
             dma.frame_w, dma.frame_h, dma.src_is_bgrx ? "bgrx8888" : "bgr565",
             opt.frames, opt.fps, pose_nc, class_filter,
             opt.det_resize_mode == DET_RESIZE_LETTERBOX ? "letterbox" : "stretch",
@@ -601,7 +642,8 @@ infer_ready:
                 (opt.ocr_preproc_mode == OCR_PREPROC_BIN ? "bin" : "none"),
             opt.display ? 1 : 0, opt.display_sync ? 1 : 0, opt.display_atomic_flip ? 1 : 0,
             opt.auto_green_filter ? 1 : 0, opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1,
-            opt.dma_pre_delay_us, opt.display_every, opt.hash_frames);
+            opt.dma_pre_delay_us, opt.display_every, opt.hash_frames,
+            opt.hash_full ? "full" : "sampled");
 
     if (!opt.no_infer) {
     /* Build the per-route binding table for the inference thread. */
@@ -698,7 +740,9 @@ infer_ready:
         ts_b = lpr_mono_us();
 
         if (opt.hash_frames > 0 && frame < opt.hash_frames) {
-            uint64_t h = lpr_frame_hash64(slot_frame, dma.frame_size);
+            uint64_t h = opt.hash_full ?
+                lpr_frame_hash64_full(slot_frame, dma.frame_size) :
+                lpr_frame_hash64_sampled(slot_frame, dma.frame_size);
             hash_seen++;
             if (hash_seen == 1) {
                 hash_current_run = 1;
@@ -706,8 +750,8 @@ infer_ready:
                 hash_adjacent_dups++;
                 hash_current_run++;
                 fprintf(stderr,
-                        "[bgp-live] frame-hash duplicate prev=%d frame=%d hash=0x%016llx\n",
-                        frame - 1, frame, (unsigned long long)h);
+                        "[bgp-live] frame-hash duplicate mode=%s prev=%d frame=%d hash=0x%016llx\n",
+                        opt.hash_full ? "full" : "sampled", frame - 1, frame, (unsigned long long)h);
             } else {
                 if (hash_current_run > hash_longest_run)
                     hash_longest_run = hash_current_run;
@@ -853,8 +897,8 @@ out:
         if (hash_current_run > hash_longest_run)
             hash_longest_run = hash_current_run;
         fprintf(stderr,
-                "[bgp-live] frame-hash summary: frames=%d adjacent_duplicates=%d longest_run=%d effective_unique_min=%d\n",
-                hash_seen, hash_adjacent_dups, hash_longest_run,
+                "[bgp-live] frame-hash summary: mode=%s frames=%d adjacent_duplicates=%d longest_run=%d effective_unique_min=%d\n",
+                opt.hash_full ? "full" : "sampled", hash_seen, hash_adjacent_dups, hash_longest_run,
                 hash_seen - hash_adjacent_dups);
     }
     if (!opt.no_infer)
