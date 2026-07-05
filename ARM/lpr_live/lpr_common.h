@@ -153,6 +153,7 @@ struct live_options {
      * frame or introduced downstream by the display path. */
     int dump_frames;
     const char *dump_path;
+    int hash_frames;
     int dma_pre_delay_us;
     int display_every;
 };

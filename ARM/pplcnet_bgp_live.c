@@ -68,6 +68,16 @@ static void on_signal(int sig)
     g_stop = 1;
 }
 
+static uint64_t lpr_frame_hash64(const uint8_t *data, size_t size)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < size; i++) {
+        h ^= (uint64_t)data[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -117,6 +127,7 @@ static void usage(const char *prog)
             "  --swap16 <0|1>                Swap raw 565 byte halves (default: 0)\n"
             "  --dump-frames <n>             Dump first n raw BGRX frames to disk for diagnostics (default: 0)\n"
             "  --dump-path <dir>             Directory for dumped frames (default: ./dump)\n"
+            "  --hash-frames <n>             Hash first n raw frames and report adjacent duplicates (default: 0)\n"
             "  --dma-pre-delay-us <n>       Sleep before each DMA read, for phase diagnostics (default: 0)\n"
             "  --display-every <n>          Display one of every n captured frames (default: 1)\n",
             prog);
@@ -152,6 +163,7 @@ static void defaults(struct live_options *o)
     o->no_infer = false;
     o->dump_frames = 0;
     o->dump_path = NULL;
+    o->hash_frames = 0;
     o->dma_pre_delay_us = 0;
     o->display_every = 1;
 }
@@ -197,6 +209,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_DET_SCORE_SCALE,
         OPT_DUMP_FRAMES,
         OPT_DUMP_PATH,
+        OPT_HASH_FRAMES,
         OPT_NO_INFER,
         OPT_DMA_PRE_DELAY_US,
         OPT_DISPLAY_EVERY,
@@ -239,6 +252,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"plate-type-classifier-special-min-conf", required_argument, NULL, OPT_PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF},
         {"dump-frames",      required_argument, NULL, OPT_DUMP_FRAMES},
         {"dump-path",        required_argument, NULL, OPT_DUMP_PATH},
+        {"hash-frames",      required_argument, NULL, OPT_HASH_FRAMES},
         {"dma-pre-delay-us", required_argument, NULL, OPT_DMA_PRE_DELAY_US},
         {"display-every",    required_argument, NULL, OPT_DISPLAY_EVERY},
         {"help",              no_argument,       NULL, 'h'},
@@ -328,6 +342,10 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         case OPT_DUMP_PATH:
             o->dump_path = optarg;
             break;
+        case OPT_HASH_FRAMES:
+            o->hash_frames = atoi(optarg);
+            if (o->hash_frames < 0) return -1;
+            break;
         case OPT_DMA_PRE_DELAY_US:
             o->dma_pre_delay_us = atoi(optarg);
             if (o->dma_pre_delay_us < 0) return -1;
@@ -366,6 +384,8 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         return -1;
     if (o->fps <= 0 || o->fps > 120 || o->frames < 0 || o->max_det <= 0 || o->max_det > MAX_DETS)
         return -1;
+    if (o->hash_frames < 0)
+        return -1;
     if (o->dma_pre_delay_us < 0 || o->dma_pre_delay_us > 1000000)
         return -1;
     if (o->display_every <= 0 || o->display_every > 120)
@@ -400,6 +420,12 @@ int main(int argc, char **argv)
     bool embassy_enabled;
     bool yellow_enabled;
     bool ptype_enabled;
+    bool dump_disabled = false;
+    int hash_seen = 0;
+    int hash_adjacent_dups = 0;
+    int hash_current_run = 0;
+    int hash_longest_run = 0;
+    uint64_t hash_prev = 0;
 
     parsed = parse_options(argc, argv, &opt);
     if (parsed != 0) {
@@ -560,7 +586,7 @@ infer_ready:
     fprintf(stderr,
             "[bgp-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
             "det_resize=%s det_score_scale=%.1f blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
-            "ptype=%s preproc=%s display=%d display_sync=%d display_atomic_flip=%d auto_green_filter=%d no_infer=%d async_infer=%d dma_pre_delay_us=%d display_every=%d\n",
+            "ptype=%s preproc=%s display=%d display_sync=%d display_atomic_flip=%d auto_green_filter=%d no_infer=%d async_infer=%d dma_pre_delay_us=%d display_every=%d hash_frames=%d\n",
             dma.frame_w, dma.frame_h, dma.src_is_bgrx ? "bgrx8888" : "bgr565",
             opt.frames, opt.fps, pose_nc, class_filter,
             opt.det_resize_mode == DET_RESIZE_LETTERBOX ? "letterbox" : "stretch",
@@ -575,7 +601,7 @@ infer_ready:
                 (opt.ocr_preproc_mode == OCR_PREPROC_BIN ? "bin" : "none"),
             opt.display ? 1 : 0, opt.display_sync ? 1 : 0, opt.display_atomic_flip ? 1 : 0,
             opt.auto_green_filter ? 1 : 0, opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1,
-            opt.dma_pre_delay_us, opt.display_every);
+            opt.dma_pre_delay_us, opt.display_every, opt.hash_frames);
 
     if (!opt.no_infer) {
     /* Build the per-route binding table for the inference thread. */
@@ -671,10 +697,29 @@ infer_ready:
         }
         ts_b = lpr_mono_us();
 
+        if (opt.hash_frames > 0 && frame < opt.hash_frames) {
+            uint64_t h = lpr_frame_hash64(slot_frame, dma.frame_size);
+            hash_seen++;
+            if (hash_seen == 1) {
+                hash_current_run = 1;
+            } else if (h == hash_prev) {
+                hash_adjacent_dups++;
+                hash_current_run++;
+                fprintf(stderr,
+                        "[bgp-live] frame-hash duplicate prev=%d frame=%d hash=0x%016llx\n",
+                        frame - 1, frame, (unsigned long long)h);
+            } else {
+                if (hash_current_run > hash_longest_run)
+                    hash_longest_run = hash_current_run;
+                hash_current_run = 1;
+            }
+            hash_prev = h;
+        }
+
         /* Optional raw-frame dump: write the captured BGRX frame verbatim,
          * before any overlay drawing, so a stored frame reflects exactly what
          * DMA delivered. Used to tell capture-side artifacts from display-side. */
-        if (opt.dump_frames > 0 && frame < opt.dump_frames) {
+        if (!dump_disabled && opt.dump_frames > 0 && frame < opt.dump_frames) {
             const char *dp = opt.dump_path ? opt.dump_path : "dump";
             char path[512];
             int dfd;
@@ -682,16 +727,44 @@ infer_ready:
             snprintf(path, sizeof(path), "%s/frame_%04d.bgrx", dp, frame);
             dfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (dfd < 0) {
-                fprintf(stderr, "[bgp-live] dump open failed: %s: %s\n", path, strerror(errno));
+                fprintf(stderr, "[bgp-live] dump open failed: %s: %s; disabling dump\n",
+                        path, strerror(errno));
+                dump_disabled = true;
             } else {
                 size_t off = 0;
+                bool dump_ok = true;
+                int dump_errno = 0;
+
                 while (off < dma.frame_size) {
                     ssize_t w = write(dfd, slot_frame + off, dma.frame_size - off);
-                    if (w <= 0) break;
+                    if (w < 0) {
+                        dump_ok = false;
+                        dump_errno = errno;
+                        break;
+                    }
+                    if (w == 0) {
+                        dump_ok = false;
+                        dump_errno = ENOSPC;
+                        break;
+                    }
                     off += (size_t)w;
                 }
-                close(dfd);
-                fprintf(stderr, "[bgp-live] dumped %s (%zu bytes)\n", path, off);
+                if (close(dfd) < 0 && dump_ok) {
+                    dump_ok = false;
+                    dump_errno = errno;
+                }
+
+                if (dump_ok && off == dma.frame_size) {
+                    fprintf(stderr, "[bgp-live] dumped %s (%zu bytes)\n", path, off);
+                } else {
+                    if (dump_errno == 0)
+                        dump_errno = EIO;
+                    fprintf(stderr,
+                            "[bgp-live] dump short write: %s wrote=%zu expected=%zu error=%s; disabling dump\n",
+                            path, off, dma.frame_size, strerror(dump_errno));
+                    unlink(path);
+                    dump_disabled = true;
+                }
             }
         }
 
@@ -776,6 +849,14 @@ infer_ready:
     ret = 0;
 
 out:
+    if (hash_seen > 0) {
+        if (hash_current_run > hash_longest_run)
+            hash_longest_run = hash_current_run;
+        fprintf(stderr,
+                "[bgp-live] frame-hash summary: frames=%d adjacent_duplicates=%d longest_run=%d effective_unique_min=%d\n",
+                hash_seen, hash_adjacent_dups, hash_longest_run,
+                hash_seen - hash_adjacent_dups);
+    }
     if (!opt.no_infer)
         lpr_infer_stop(&infer);
     lpr_display_stop(&display);

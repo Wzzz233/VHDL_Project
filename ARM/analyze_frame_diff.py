@@ -16,15 +16,15 @@ import statistics
 from typing import List
 
 
-def calc_unique_hashes(files: List[str]) -> int:
-    hashes = set()
+def calc_hashes(files: List[str]) -> List[str]:
+    hashes: List[str] = []
     for path in files:
         h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
-        hashes.add(h.hexdigest())
-    return len(hashes)
+        hashes.append(h.hexdigest())
+    return hashes
 
 
 def frame_diff_ratio(a: bytes, b: bytes) -> float:
@@ -50,12 +50,35 @@ def main() -> int:
         default="/tmp/fprobe/motion_*.raw",
         help="Glob pattern for raw frame files",
     )
+    parser.add_argument("--expected-size", type=int, default=0, help="Skip files whose byte size does not match")
+    parser.add_argument("--hash-only", action="store_true", help="Only report SHA-256 uniqueness and adjacent duplicates")
     args = parser.parse_args()
 
-    files = sorted(glob.glob(args.pattern))
+    all_files = sorted(glob.glob(args.pattern))
+    files = all_files
+    skipped = 0
+    if args.expected_size > 0:
+        files = [p for p in all_files if os.path.getsize(p) == args.expected_size]
+        skipped = len(all_files) - len(files)
     if len(files) < 2:
-        print(f"ERR: not enough frames for pattern: {args.pattern}")
+        print(f"ERR: not enough complete frames for pattern: {args.pattern}")
+        if skipped:
+            print(f"skipped_incomplete={skipped} expected_size={args.expected_size}")
         return 1
+
+    hashes = calc_hashes(files)
+    adjacent_dups = [i for i in range(1, len(hashes)) if hashes[i] == hashes[i - 1]]
+    unique = len(set(hashes))
+
+    if args.hash_only:
+        print("=== Phase 3.2 Frame Hash Report ===")
+        print(f"frames={len(files)} pairs={len(files) - 1} unique_sha256={unique}")
+        print(f"adjacent_duplicates={len(adjacent_dups)}")
+        if adjacent_dups:
+            print("duplicate_pairs=" + ", ".join(f"{os.path.basename(files[i-1])}->{os.path.basename(files[i])}" for i in adjacent_dups[:20]))
+        if skipped:
+            print(f"skipped_incomplete={skipped} expected_size={args.expected_size}")
+        return 0
 
     ratios: List[float] = []
     for i in range(1, len(files)):
@@ -65,7 +88,6 @@ def main() -> int:
             b = fb.read()
         ratios.append(frame_diff_ratio(a, b))
 
-    unique = calc_unique_hashes(files)
     gt1 = sum(r > 0.01 for r in ratios)
     gt5 = sum(r > 0.05 for r in ratios)
     avg = statistics.mean(ratios)
@@ -78,6 +100,9 @@ def main() -> int:
     )
     print(f"pairs_over_1pct={gt1}/{len(ratios)}")
     print(f"pairs_over_5pct={gt5}/{len(ratios)}")
+    print(f"adjacent_duplicates={len(adjacent_dups)}")
+    if skipped:
+        print(f"skipped_incomplete={skipped} expected_size={args.expected_size}")
     print(f"classification={classify(avg)}")
 
     base = os.path.splitext(files[0])[0]
