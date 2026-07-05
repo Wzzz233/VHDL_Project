@@ -93,23 +93,46 @@ static uint64_t lpr_frame_hash64_full(const uint8_t *data, size_t size)
     return h;
 }
 
-static uint64_t lpr_frame_hash64_sampled(const uint8_t *data, size_t size)
+static uint64_t lpr_rotl64(uint64_t v, unsigned int r)
 {
-    const size_t step = 64;
-    uint64_t h = lpr_hash_mix64(1469598103934665603ULL, (uint64_t)size);
-    size_t i;
+    return (v << r) | (v >> (64U - r));
+}
 
-    for (i = 0; i + sizeof(uint64_t) <= size; i += step) {
+static uint64_t lpr_frame_fingerprint64_fast(const uint8_t *data, size_t size)
+{
+    uint64_t a = 0x9e3779b97f4a7c15ULL ^ (uint64_t)size;
+    uint64_t b = 0xc2b2ae3d27d4eb4fULL + (uint64_t)size;
+    uint64_t c = 0x165667b19e3779f9ULL;
+    size_t i = 0;
+
+    while (i + 4U * sizeof(uint64_t) <= size) {
+        uint64_t v0, v1, v2, v3;
+        memcpy(&v0, data + i, sizeof(v0));
+        memcpy(&v1, data + i + 8U, sizeof(v1));
+        memcpy(&v2, data + i + 16U, sizeof(v2));
+        memcpy(&v3, data + i + 24U, sizeof(v3));
+        a += v0;
+        b ^= lpr_rotl64(v1, 17);
+        c += v2 * 0x100000001b3ULL;
+        a ^= lpr_rotl64(v3, 31);
+        i += 4U * sizeof(uint64_t);
+    }
+    while (i + sizeof(uint64_t) <= size) {
         uint64_t v;
         memcpy(&v, data + i, sizeof(v));
-        h = lpr_hash_mix64(h, v);
+        a += v;
+        b ^= lpr_rotl64(v, 23);
+        i += sizeof(uint64_t);
     }
-    if (size >= sizeof(uint64_t)) {
-        uint64_t v;
-        memcpy(&v, data + size - sizeof(v), sizeof(v));
-        h = lpr_hash_mix64(h, v);
+    while (i < size) {
+        c += (uint64_t)data[i] << ((i & 7U) * 8U);
+        i++;
     }
-    return h;
+
+    a = lpr_hash_mix64(a, b);
+    b = lpr_hash_mix64(b, c);
+    c = lpr_hash_mix64(c, a);
+    return a ^ lpr_rotl64(b, 21) ^ lpr_rotl64(c, 42);
 }
 
 static void usage(const char *prog)
@@ -161,8 +184,8 @@ static void usage(const char *prog)
             "  --swap16 <0|1>                Swap raw 565 byte halves (default: 0)\n"
             "  --dump-frames <n>             Dump first n raw BGRX frames to disk for diagnostics (default: 0)\n"
             "  --dump-path <dir>             Directory for dumped frames (default: ./dump)\n"
-            "  --hash-frames <n>             Hash first n raw frames and report adjacent duplicates (default: 0)\n"
-            "  --hash-full                   Hash every byte; use only with --no-display diagnostics\n"
+            "  --hash-frames <n>             Fingerprint first n raw frames and report adjacent duplicates (default: 0)\n"
+            "  --hash-full                   Use stronger full-frame hash instead of fast fingerprint\n"
             "  --dma-pre-delay-us <n>       Sleep before each DMA read, for phase diagnostics (default: 0)\n"
             "  --display-every <n>          Display one of every n captured frames (default: 1)\n",
             prog);
@@ -643,7 +666,7 @@ infer_ready:
             opt.display ? 1 : 0, opt.display_sync ? 1 : 0, opt.display_atomic_flip ? 1 : 0,
             opt.auto_green_filter ? 1 : 0, opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1,
             opt.dma_pre_delay_us, opt.display_every, opt.hash_frames,
-            opt.hash_full ? "full" : "sampled");
+            opt.hash_full ? "strong-full" : "fast-full");
 
     if (!opt.no_infer) {
     /* Build the per-route binding table for the inference thread. */
@@ -706,7 +729,7 @@ infer_ready:
      * (now + k*target_us), not "previous end + remaining". This keeps the
      * capture cadence phase-locked to a steady clock instead of drifting with
      * per-frame processing jitter, which is what produced the visible stutter
-     * when moving objects were sampled at irregular intervals. Mirrors the
+     * when moving objects were captured at irregular intervals. Mirrors the
      * pacing used by fpga_hdmi_display.c. */
     int64_t next_frame_us = lpr_mono_us() + target_us;
     /* Per-stage timing accumulators for a 1s cadence dump, to localize where
@@ -742,7 +765,7 @@ infer_ready:
         if (opt.hash_frames > 0 && frame < opt.hash_frames) {
             uint64_t h = opt.hash_full ?
                 lpr_frame_hash64_full(slot_frame, dma.frame_size) :
-                lpr_frame_hash64_sampled(slot_frame, dma.frame_size);
+                lpr_frame_fingerprint64_fast(slot_frame, dma.frame_size);
             hash_seen++;
             if (hash_seen == 1) {
                 hash_current_run = 1;
@@ -751,7 +774,7 @@ infer_ready:
                 hash_current_run++;
                 fprintf(stderr,
                         "[bgp-live] frame-hash duplicate mode=%s prev=%d frame=%d hash=0x%016llx\n",
-                        opt.hash_full ? "full" : "sampled", frame - 1, frame, (unsigned long long)h);
+                        opt.hash_full ? "strong-full" : "fast-full", frame - 1, frame, (unsigned long long)h);
             } else {
                 if (hash_current_run > hash_longest_run)
                     hash_longest_run = hash_current_run;
@@ -898,7 +921,7 @@ out:
             hash_longest_run = hash_current_run;
         fprintf(stderr,
                 "[bgp-live] frame-hash summary: mode=%s frames=%d adjacent_duplicates=%d longest_run=%d effective_unique_min=%d\n",
-                opt.hash_full ? "full" : "sampled", hash_seen, hash_adjacent_dups, hash_longest_run,
+                opt.hash_full ? "strong-full" : "fast-full", hash_seen, hash_adjacent_dups, hash_longest_run,
                 hash_seen - hash_adjacent_dups);
     }
     if (!opt.no_infer)
