@@ -792,12 +792,12 @@ infer_ready:
 
     target_us = 1000000LL / opt.fps;
     /* Absolute-deadline pacing: each capture starts at a fixed grid point
-     * (now + k*target_us), not "previous end + remaining". This keeps the
+     * (start + k*target_us), not "previous end + remaining". This keeps the
      * capture cadence phase-locked to a steady clock instead of drifting with
      * per-frame processing jitter, which is what produced the visible stutter
      * when moving objects were captured at irregular intervals. Mirrors the
      * pacing used by fpga_hdmi_display.c. */
-    int64_t next_frame_us = lpr_mono_us() + target_us;
+    int64_t next_frame_us = lpr_mono_us();
     /* Per-stage timing accumulators for a 1s cadence dump, to localize where
      * wall-clock time goes when the display appears to drop frames. */
     int64_t stat_last_us = lpr_mono_us();
