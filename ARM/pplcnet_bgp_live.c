@@ -545,6 +545,8 @@ int main(int argc, char **argv)
     int hash_adjacent_dups = 0;
     int hash_current_run = 0;
     int hash_longest_run = 0;
+    int64_t hash_first_us = 0;
+    int64_t hash_last_us = 0;
     uint64_t hash_prev = 0;
 
     parsed = parse_options(argc, argv, &opt);
@@ -824,6 +826,8 @@ infer_ready:
                 lpr_frame_fingerprint64_fast(slot_frame, dma.frame_size);
             hash_seen++;
             if (hash_seen == 1) {
+                hash_first_us = ts_b;
+                hash_last_us = ts_b;
                 hash_current_run = 1;
             } else if (h == hash_prev) {
                 hash_adjacent_dups++;
@@ -836,6 +840,7 @@ infer_ready:
                     hash_longest_run = hash_current_run;
                 hash_current_run = 1;
             }
+            hash_last_us = ts_b;
             hash_prev = h;
         }
 
@@ -973,12 +978,24 @@ infer_ready:
 
 out:
     if (hash_seen > 0) {
+        int hash_unique_min = hash_seen - hash_adjacent_dups;
+        double hash_elapsed_ms = 0.0;
+        double hash_read_fps = 0.0;
+        double hash_unique_fps = 0.0;
+        double hash_dup_pct = 0.0;
         if (hash_current_run > hash_longest_run)
             hash_longest_run = hash_current_run;
+        if (hash_seen > 1 && hash_last_us > hash_first_us) {
+            hash_elapsed_ms = (double)(hash_last_us - hash_first_us) / 1000.0;
+            hash_read_fps = (double)(hash_seen - 1) * 1000.0 / hash_elapsed_ms;
+            if (hash_unique_min > 1)
+                hash_unique_fps = (double)(hash_unique_min - 1) * 1000.0 / hash_elapsed_ms;
+            hash_dup_pct = (double)hash_adjacent_dups * 100.0 / (double)(hash_seen - 1);
+        }
         fprintf(stderr,
-                "[bgp-live] frame-hash summary: mode=%s frames=%d adjacent_duplicates=%d longest_run=%d effective_unique_min=%d\n",
+                "[bgp-live] frame-hash summary: mode=%s frames=%d adjacent_duplicates=%d longest_run=%d effective_unique_min=%d elapsed_ms=%.1f read_fps=%.2f effective_unique_fps=%.2f duplicate_ratio=%.1f%%\n",
                 opt.hash_full ? "strong-full" : "xxh64-full", hash_seen, hash_adjacent_dups, hash_longest_run,
-                hash_seen - hash_adjacent_dups);
+                hash_unique_min, hash_elapsed_ms, hash_read_fps, hash_unique_fps, hash_dup_pct);
     }
     if (!opt.no_infer)
         lpr_infer_stop(&infer);
