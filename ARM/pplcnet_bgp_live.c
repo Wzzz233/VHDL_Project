@@ -238,6 +238,26 @@ static uint64_t lpr_frame_fingerprint64_fast(const uint8_t *data, size_t size)
     return h;
 }
 
+/* FPGA frame-identity stamp: wr_buf overwrites the first 8 pixels of the
+ * first and last active lines with {X=0xA5, R=cnt, G=~cnt, B=0x5A} where cnt
+ * increments once per camera frame. Returns 0 and the counter value if all 8
+ * stamp pixels are well-formed and agree, -1 otherwise. */
+#define FRAME_STAMP_PIXELS 8
+static int frame_stamp_extract(const uint8_t *frame, uint32_t w, uint32_t line, uint8_t *cnt_out)
+{
+    const uint8_t *p = frame + (size_t)line * w * 4U;
+    uint8_t cnt = p[2];
+    int i;
+
+    for (i = 0; i < FRAME_STAMP_PIXELS; i++, p += 4) {
+        if (p[0] != 0x5A || p[3] != 0xA5 ||
+            p[1] != (uint8_t)~p[2] || p[2] != cnt)
+            return -1;
+    }
+    *cnt_out = cnt;
+    return 0;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -292,7 +312,8 @@ static void usage(const char *prog)
             "  --hash-full                   Use slower full-frame hash comparison instead of exact frame copy\n"
             "  --dma-pre-delay-us <n>       Sleep before each DMA read, for phase diagnostics (default: 0)\n"
             "  --display-every <n>          Display one of every n captured frames (default: 1)\n"
-            "  --wait-new-frame <0|1>       Wait for FPGA frame counter before each DMA read (default: 0)\n",
+            "  --wait-new-frame <0|1>       Wait for FPGA frame counter before each DMA read (default: 0)\n"
+            "  --frame-stamp-check <0|1>    Verify FPGA frame-identity stamp in DMA readbacks (default: 0)\n",
             prog);
 }
 
@@ -332,6 +353,7 @@ static void defaults(struct live_options *o)
     o->dma_pre_delay_us = 0;
     o->display_every = 1;
     o->wait_new_frame = false;
+    o->frame_stamp_check = false;
 }
 
 static int parse_options(int argc, char **argv, struct live_options *o)
@@ -382,6 +404,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_DMA_PRE_DELAY_US,
         OPT_DISPLAY_EVERY,
         OPT_WAIT_NEW_FRAME,
+        OPT_FRAME_STAMP_CHECK,
     };
     static const struct option opts[] = {
         {"device",            required_argument, NULL, OPT_DEVICE},
@@ -427,6 +450,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"dma-pre-delay-us", required_argument, NULL, OPT_DMA_PRE_DELAY_US},
         {"display-every",    required_argument, NULL, OPT_DISPLAY_EVERY},
         {"wait-new-frame",   required_argument, NULL, OPT_WAIT_NEW_FRAME},
+        {"frame-stamp-check", required_argument, NULL, OPT_FRAME_STAMP_CHECK},
         {"help",              no_argument,       NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -535,6 +559,9 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         case OPT_WAIT_NEW_FRAME:
             o->wait_new_frame = (strcmp(optarg, "1") == 0 || strcmp(optarg, "true") == 0 || strcmp(optarg, "on") == 0);
             break;
+        case OPT_FRAME_STAMP_CHECK:
+            o->frame_stamp_check = (strcmp(optarg, "1") == 0 || strcmp(optarg, "true") == 0 || strcmp(optarg, "on") == 0);
+            break;
         case 'h': return 1;
         default:  return -1;
         }
@@ -610,6 +637,15 @@ int main(int argc, char **argv)
     int64_t hash_last_us = 0;
     uint32_t frame_status_change_count = 0;
     uint8_t *hash_prev_frame = NULL;
+    uint32_t stamp_samples = 0;
+    uint32_t stamp_malformed = 0;
+    uint32_t stamp_torn = 0;
+    uint32_t stamp_duplicates = 0;
+    uint32_t stamp_backward = 0;
+    uint32_t stamp_skips = 0;
+    uint32_t stamp_skipped_frames = 0;
+    uint8_t stamp_prev_cnt = 0;
+    bool stamp_have_prev = false;
     bool camera_status_seen = false;
     uint32_t camera_frame_start = 0;
     uint32_t camera_sample_prev_counter = 0;
@@ -1022,6 +1058,46 @@ infer_ready:
             hash_last_us = ts_b;
         }
 
+        if (opt.frame_stamp_check) {
+            uint8_t head_cnt = 0, tail_cnt = 0;
+            int head_ok = frame_stamp_extract(slot_frame, dma.frame_w, 0, &head_cnt);
+            int tail_ok = frame_stamp_extract(slot_frame, dma.frame_w, dma.frame_h - 1, &tail_cnt);
+
+            stamp_samples++;
+            if (head_ok < 0 || tail_ok < 0) {
+                stamp_malformed++;
+                if (stamp_malformed <= 8)
+                    fprintf(stderr, "[bgp-live] frame-stamp malformed frame=%d head_ok=%d tail_ok=%d "
+                            "(is the stamp bitstream loaded?)\n", frame, head_ok >= 0, tail_ok >= 0);
+            } else {
+                if (head_cnt != tail_cnt) {
+                    stamp_torn++;
+                    if (stamp_torn <= 12)
+                        fprintf(stderr, "[bgp-live] frame-stamp TORN frame=%d head=%u tail=%u\n",
+                                frame, head_cnt, tail_cnt);
+                }
+                if (stamp_have_prev) {
+                    uint8_t delta = (uint8_t)(head_cnt - stamp_prev_cnt);
+                    if (delta == 0) {
+                        stamp_duplicates++;
+                        if (stamp_duplicates <= 12)
+                            fprintf(stderr, "[bgp-live] frame-stamp DUPLICATE frame=%d cnt=%u\n",
+                                    frame, head_cnt);
+                    } else if (delta >= 128) {
+                        stamp_backward++;
+                        if (stamp_backward <= 12)
+                            fprintf(stderr, "[bgp-live] frame-stamp BACKWARD frame=%d prev=%u now=%u\n",
+                                    frame, stamp_prev_cnt, head_cnt);
+                    } else if (delta > 1) {
+                        stamp_skips++;
+                        stamp_skipped_frames += delta - 1;
+                    }
+                }
+                stamp_prev_cnt = head_cnt;
+                stamp_have_prev = true;
+            }
+        }
+
         /* Optional raw-frame dump: write the captured BGRX frame verbatim,
          * before any overlay drawing, so a stored frame reflects exactly what
          * DMA delivered. Used to tell capture-side artifacts from display-side. */
@@ -1219,6 +1295,20 @@ out:
                 "[bgp-live] frame-hash summary: mode=%s frames=%d adjacent_duplicates=%d longest_run=%d effective_unique_min=%d elapsed_ms=%.1f read_fps=%.2f effective_unique_fps=%.2f duplicate_ratio=%.1f%%\n",
                 opt.hash_full ? "strong-full" : "exact-adjacent", hash_seen, hash_adjacent_dups, hash_longest_run,
                 hash_unique_min, hash_elapsed_ms, hash_read_fps, hash_unique_fps, hash_dup_pct);
+    }
+    if (opt.frame_stamp_check && stamp_samples > 0) {
+        uint32_t stamp_valid = stamp_samples - stamp_malformed;
+        double dup_pct = 0.0, torn_pct = 0.0;
+
+        if (stamp_valid > 1) {
+            dup_pct = (double)stamp_duplicates * 100.0 / (double)(stamp_valid - 1);
+            torn_pct = (double)stamp_torn * 100.0 / (double)stamp_valid;
+        }
+        fprintf(stderr,
+                "[bgp-live] frame-stamp summary: samples=%u malformed=%u torn=%u (%.1f%%) "
+                "duplicates=%u (%.1f%%) backward=%u skips=%u skipped_frames=%u\n",
+                stamp_samples, stamp_malformed, stamp_torn, torn_pct,
+                stamp_duplicates, dup_pct, stamp_backward, stamp_skips, stamp_skipped_frames);
     }
     free(hash_prev_frame);
     if (!opt.no_infer)

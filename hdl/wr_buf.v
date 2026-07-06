@@ -142,7 +142,7 @@ generate
     begin
         always @(posedge wr_clk)
         begin
-            write_data <= wr_data;
+            write_data <= stamp_hit ? {8'hA5, stamp_frame_cnt, ~stamp_frame_cnt, 8'h5A} : wr_data;
             write_en <= wr_data_vld;
         end 
     end
@@ -182,6 +182,24 @@ endgenerate
         else
             y_cnt <= y_cnt;
     end 
+    
+    // Frame-identity stamp: overwrite the first STAMP_PIXELS pixels of the
+    // first and last active lines with {8'hA5, cnt, ~cnt, 8'h5A} so the host
+    // can detect duplicate/stale/torn DDR readbacks. cnt increments once per
+    // wr_fsync in the wr_clk domain, so it tracks the DDR-domain frame_wcnt
+    // cadence without crossing clocks. Diagnostic aid; only wired into the
+    // 32-bit BGRX pixel path.
+    localparam [11:0] STAMP_PIXELS = 12'd8;
+    reg [7:0] stamp_frame_cnt = 8'd0;
+    always @(posedge wr_clk)
+    begin
+        if(~wr_fsync_1d & wr_fsync & ddr_rstn_2d)
+            stamp_frame_cnt <= stamp_frame_cnt + 8'd1;
+        else
+            stamp_frame_cnt <= stamp_frame_cnt;
+    end 
+    wire stamp_line = (y_cnt == 12'd1) || (y_cnt == V_NUM);
+    wire stamp_hit  = wr_data_vld & wr_enable & stamp_line & (x_cnt < STAMP_PIXELS);
     
     reg rd_pulse;
     always @(posedge wr_clk)

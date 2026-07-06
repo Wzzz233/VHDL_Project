@@ -159,6 +159,11 @@ struct live_options {
     int dma_pre_delay_us;
     int display_every;
     bool wait_new_frame;
+    /* Check the FPGA frame-identity stamp (first 8 pixels of the first and
+     * last lines carry the wr_buf frame counter) on every DMA readback.
+     * Detects duplicate/stale/backward/torn frames served from DDR.
+     * Requires a bitstream with the wr_buf stamp logic. */
+    bool frame_stamp_check;
 };
 
 /* ---------------- Detector outputs ---------------- */
