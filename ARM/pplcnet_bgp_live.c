@@ -568,6 +568,13 @@ int main(int argc, char **argv)
     uint8_t *hash_prev_frame = NULL;
     bool camera_status_seen = false;
     uint32_t camera_frame_start = 0;
+    uint32_t camera_sample_prev_counter = 0;
+    uint32_t camera_sample_prev_hash = 0;
+    uint32_t camera_hash_samples = 0;
+    uint32_t camera_hash_adjacent_dups = 0;
+    uint32_t camera_hash_current_run = 0;
+    uint32_t camera_hash_longest_run = 0;
+    uint32_t camera_counter_nonunit_steps = 0;
     int64_t camera_status_start_us = 0;
     uint64_t hash_prev = 0;
 
@@ -876,6 +883,35 @@ infer_ready:
                 fprintf(stderr, "[bgp-live] wait for new FPGA frame failed\n");
                 goto out;
             }
+            if (camera_status_seen) {
+                struct fpga_frame_status status;
+                if (lpr_dma_get_frame_status(&dma, &status) == 0 &&
+                    status.camera_magic == FPGA_CAMERA_STATUS_MAGIC) {
+                    if (camera_hash_samples == 0) {
+                        camera_hash_current_run = 1;
+                    } else {
+                        uint32_t camera_counter_step =
+                            status.camera_frame_counter - camera_sample_prev_counter;
+
+                        if (camera_counter_step != 1U)
+                            camera_counter_nonunit_steps++;
+                        if (status.camera_hash == camera_sample_prev_hash) {
+                            camera_hash_adjacent_dups++;
+                            camera_hash_current_run++;
+                        } else {
+                            if (camera_hash_current_run > camera_hash_longest_run)
+                                camera_hash_longest_run = camera_hash_current_run;
+                            camera_hash_current_run = 1;
+                        }
+                    }
+                    camera_sample_prev_counter = status.camera_frame_counter;
+                    camera_sample_prev_hash = status.camera_hash;
+                    camera_hash_samples++;
+                } else {
+                    fprintf(stderr, "[bgp-live] camera-status sample failed\n");
+                    goto out;
+                }
+            }
         }
         slot = lpr_dma_acquire_slot(&dma);
         if (opt.dma_pre_delay_us > 0)
@@ -1084,6 +1120,22 @@ out:
                     status.camera_hash);
         } else {
             fprintf(stderr, "[bgp-live] camera-status summary unavailable\n");
+        }
+        if (camera_hash_samples > 0) {
+            double camera_hash_dup_pct = 0.0;
+
+            if (camera_hash_current_run > camera_hash_longest_run)
+                camera_hash_longest_run = camera_hash_current_run;
+            if (camera_hash_samples > 1)
+                camera_hash_dup_pct = (double)camera_hash_adjacent_dups * 100.0 /
+                                      (double)(camera_hash_samples - 1U);
+            fprintf(stderr,
+                    "[bgp-live] camera-hash summary: samples=%u adjacent_duplicates=%u longest_run=%u counter_nonunit_steps=%u duplicate_ratio=%.1f%%\n",
+                    camera_hash_samples,
+                    camera_hash_adjacent_dups,
+                    camera_hash_longest_run,
+                    camera_counter_nonunit_steps,
+                    camera_hash_dup_pct);
         }
     }
     if (hash_seen > 0) {
