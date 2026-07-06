@@ -93,6 +93,31 @@ static uint64_t lpr_frame_hash64_full(const uint8_t *data, size_t size)
     return h;
 }
 
+static uint64_t lpr_frame_hash64_sampled(const uint8_t *data, size_t size)
+{
+    const size_t max_samples = 4096;
+    size_t words = size / sizeof(uint64_t);
+    size_t samples = words < max_samples ? words : max_samples;
+    uint64_t h = lpr_hash_mix64(1099511628211ULL, (uint64_t)size);
+
+    if (!data || words == 0)
+        return h;
+
+    if (samples <= 1) {
+        uint64_t v = 0;
+        memcpy(&v, data, sizeof(v));
+        return lpr_hash_mix64(h, v);
+    }
+
+    for (size_t i = 0; i < samples; i++) {
+        size_t word = (i * (words - 1)) / (samples - 1);
+        uint64_t v;
+        memcpy(&v, data + word * sizeof(v), sizeof(v));
+        h = lpr_hash_mix64(h, v ^ (uint64_t)word);
+    }
+    return h;
+}
+
 static uint64_t lpr_rotl64(uint64_t v, unsigned int r)
 {
     return (v << r) | (v >> (64U - r));
@@ -242,6 +267,7 @@ static void usage(const char *prog)
             "  --dump-path <dir>             Directory for dumped frames (default: ./dump)\n"
             "  --hash-frames <n>             Check first n raw frames for exact adjacent duplicates (default: 0)\n"
             "  --hash-full                   Use slower full-frame hash comparison instead of exact frame copy\n"
+            "  --hash-sampled                Use lightweight sampled hash comparison for real-time diagnostics\n"
             "  --dma-pre-delay-us <n>       Sleep before each DMA read, for phase diagnostics (default: 0)\n"
             "  --display-every <n>          Display one of every n captured frames (default: 1)\n"
             "  --wait-new-frame <0|1>       Wait for FPGA frame counter before each DMA read (default: 0)\n",
@@ -280,6 +306,7 @@ static void defaults(struct live_options *o)
     o->dump_path = NULL;
     o->hash_frames = 0;
     o->hash_full = false;
+    o->hash_sampled = false;
     o->dma_pre_delay_us = 0;
     o->display_every = 1;
     o->wait_new_frame = false;
@@ -328,6 +355,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_DUMP_PATH,
         OPT_HASH_FRAMES,
         OPT_HASH_FULL,
+        OPT_HASH_SAMPLED,
         OPT_NO_INFER,
         OPT_DMA_PRE_DELAY_US,
         OPT_DISPLAY_EVERY,
@@ -373,6 +401,7 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         {"dump-path",        required_argument, NULL, OPT_DUMP_PATH},
         {"hash-frames",      required_argument, NULL, OPT_HASH_FRAMES},
         {"hash-full",        no_argument,       NULL, OPT_HASH_FULL},
+        {"hash-sampled",     no_argument,       NULL, OPT_HASH_SAMPLED},
         {"dma-pre-delay-us", required_argument, NULL, OPT_DMA_PRE_DELAY_US},
         {"display-every",    required_argument, NULL, OPT_DISPLAY_EVERY},
         {"wait-new-frame",   required_argument, NULL, OPT_WAIT_NEW_FRAME},
@@ -469,6 +498,9 @@ static int parse_options(int argc, char **argv, struct live_options *o)
             break;
         case OPT_HASH_FULL:
             o->hash_full = true;
+            break;
+        case OPT_HASH_SAMPLED:
+            o->hash_sampled = true;
             break;
         case OPT_DMA_PRE_DELAY_US:
             o->dma_pre_delay_us = atoi(optarg);
@@ -622,7 +654,7 @@ int main(int argc, char **argv)
                 opt.device_path, strerror(errno));
         goto out;
     }
-    if (opt.hash_frames > 0 && !opt.hash_full) {
+    if (opt.hash_frames > 0 && !opt.hash_full && !opt.hash_sampled) {
         hash_prev_frame = malloc(dma.frame_size);
         if (!hash_prev_frame) {
             fprintf(stderr, "[bgp-live] failed to allocate exact duplicate buffer (%zu bytes)\n", dma.frame_size);
@@ -761,7 +793,7 @@ infer_ready:
             opt.display ? 1 : 0, opt.display_sync ? 1 : 0, opt.display_atomic_flip ? 1 : 0,
             opt.auto_green_filter ? 1 : 0, opt.no_infer ? 1 : 0, opt.no_infer ? 0 : 1,
             opt.dma_pre_delay_us, opt.display_every, opt.wait_new_frame ? 1 : 0, opt.hash_frames,
-            opt.hash_full ? "strong-full" : "exact-adjacent");
+            opt.hash_sampled ? "sampled" : (opt.hash_full ? "strong-full" : "exact-adjacent"));
 
     if (!opt.no_infer) {
     /* Build the per-route binding table for the inference thread. */
@@ -866,7 +898,9 @@ infer_ready:
         if (opt.hash_frames > 0 && frame < opt.hash_frames) {
             uint64_t h = 0;
             bool duplicate = false;
-            if (opt.hash_full)
+            if (opt.hash_sampled)
+                h = lpr_frame_hash64_sampled(slot_frame, dma.frame_size);
+            else if (opt.hash_full)
                 h = lpr_frame_hash64_full(slot_frame, dma.frame_size);
 
             hash_seen++;
@@ -874,7 +908,7 @@ infer_ready:
                 hash_first_us = ts_b;
                 hash_current_run = 1;
             } else {
-                if (opt.hash_full)
+                if (opt.hash_sampled || opt.hash_full)
                     duplicate = (h == hash_prev);
                 else
                     duplicate = (memcmp(hash_prev_frame, slot_frame, dma.frame_size) == 0);
@@ -882,18 +916,18 @@ infer_ready:
                 if (duplicate) {
                     hash_adjacent_dups++;
                     hash_current_run++;
-                    if (!opt.hash_full)
+                    if (!opt.hash_full && !opt.hash_sampled)
                         h = lpr_frame_fingerprint64_fast(slot_frame, dma.frame_size);
                     fprintf(stderr,
                             "[bgp-live] frame-hash duplicate mode=%s prev=%d frame=%d hash=0x%016llx\n",
-                            opt.hash_full ? "strong-full" : "exact-adjacent", frame - 1, frame, (unsigned long long)h);
+                            opt.hash_sampled ? "sampled" : (opt.hash_full ? "strong-full" : "exact-adjacent"), frame - 1, frame, (unsigned long long)h);
                 } else {
                     if (hash_current_run > hash_longest_run)
                         hash_longest_run = hash_current_run;
                     hash_current_run = 1;
                 }
             }
-            if (opt.hash_full)
+            if (opt.hash_full || opt.hash_sampled)
                 hash_prev = h;
             else
                 memcpy(hash_prev_frame, slot_frame, dma.frame_size);
@@ -1050,7 +1084,7 @@ out:
         }
         fprintf(stderr,
                 "[bgp-live] frame-hash summary: mode=%s frames=%d adjacent_duplicates=%d longest_run=%d effective_unique_min=%d elapsed_ms=%.1f read_fps=%.2f effective_unique_fps=%.2f duplicate_ratio=%.1f%%\n",
-                opt.hash_full ? "strong-full" : "exact-adjacent", hash_seen, hash_adjacent_dups, hash_longest_run,
+                opt.hash_sampled ? "sampled" : (opt.hash_full ? "strong-full" : "exact-adjacent"), hash_seen, hash_adjacent_dups, hash_longest_run,
                 hash_unique_min, hash_elapsed_ms, hash_read_fps, hash_unique_fps, hash_dup_pct);
     }
     free(hash_prev_frame);

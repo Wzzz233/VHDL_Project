@@ -155,6 +155,7 @@ struct live_options {
     const char *dump_path;
     int hash_frames;
     bool hash_full;
+    bool hash_sampled;
     int dma_pre_delay_us;
     int display_every;
     bool wait_new_frame;
