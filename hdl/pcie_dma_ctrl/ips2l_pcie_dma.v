@@ -157,6 +157,7 @@ wire                            bar0_rd_clk_en/*synthesis PAP_MARK_DEBUG="1"*/;
 wire        [ADDR_WIDTH-1:0]    bar0_rd_addr;
 wire        [127:0]             bar0_rd_data;
 wire        [127:0]             bar0_rd_data_mux;
+reg                             bar0_status_sel_d;
 //bar1 wr interface
 wire                            bar1_wr_en/*synthesis PAP_MARK_DEBUG="1"*/;
 wire        [ADDR_WIDTH-1:0]    bar1_wr_addr/*synthesis PAP_MARK_DEBUG="1"*/;
@@ -174,8 +175,16 @@ assign o_bar2_rd_addr_ext   = bar2_rd_addr;
 assign bar2_rd_data         = i_ext_bar2_rd_sel ? i_ext_bar2_rd_data : bar2_rd_data_int;
 assign o_tx_restart_ext     = tx_restart;
 assign o_frame_done_pulse_ext = frame_done_pulse;
-assign bar0_rd_data_mux     = (bar0_rd_addr == i_bar0_status_addr) ?
-                              i_bar0_status_data : bar0_rd_data;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)
+        bar0_status_sel_d <= 1'b0;
+    else
+        bar0_status_sel_d <= bar0_rd_clk_en &&
+                             (bar0_rd_addr == i_bar0_status_addr);
+end
+
+assign bar0_rd_data_mux     = bar0_status_sel_d ? i_bar0_status_data : bar0_rd_data;
 //**********************************************************************
 //rst tlp cnt
 wire                            tx_restart;
