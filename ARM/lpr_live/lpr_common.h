@@ -143,6 +143,7 @@ struct live_options {
     bool display;
     bool display_sync;
     bool display_atomic_flip;
+    bool display_do_timestamp;
     bool det_zero_copy;
     bool no_infer;
     /* Raw-frame dump for display-vs-capture diagnostics. When dump_frames > 0,

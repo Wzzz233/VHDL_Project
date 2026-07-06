@@ -32,6 +32,8 @@ struct display_state {
     int connector_id;
     bool sync;
     bool atomic_flip;
+    bool do_timestamp;
+    bool pts_initialized;
     size_t frame_size;
     uint64_t next_pts_ns;
     GstElement *pipeline;

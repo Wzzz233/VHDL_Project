@@ -386,6 +386,7 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
     d->w = w; d->h = h; d->fps = opt->fps; d->connector_id = opt->connector_id;
     d->sync = opt->display_sync;
     d->atomic_flip = opt->display_atomic_flip;
+    d->do_timestamp = opt->display_do_timestamp;
     d->frame_size = (size_t)w * (size_t)h * 4U;
     d->pending_slot = -1;
     if (opt->drm_card_path && opt->drm_card_path[0]) {
@@ -410,13 +411,8 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
                                "width", G_TYPE_INT, (int)w, "height", G_TYPE_INT, (int)h,
                                "framerate", GST_TYPE_FRACTION, opt->fps, 1, NULL);
     if (!caps) return -1;
-    /* do-timestamp must be TRUE for is-live appsrc: it stamps buffers with the
-     * pipeline clock so the live source throttles correctly. Disabling it (as
-     * an earlier attempt did) left is-live without a valid time base and the
-     * display stuttered at sync=0 even though cadence logs showed 30fps push.
-     * Matches the proven fpga_hdmi_display.c config. The incrementing PTS we
-     * also set is simply overwritten by the timestamp. */
-    g_object_set(d->appsrc, "caps", caps, "is-live", TRUE, "do-timestamp", TRUE,
+    g_object_set(d->appsrc, "caps", caps, "is-live", TRUE,
+                 "do-timestamp", d->do_timestamp ? TRUE : FALSE,
                  "format", GST_FORMAT_TIME, "block", FALSE,
                  "max-bytes", (guint64)d->frame_size * 2U, NULL);
     gst_caps_unref(caps);
@@ -454,9 +450,9 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
         return -1;
     }
     d->thread_started = true;
-    fprintf(stderr, "[display] started appsrc BGRx %ux%u -> kmssink sync=%d atomic_flip=%d connector=%d copy_slots=%d release_delay_ms=%d\n",
-            w, h, d->sync ? 1 : 0, d->atomic_flip ? 1 : 0, d->connector_id,
-            LPR_DISPLAY_COPY_SLOTS, LPR_DISPLAY_RELEASE_DELAY_MS);
+    fprintf(stderr, "[display] started appsrc BGRx %ux%u -> kmssink sync=%d atomic_flip=%d do_timestamp=%d connector=%d copy_slots=%d release_delay_ms=%d\n",
+            w, h, d->sync ? 1 : 0, d->atomic_flip ? 1 : 0, d->do_timestamp ? 1 : 0,
+            d->connector_id, LPR_DISPLAY_COPY_SLOTS, LPR_DISPLAY_RELEASE_DELAY_MS);
     return 0;
 }
 
@@ -585,6 +581,25 @@ static int display_acquire_slot(struct display_state *d, struct display_slot_tic
     return 1;
 }
 
+static uint64_t display_running_time_ns(struct display_state *d)
+{
+    GstClock *clock;
+    GstClockTime now;
+    GstClockTime base;
+
+    if (!d || !d->pipeline)
+        return 0;
+    clock = gst_element_get_clock(d->pipeline);
+    if (!clock)
+        return 0;
+    now = gst_clock_get_time(clock);
+    base = gst_element_get_base_time(d->pipeline);
+    gst_object_unref(clock);
+    if (!GST_CLOCK_TIME_IS_VALID(now) || !GST_CLOCK_TIME_IS_VALID(base) || now < base)
+        return 0;
+    return (uint64_t)(now - base);
+}
+
 static int display_copy_push_slot(struct display_state *d, int slot, uint64_t generation)
 {
     struct display_slot_ticket ticket;
@@ -643,9 +658,19 @@ static int display_copy_push_slot(struct display_state *d, int slot, uint64_t ge
         g_free(cookie);
         return -1;
     }
-    GST_BUFFER_PTS(buf) = d->next_pts_ns;
-    GST_BUFFER_DURATION(buf) = (guint64)(GST_SECOND / d->fps);
-    d->next_pts_ns += GST_BUFFER_DURATION(buf);
+    {
+        guint64 duration = (guint64)(GST_SECOND / d->fps);
+
+        if (!d->do_timestamp && !d->pts_initialized) {
+            uint64_t running_ns = display_running_time_ns(d);
+            d->next_pts_ns = ((running_ns + duration - 1U) / duration) * duration;
+            d->pts_initialized = true;
+        }
+        GST_BUFFER_PTS(buf) = d->next_pts_ns;
+        GST_BUFFER_DTS(buf) = GST_CLOCK_TIME_NONE;
+        GST_BUFFER_DURATION(buf) = duration;
+        d->next_pts_ns += duration;
+    }
     flow = gst_app_src_push_buffer(GST_APP_SRC(d->appsrc), buf);
     if (flow != GST_FLOW_OK)
         return -1;
