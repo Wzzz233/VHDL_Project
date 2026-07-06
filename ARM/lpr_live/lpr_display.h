@@ -34,6 +34,7 @@ struct display_state {
     bool atomic_flip;
     bool do_timestamp;
     bool pts_initialized;
+    bool pts_logged;
     size_t frame_size;
     uint64_t next_pts_ns;
     GstElement *pipeline;

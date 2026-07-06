@@ -419,6 +419,12 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
     g_object_set(d->queue, "max-size-buffers", 1, "max-size-bytes", 0,
                  "max-size-time", (guint64)0, "leaky", 2, NULL);
     g_object_set(d->sink, "sync", d->sync ? TRUE : FALSE, NULL);
+    if (!d->do_timestamp) {
+        guint64 duration = (guint64)(GST_SECOND / d->fps);
+        g_object_set(d->appsrc, "min-latency", (gint64)0,
+                     "max-latency", (gint64)(duration * 2U), NULL);
+        g_object_set(d->sink, "max-lateness", (gint64)-1, "qos", FALSE, NULL);
+    }
     if (d->atomic_flip) {
         /* Atomic flip is useful when diagnosing true scanout tearing, but on
          * this RK3568 path it can make 30fps motion cadence visibly uneven.
@@ -663,8 +669,16 @@ static int display_copy_push_slot(struct display_state *d, int slot, uint64_t ge
 
         if (!d->do_timestamp && !d->pts_initialized) {
             uint64_t running_ns = display_running_time_ns(d);
-            d->next_pts_ns = ((running_ns + duration - 1U) / duration) * duration;
+            d->next_pts_ns = running_ns + duration * 2U;
             d->pts_initialized = true;
+            if (!d->pts_logged) {
+                fprintf(stderr,
+                        "[display] manual PTS init running_ms=%.2f first_pts_ms=%.2f duration_ms=%.2f\n",
+                        (double)running_ns / 1000000.0,
+                        (double)d->next_pts_ns / 1000000.0,
+                        (double)duration / 1000000.0);
+                d->pts_logged = true;
+            }
         }
         GST_BUFFER_PTS(buf) = d->next_pts_ns;
         GST_BUFFER_DTS(buf) = GST_CLOCK_TIME_NONE;
