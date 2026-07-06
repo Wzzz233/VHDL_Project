@@ -78,6 +78,43 @@ static uint32_t lpr_camera_status_lines(const struct fpga_frame_status *status)
     return status->camera_shape >> 20;
 }
 
+struct lpr_interval_stats {
+    int samples;
+    int64_t min_us;
+    int64_t max_us;
+    int64_t sum_us;
+    int over_40ms;
+    int over_50ms;
+};
+
+static void lpr_interval_stats_update(struct lpr_interval_stats *stats, int64_t delta_us)
+{
+    if (!stats || delta_us < 0)
+        return;
+    if (stats->samples == 0 || delta_us < stats->min_us)
+        stats->min_us = delta_us;
+    if (delta_us > stats->max_us)
+        stats->max_us = delta_us;
+    stats->sum_us += delta_us;
+    stats->samples++;
+    if (delta_us > 40000)
+        stats->over_40ms++;
+    if (delta_us > 50000)
+        stats->over_50ms++;
+}
+
+static void lpr_interval_stats_print(const char *name, const struct lpr_interval_stats *stats)
+{
+    if (!stats || stats->samples <= 0)
+        return;
+    fprintf(stderr,
+            "[bgp-live] %s interval summary: samples=%d avg_ms=%.2f min_ms=%.2f max_ms=%.2f over40ms=%d over50ms=%d\n",
+            name, stats->samples,
+            (double)stats->sum_us / (double)stats->samples / 1000.0,
+            (double)stats->min_us / 1000.0, (double)stats->max_us / 1000.0,
+            stats->over_40ms, stats->over_50ms);
+}
+
 static uint64_t lpr_hash_mix64(uint64_t h, uint64_t v)
 {
     h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
@@ -576,6 +613,12 @@ int main(int argc, char **argv)
     uint32_t camera_hash_longest_run = 0;
     uint32_t camera_counter_nonunit_steps = 0;
     int64_t camera_status_start_us = 0;
+    struct lpr_interval_stats capture_start_intervals = {0};
+    struct lpr_interval_stats dma_done_intervals = {0};
+    struct lpr_interval_stats display_push_intervals = {0};
+    int64_t prev_capture_start_us = 0;
+    int64_t prev_dma_done_us = 0;
+    int64_t prev_display_push_us = 0;
     uint64_t hash_prev = 0;
 
     parsed = parse_options(argc, argv, &opt);
@@ -878,6 +921,9 @@ infer_ready:
         int64_t ts_a, ts_b, ts_c, ts_d;
 
         ts_a = lpr_mono_us();
+        if (prev_capture_start_us > 0)
+            lpr_interval_stats_update(&capture_start_intervals, ts_a - prev_capture_start_us);
+        prev_capture_start_us = ts_a;
         if (opt.wait_new_frame) {
             if (lpr_dma_wait_new_frame(&dma, &frame_status_change_count, 1000) < 0) {
                 fprintf(stderr, "[bgp-live] wait for new FPGA frame failed\n");
@@ -928,6 +974,9 @@ infer_ready:
             goto out;
         }
         ts_b = lpr_mono_us();
+        if (prev_dma_done_us > 0)
+            lpr_interval_stats_update(&dma_done_intervals, ts_b - prev_dma_done_us);
+        prev_dma_done_us = ts_b;
 
         if (opt.hash_frames > 0 && frame < opt.hash_frames) {
             uint64_t h = 0;
@@ -1055,6 +1104,9 @@ infer_ready:
                 goto out;
             ts_d = lpr_mono_us();
             stat_push_us += ts_d - ts_c;
+            if (prev_display_push_us > 0)
+                lpr_interval_stats_update(&display_push_intervals, ts_d - prev_display_push_us);
+            prev_display_push_us = ts_d;
         } else {
             ts_d = ts_c;
         }
@@ -1138,6 +1190,9 @@ out:
                     camera_hash_dup_pct);
         }
     }
+    lpr_interval_stats_print("capture-start", &capture_start_intervals);
+    lpr_interval_stats_print("dma-done", &dma_done_intervals);
+    lpr_interval_stats_print("display-push", &display_push_intervals);
     if (hash_seen > 0) {
         int hash_unique_min = hash_seen - hash_adjacent_dups;
         double hash_elapsed_ms = 0.0;
