@@ -631,10 +631,18 @@ int main(int argc, char **argv)
     }
     if (opt.wait_new_frame) {
         struct fpga_frame_status status;
+        errno = 0;
         if (lpr_dma_get_frame_status(&dma, &status) < 0) {
+            int saved_errno = errno;
             fprintf(stderr,
                     "[bgp-live] --wait-new-frame requested but FPGA frame status is unavailable; "
                     "rebuild/reload the updated bitstream and pcie_fpga_dma.ko\n");
+            fprintf(stderr,
+                    "[bgp-live] frame-status probe raw counter=%u changes=%u flags=0x%08x "
+                    "magic=0x%08x expected=0x%08x ioctl_errno=%d (%s)\n",
+                    status.frame_counter, status.frame_change_count, status.flags,
+                    status.magic, FPGA_FRAME_STATUS_MAGIC, saved_errno,
+                    saved_errno ? strerror(saved_errno) : "none");
             goto out;
         }
         frame_status_change_count = status.frame_change_count;
