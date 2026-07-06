@@ -86,6 +86,9 @@ LPR_LIVE_HDRS := \
 BGP_PKG_CONFIG_PATH := $(SDK_SYSROOT)/usr/lib/aarch64-linux-gnu/pkgconfig:$(SDK_SYSROOT)/usr/share/pkgconfig
 BGP_GST_CFLAGS := $(shell PKG_CONFIG_SYSROOT_DIR=$(SDK_SYSROOT) PKG_CONFIG_LIBDIR=$(BGP_PKG_CONFIG_PATH) PKG_CONFIG_PATH=$(BGP_PKG_CONFIG_PATH) pkg-config --cflags $(GST_PKGS))
 BGP_GST_LIBS   := $(shell PKG_CONFIG_SYSROOT_DIR=$(SDK_SYSROOT) PKG_CONFIG_LIBDIR=$(BGP_PKG_CONFIG_PATH) PKG_CONFIG_PATH=$(BGP_PKG_CONFIG_PATH) pkg-config --libs $(GST_PKGS))
+DRM_PKGS := libdrm
+DRM_CFLAGS := $(shell PKG_CONFIG_SYSROOT_DIR=$(SDK_SYSROOT) PKG_CONFIG_LIBDIR=$(BGP_PKG_CONFIG_PATH) PKG_CONFIG_PATH=$(BGP_PKG_CONFIG_PATH) pkg-config --cflags $(DRM_PKGS))
+DRM_LIBS := $(shell PKG_CONFIG_SYSROOT_DIR=$(SDK_SYSROOT) PKG_CONFIG_LIBDIR=$(BGP_PKG_CONFIG_PATH) PKG_CONFIG_PATH=$(BGP_PKG_CONFIG_PATH) pkg-config --libs $(DRM_PKGS))
 
 pplcnet-bgp-live: pplcnet_bgp_live.c $(LPR_LIVE_SRCS) $(LPR_LIVE_HDRS) ocr_decode.c ocr_decode.h pcie_fpga_dma.h
 	$(CROSS_COMPILE)gcc -Wall -Wextra -O2 \
@@ -95,6 +98,12 @@ pplcnet-bgp-live: pplcnet_bgp_live.c $(LPR_LIVE_SRCS) $(LPR_LIVE_HDRS) ocr_decod
 		pplcnet_bgp_live.c $(LPR_LIVE_SRCS) ocr_decode.c \
 		-pthread $(BGP_GST_CFLAGS) $(BGP_GST_LIBS) \
 		-L$(RKNN_LIB_DIR) -lrknnrt -lm
+
+fpga-drm-display: fpga_drm_display.c pcie_fpga_dma.h
+	$(CROSS_COMPILE)gcc -Wall -Wextra -O2 \
+		--sysroot=$(SDK_SYSROOT) \
+		-o fpga_drm_display fpga_drm_display.c \
+		$(DRM_CFLAGS) $(DRM_LIBS)
 
 # Standalone PPM-input PPLCNet RKNN tester. Cross-compiled for the board (uses libplcnetrt).
 # Run on board:  ./test_pplcnet_green model.rknn keys.txt image.ppm [...] | @list.txt
@@ -123,6 +132,7 @@ clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f fpga_dma_test
 	rm -f fpga_hdmi_display
+	rm -f fpga_drm_display
 	rm -f fpga_lpr_display
 	rm -f pplcnet_green_live
 	rm -f pplcnet_bg_live
