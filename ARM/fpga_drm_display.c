@@ -456,6 +456,37 @@ static int wait_flip(int fd, bool *waiting)
     return 0;
 }
 
+static int choose_free_fb(int current_fb, int pending_fb)
+{
+    for (int i = 0; i < DRM_BUFFER_COUNT; i++) {
+        if (i != current_fb && i != pending_fb)
+            return i;
+    }
+    return -1;
+}
+
+static int finish_pending_flip(struct drm_state *drm, bool *flip_waiting,
+                               int *current_fb, int *pending_fb,
+                               struct interval_stats *flip_intervals,
+                               int64_t *prev_flip_done)
+{
+    int64_t now;
+
+    if (!*flip_waiting)
+        return 0;
+    if (wait_flip(drm->fd, flip_waiting) < 0)
+        return -1;
+    if (g_stop)
+        return 0;
+    *current_fb = *pending_fb;
+    *pending_fb = -1;
+    now = mono_us();
+    if (*prev_flip_done > 0)
+        stats_update(flip_intervals, now - *prev_flip_done);
+    *prev_flip_done = now;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct options opt;
@@ -469,6 +500,8 @@ int main(int argc, char **argv)
     uint32_t last_change = 0;
     int ret = 1;
     int current_fb = 0;
+    int pending_fb = -1;
+    bool flip_waiting = false;
     int64_t next_us;
     int64_t prev_read_done = 0;
     int64_t prev_flip_done = 0;
@@ -530,7 +563,20 @@ int main(int argc, char **argv)
             next_us += 1000000LL / opt.fps;
         }
 
-        fb_index = (frame == 0) ? 0 : ((current_fb + 1) % DRM_BUFFER_COUNT);
+        fb_index = (frame == 0) ? 0 : choose_free_fb(current_fb, pending_fb);
+        if (fb_index < 0) {
+            if (finish_pending_flip(&drm, &flip_waiting, &current_fb, &pending_fb,
+                                    &flip_intervals, &prev_flip_done) < 0) {
+                perror("wait page flip");
+                goto out;
+            }
+            fb_index = choose_free_fb(current_fb, pending_fb);
+        }
+        if (fb_index < 0) {
+            fprintf(stderr, "[drm-display] no free DRM framebuffer\n");
+            goto out;
+        }
+
         if (dma_read_frame(dma_fd, 0, drm.fb[fb_index].map, frame_size) < 0) {
             perror("FPGA_DMA_READ_FRAME");
             goto out;
@@ -548,24 +594,29 @@ int main(int argc, char **argv)
             }
             current_fb = fb_index;
         } else {
-            bool waiting = true;
-            if (drmModePageFlip(drm.fd, drm.crtc_id, drm.fb[fb_index].fb_id,
-                                DRM_MODE_PAGE_FLIP_EVENT, &waiting) < 0) {
-                perror("drmModePageFlip");
-                goto out;
-            }
-            if (wait_flip(drm.fd, &waiting) < 0) {
+            if (finish_pending_flip(&drm, &flip_waiting, &current_fb, &pending_fb,
+                                    &flip_intervals, &prev_flip_done) < 0) {
                 perror("wait page flip");
                 goto out;
             }
-            current_fb = fb_index;
-            if (prev_flip_done > 0)
-                stats_update(&flip_intervals, mono_us() - prev_flip_done);
-            prev_flip_done = mono_us();
+            flip_waiting = true;
+            pending_fb = fb_index;
+            if (drmModePageFlip(drm.fd, drm.crtc_id, drm.fb[fb_index].fb_id,
+                                DRM_MODE_PAGE_FLIP_EVENT, &flip_waiting) < 0) {
+                perror("drmModePageFlip");
+                goto out;
+            }
         }
         frames++;
         if (frames % 60U == 0)
             fprintf(stderr, "[drm-display] frames=%llu\n", (unsigned long long)frames);
+    }
+    if (flip_waiting && !g_stop) {
+        if (finish_pending_flip(&drm, &flip_waiting, &current_fb, &pending_fb,
+                                &flip_intervals, &prev_flip_done) < 0) {
+            perror("wait final page flip");
+            goto out;
+        }
     }
     ret = 0;
 
