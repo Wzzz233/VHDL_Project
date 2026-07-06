@@ -540,6 +540,10 @@ static long fpga_dma_ioctl(struct file *file, unsigned int cmd, unsigned long ar
         status.frame_change_count = ioread32(dev->bar0 + BAR0_FRAME_STATUS_OFFSET + 4U);
         status.flags = ioread32(dev->bar0 + BAR0_FRAME_STATUS_OFFSET + 8U);
         status.magic = ioread32(dev->bar0 + BAR0_FRAME_STATUS_OFFSET + 12U);
+        status.camera_frame_counter = ioread32(dev->bar0 + BAR0_CAMERA_STATUS_OFFSET);
+        status.camera_shape = ioread32(dev->bar0 + BAR0_CAMERA_STATUS_OFFSET + 4U);
+        status.camera_hash = ioread32(dev->bar0 + BAR0_CAMERA_STATUS_OFFSET + 8U);
+        status.camera_magic = ioread32(dev->bar0 + BAR0_CAMERA_STATUS_OFFSET + 12U);
 
         if (copy_to_user(argp, &status, sizeof(status)))
             ret = -EFAULT;

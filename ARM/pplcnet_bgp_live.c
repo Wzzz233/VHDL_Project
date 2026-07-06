@@ -68,6 +68,16 @@ static void on_signal(int sig)
     g_stop = 1;
 }
 
+static uint32_t lpr_camera_status_words(const struct fpga_frame_status *status)
+{
+    return status->camera_shape & 0x000fffffU;
+}
+
+static uint32_t lpr_camera_status_lines(const struct fpga_frame_status *status)
+{
+    return status->camera_shape >> 20;
+}
+
 static uint64_t lpr_hash_mix64(uint64_t h, uint64_t v)
 {
     h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
@@ -556,6 +566,9 @@ int main(int argc, char **argv)
     int64_t hash_last_us = 0;
     uint32_t frame_status_change_count = 0;
     uint8_t *hash_prev_frame = NULL;
+    bool camera_status_seen = false;
+    uint32_t camera_frame_start = 0;
+    int64_t camera_status_start_us = 0;
     uint64_t hash_prev = 0;
 
     parsed = parse_options(argc, argv, &opt);
@@ -649,6 +662,23 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "[bgp-live] frame-status counter=%u changes=%u flags=0x%08x magic=0x%08x\n",
                 status.frame_counter, status.frame_change_count, status.flags, status.magic);
+        if (status.camera_magic == FPGA_CAMERA_STATUS_MAGIC) {
+            camera_status_seen = true;
+            camera_frame_start = status.camera_frame_counter;
+            camera_status_start_us = lpr_mono_us();
+            fprintf(stderr,
+                    "[bgp-live] camera-status frames=%u lines=%u words=%u hash=0x%08x magic=0x%08x\n",
+                    status.camera_frame_counter,
+                    lpr_camera_status_lines(&status),
+                    lpr_camera_status_words(&status),
+                    status.camera_hash,
+                    status.camera_magic);
+        } else {
+            fprintf(stderr,
+                    "[bgp-live] camera-status unavailable raw magic=0x%08x expected=0x%08x\n",
+                    status.camera_magic,
+                    FPGA_CAMERA_STATUS_MAGIC);
+        }
     }
     if (lpr_display_start(&display, &opt, dma.frame_w, dma.frame_h) < 0) {
         fprintf(stderr, "[bgp-live] failed to start display\n");
@@ -1033,6 +1063,29 @@ infer_ready:
     ret = 0;
 
 out:
+    if (camera_status_seen && dma.fd >= 0) {
+        struct fpga_frame_status status;
+        if (lpr_dma_get_frame_status(&dma, &status) == 0 &&
+            status.camera_magic == FPGA_CAMERA_STATUS_MAGIC) {
+            uint32_t camera_delta = status.camera_frame_counter - camera_frame_start;
+            int64_t camera_elapsed_us = lpr_mono_us() - camera_status_start_us;
+            double camera_elapsed_ms = (double)camera_elapsed_us / 1000.0;
+            double camera_fps = 0.0;
+
+            if (camera_elapsed_us > 0)
+                camera_fps = (double)camera_delta * 1000000.0 / (double)camera_elapsed_us;
+            fprintf(stderr,
+                    "[bgp-live] camera-status summary: frames_delta=%u elapsed_ms=%.1f camera_fps=%.2f last_lines=%u last_words=%u last_hash=0x%08x\n",
+                    camera_delta,
+                    camera_elapsed_ms,
+                    camera_fps,
+                    lpr_camera_status_lines(&status),
+                    lpr_camera_status_words(&status),
+                    status.camera_hash);
+        } else {
+            fprintf(stderr, "[bgp-live] camera-status summary unavailable\n");
+        }
+    }
     if (hash_seen > 0) {
         int hash_unique_min = hash_seen - hash_adjacent_dups;
         double hash_elapsed_ms = 0.0;

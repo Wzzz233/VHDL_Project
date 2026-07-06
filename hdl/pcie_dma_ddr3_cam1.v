@@ -199,11 +199,18 @@ wire	[127:0]	bar1_pt_wr_data;
 // BAR0 lightweight frame-status register exposed to the host.
 localparam [11:0]          BAR0_STATUS_ADDR = 12'h0ff;
 localparam [31:0]          BAR0_STATUS_MAGIC = 32'h46505331; // "FPS1"
+localparam [11:0]          BAR0_CAMERA_STATUS_ADDR = 12'h0fe;
+localparam [31:0]          BAR0_CAMERA_STATUS_MAGIC = 32'h43414d31; // "CAM1"
 wire [31:0]                bar0_status_word0;
 wire [31:0]                bar0_status_word1;
 wire [31:0]                bar0_status_word2;
 wire [31:0]                bar0_status_word3;
 wire [127:0]               bar0_status_data;
+wire [31:0]                bar0_camera_status_word0;
+wire [31:0]                bar0_camera_status_word1;
+wire [31:0]                bar0_camera_status_word2;
+wire [31:0]                bar0_camera_status_word3;
+wire [127:0]               bar0_camera_status_data;
 
 wire			cfg_msi_en;
 wire			ven_msi_grant;
@@ -468,7 +475,9 @@ ips2l_pcie_dma #(
     .o_bar1_pt_wr_addr	(bar1_pt_wr_addr),
     .o_bar1_pt_wr_data	(bar1_pt_wr_data),
     .i_bar0_status_addr	(BAR0_STATUS_ADDR),
-    .i_bar0_status_data	(bar0_status_data)
+    .i_bar0_status_data	(bar0_status_data),
+    .i_bar0_camera_status_addr	(BAR0_CAMERA_STATUS_ADDR),
+    .i_bar0_camera_status_data	(bar0_camera_status_data)
 );
 
 // CFG CTRL
@@ -833,6 +842,60 @@ wire        cmos1_frame_start = (~cmos1_vsync_16bit_d) && cmos1_vsync_16bit;
 wire        cmos1_line_start  = (~cmos1_href_16bit_d) && cmos1_href_16bit;
 wire [15:0] cmos1_yuv_word_in = FORCE_COLOR_BAR_PRE_DDR ? cmos1_bar_data : cmos1_rgb565_fmt;
 
+// Camera-source diagnostics. These counters run before DDR and DMA so the host
+// can distinguish camera input cadence/content from PCIe/display behavior.
+reg [31:0] cmos1_frame_count;
+reg [19:0] cmos1_word_count;
+reg [11:0] cmos1_line_count;
+reg [31:0] cmos1_hash;
+reg [31:0] cmos1_last_frame_count;
+reg [19:0] cmos1_last_word_count;
+reg [11:0] cmos1_last_line_count;
+reg [31:0] cmos1_last_hash;
+reg        cmos1_diag_toggle;
+
+function [31:0] cmos1_hash_next;
+    input [31:0] hash;
+    input [15:0] word;
+begin
+    cmos1_hash_next = {hash[26:0], hash[31:27]} ^ {word, (word ^ 16'h9e37)};
+end
+endfunction
+
+always @(posedge cmos1_pclk or negedge cmos1_init_done_pclk) begin
+    if (!cmos1_init_done_pclk) begin
+        cmos1_frame_count <= 32'd0;
+        cmos1_word_count <= 20'd0;
+        cmos1_line_count <= 12'd0;
+        cmos1_hash <= 32'h811c9dc5;
+        cmos1_last_frame_count <= 32'd0;
+        cmos1_last_word_count <= 20'd0;
+        cmos1_last_line_count <= 12'd0;
+        cmos1_last_hash <= 32'h811c9dc5;
+        cmos1_diag_toggle <= 1'b0;
+    end else begin
+        if (cmos1_frame_start) begin
+            cmos1_frame_count <= cmos1_frame_count + 32'd1;
+            cmos1_last_frame_count <= cmos1_frame_count + 32'd1;
+            cmos1_last_word_count <= cmos1_word_count;
+            cmos1_last_line_count <= cmos1_line_count;
+            cmos1_last_hash <= cmos1_hash;
+            cmos1_word_count <= 20'd0;
+            cmos1_line_count <= 12'd0;
+            cmos1_hash <= 32'h811c9dc5;
+            cmos1_diag_toggle <= ~cmos1_diag_toggle;
+        end else begin
+            if (cmos1_line_start && cmos1_line_count != 12'hfff)
+                cmos1_line_count <= cmos1_line_count + 12'd1;
+            if (cmos1_pix_vld) begin
+                if (cmos1_word_count != 20'hfffff)
+                    cmos1_word_count <= cmos1_word_count + 20'd1;
+                cmos1_hash <= cmos1_hash_next(cmos1_hash, cmos1_yuv_word_in);
+            end
+        end
+    end
+end
+
 //=============================================================================
 // Frame Buffer (Camera 闁?DDR3)
 //=============================================================================
@@ -872,6 +935,13 @@ reg                        frame_wirq_dbg_meta;
 reg                        frame_wirq_dbg_pclk;
 reg                        frame_wirq_dbg_pclk_d;
 reg  [31:0]                frame_wcnt_change_count;
+reg                        cmos1_diag_toggle_meta;
+reg                        cmos1_diag_toggle_pclk;
+reg                        cmos1_diag_toggle_pclk_d;
+reg [31:0]                 camera_frame_count_pclk;
+reg [19:0]                 camera_last_word_count_pclk;
+reg [11:0]                 camera_last_line_count_pclk;
+reg [31:0]                 camera_last_hash_pclk;
 
 //=============================================================================
 // MWR Data Source (frame data for DMA transfer to host)
@@ -1189,6 +1259,12 @@ assign bar0_status_word1 = frame_wcnt_change_count;
 assign bar0_status_word2 = {29'd0, frame_rd_data_ready, dma_session_active, cmos1_init_done_pclk};
 assign bar0_status_word3 = BAR0_STATUS_MAGIC;
 assign bar0_status_data = {bar0_status_word3, bar0_status_word2, bar0_status_word1, bar0_status_word0};
+assign bar0_camera_status_word0 = camera_frame_count_pclk;
+assign bar0_camera_status_word1 = {camera_last_line_count_pclk, camera_last_word_count_pclk};
+assign bar0_camera_status_word2 = camera_last_hash_pclk;
+assign bar0_camera_status_word3 = BAR0_CAMERA_STATUS_MAGIC;
+assign bar0_camera_status_data = {bar0_camera_status_word3, bar0_camera_status_word2,
+                                  bar0_camera_status_word1, bar0_camera_status_word0};
 
 always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
     if (!pclk_div2_core_rst_n) begin
@@ -1198,6 +1274,13 @@ always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
         frame_wirq_dbg_pclk <= 1'b0;
         frame_wirq_dbg_pclk_d <= 1'b0;
         frame_wcnt_change_count <= 32'd0;
+        cmos1_diag_toggle_meta <= 1'b0;
+        cmos1_diag_toggle_pclk <= 1'b0;
+        cmos1_diag_toggle_pclk_d <= 1'b0;
+        camera_frame_count_pclk <= 32'd0;
+        camera_last_word_count_pclk <= 20'd0;
+        camera_last_line_count_pclk <= 12'd0;
+        camera_last_hash_pclk <= 32'd0;
     end else begin
         frame_wcnt_dbg_meta <= frame_wcnt_dbg_ddr;
         frame_wcnt_dbg_pclk <= frame_wcnt_dbg_meta;
@@ -1206,6 +1289,15 @@ always @(posedge pclk_div2 or negedge pclk_div2_core_rst_n) begin
         frame_wirq_dbg_pclk_d <= frame_wirq_dbg_pclk;
         if (frame_wirq_dbg_pclk && !frame_wirq_dbg_pclk_d)
             frame_wcnt_change_count <= frame_wcnt_change_count + 32'd1;
+        cmos1_diag_toggle_meta <= cmos1_diag_toggle;
+        cmos1_diag_toggle_pclk <= cmos1_diag_toggle_meta;
+        cmos1_diag_toggle_pclk_d <= cmos1_diag_toggle_pclk;
+        if (cmos1_diag_toggle_pclk != cmos1_diag_toggle_pclk_d) begin
+            camera_frame_count_pclk <= cmos1_last_frame_count;
+            camera_last_word_count_pclk <= cmos1_last_word_count;
+            camera_last_line_count_pclk <= cmos1_last_line_count;
+            camera_last_hash_pclk <= cmos1_last_hash;
+        end
     end
 end
 

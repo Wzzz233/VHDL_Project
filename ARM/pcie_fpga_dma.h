@@ -42,6 +42,8 @@
 /* BAR0 lightweight status register exported by the FPGA fabric. */
 #define BAR0_FRAME_STATUS_OFFSET 0x0FF0U
 #define FPGA_FRAME_STATUS_MAGIC  0x46505331U /* "FPS1" */
+#define BAR0_CAMERA_STATUS_OFFSET 0x0FE0U
+#define FPGA_CAMERA_STATUS_MAGIC  0x43414d31U /* "CAM1" */
 
 /* BAR1 DMA Control Register Offsets (from ips2l_pcie_dma_controller.v) */
 #define BAR1_DMA_CMD_REG     0x100  /* DMA command register */
@@ -135,12 +137,20 @@ struct buffer_map {
  * @frame_change_count: host-clock-domain count of observed frame counter changes
  * @flags: bit0=camera init done, bit1=DMA session active, bit2=frame read data ready
  * @magic: FPGA_FRAME_STATUS_MAGIC when the bitstream exposes this register
+ * @camera_frame_counter: camera-input frame counter before DDR/DMA
+ * @camera_shape: bits [31:20]=input lines, bits [19:0]=16-bit input words
+ * @camera_hash: rolling hash of the last completed camera-input frame
+ * @camera_magic: FPGA_CAMERA_STATUS_MAGIC when camera diagnostics are exposed
  */
 struct fpga_frame_status {
     __u32 frame_counter;
     __u32 frame_change_count;
     __u32 flags;
     __u32 magic;
+    __u32 camera_frame_counter;
+    __u32 camera_shape;
+    __u32 camera_hash;
+    __u32 camera_magic;
 };
 
 #endif /* _PCIE_FPGA_DMA_H */

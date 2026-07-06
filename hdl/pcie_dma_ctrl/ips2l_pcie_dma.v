@@ -92,7 +92,9 @@ module ips2l_pcie_dma #(
     // BAR0 status override for lightweight host diagnostics. Address is in
     // 16-byte BAR0 read units, matching o_bar0_rd_addr.
     input           [ADDR_WIDTH-1:0]    i_bar0_status_addr      ,
-    input           [127:0]             i_bar0_status_data
+    input           [127:0]             i_bar0_status_data      ,
+    input           [ADDR_WIDTH-1:0]    i_bar0_camera_status_addr,
+    input           [127:0]             i_bar0_camera_status_data
     //debug
     //output  wire    [159:0]             o_dbg_bus
 );
@@ -158,6 +160,7 @@ wire        [ADDR_WIDTH-1:0]    bar0_rd_addr;
 wire        [127:0]             bar0_rd_data;
 wire        [127:0]             bar0_rd_data_mux;
 reg                             bar0_status_sel_d;
+reg                             bar0_camera_status_sel_d;
 //bar1 wr interface
 wire                            bar1_wr_en/*synthesis PAP_MARK_DEBUG="1"*/;
 wire        [ADDR_WIDTH-1:0]    bar1_wr_addr/*synthesis PAP_MARK_DEBUG="1"*/;
@@ -182,9 +185,15 @@ always @(posedge clk or negedge rst_n) begin
     else
         bar0_status_sel_d <= bar0_rd_clk_en &&
                              (bar0_rd_addr == i_bar0_status_addr);
+    if (!rst_n)
+        bar0_camera_status_sel_d <= 1'b0;
+    else
+        bar0_camera_status_sel_d <= bar0_rd_clk_en &&
+                                    (bar0_rd_addr == i_bar0_camera_status_addr);
 end
 
-assign bar0_rd_data_mux     = bar0_status_sel_d ? i_bar0_status_data : bar0_rd_data;
+assign bar0_rd_data_mux     = bar0_status_sel_d ? i_bar0_status_data :
+                              (bar0_camera_status_sel_d ? i_bar0_camera_status_data : bar0_rd_data);
 //**********************************************************************
 //rst tlp cnt
 wire                            tx_restart;
