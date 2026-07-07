@@ -26,6 +26,8 @@ struct letterbox_meta {
     bool valid;
 };
 
+#define DET_BALANCE_MAX_CLASSES 64
+
 /* ---------------- Image resize helpers ---------------- */
 
 static void resize_nn(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh)
@@ -200,25 +202,131 @@ static int compare_det_desc(const void *pa, const void *pb)
     return 0;
 }
 
+static bool class_list_contains(const int *classes, int count, int cls)
+{
+    for (int i = 0; i < count; i++) {
+        if (classes[i] == cls)
+            return true;
+    }
+    return false;
+}
+
 static void nms(struct det_box *dets, int *count, float thr, int max_det)
 {
+    struct det_box suppressed[MAX_DETS];
     struct det_box kept[MAX_DETS];
+    bool selected[MAX_DETS];
+    int classes[MAX_DETS];
+    int suppressed_n = 0;
     int kept_n = 0;
-    int i, j;
-    qsort(dets, (size_t)*count, sizeof(dets[0]), compare_det_desc);
-    for (i = 0; i < *count && kept_n < max_det; i++) {
+    int class_n = 0;
+    int n = *count;
+
+    if (n < 0)
+        n = 0;
+    if (n > MAX_DETS)
+        n = MAX_DETS;
+    if (max_det <= 0 || max_det > MAX_DETS)
+        max_det = MAX_DETS;
+
+    qsort(dets, (size_t)n, sizeof(dets[0]), compare_det_desc);
+    for (int i = 0; i < n && suppressed_n < MAX_DETS; i++) {
         bool drop = false;
-        for (j = 0; j < kept_n; j++) {
-            if (box_iou(&dets[i], &kept[j]) > thr) {
+        for (int j = 0; j < suppressed_n; j++) {
+            if (dets[i].cls != suppressed[j].cls)
+                continue;
+            if (box_iou(&dets[i], &suppressed[j]) > thr) {
                 drop = true;
                 break;
             }
         }
         if (!drop)
-            kept[kept_n++] = dets[i];
+            suppressed[suppressed_n++] = dets[i];
     }
+
+    if (suppressed_n <= max_det) {
+        memcpy(dets, suppressed, (size_t)suppressed_n * sizeof(dets[0]));
+        *count = suppressed_n;
+        return;
+    }
+
+    memset(selected, 0, sizeof(selected));
+    for (int i = 0; i < suppressed_n && kept_n < max_det; i++) {
+        if (class_list_contains(classes, class_n, suppressed[i].cls))
+            continue;
+        classes[class_n++] = suppressed[i].cls;
+        kept[kept_n++] = suppressed[i];
+        selected[i] = true;
+    }
+
+    if (class_n <= 1) {
+        kept_n = max_det;
+        memcpy(kept, suppressed, (size_t)kept_n * sizeof(kept[0]));
+    } else {
+        for (int i = 0; i < suppressed_n && kept_n < max_det; i++) {
+            if (!selected[i])
+                kept[kept_n++] = suppressed[i];
+        }
+    }
+
     memcpy(dets, kept, (size_t)kept_n * sizeof(dets[0]));
     *count = kept_n;
+}
+
+static void insert_candidate_global(struct det_box *out, int *count,
+                                    const struct det_box *d)
+{
+    if (*count < MAX_DETS) {
+        out[(*count)++] = *d;
+        return;
+    }
+
+    int min_i = 0;
+    float min_conf = out[0].conf;
+    for (int j = 1; j < MAX_DETS; j++) {
+        if (out[j].conf < min_conf) {
+            min_conf = out[j].conf;
+            min_i = j;
+        }
+    }
+    if (d->conf > min_conf)
+        out[min_i] = *d;
+}
+
+static void insert_candidate_balanced(struct det_box *out, int *count,
+                                      int *class_counts, int pose_nc,
+                                      int per_class_cap,
+                                      const struct det_box *d)
+{
+    int cls = d->cls;
+
+    if (cls < 0 || cls >= pose_nc) {
+        insert_candidate_global(out, count, d);
+        return;
+    }
+
+    if (class_counts[cls] < per_class_cap && *count < MAX_DETS) {
+        out[(*count)++] = *d;
+        class_counts[cls]++;
+        return;
+    }
+
+    int min_i = -1;
+    for (int j = 0; j < *count; j++) {
+        if (out[j].cls != cls)
+            continue;
+        if (min_i < 0 || out[j].conf < out[min_i].conf)
+            min_i = j;
+    }
+
+    if (min_i >= 0) {
+        if (d->conf > out[min_i].conf)
+            out[min_i] = *d;
+        return;
+    }
+
+    insert_candidate_global(out, count, d);
+    class_counts[cls]++;
 }
 
 /* ---------------- Tensor view (NCHW vs NHWC autodetect) ---------------- */
@@ -276,8 +384,12 @@ static int decode_pose_outputs(const struct rknn_model *m, const rknn_output *ou
     struct tensor_cn_view tv;
     int out_idx = -1;
     int count = 0;
+    int class_counts[DET_BALANCE_MAX_CLASSES];
+    int per_class_cap = MAX_DETS;
+    bool balance_classes = false;
     uint32_t oi;
     *out_count = 0;
+    memset(class_counts, 0, sizeof(class_counts));
     for (oi = 0; oi < m->io_num.n_output; oi++) {
         if (build_tensor_cn_view(&m->output_attrs[oi], (const float *)outs[oi].buf, &tv) &&
             tv.n == OBB_POINT_COUNT && tv.c >= POSE_MIN_CHANNELS) {
@@ -292,6 +404,12 @@ static int decode_pose_outputs(const struct rknn_model *m, const rknn_output *ou
         pose_nc = tv.c - POSE_BOX_CHANNELS - POSE_KPT_CHANNELS;
     if (score_scale <= 0.0f || !isfinite(score_scale))
         score_scale = 1.0f;
+    if (pose_nc > 1 && pose_nc <= DET_BALANCE_MAX_CLASSES && class_filter < 0) {
+        balance_classes = true;
+        per_class_cap = MAX_DETS / pose_nc;
+        if (per_class_cap < 1)
+            per_class_cap = 1;
+    }
     for (int i = 0; i < tv.n; i++) {
         int best_cls = 0;
         float best_score;
@@ -334,20 +452,10 @@ static int decode_pose_outputs(const struct rknn_model *m, const rknn_output *ou
         bbox_from_quad(&d, img_w, img_h);
         if (d.x2 <= d.x1 || d.y2 <= d.y1)
             continue;
-        if (count < MAX_DETS) {
-            out[count++] = d;
-        } else {
-            int min_i = 0;
-            float min_conf = out[0].conf;
-            for (int j = 1; j < MAX_DETS; j++) {
-                if (out[j].conf < min_conf) {
-                    min_conf = out[j].conf;
-                    min_i = j;
-                }
-            }
-            if (d.conf > min_conf)
-                out[min_i] = d;
-        }
+        if (balance_classes)
+            insert_candidate_balanced(out, &count, class_counts, pose_nc, per_class_cap, &d);
+        else
+            insert_candidate_global(out, &count, &d);
     }
     qsort(out, (size_t)count, sizeof(out[0]), compare_det_desc);
     *out_count = count;

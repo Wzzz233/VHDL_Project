@@ -351,6 +351,150 @@ static void test_nc2_unknown_warning(void)
     free(buf);
 }
 
+
+#define TEST_NMS_MAX 16
+
+static float test_box_iou(const struct det_box *a, const struct det_box *b)
+{
+    int x1 = a->x1 > b->x1 ? a->x1 : b->x1;
+    int y1 = a->y1 > b->y1 ? a->y1 : b->y1;
+    int x2 = a->x2 < b->x2 ? a->x2 : b->x2;
+    int y2 = a->y2 < b->y2 ? a->y2 : b->y2;
+    int iw = x2 - x1 + 1;
+    int ih = y2 - y1 + 1;
+    float inter, aa, ba;
+    if (iw <= 0 || ih <= 0)
+        return 0.0f;
+    inter = (float)iw * (float)ih;
+    aa = (float)(a->x2 - a->x1 + 1) * (float)(a->y2 - a->y1 + 1);
+    ba = (float)(b->x2 - b->x1 + 1) * (float)(b->y2 - b->y1 + 1);
+    return inter / fmaxf(1.0f, aa + ba - inter);
+}
+
+static int test_det_conf_cmp(const void *pa, const void *pb)
+{
+    const struct det_box *a = (const struct det_box *)pa;
+    const struct det_box *b = (const struct det_box *)pb;
+    if (a->conf < b->conf) return 1;
+    if (a->conf > b->conf) return -1;
+    return 0;
+}
+
+static bool test_class_list_contains(const int *classes, int count, int cls)
+{
+    for (int i = 0; i < count; i++) {
+        if (classes[i] == cls)
+            return true;
+    }
+    return false;
+}
+
+static void test_nms_class_aware(struct det_box *dets, int *count, float thr, int max_det)
+{
+    struct det_box suppressed[TEST_NMS_MAX];
+    struct det_box kept[TEST_NMS_MAX];
+    bool selected[TEST_NMS_MAX];
+    int classes[TEST_NMS_MAX];
+    int suppressed_n = 0;
+    int kept_n = 0;
+    int class_n = 0;
+    int n = *count;
+
+    if (n > TEST_NMS_MAX)
+        n = TEST_NMS_MAX;
+    if (max_det <= 0 || max_det > TEST_NMS_MAX)
+        max_det = TEST_NMS_MAX;
+    qsort(dets, (size_t)n, sizeof(dets[0]), test_det_conf_cmp);
+
+    for (int i = 0; i < n; i++) {
+        bool drop = false;
+        for (int j = 0; j < suppressed_n; j++) {
+            if (dets[i].cls != suppressed[j].cls)
+                continue;
+            if (test_box_iou(&dets[i], &suppressed[j]) > thr) {
+                drop = true;
+                break;
+            }
+        }
+        if (!drop)
+            suppressed[suppressed_n++] = dets[i];
+    }
+
+    if (suppressed_n <= max_det) {
+        memcpy(dets, suppressed, (size_t)suppressed_n * sizeof(dets[0]));
+        *count = suppressed_n;
+        return;
+    }
+
+    memset(selected, 0, sizeof(selected));
+    for (int i = 0; i < suppressed_n && kept_n < max_det; i++) {
+        if (test_class_list_contains(classes, class_n, suppressed[i].cls))
+            continue;
+        classes[class_n++] = suppressed[i].cls;
+        kept[kept_n++] = suppressed[i];
+        selected[i] = true;
+    }
+    if (class_n <= 1) {
+        kept_n = max_det;
+        memcpy(kept, suppressed, (size_t)kept_n * sizeof(kept[0]));
+    } else {
+        for (int i = 0; i < suppressed_n && kept_n < max_det; i++) {
+            if (!selected[i])
+                kept[kept_n++] = suppressed[i];
+        }
+    }
+    memcpy(dets, kept, (size_t)kept_n * sizeof(dets[0]));
+    *count = kept_n;
+}
+
+static bool test_has_cls(const struct det_box *dets, int count, int cls)
+{
+    for (int i = 0; i < count; i++) {
+        if (dets[i].cls == cls)
+            return true;
+    }
+    return false;
+}
+
+static void test_class_aware_nms_keeps_overlapping_different_classes(void)
+{
+    struct det_box dets[TEST_NMS_MAX];
+    int count = 3;
+    memset(dets, 0, sizeof(dets));
+
+    dets[0].x1 = 10; dets[0].y1 = 10; dets[0].x2 = 100; dets[0].y2 = 40; dets[0].conf = 0.95f; dets[0].cls = 0;
+    dets[1].x1 = 10; dets[1].y1 = 10; dets[1].x2 = 100; dets[1].y2 = 40; dets[1].conf = 0.90f; dets[1].cls = 1;
+    dets[2].x1 = 12; dets[2].y1 = 12; dets[2].x2 = 102; dets[2].y2 = 42; dets[2].conf = 0.80f; dets[2].cls = 0;
+
+    test_nms_class_aware(dets, &count, 0.5f, TEST_NMS_MAX);
+    TEST_ASSERT(count == 2, "class-aware nms: same-class duplicate removed only");
+    TEST_ASSERT(test_has_cls(dets, count, 0), "class-aware nms: cls0 kept");
+    TEST_ASSERT(test_has_cls(dets, count, 1), "class-aware nms: overlapping cls1 kept");
+}
+
+static void test_nms_final_slots_keep_multiple_classes(void)
+{
+    struct det_box dets[TEST_NMS_MAX];
+    int count = 6;
+    memset(dets, 0, sizeof(dets));
+
+    for (int i = 0; i < 4; i++) {
+        dets[i].x1 = 10 + i * 120;
+        dets[i].y1 = 10;
+        dets[i].x2 = 80 + i * 120;
+        dets[i].y2 = 40;
+        dets[i].conf = 0.99f - (float)i * 0.01f;
+        dets[i].cls = 0;
+    }
+    dets[4].x1 = 10; dets[4].y1 = 100; dets[4].x2 = 80; dets[4].y2 = 130; dets[4].conf = 0.60f; dets[4].cls = 1;
+    dets[5].x1 = 130; dets[5].y1 = 100; dets[5].x2 = 200; dets[5].y2 = 130; dets[5].conf = 0.55f; dets[5].cls = 2;
+
+    test_nms_class_aware(dets, &count, 0.5f, 4);
+    TEST_ASSERT(count == 4, "class-aware nms: respects max_det");
+    TEST_ASSERT(test_has_cls(dets, count, 1), "class-aware nms: lower-score green slot kept");
+    TEST_ASSERT(test_has_cls(dets, count, 2), "class-aware nms: lower-score yellow slot kept");
+}
+
 int main(void)
 {
     printf("=== test_pose_decoder ===\n");
@@ -359,6 +503,8 @@ int main(void)
     test_new_21ch_cls3();
     test_sigmoid_fallback();
     test_nc2_unknown_warning();
+    test_class_aware_nms_keeps_overlapping_different_classes();
+    test_nms_final_slots_keep_multiple_classes();
 
     printf("\n%d tests, %d failures\n", g_tests, g_fails);
     return g_fails > 0 ? 1 : 0;
