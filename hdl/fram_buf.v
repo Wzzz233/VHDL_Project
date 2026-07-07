@@ -110,15 +110,15 @@ module fram_buf #(
     function [1:0] mod3_u;
         input [FRAME_CNT_WIDTH-1:0] value;
         integer i;
-        reg [1:0] rem;
+        reg [2:0] rem;                                  // rem*2+bit reaches 5, need 3 bits
     begin
-        rem = 2'd0;
+        rem = 3'd0;
         for (i = FRAME_CNT_WIDTH-1; i >= 0; i = i - 1) begin
-            rem = rem + {1'b0, value[i]};
-            if (rem >= 2'd3)
-                rem = rem - 2'd3;
+            rem = (rem << 1) | {2'b0, value[i]};         // standard long division: rem = rem*2 + bit
+            if (rem >= 3'd3)
+                rem = rem - 3'd3;
         end
-        mod3_u = rem;
+        mod3_u = rem[1:0];
     end
     endfunction
 
