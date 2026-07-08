@@ -135,7 +135,7 @@ static void test_green8_family_aware_recovers_short_greedy(void)
     expect_str_eq("green8_recover", family_text, "陕AA02222");
 }
 
-static void test_none_family_falls_back_to_greedy(void)
+static void test_none_family_beam_matches_greedy(void)
 {
     static const char *const keys[] = {"陕", "A", "D", "0", "2"};
     const int blank_idx = ARRAY_LEN(keys);
@@ -168,7 +168,7 @@ static void test_none_family_falls_back_to_greedy(void)
                             text, sizeof(text), &conf, NULL);
     if (ret != 0)
         fail("none-family decode returned non-zero");
-    expect_str_eq("none_family_greedy", text, "陕AA0222");
+    expect_str_eq("none_family_beam_matches_greedy", text, "陕AA0222");
 }
 
 static void test_police7_family_forces_jing_tail(void)
@@ -251,7 +251,7 @@ int main(void)
 {
     test_green8_relaxed_allows_aa02222();
     test_green8_family_aware_recovers_short_greedy();
-    test_none_family_falls_back_to_greedy();
+    test_none_family_beam_matches_greedy();
     test_police7_family_forces_jing_tail();
     test_embassy7_family_recovers_blank_greedy();
     printf("[PASS] test_ocr_decode\n");

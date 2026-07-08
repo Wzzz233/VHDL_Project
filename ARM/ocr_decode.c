@@ -489,8 +489,6 @@ int ocr_decode_logits(const float *buf, int t_size, int c_size, int t_stride, in
     int prev = -1;
     int emitted = 0;
     int blank_top1_count = 0;
-    int greedy_ids[OCR_DECODE_MAX_TOKENS];
-    int greedy_count = 0;
     double conf_sum = 0.0;
     char greedy_text[OCR_DECODE_MAX_TEXT];
 
@@ -538,8 +536,6 @@ int ocr_decode_logits(const float *buf, int t_size, int c_size, int t_stride, in
         if (best_c >= 0 && best_c < key_count) {
             double prob = exp((double)best_logit - (double)max_logit) / exp_sum;
             if (append_utf8_token_local(greedy_text, sizeof(greedy_text), keys[best_c])) {
-                if (greedy_count < OCR_DECODE_MAX_TOKENS)
-                    greedy_ids[greedy_count++] = best_c;
                 emitted++;
                 conf_sum += prob;
             }
@@ -558,10 +554,13 @@ int ocr_decode_logits(const float *buf, int t_size, int c_size, int t_stride, in
         diag->blank_top1_ratio = (t_size > 0) ? ((float)blank_top1_count / (float)t_size) : 0.0f;
     }
 
-    if (family == OCR_DECODE_FAMILY_NONE)
-        return 0;
-    if (family_full_valid(family, greedy_ids, greedy_count, keys, key_count))
-        return 0;
+    /* Beam search 主路径:对所有 family (含 NONE) 总是跑 constrained beam
+     * (带 family 前缀约束, 保留 police/embassy 专用解码规则);
+     * greedy 仅作为 beam 失败时 fallback. CTC beam 搜索空间 ⊇ greedy 路径,
+     * 零误伤 (诊断见 obsidian firstchar-decode-optimization-diag-2026-07-07:
+     * bw=5 修 LEN 长度抖动零误伤, 蓝/绿退化切片 +1.4/+0.8pp).
+     * 之前 NONE 直接返回 greedy、greedy 合法也返回 greedy, 会漏掉 greedy
+     * 合法但 beam 能找到更高分候选的情况; 现统一走 beam. */
     if (constrained_decode(buf, t_size, c_size, t_stride, c_stride,
                            keys, key_count, blank_idx, family,
                            text, text_len) == 0)
