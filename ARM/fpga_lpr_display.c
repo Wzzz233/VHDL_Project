@@ -301,6 +301,14 @@ struct lpr_results {
     double infer_ms_last;
     uint64_t infer_frames_total;
     double infer_ms_total;
+    /* Per-stage timing aligned with PPLCNet pplcnet_bgp_live for comparison.
+     * infer_ms_last above only covers detection (t0..t1); OCR runs after t1.
+     * det_ms+ocr_total_ms together correspond to PPLCNet detocr_ms. */
+    double det_ms;        /* plate detection only (ped disabled in benchmark) */
+    double ocr_total_ms;  /* whole per-plate OCR loop */
+    double ocr_run_ms;    /* last single OCR NPU inference */
+    double refiner_ms;    /* quad refiner total (0 when --quad-refiner-model off) */
+    double dec_ms;        /* last CTC decode */
 };
 
 struct detect_decode_diag {
@@ -317,6 +325,9 @@ struct ocr_diag {
     int blank_idx;
     float blank_top1_ratio;
     float in_occ_ratio;
+    /* Per-stage timing (PPLCNet-aligned), filled by run_model_ocr. */
+    double run_ms;  /* NPU inference: inputs_set..outputs_get */
+    double dec_ms;  /* CTC decode: ctc_decode_logits */
 };
 
 struct letterbox_meta {
@@ -382,6 +393,12 @@ struct ocr_model {
     char keys[MAX_OCR_KEYS][MAX_OCR_KEY_LEN];
     int key_count;
 };
+
+/* Per-frame quad refiner timing accumulator (PPLCNet-aligned benchmark).
+ * The refiner runs inside prepare_plate_crop_rgb888 under a const ctx, so it
+ * cannot mutate ctx; this file-scope static is safe because the infer path is
+ * single-threaded. Cleared at the start of each infer iteration. */
+static double s_refiner_acc_ms = 0.0;
 
 struct quad_refiner_model {
     const char *name;
@@ -2704,6 +2721,7 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
         return -1;
     }
 
+    int64_t orun0 = mono_us();
     memset(&in, 0, sizeof(in));
     in.index = 0;
     in.buf = (void *)ocr_in;
@@ -2721,6 +2739,9 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
     for (i = 0; i < m->io_num.n_output; i++)
         outs[i].want_float = 1;
     ret = rknn_outputs_get(m->ctx, m->io_num.n_output, outs, NULL);
+    int64_t orun1 = mono_us();
+    if (diag)
+        diag->run_ms = (double)(orun1 - orun0) / 1000.0;
     if (ret < 0)
         goto out;
 
@@ -2768,10 +2789,14 @@ static int run_model_ocr(struct app_ctx *ctx, const uint8_t *crop_rgb, int crop_
 
         {
             enum ocr_decode_family family = select_decode_family(expert_name, plate_color);
+            int64_t odec0 = mono_us();
             ret = ctc_decode_logits((const float *)outs[decode_output_idx].buf,
                                     t_size, c_size, t_stride, c_stride,
                                     keys, key_count, blank_index,
                                     family, text, text_len, conf_out, diag);
+            int64_t odec1 = mono_us();
+            if (diag)
+                diag->dec_ms = (double)(odec1 - odec0) / 1000.0;
         }
     }
     if (diag)
@@ -5181,6 +5206,7 @@ static bool run_quad_refiner(const struct app_ctx *ctx,
     in.size = input_size;
     in.type = RKNN_TENSOR_FLOAT32;
     in.fmt = m->input_attr.fmt;
+    int64_t tref0 = mono_us();
     ret = rknn_inputs_set(m->ctx, 1, &in);
     if (ret < 0)
         goto out;
@@ -5192,6 +5218,8 @@ static bool run_quad_refiner(const struct app_ctx *ctx,
     for (i = 0; i < (int)m->io_num.n_output; i++)
         outs[i].want_float = 1;
     ret = rknn_outputs_get(m->ctx, m->io_num.n_output, outs, NULL);
+    int64_t tref1 = mono_us();
+    s_refiner_acc_ms += (double)(tref1 - tref0) / 1000.0;
     if (ret < 0)
         goto out;
 
@@ -7356,7 +7384,17 @@ static void *infer_thread_main(void *arg)
         bool a_roi_valid = false;
         int i;
         int64_t t0, t1;
+        /* Per-stage timing (PPLCNet-aligned). t_det wraps plate detection;
+         * t_ocr wraps the per-plate OCR loop; ocr_run_acc accumulates OCR
+         * NPU time across plates. refiner runs inside prepare_plate_crop. */
+        int64_t t_det0 = 0, t_det1 = 0;
+        int64_t t_ocr0 = 0, t_ocr1 = 0;
+        double ocr_run_acc_ms = 0.0;
+        double last_ocr_run_ms = 0.0;
+        double last_dec_ms = 0.0;
+        int ocr_run_seen = 0;
         uint64_t seq;
+        s_refiner_acc_ms = 0.0;
         const uint8_t *det_src_rgb = rgb_full;
 
         pthread_mutex_lock(&ctx->infer_lock);
@@ -7406,6 +7444,7 @@ static void *infer_thread_main(void *arg)
                                   ctx->opt.min_car_conf, algo_rgb, ped_in, persons, &person_count, NULL) < 0)
                 person_count = 0;
         }
+        t_det0 = mono_us();
         {
             float plate_thr = ctx->opt.min_plate_conf;
             if (ctx->opt.fpga_a_mask && a_roi_valid)
@@ -7428,6 +7467,7 @@ static void *infer_thread_main(void *arg)
                 ctx->opt.det_resize_mode = saved_mode;
             }
         }
+        t_det1 = mono_us();
         if (raw_plate_count > 0) {
             ctx->gate_plate_raw_positive_frames++;
             ctx->gate_plate_raw_positive_streak++;
@@ -7507,6 +7547,7 @@ static void *infer_thread_main(void *arg)
                 r.persons[r.person_count++] = tracked_persons[i];
         }
 
+        t_ocr0 = mono_us();
         for (i = 0; i < stable_plate_count && r.plate_count < MAX_DETS; i++) {
             struct plate_det pd;
             struct ocr_diag odiag;
@@ -7628,7 +7669,10 @@ static void *infer_thread_main(void *arg)
                         pd.ocr_blank_top1 = odiag.blank_top1_ratio;
                         pd.ocr_in_occ_ratio = odiag.in_occ_ratio;
                         ocr_run_count++;
-
+                        last_ocr_run_ms = odiag.run_ms;
+                        last_dec_ms = odiag.dec_ms;
+                        ocr_run_acc_ms += odiag.run_ms;
+                        ocr_run_seen++;
                     }
                 }
             }
@@ -7708,6 +7752,7 @@ static void *infer_thread_main(void *arg)
             ctx->pred_rows_total++;
             r.plates[r.plate_count++] = pd;
         }
+        t_ocr1 = mono_us();
         r.ocr_run_count = ocr_run_count;
         r.ocr_skip_size = ocr_skip_size;
         r.ocr_skip_blur = ocr_skip_blur;
@@ -7715,6 +7760,12 @@ static void *infer_thread_main(void *arg)
         r.overlay_text_nonempty_count = overlay_nonempty_count;
         r.frame_seq = seq;
         r.infer_ms_last = (double)(t1 - t0) / 1000.0;
+        r.det_ms = (double)(t_det1 - t_det0) / 1000.0;
+        r.ocr_total_ms = (double)(t_ocr1 - t_ocr0) / 1000.0;
+        r.ocr_run_ms = last_ocr_run_ms;
+        r.refiner_ms = s_refiner_acc_ms;
+        r.dec_ms = last_dec_ms;
+        (void)ocr_run_acc_ms; (void)ocr_run_seen;
         pthread_mutex_lock(&ctx->result_lock);
         r.infer_frames_total = ctx->results.infer_frames_total + 1;
         r.infer_ms_total = ctx->results.infer_ms_total + r.infer_ms_last;
@@ -7801,7 +7852,8 @@ static void print_stats(struct app_ctx *ctx)
             " infer=%" PRIu64 " infer_ms=%.2f cars=%d(raw=%d) persons=%d(raw=%d)"
             " plates=%d(raw=%d) rows=%d/%d heads=%d/%d mode=%s ocr=%d run=%d skip_sz=%d skip_blur=%d ovtxt=%d aroi=%d red=%d ped_evt=%" PRIu64
             " gate_raw_pos=%" PRIu64 " gate_streak=%" PRIu64 " pred_rows=%" PRIu64 " drop=%" PRIu64
-            " cap_fps=%.2f disp_fps=%.2f infer_fps=%.2f\n",
+            " cap_fps=%.2f disp_fps=%.2f infer_fps=%.2f"
+            " det_ms=%.1f ocr_total_ms=%.1f ocr_run_ms=%.1f refiner_ms=%.1f dec_ms=%.1f\n",
             ctx->captured_frames, ctx->pushed_frames, ctx->released_frames,
             r.infer_frames_total, r.infer_ms_last,
             r.car_count, r.car_raw_count,
@@ -7815,7 +7867,8 @@ static void print_stats(struct app_ctx *ctx)
             ctx->infer_overwrite_count,
             (double)(ctx->captured_frames - ctx->last_stats_cap) * 1000000.0 / (double)dt,
             (double)(ctx->released_frames - ctx->last_stats_rel) * 1000000.0 / (double)dt,
-            (double)(r.infer_frames_total - ctx->last_stats_infer) * 1000000.0 / (double)dt);
+            (double)(r.infer_frames_total - ctx->last_stats_infer) * 1000000.0 / (double)dt,
+            r.det_ms, r.ocr_total_ms, r.ocr_run_ms, r.refiner_ms, r.dec_ms);
     ctx->last_stats_cap = ctx->captured_frames;
     ctx->last_stats_rel = ctx->released_frames;
     ctx->last_stats_infer = r.infer_frames_total;
