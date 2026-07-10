@@ -27,11 +27,15 @@ C mask cleanup.
 
 ## Board build
 
-Use the existing SDK container or set the SDK variables to matching local
-locations:
+Use the verified local Docker environment:
 
 ```sh
-make -C cplus_driver -f Makefile.rk3568 cplus-rk3568-driver
+cd <feature-branch-checkout>/ARM
+sudo docker run --rm --privileged -u root \
+  -v "$PWD":/app \
+  -v /home/wzzz/RK3568J_SDK:/home/hjf/SDK \
+  -w /app/cplus_driver \
+  cdc81f835218 make -f Makefile.rk3568 cplus-rk3568-driver
 ```
 
 The board must have a compatible `librknnrt.so` and a BGRX8888 FPGA DMA stream.
