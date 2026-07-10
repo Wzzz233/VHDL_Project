@@ -19,7 +19,9 @@ struct cplus_async_result {
     int count;
     uint64_t sequence;
     uint64_t source_frame;
+    bool mask_valid;
     bool valid;
+    uint8_t mask[CPLUS_MODEL_PIXELS];
 };
 
 struct cplus_async_stats {
@@ -49,6 +51,9 @@ struct cplus_async_infer {
     uint8_t *detector_rgb;
     uint8_t *segmenter_rgb;
     uint8_t *mask;
+    struct cplus_mask_workspace mask_workspace;
+    int mask_workspace_initialized;
+    bool mask_all_other_reported;
     uint64_t completed;
     struct cplus_async_result result;
 };
@@ -60,11 +65,13 @@ int cplus_async_infer_start(struct cplus_async_infer *state,
                             struct cplus_rknn_model *segmenter,
                             const struct cplus_runtime_config *config,
                             bool always_segment);
-void cplus_async_infer_stop(struct cplus_async_infer *state);
+uint64_t cplus_async_infer_stop(struct cplus_async_infer *state);
 int cplus_async_submit_frame(struct cplus_async_infer *state, int slot,
                              uint64_t source_frame);
 bool cplus_async_get_result(struct cplus_async_infer *state,
                             struct cplus_async_result *result);
+bool cplus_async_refresh_result(struct cplus_async_infer *state,
+                                struct cplus_async_result *result);
 int cplus_async_wait_for_frame(struct cplus_async_infer *state,
                                uint64_t source_frame);
 bool cplus_async_failed(struct cplus_async_infer *state);

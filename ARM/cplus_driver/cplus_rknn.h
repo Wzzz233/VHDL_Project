@@ -8,6 +8,12 @@
 
 #include <rknn_api.h>
 
+struct cplus_rknn_output_view {
+    const void *data;
+    size_t element_count;
+    rknn_tensor_type type;
+};
+
 struct cplus_rknn_model {
     const char *name;
     rknn_context context;
@@ -24,8 +30,8 @@ struct cplus_rknn_model {
 int cplus_rknn_model_load(struct cplus_rknn_model *model, const char *name, const char *path);
 void cplus_rknn_model_release(struct cplus_rknn_model *model);
 int cplus_rknn_infer_rgb(struct cplus_rknn_model *model, const uint8_t *rgb,
-                          uint32_t width, uint32_t height,
-                          const float **output, size_t *float_count);
+                         uint32_t width, uint32_t height,
+                         struct cplus_rknn_output_view *output);
 void cplus_rknn_release_output(struct cplus_rknn_model *model);
 
 #endif /* CPLUS_DRIVER_RKNN_H */

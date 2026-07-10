@@ -50,6 +50,20 @@ static void draw_rect(uint8_t *pixels, int stride, int width, int height, const 
     }
 }
 
+static void draw_source_rect(uint8_t *pixels, int stride, int width, int height,
+                             const struct cplus_rect *rect,
+                             uint8_t red, uint8_t green, uint8_t blue)
+{
+    struct cplus_box box;
+    if (!rect) return;
+    memset(&box, 0, sizeof(box));
+    box.x1 = (float)rect->x1;
+    box.y1 = (float)rect->y1;
+    box.x2 = (float)rect->x2;
+    box.y2 = (float)rect->y2;
+    draw_rect(pixels, stride, width, height, &box, red, green, blue);
+}
+
 static uint8_t glyph5x7(char character, int row)
 {
     if (character >= 'a' && character <= 'z') character = (char)(character - 'a' + 'A');
@@ -151,6 +165,10 @@ void cplus_overlay_results(uint8_t *bgrx, int stride, int width, int height,
             red = 250; green = 180; blue = 30;
         }
         draw_rect(bgrx, stride, width, height, &result->detection.box, red, green, blue);
+        if (result->detection.box.class_id == CPLUS_COCO_PERSON &&
+            result->detection.target_type == CPLUS_TARGET_PEDESTRIAN)
+            draw_source_rect(bgrx, stride, width, height, &result->foot_box_source,
+                             255, 220, 40);
         text_y = (int)lroundf(result->detection.box.y1) - 11;
         if (text_y < 1) text_y = (int)lroundf(result->detection.box.y2) + 3;
         draw_text(bgrx, stride, width, height, (int)lroundf(result->detection.box.x1), text_y,
@@ -323,19 +341,25 @@ failed:
 
 int cplus_display_present(struct cplus_display *display, const uint8_t *bgrx,
                           const struct cplus_person_result *results, int count,
-                          bool result_available)
+                          bool result_available,
+                          const uint8_t *mask, bool mask_available)
 {
     int next;
     int row;
     bool waiting = true;
     struct cplus_drm_fb *framebuffer;
     if (!display || !display->started || !bgrx || count < 0 ||
-        count > CPLUS_MAX_DETECTIONS || (count > 0 && !results)) return -1;
+        count > CPLUS_MAX_DETECTIONS || (count > 0 && !results) ||
+        (mask_available && !mask)) return -1;
     next = display->active_fb < 0 ? 0 : 1 - display->active_fb;
     framebuffer = &display->fb[next];
     for (row = 0; row < display->height; ++row)
         memcpy(framebuffer->map + (size_t)row * framebuffer->pitch,
                bgrx + (size_t)row * display->width * 4U, (size_t)display->width * 4U);
+    if (mask_available)
+        cplus_overlay_mask_bgrx(framebuffer->map, (int)framebuffer->pitch,
+                                display->width, display->height, mask,
+                                CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT);
     cplus_overlay_results(framebuffer->map, (int)framebuffer->pitch, display->width, display->height,
                           results, count, result_available);
     if (display->active_fb < 0) {

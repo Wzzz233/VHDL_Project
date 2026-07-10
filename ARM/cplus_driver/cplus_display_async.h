@@ -15,6 +15,8 @@ struct cplus_display_job {
     struct cplus_person_result results[CPLUS_MAX_DETECTIONS];
     int count;
     bool result_available;
+    bool mask_available;
+    uint8_t mask[CPLUS_MODEL_PIXELS];
 };
 
 struct cplus_display_async {
@@ -37,9 +39,10 @@ int cplus_display_async_start(struct cplus_display_async *display,
                               int width, int height);
 int cplus_display_async_submit(struct cplus_display_async *display, int slot,
                                const struct cplus_person_result *results, int count,
-                               bool result_available);
+                               bool result_available,
+                               const uint8_t *mask, bool mask_available);
 bool cplus_display_async_failed(struct cplus_display_async *display);
-void cplus_display_async_stop(struct cplus_display_async *display);
+uint64_t cplus_display_async_stop(struct cplus_display_async *display);
 void cplus_display_async_stats(struct cplus_display_async *display,
                                uint64_t *presented, uint64_t *replaced);
 

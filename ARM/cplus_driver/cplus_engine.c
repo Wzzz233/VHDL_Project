@@ -99,36 +99,98 @@ void cplus_resize_rgb_nearest(const uint8_t *src, int src_w, int src_h,
     }
 }
 
+static void resize_rgb_bilinear_stride(const uint8_t *src, int src_w, int src_h,
+                                       uint8_t *dst, int dst_w, int dst_h,
+                                       int dst_stride)
+{
+    int x_base[CPLUS_MODEL_WIDTH];
+    int x_weight[CPLUS_MODEL_WIDTH];
+    int x, y;
+    if (!src || !dst || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 ||
+        dst_w > CPLUS_MODEL_WIDTH || dst_stride < dst_w)
+        return;
+    for (x = 0; x < dst_w; ++x) {
+        int64_t coordinate = (int64_t)(2 * x + 1) * src_w * 128 / dst_w - 128;
+        if (coordinate <= 0) {
+            x_base[x] = 0;
+            x_weight[x] = 0;
+        } else {
+            x_base[x] = (int)(coordinate >> 8);
+            x_weight[x] = (int)(coordinate & 255);
+            if (x_base[x] >= src_w - 1) {
+                x_base[x] = src_w - 1;
+                x_weight[x] = 0;
+            }
+        }
+    }
+    for (y = 0; y < dst_h; ++y) {
+        int64_t coordinate = (int64_t)(2 * y + 1) * src_h * 128 / dst_h - 128;
+        int y_base;
+        int y_weight;
+        if (coordinate <= 0) {
+            y_base = 0;
+            y_weight = 0;
+        } else {
+            y_base = (int)(coordinate >> 8);
+            y_weight = (int)(coordinate & 255);
+            if (y_base >= src_h - 1) {
+                y_base = src_h - 1;
+                y_weight = 0;
+            }
+        }
+        for (x = 0; x < dst_w; ++x) {
+            int x_next = x_base[x] < src_w - 1 ? x_base[x] + 1 : x_base[x];
+            int y_next = y_base < src_h - 1 ? y_base + 1 : y_base;
+            int channel;
+            const uint8_t *top_left = src + ((size_t)y_base * src_w + x_base[x]) * 3U;
+            const uint8_t *top_right = src + ((size_t)y_base * src_w + x_next) * 3U;
+            const uint8_t *bottom_left = src + ((size_t)y_next * src_w + x_base[x]) * 3U;
+            const uint8_t *bottom_right = src + ((size_t)y_next * src_w + x_next) * 3U;
+            uint8_t *out = dst + ((size_t)y * dst_stride + x) * 3U;
+            for (channel = 0; channel < 3; ++channel) {
+                int top = top_left[channel] * (256 - x_weight[x]) +
+                          top_right[channel] * x_weight[x];
+                int bottom = bottom_left[channel] * (256 - x_weight[x]) +
+                             bottom_right[channel] * x_weight[x];
+                out[channel] = (uint8_t)((top * (256 - y_weight) +
+                                          bottom * y_weight + 32768) >> 16);
+            }
+        }
+    }
+}
+
+void cplus_resize_rgb_bilinear(const uint8_t *src, int src_w, int src_h,
+                               uint8_t *dst, int dst_w, int dst_h)
+{
+    resize_rgb_bilinear_stride(src, src_w, src_h, dst, dst_w, dst_h, dst_w);
+}
+
 void cplus_prepare_detector_rgb(const uint8_t *src, int src_w, int src_h,
                                  uint8_t *dst, struct cplus_letterbox *meta)
 {
     float scale;
-    int resized_w, resized_h, offset_x, offset_y, y;
-    uint8_t *resized;
+    int resized_w, resized_h, offset_x, offset_y;
     if (!meta || !dst) return;
     memset(meta, 0, sizeof(*meta));
     meta->src_w = src_w; meta->src_h = src_h;
     meta->dst_w = CPLUS_MODEL_WIDTH; meta->dst_h = CPLUS_MODEL_HEIGHT;
     if (!src || src_w <= 0 || src_h <= 0) return;
-    memset(dst, 114, (size_t)CPLUS_MODEL_WIDTH * CPLUS_MODEL_HEIGHT * 3U);
+    memset(dst, 114, CPLUS_MODEL_PIXELS * 3U);
     scale = fminf((float)CPLUS_MODEL_WIDTH / src_w, (float)CPLUS_MODEL_HEIGHT / src_h);
     resized_w = clampi((int)lroundf(src_w * scale), 1, CPLUS_MODEL_WIDTH);
     resized_h = clampi((int)lroundf(src_h * scale), 1, CPLUS_MODEL_HEIGHT);
     offset_x = (CPLUS_MODEL_WIDTH - resized_w) / 2;
     offset_y = (CPLUS_MODEL_HEIGHT - resized_h) / 2;
-    resized = malloc((size_t)resized_w * resized_h * 3U);
-    if (!resized) return;
-    cplus_resize_rgb_nearest(src, src_w, src_h, resized, resized_w, resized_h);
-    for (y = 0; y < resized_h; ++y)
-        memcpy(dst + ((size_t)(offset_y + y) * CPLUS_MODEL_WIDTH + offset_x) * 3U,
-               resized + (size_t)y * resized_w * 3U, (size_t)resized_w * 3U);
-    free(resized);
+    resize_rgb_bilinear_stride(src, src_w, src_h,
+                               dst + ((size_t)offset_y * CPLUS_MODEL_WIDTH + offset_x) * 3U,
+                               resized_w, resized_h, CPLUS_MODEL_WIDTH);
     meta->scale = scale; meta->pad_x = offset_x; meta->pad_y = offset_y; meta->valid = true;
 }
 
 void cplus_prepare_segmenter_rgb(const uint8_t *src, int src_w, int src_h, uint8_t *dst)
 {
-    cplus_resize_rgb_nearest(src, src_w, src_h, dst, CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT);
+    cplus_resize_rgb_bilinear(src, src_w, src_h, dst,
+                              CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT);
 }
 
 void cplus_map_box_from_detector(struct cplus_box *box, const struct cplus_letterbox *meta)
@@ -189,16 +251,55 @@ static int suppress_detections(struct cplus_detection *detections, int count,
     return kept;
 }
 
-int cplus_decode_yolo(const float *output, size_t float_count,
-                      const struct cplus_letterbox *meta,
-                      const struct cplus_runtime_config *config,
-                      struct cplus_detection *detections, int capacity)
+static float fp16_to_float(uint16_t value)
+{
+    uint32_t sign = (uint32_t)(value & 0x8000U) << 16;
+    uint32_t exponent = (value >> 10) & 0x1fU;
+    uint32_t mantissa = value & 0x03ffU;
+    uint32_t bits;
+    float result;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            bits = sign;
+        } else {
+            int shift = 0;
+            while ((mantissa & 0x0400U) == 0) {
+                mantissa <<= 1;
+                ++shift;
+            }
+            mantissa &= 0x03ffU;
+            bits = sign | (uint32_t)(127 - 14 - shift) << 23 | mantissa << 13;
+        }
+    } else if (exponent == 0x1fU) {
+        bits = sign | 0x7f800000U | mantissa << 13;
+    } else {
+        bits = sign | (exponent + 112U) << 23 | mantissa << 13;
+    }
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+struct yolo_output_view {
+    const void *data;
+    bool fp16;
+};
+
+static float yolo_value(const struct yolo_output_view *view, size_t index)
+{
+    if (view->fp16) return fp16_to_float(((const uint16_t *)view->data)[index]);
+    return ((const float *)view->data)[index];
+}
+
+static int decode_yolo_common(const struct yolo_output_view *view, size_t element_count,
+                              const struct cplus_letterbox *meta,
+                              const struct cplus_runtime_config *config,
+                              struct cplus_detection *detections, int capacity)
 {
     struct cplus_runtime_config defaults;
     struct cplus_detection candidates[CPLUS_MAX_RAW_CANDIDATES];
     int prediction, count = 0, output_count;
-    if (!output || !meta || !detections || capacity <= 0 ||
-        float_count < (size_t)CPLUS_YOLO_CHANNELS * CPLUS_YOLO_PREDICTIONS) return -1;
+    if (!view || !view->data || !meta || !detections || capacity <= 0 ||
+        element_count < (size_t)CPLUS_YOLO_CHANNELS * CPLUS_YOLO_PREDICTIONS) return -1;
     if (!config) { cplus_default_runtime_config(&defaults); config = &defaults; }
     if (capacity > CPLUS_MAX_DETECTIONS) capacity = CPLUS_MAX_DETECTIONS;
     for (prediction = 0; prediction < CPLUS_YOLO_PREDICTIONS; ++prediction) {
@@ -209,18 +310,20 @@ int cplus_decode_yolo(const float *output, size_t float_count,
             int coco_id = channel - 4;
             float value;
             if (!retained_class(coco_id)) continue;
-            value = output[(size_t)channel * CPLUS_YOLO_PREDICTIONS + prediction];
+            value = yolo_value(view, (size_t)channel * CPLUS_YOLO_PREDICTIONS + prediction);
             if (value > score) { score = value; class_id = coco_id; }
         }
         threshold = class_id == CPLUS_COCO_PERSON ? config->person_confidence : config->vehicle_confidence;
         if (class_id < 0 || score < threshold || count == CPLUS_MAX_RAW_CANDIDATES) continue;
         memset(&candidate, 0, sizeof(candidate));
-        candidate.box.x1 = output[prediction] - output[(size_t)2 * CPLUS_YOLO_PREDICTIONS + prediction] * 0.5f;
-        candidate.box.y1 = output[CPLUS_YOLO_PREDICTIONS + prediction] -
-                           output[(size_t)3 * CPLUS_YOLO_PREDICTIONS + prediction] * 0.5f;
-        candidate.box.x2 = output[prediction] + output[(size_t)2 * CPLUS_YOLO_PREDICTIONS + prediction] * 0.5f;
-        candidate.box.y2 = output[CPLUS_YOLO_PREDICTIONS + prediction] +
-                           output[(size_t)3 * CPLUS_YOLO_PREDICTIONS + prediction] * 0.5f;
+        candidate.box.x1 = yolo_value(view, prediction) -
+                           yolo_value(view, (size_t)2 * CPLUS_YOLO_PREDICTIONS + prediction) * 0.5f;
+        candidate.box.y1 = yolo_value(view, CPLUS_YOLO_PREDICTIONS + prediction) -
+                           yolo_value(view, (size_t)3 * CPLUS_YOLO_PREDICTIONS + prediction) * 0.5f;
+        candidate.box.x2 = yolo_value(view, prediction) +
+                           yolo_value(view, (size_t)2 * CPLUS_YOLO_PREDICTIONS + prediction) * 0.5f;
+        candidate.box.y2 = yolo_value(view, CPLUS_YOLO_PREDICTIONS + prediction) +
+                           yolo_value(view, (size_t)3 * CPLUS_YOLO_PREDICTIONS + prediction) * 0.5f;
         candidate.box.score = score; candidate.box.class_id = class_id;
         candidate.target_type = target_for_class(class_id);
         cplus_map_box_from_detector(&candidate.box, meta);
@@ -231,6 +334,24 @@ int cplus_decode_yolo(const float *output, size_t float_count,
     if (output_count > capacity) output_count = capacity;
     memcpy(detections, candidates, (size_t)output_count * sizeof(*detections));
     return output_count;
+}
+
+int cplus_decode_yolo(const float *output, size_t float_count,
+                      const struct cplus_letterbox *meta,
+                      const struct cplus_runtime_config *config,
+                      struct cplus_detection *detections, int capacity)
+{
+    const struct yolo_output_view view = { .data = output, .fp16 = false };
+    return decode_yolo_common(&view, float_count, meta, config, detections, capacity);
+}
+
+int cplus_decode_yolo_fp16(const uint16_t *output, size_t element_count,
+                           const struct cplus_letterbox *meta,
+                           const struct cplus_runtime_config *config,
+                           struct cplus_detection *detections, int capacity)
+{
+    const struct yolo_output_view view = { .data = output, .fp16 = true };
+    return decode_yolo_common(&view, element_count, meta, config, detections, capacity);
 }
 
 static struct cplus_box expand_box(const struct cplus_box *box, float x_pad, float y_pad,
@@ -315,7 +436,7 @@ void cplus_assign_riders(struct cplus_detection *detections, int count, int imag
 
 int cplus_mask_argmax(const float *logits, size_t float_count, uint8_t *mask)
 {
-    size_t pixel, plane = (size_t)CPLUS_MODEL_WIDTH * CPLUS_MODEL_HEIGHT;
+    size_t pixel, plane = CPLUS_MODEL_PIXELS;
     if (!logits || !mask || float_count < plane * 4U) return -1;
     for (pixel = 0; pixel < plane; ++pixel) {
         int class_id; float best = logits[pixel]; uint8_t best_class = 0;
@@ -328,44 +449,134 @@ int cplus_mask_argmax(const float *logits, size_t float_count, uint8_t *mask)
     return 0;
 }
 
-/* Candidate C uses an elliptical close.  The sliding horizontal pass keeps
- * its cost linear in pixels times kernel height instead of kernel area. */
-static void ellipse_dilate(const uint8_t *source, uint8_t *dest, int width, int height, int kernel)
+static uint16_t fp16_order_key(uint16_t value)
 {
-    int radius = kernel / 2, dy, y;
-    size_t total = (size_t)width * height;
-    memset(dest, 0, total);
-    for (dy = -radius; dy <= radius; ++dy) {
-        float normalized = (float)dy / fmaxf(1.0f, (float)radius);
-        int x_radius = (int)floorf((float)radius * sqrtf(fmaxf(0.0f, 1.0f - normalized * normalized)));
-        for (y = 0; y < height; ++y) {
-            int sy = y + dy, x, left = 0, right = -1, count = 0;
-            const uint8_t *row;
-            uint8_t *out;
-            if (sy < 0 || sy >= height) continue;
-            row = source + (size_t)sy * width;
-            out = dest + (size_t)y * width;
-            for (x = 0; x < width; ++x) {
-                int wanted_right = x + x_radius;
-                int wanted_left = x - x_radius;
-                if (wanted_right >= width) wanted_right = width - 1;
-                if (wanted_left < 0) wanted_left = 0;
-                while (right < wanted_right) count += row[++right] != 0;
-                while (left < wanted_left) count -= row[left++] != 0;
-                if (count > 0) out[x] = 1;
-            }
+    if ((value & 0x7c00U) == 0x7c00U && (value & 0x03ffU) != 0)
+        return 0;
+    return (value & 0x8000U) != 0 ? (uint16_t)~value : (uint16_t)(value ^ 0x8000U);
+}
+
+int cplus_mask_argmax_fp16(const uint16_t *logits, size_t element_count,
+                           uint8_t *mask)
+{
+    size_t pixel, plane = CPLUS_MODEL_PIXELS;
+    if (!logits || !mask || element_count < plane * 4U) return -1;
+    for (pixel = 0; pixel < plane; ++pixel) {
+        int class_id;
+        uint16_t best = fp16_order_key(logits[pixel]);
+        uint8_t best_class = 0;
+        for (class_id = 1; class_id < 4; ++class_id) {
+            uint16_t value = fp16_order_key(logits[(size_t)class_id * plane + pixel]);
+            if (value > best) { best = value; best_class = (uint8_t)class_id; }
         }
+        mask[pixel] = best_class;
+    }
+    return 0;
+}
+
+/* Exact circular morphology using a linear-time squared-distance transform. */
+#define CPLUS_EDT_INFINITY 0x10000000
+
+static void squared_distance_1d(const int *input, int length, int *output,
+                                int *envelope, double *boundaries)
+{
+    int envelope_size = 0;
+    int q;
+    envelope[0] = 0;
+    boundaries[0] = -1.0e30;
+    boundaries[1] = 1.0e30;
+    for (q = 1; q < length; ++q) {
+        double intersection;
+        do {
+            int previous = envelope[envelope_size];
+            intersection =
+                ((double)input[q] + (double)q * q -
+                 ((double)input[previous] + (double)previous * previous)) /
+                (2.0 * (q - previous));
+            if (intersection > boundaries[envelope_size]) break;
+            --envelope_size;
+        } while (envelope_size >= 0);
+        if (envelope_size < 0) {
+            envelope_size = 0;
+            envelope[0] = q;
+            boundaries[0] = -1.0e30;
+            boundaries[1] = 1.0e30;
+        } else {
+            ++envelope_size;
+            envelope[envelope_size] = q;
+            boundaries[envelope_size] = intersection;
+            boundaries[envelope_size + 1] = 1.0e30;
+        }
+    }
+    envelope_size = 0;
+    for (q = 0; q < length; ++q) {
+        int delta;
+        while (boundaries[envelope_size + 1] < q) ++envelope_size;
+        delta = q - envelope[envelope_size];
+        output[q] = delta * delta + input[envelope[envelope_size]];
     }
 }
 
-static void ellipse_close_class(const uint8_t *mask, int class_id, int width, int height, int kernel,
-                                uint8_t *class_mask, uint8_t *tmp, uint8_t *closed)
+static bool radius45_boundary_hit(const uint8_t *source, int width, int height,
+                                  int x, int y)
+{
+    static const int offsets[8][2] = {
+        {-45, 0}, {45, 0}, {0, -45}, {0, 45},
+        {-36, -27}, {-36, 27}, {36, -27}, {36, 27},
+    };
+    int index;
+    for (index = 0; index < 8; ++index) {
+        int source_x = x + offsets[index][0];
+        int source_y = y + offsets[index][1];
+        if (source_x >= 0 && source_x < width &&
+            source_y >= 0 && source_y < height &&
+            source[(size_t)source_y * width + source_x])
+            return true;
+    }
+    return false;
+}
+
+static void circle_dilate(const uint8_t *source, uint8_t *dest, int width,
+                          int height, int radius, int *distance)
+{
+    int line_input[CPLUS_MODEL_WIDTH];
+    int line_output[CPLUS_MODEL_WIDTH];
+    int envelope[CPLUS_MODEL_WIDTH];
+    double boundaries[CPLUS_MODEL_WIDTH + 1];
+    int x, y;
+    int radius_squared = radius * radius;
+    if (width > CPLUS_MODEL_WIDTH || height > CPLUS_MODEL_HEIGHT) return;
+    for (y = 0; y < height; ++y) {
+        for (x = 0; x < width; ++x)
+            line_input[x] = source[(size_t)y * width + x] ? 0 : CPLUS_EDT_INFINITY;
+        squared_distance_1d(line_input, width, line_output, envelope, boundaries);
+        memcpy(distance + (size_t)y * width, line_output, (size_t)width * sizeof(*distance));
+    }
+    for (x = 0; x < width; ++x) {
+        for (y = 0; y < height; ++y)
+            line_input[y] = distance[(size_t)y * width + x];
+        squared_distance_1d(line_input, height, line_output, envelope, boundaries);
+        for (y = 0; y < height; ++y)
+            if (line_output[y] < radius_squared)
+                dest[(size_t)y * width + x] = 1;
+            else if (line_output[y] > radius_squared)
+                dest[(size_t)y * width + x] = 0;
+            else
+                dest[(size_t)y * width + x] =
+                    radius != 45 || radius45_boundary_hit(source, width, height, x, y);
+    }
+}
+
+static void ellipse_close_class(const uint8_t *mask, int class_id, int width, int height,
+                                int kernel, uint8_t *class_mask, uint8_t *tmp,
+                                uint8_t *closed, int *distance)
 {
     size_t total = (size_t)width * height, index;
+    int radius = kernel / 2;
     for (index = 0; index < total; ++index) class_mask[index] = mask[index] == class_id;
-    ellipse_dilate(class_mask, tmp, width, height, kernel);
+    circle_dilate(class_mask, tmp, width, height, radius, distance);
     for (index = 0; index < total; ++index) class_mask[index] = tmp[index] == 0;
-    ellipse_dilate(class_mask, closed, width, height, kernel);
+    circle_dilate(class_mask, closed, width, height, radius, distance);
     for (index = 0; index < total; ++index) closed[index] = closed[index] == 0;
 }
 
@@ -433,7 +644,7 @@ static void guarded_fill_class(uint8_t *mask, int class_id, int width, int heigh
 {
     size_t total = (size_t)width * height, index;
     int conflict_class = class_id == CPLUS_MASK_ROAD ? CPLUS_MASK_SIDEWALK : CPLUS_MASK_ROAD;
-    ellipse_close_class(mask, class_id, width, height, kernel, candidate, tmp, closed);
+    ellipse_close_class(mask, class_id, width, height, kernel, candidate, tmp, closed, queue);
     for (index = 0; index < total; ++index) candidate[index] = closed[index] && mask[index] == CPLUS_MASK_OTHER;
     memset(visited, 0, total);
     for (index = 0; index < total; ++index) {
@@ -491,7 +702,7 @@ static void fill_zebra_holes(uint8_t *mask, int width, int height, uint8_t *cand
                              int *changed_components, int *changed_pixels)
 {
     size_t total = (size_t)width * height, index;
-    ellipse_close_class(mask, CPLUS_MASK_CROSSWALK_ZEBRA, width, height, 55, candidate, tmp, closed);
+    ellipse_close_class(mask, CPLUS_MASK_CROSSWALK_ZEBRA, width, height, 55, candidate, tmp, closed, queue);
     for (index = 0; index < total; ++index) candidate[index] = closed[index] && mask[index] == CPLUS_MASK_OTHER;
     memset(visited, 0, total);
     for (index = 0; index < total; ++index) {
@@ -526,38 +737,150 @@ static void absorb_zebra_islands(uint8_t *mask, int width, int height, uint8_t *
     }
 }
 
-int cplus_postprocess_mask_candidate_c(uint8_t *mask, int width, int height, struct cplus_mask_stats *stats)
+int cplus_mask_workspace_init(struct cplus_mask_workspace *workspace,
+                              int width, int height)
 {
     size_t total;
-    uint8_t *raw, *candidate, *closed, *tmp, *visited;
-    int *queue;
-    uint32_t *component_marks, *border_marks, stamp = 0;
-    if (!mask || width <= 0 || height <= 0 || !stats) return -1;
+    if (!workspace || width <= 0 || height <= 0 ||
+        width > CPLUS_MODEL_WIDTH || height > CPLUS_MODEL_HEIGHT)
+        return -1;
+    memset(workspace, 0, sizeof(*workspace));
     total = (size_t)width * height;
-    raw = malloc(total); candidate = malloc(total); closed = malloc(total); tmp = malloc(total); visited = malloc(total);
-    queue = malloc(total * sizeof(*queue));
-    component_marks = calloc(total, sizeof(*component_marks)); border_marks = calloc(total, sizeof(*border_marks));
-    if (!raw || !candidate || !closed || !tmp || !visited || !queue || !component_marks || !border_marks) {
-        free(raw); free(candidate); free(closed); free(tmp); free(visited); free(queue); free(component_marks); free(border_marks);
+    workspace->width = width;
+    workspace->height = height;
+    workspace->total = total;
+    workspace->raw = malloc(total);
+    workspace->candidate = malloc(total);
+    workspace->closed = malloc(total);
+    workspace->tmp = malloc(total);
+    workspace->visited = malloc(total);
+    workspace->queue = malloc(total * sizeof(*workspace->queue));
+    workspace->component_marks = calloc(total, sizeof(*workspace->component_marks));
+    workspace->border_marks = calloc(total, sizeof(*workspace->border_marks));
+    if (!workspace->raw || !workspace->candidate || !workspace->closed ||
+        !workspace->tmp || !workspace->visited || !workspace->queue ||
+        !workspace->component_marks || !workspace->border_marks) {
+        cplus_mask_workspace_release(workspace);
         return -1;
     }
-    memcpy(raw, mask, total); memset(stats, 0, sizeof(*stats));
-    guarded_fill_class(mask, CPLUS_MASK_ROAD, width, height, 91, 32768, candidate, closed, tmp, visited, queue,
-                       component_marks, border_marks, &stamp, &stats->road_hole_components_filled,
-                       &stats->road_hole_pixels_filled);
-    guarded_fill_class(mask, CPLUS_MASK_SIDEWALK, width, height, 91, 32768, candidate, closed, tmp, visited, queue,
-                       component_marks, border_marks, &stamp, &stats->sidewalk_hole_components_filled,
-                       &stats->sidewalk_hole_pixels_filled);
-    remove_small_raw_zebra(raw, mask, width, height, candidate, visited, queue, component_marks, border_marks, &stamp,
-                           &stats->small_zebra_components_removed, &stats->small_zebra_pixels_removed);
-    fill_zebra_holes(mask, width, height, candidate, closed, tmp, visited, queue,
-                     &stats->zebra_hole_components_filled, &stats->zebra_hole_pixels_filled);
-    absorb_zebra_islands(mask, width, height, candidate, visited, queue, component_marks, border_marks, &stamp,
-                         &stats->zebra_inner_island_components_absorbed,
-                         &stats->zebra_inner_island_pixels_absorbed);
-    for (size_t index = 0; index < total; ++index) if (mask[index] != raw[index]) ++stats->changed_pixels_total;
-    free(raw); free(candidate); free(closed); free(tmp); free(visited); free(queue); free(component_marks); free(border_marks);
     return 0;
+}
+
+void cplus_mask_workspace_release(struct cplus_mask_workspace *workspace)
+{
+    if (!workspace) return;
+    free(workspace->raw);
+    free(workspace->candidate);
+    free(workspace->closed);
+    free(workspace->tmp);
+    free(workspace->visited);
+    free(workspace->queue);
+    free(workspace->component_marks);
+    free(workspace->border_marks);
+    memset(workspace, 0, sizeof(*workspace));
+}
+
+int cplus_postprocess_mask_candidate_c_workspace(
+    uint8_t *mask, int width, int height, struct cplus_mask_stats *stats,
+    struct cplus_mask_workspace *workspace)
+{
+    size_t index;
+    size_t class_counts[4] = {0};
+    if (!mask || !stats || !workspace || width != workspace->width ||
+        height != workspace->height || workspace->total != (size_t)width * height)
+        return -1;
+    memcpy(workspace->raw, mask, workspace->total);
+    memset(stats, 0, sizeof(*stats));
+    for (index = 0; index < workspace->total; ++index)
+        if (workspace->raw[index] < 4) ++class_counts[workspace->raw[index]];
+
+    if (class_counts[CPLUS_MASK_ROAD] > 0)
+        guarded_fill_class(mask, CPLUS_MASK_ROAD, width, height, 91, 32768,
+                           workspace->candidate, workspace->closed, workspace->tmp,
+                           workspace->visited, workspace->queue,
+                           workspace->component_marks, workspace->border_marks,
+                           &workspace->stamp, &stats->road_hole_components_filled,
+                           &stats->road_hole_pixels_filled);
+    if (class_counts[CPLUS_MASK_SIDEWALK] > 0)
+        guarded_fill_class(mask, CPLUS_MASK_SIDEWALK, width, height, 91, 32768,
+                           workspace->candidate, workspace->closed, workspace->tmp,
+                           workspace->visited, workspace->queue,
+                           workspace->component_marks, workspace->border_marks,
+                           &workspace->stamp, &stats->sidewalk_hole_components_filled,
+                           &stats->sidewalk_hole_pixels_filled);
+    if (class_counts[CPLUS_MASK_CROSSWALK_ZEBRA] > 0) {
+        remove_small_raw_zebra(workspace->raw, mask, width, height,
+                               workspace->candidate, workspace->visited,
+                               workspace->queue, workspace->component_marks,
+                               workspace->border_marks, &workspace->stamp,
+                               &stats->small_zebra_components_removed,
+                               &stats->small_zebra_pixels_removed);
+        fill_zebra_holes(mask, width, height, workspace->candidate,
+                         workspace->closed, workspace->tmp, workspace->visited,
+                         workspace->queue, &stats->zebra_hole_components_filled,
+                         &stats->zebra_hole_pixels_filled);
+        absorb_zebra_islands(mask, width, height, workspace->candidate,
+                             workspace->visited, workspace->queue,
+                             workspace->component_marks, workspace->border_marks,
+                             &workspace->stamp,
+                             &stats->zebra_inner_island_components_absorbed,
+                             &stats->zebra_inner_island_pixels_absorbed);
+    }
+    for (index = 0; index < workspace->total; ++index)
+        if (mask[index] != workspace->raw[index]) ++stats->changed_pixels_total;
+    return 0;
+}
+
+int cplus_postprocess_mask_candidate_c(uint8_t *mask, int width, int height,
+                                       struct cplus_mask_stats *stats)
+{
+    struct cplus_mask_workspace workspace;
+    int result;
+    if (cplus_mask_workspace_init(&workspace, width, height) < 0) return -1;
+    result = cplus_postprocess_mask_candidate_c_workspace(mask, width, height,
+                                                          stats, &workspace);
+    cplus_mask_workspace_release(&workspace);
+    return result;
+}
+
+void cplus_overlay_mask_bgrx(uint8_t *bgrx, int stride, int width, int height,
+                             const uint8_t *mask, int mask_w, int mask_h)
+{
+    static const uint8_t palette_bgr[4][3] = {
+        {0, 0, 0},
+        {0, 180, 0},
+        {255, 120, 0},
+        {50, 50, 255},
+    };
+    uint64_t x_step;
+    uint64_t y_step;
+    uint64_t x_offset;
+    uint64_t y_offset;
+    int x, y;
+    if (!bgrx || !mask || width <= 0 || height <= 0 || mask_w <= 0 || mask_h <= 0 ||
+        stride < width * 4)
+        return;
+    x_step = (((uint64_t)mask_w << 32) + (uint32_t)width - 1U) /
+             (uint32_t)width;
+    y_step = (((uint64_t)mask_h << 32) + (uint32_t)height - 1U) /
+             (uint32_t)height;
+    x_offset = x_step / 2;
+    y_offset = y_step / 2;
+    for (y = 0; y < height; ++y) {
+        int mask_y = (int)(((uint64_t)y * y_step + y_offset) >> 32);
+        uint8_t *row = bgrx + (size_t)y * stride;
+        for (x = 0; x < width; ++x) {
+            int mask_x = (int)(((uint64_t)x * x_step + x_offset) >> 32);
+            uint8_t class_id = mask[(size_t)mask_y * mask_w + mask_x];
+            uint8_t *pixel;
+            if (class_id == CPLUS_MASK_OTHER || class_id > CPLUS_MASK_CROSSWALK_ZEBRA)
+                continue;
+            pixel = row + (size_t)x * 4U;
+            pixel[0] = (uint8_t)((pixel[0] + palette_bgr[class_id][0]) / 2);
+            pixel[1] = (uint8_t)((pixel[1] + palette_bgr[class_id][1]) / 2);
+            pixel[2] = (uint8_t)((pixel[2] + palette_bgr[class_id][2]) / 2);
+        }
+    }
 }
 
 void cplus_make_foot_box(const struct cplus_box *box, int image_w, int image_h, struct cplus_rect *foot)

@@ -177,6 +177,41 @@ static int read_dma_frame(int fd, uint8_t *frame, size_t size)
     return ioctl(fd, FPGA_DMA_READ_FRAME, &transfer) == 0 && transfer.result == 0 ? 0 : -1;
 }
 
+static bool fp_output_type(rknn_tensor_type type)
+{
+    return type == RKNN_TENSOR_FLOAT16 || type == RKNN_TENSOR_FLOAT32;
+}
+
+static int validate_model_contracts(const struct cplus_rknn_model *detector,
+                                    const struct cplus_rknn_model *segmenter)
+{
+    const rknn_tensor_attr *detector_output = &detector->output_attr;
+    const rknn_tensor_attr *segmenter_output = &segmenter->output_attr;
+    if (detector_output->n_dims != 3 ||
+        detector_output->dims[0] != 1 ||
+        detector_output->dims[1] != CPLUS_YOLO_CHANNELS ||
+        detector_output->dims[2] != CPLUS_YOLO_PREDICTIONS ||
+        detector_output->n_elems !=
+            (uint32_t)(CPLUS_YOLO_CHANNELS * CPLUS_YOLO_PREDICTIONS) ||
+        !fp_output_type(detector_output->type)) {
+        fprintf(stderr, "Detector output must be [1,84,8400] in FP16 or FP32\n");
+        return -1;
+    }
+    if (segmenter_output->n_dims != 4 ||
+        segmenter_output->dims[0] != 1 ||
+        segmenter_output->dims[1] != 4 ||
+        segmenter_output->dims[2] != CPLUS_MODEL_HEIGHT ||
+        segmenter_output->dims[3] != CPLUS_MODEL_WIDTH ||
+        segmenter_output->n_elems != (uint32_t)(4U * CPLUS_MODEL_PIXELS) ||
+        segmenter_output->fmt != RKNN_TENSOR_NCHW ||
+        !fp_output_type(segmenter_output->type)) {
+        fprintf(stderr,
+                "Segmenter output must be NCHW [1,4,640,640] in FP16 or FP32\n");
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct options options;
@@ -230,11 +265,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "Model initialization failed\n");
         goto done;
     }
-    if (detector.input_width != CPLUS_MODEL_WIDTH || detector.input_height != CPLUS_MODEL_HEIGHT ||
-        segmenter.input_width != CPLUS_MODEL_WIDTH || segmenter.input_height != CPLUS_MODEL_HEIGHT) {
-        fprintf(stderr, "Both models must use 640x640 inputs\n");
+    if (detector.input_width != CPLUS_MODEL_WIDTH ||
+        detector.input_height != CPLUS_MODEL_HEIGHT ||
+        detector.input_channels != 3 ||
+        segmenter.input_width != CPLUS_MODEL_WIDTH ||
+        segmenter.input_height != CPLUS_MODEL_HEIGHT ||
+        segmenter.input_channels != 3) {
+        fprintf(stderr, "Both models must use three-channel 640x640 inputs\n");
         goto done;
     }
+    if (validate_model_contracts(&detector, &segmenter) < 0) goto done;
     cplus_default_runtime_config(&config);
     if (options.display &&
         cplus_display_async_start(&display, &pool, options.drm_card_path,
@@ -256,7 +296,6 @@ int main(int argc, char **argv)
 
     for (frame_index = 0; !stop_requested &&
          (frame_count == 0 || frame_index < frame_count); ++frame_index) {
-        struct cplus_async_result overlay = {0};
         uint8_t *frame = NULL;
         int slot = -1;
         int acquire_status;
@@ -289,11 +328,12 @@ int main(int argc, char **argv)
             }
             dump_written = true;
         }
-        have_result = cplus_async_get_result(&infer, &overlay);
+        have_result = cplus_async_refresh_result(&infer, &latest);
         if (cplus_async_submit_frame(&infer, slot, (uint64_t)frame_index) < 0 ||
             (options.display && cplus_display_async_submit(&display, slot,
-                                                           overlay.results, overlay.count,
-                                                           have_result) < 0)) {
+                                                           latest.results, latest.count,
+                                                           have_result, latest.mask,
+                                                           have_result && latest.mask_valid) < 0)) {
             cplus_frame_pool_release(&pool, slot);
             fprintf(stderr, "Unable to submit frame %d to asynchronous pipeline\n", frame_index);
             goto done;
@@ -319,7 +359,8 @@ int main(int argc, char **argv)
         }
         if (options.display &&
             cplus_display_async_submit(&display, final_slot, latest.results,
-                                       latest.count, true) < 0) {
+                                       latest.count, true, latest.mask,
+                                       latest.mask_valid) < 0) {
             fprintf(stderr, "Unable to submit final result to HDMI display\n");
             goto done;
         }
@@ -333,7 +374,9 @@ done:
     }
     cplus_async_get_stats(&infer, &infer_stats);
     cplus_display_async_stats(&display, &display_presented, &display_replaced);
-    if (infer.thread_started) {
+    display_presented = cplus_display_async_stop(&display);
+    infer_stats.completed = cplus_async_infer_stop(&infer);
+    if (infer_stats.submitted || infer_stats.completed) {
         fprintf(stderr, "[pipeline] inference submitted=%llu completed=%llu replaced=%llu "
                         "displayed=%llu display_replaced=%llu\n",
                 (unsigned long long)infer_stats.submitted,
@@ -342,8 +385,6 @@ done:
                 (unsigned long long)display_presented,
                 (unsigned long long)display_replaced);
     }
-    cplus_display_async_stop(&display);
-    cplus_async_infer_stop(&infer);
     if (fd >= 0) close(fd);
     cplus_rknn_model_release(&detector);
     cplus_rknn_model_release(&segmenter);

@@ -17,6 +17,7 @@
 
 #define CPLUS_MODEL_WIDTH 640
 #define CPLUS_MODEL_HEIGHT 640
+#define CPLUS_MODEL_PIXELS ((size_t)CPLUS_MODEL_WIDTH * CPLUS_MODEL_HEIGHT)
 #define CPLUS_YOLO_CHANNELS 84
 #define CPLUS_YOLO_PREDICTIONS 8400
 #define CPLUS_MAX_DETECTIONS 128
@@ -134,6 +135,22 @@ struct cplus_mask_stats {
     int changed_pixels_total;
 };
 
+/* Reused scratch memory for the 640x640 Candidate C mask cleanup. */
+struct cplus_mask_workspace {
+    int width;
+    int height;
+    size_t total;
+    uint8_t *raw;
+    uint8_t *candidate;
+    uint8_t *closed;
+    uint8_t *tmp;
+    uint8_t *visited;
+    int *queue;
+    uint32_t *component_marks;
+    uint32_t *border_marks;
+    uint32_t stamp;
+};
+
 void cplus_default_runtime_config(struct cplus_runtime_config *config);
 
 const char *cplus_target_type_name(enum cplus_target_type type);
@@ -141,6 +158,8 @@ const char *cplus_decision_name(enum cplus_decision decision);
 const char *cplus_reason_name(enum cplus_reason reason);
 
 void cplus_resize_rgb_nearest(const uint8_t *src, int src_w, int src_h,
+                               uint8_t *dst, int dst_w, int dst_h);
+void cplus_resize_rgb_bilinear(const uint8_t *src, int src_w, int src_h,
                                uint8_t *dst, int dst_w, int dst_h);
 void cplus_prepare_detector_rgb(const uint8_t *src, int src_w, int src_h,
                                  uint8_t *dst, struct cplus_letterbox *meta);
@@ -153,13 +172,27 @@ int cplus_decode_yolo(const float *output, size_t float_count,
                       const struct cplus_letterbox *meta,
                       const struct cplus_runtime_config *config,
                       struct cplus_detection *detections, int capacity);
+int cplus_decode_yolo_fp16(const uint16_t *output, size_t element_count,
+                           const struct cplus_letterbox *meta,
+                           const struct cplus_runtime_config *config,
+                           struct cplus_detection *detections, int capacity);
 void cplus_assign_riders(struct cplus_detection *detections, int count,
                          int image_w, int image_h,
                          const struct cplus_runtime_config *config);
 
 int cplus_mask_argmax(const float *logits, size_t float_count, uint8_t *mask);
+int cplus_mask_argmax_fp16(const uint16_t *logits, size_t element_count,
+                           uint8_t *mask);
+int cplus_mask_workspace_init(struct cplus_mask_workspace *workspace,
+                              int width, int height);
+void cplus_mask_workspace_release(struct cplus_mask_workspace *workspace);
+int cplus_postprocess_mask_candidate_c_workspace(
+    uint8_t *mask, int width, int height, struct cplus_mask_stats *stats,
+    struct cplus_mask_workspace *workspace);
 int cplus_postprocess_mask_candidate_c(uint8_t *mask, int width, int height,
                                         struct cplus_mask_stats *stats);
+void cplus_overlay_mask_bgrx(uint8_t *bgrx, int stride, int width, int height,
+                             const uint8_t *mask, int mask_w, int mask_h);
 void cplus_make_foot_box(const struct cplus_box *box, int image_w, int image_h,
                          struct cplus_rect *foot);
 void cplus_scale_rect(const struct cplus_rect *source, int source_w, int source_h,

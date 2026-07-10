@@ -17,7 +17,9 @@ static void *display_thread_main(void *argument)
         int present_status = cplus_display_present(&display->drm, frame,
                                                    job->result_available ? job->results : NULL,
                                                    job->result_available ? job->count : 0,
-                                                   job->result_available);
+                                                   job->result_available,
+                                                   job->mask_available ? job->mask : NULL,
+                                                   job->mask_available);
         cplus_frame_pool_release(display->pool, slot);
         pthread_mutex_lock(&display->status_lock);
         if (present_status < 0) {
@@ -71,19 +73,23 @@ failed:
 
 int cplus_display_async_submit(struct cplus_display_async *display, int slot,
                                const struct cplus_person_result *results, int count,
-                               bool result_available)
+                               bool result_available,
+                               const uint8_t *mask, bool mask_available)
 {
     struct cplus_display_job *job;
     if (!display || !display->thread_started || slot < 0 ||
         slot >= CPLUS_FRAME_POOL_SLOTS || count < 0 || count > CPLUS_MAX_DETECTIONS ||
-        (result_available && count > 0 && !results))
+        (result_available && count > 0 && !results) ||
+        (mask_available && (!result_available || !mask)))
         return -1;
     if (cplus_display_async_failed(display)) return -1;
     job = &display->jobs[slot];
     job->count = result_available ? count : 0;
     job->result_available = result_available;
+    job->mask_available = result_available && mask_available;
     if (job->count > 0 && results)
         memcpy(job->results, results, (size_t)job->count * sizeof(job->results[0]));
+    if (job->mask_available) memcpy(job->mask, mask, CPLUS_MODEL_PIXELS);
     return cplus_latest_queue_submit(&display->queue, slot);
 }
 
@@ -97,9 +103,10 @@ bool cplus_display_async_failed(struct cplus_display_async *display)
     return failed != 0;
 }
 
-void cplus_display_async_stop(struct cplus_display_async *display)
+uint64_t cplus_display_async_stop(struct cplus_display_async *display)
 {
-    if (!display) return;
+    uint64_t presented;
+    if (!display) return 0;
     if (display->queue_initialized) cplus_latest_queue_stop(&display->queue);
     if (display->thread_started) {
         pthread_join(display->thread, NULL);
@@ -114,9 +121,11 @@ void cplus_display_async_stop(struct cplus_display_async *display)
         display->status_lock_initialized = 0;
     }
     cplus_display_stop(&display->drm);
+    presented = display->presented;
     memset(display, 0, sizeof(*display));
     display->drm.fd = -1;
     display->drm.active_fb = -1;
+    return presented;
 }
 
 void cplus_display_async_stats(struct cplus_display_async *display,
