@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-/* The display loop never waits for RKNN; this worker accepts only the latest job. */
 
 #include "cplus_async.h"
 
@@ -37,7 +36,8 @@ static void print_result_json(const struct cplus_async_result *result)
     for (index = 0; index < result->count; ++index) {
         const struct cplus_person_result *target = &result->results[index];
         if (index) putchar(',');
-        printf("{\"type\":\"%s\",\"score\":%.3f,\"decision\":\"%s\",\"reason\":\"%s\",\"box\":[%.1f,%.1f,%.1f,%.1f],\"ground\":{\"road\":%.4f,\"sidewalk\":%.4f,\"zebra\":%.4f}}",
+        printf("{\"type\":\"%s\",\"score\":%.3f,\"decision\":\"%s\",\"reason\":\"%s\","
+               "\"box\":[%.1f,%.1f,%.1f,%.1f],\"ground\":{\"road\":%.4f,\"sidewalk\":%.4f,\"zebra\":%.4f}}",
                cplus_target_type_name(target->detection.target_type), target->detection.box.score,
                cplus_decision_name(target->decision), cplus_reason_name(target->reason),
                target->detection.box.x1, target->detection.box.y1,
@@ -71,8 +71,7 @@ static int infer_frame(struct cplus_async_infer *state, const uint8_t *bgrx,
     detection_count = cplus_decode_yolo(output, output_count, &letterbox,
                                         &state->config, detections, CPLUS_MAX_DETECTIONS);
     cplus_rknn_release_output(state->detector);
-    if (detection_count < 0)
-        return -1;
+    if (detection_count < 0) return -1;
     cplus_assign_riders(detections, detection_count, state->width, state->height,
                         &state->config);
     ordinary_count = ordinary_people_count(detections, detection_count);
@@ -81,9 +80,8 @@ static int infer_frame(struct cplus_async_infer *state, const uint8_t *bgrx,
                                     state->segmenter_rgb);
         if (cplus_rknn_infer_rgb(state->segmenter, state->segmenter_rgb,
                                  CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT,
-                                 &output, &output_count) < 0) {
+                                 &output, &output_count) < 0)
             return -1;
-        }
         if (cplus_mask_argmax(output, output_count, state->mask) < 0) {
             cplus_rknn_release_output(state->segmenter);
             return -1;
@@ -100,8 +98,7 @@ static int infer_frame(struct cplus_async_infer *state, const uint8_t *bgrx,
                                               CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT,
                                               state->width, state->height,
                                               result->results, CPLUS_MAX_DETECTIONS);
-    if (result->count < 0)
-        return -1;
+    if (result->count < 0) return -1;
     result->valid = true;
     fprintf(stderr, "[infer] source_frame=%llu targets=%d ordinary_pedestrians=%d%s\n",
             (unsigned long long)source_frame, result->count, ordinary_count,
@@ -112,203 +109,121 @@ static int infer_frame(struct cplus_async_infer *state, const uint8_t *bgrx,
 static void *infer_thread_main(void *argument)
 {
     struct cplus_async_infer *state = argument;
+    int slot;
+    int take_status;
 
-    for (;;) {
+    while ((take_status = cplus_latest_queue_take(&state->queue, &slot)) > 0) {
         struct cplus_async_result result;
-        int slot;
-        uint64_t source_frame;
-        int inference_status;
-
-        pthread_mutex_lock(&state->lock);
-        while (state->running && state->pending_slot < 0)
-            pthread_cond_wait(&state->pending_cond, &state->lock);
-        if (!state->running) {
-            if (state->pending_slot >= 0)
-                state->slot_state[state->pending_slot] = CPLUS_ASYNC_SLOT_FREE;
-            state->pending_slot = -1;
-            pthread_cond_broadcast(&state->idle_cond);
-            pthread_mutex_unlock(&state->lock);
-            break;
-        }
-        slot = state->pending_slot;
-        source_frame = state->slot_frame[slot];
-        state->pending_slot = -1;
-        state->slot_state[slot] = CPLUS_ASYNC_SLOT_WORKING;
-        state->busy = true;
-        pthread_mutex_unlock(&state->lock);
-
-        inference_status = infer_frame(state, state->slots[slot], source_frame, &result);
-
+        uint64_t source_frame = state->slot_frame[slot];
+        const uint8_t *frame = cplus_frame_pool_data(state->pool, slot);
+        int inference_status = infer_frame(state, frame, source_frame, &result);
+        cplus_frame_pool_release(state->pool, slot);
+        pthread_mutex_lock(&state->result_lock);
         if (inference_status < 0) {
-            pthread_mutex_lock(&state->lock);
-            state->slot_state[slot] = CPLUS_ASYNC_SLOT_FREE;
-            state->busy = false;
-            state->failed = true;
-            state->running = false;
-            pthread_cond_broadcast(&state->idle_cond);
-            pthread_mutex_unlock(&state->lock);
+            state->failed = 1;
+            pthread_cond_broadcast(&state->result_cond);
+            pthread_mutex_unlock(&state->result_lock);
             fprintf(stderr, "[infer] source_frame=%llu failed\n",
                     (unsigned long long)source_frame);
+            cplus_latest_queue_stop(&state->queue);
             break;
         }
-        pthread_mutex_lock(&state->lock);
         ++state->completed;
         result.sequence = state->completed;
-        pthread_mutex_unlock(&state->lock);
-        pthread_mutex_lock(&state->result_lock);
         state->result = result;
+        pthread_cond_broadcast(&state->result_cond);
         pthread_mutex_unlock(&state->result_lock);
         print_result_json(&result);
-        pthread_mutex_lock(&state->lock);
-        state->slot_state[slot] = CPLUS_ASYNC_SLOT_FREE;
-        state->busy = false;
-        pthread_cond_broadcast(&state->idle_cond);
-        pthread_mutex_unlock(&state->lock);
+    }
+    if (take_status < 0) {
+        pthread_mutex_lock(&state->result_lock);
+        state->failed = 1;
+        pthread_cond_broadcast(&state->result_cond);
+        pthread_mutex_unlock(&state->result_lock);
     }
     return NULL;
 }
 
-int cplus_async_infer_start(struct cplus_async_infer *state, int width, int height,
+int cplus_async_infer_start(struct cplus_async_infer *state,
+                            struct cplus_frame_pool *pool,
+                            int width, int height,
                             struct cplus_rknn_model *detector,
                             struct cplus_rknn_model *segmenter,
                             const struct cplus_runtime_config *config,
                             bool always_segment)
 {
-    int index;
-    if (!state || !detector || !segmenter || !config || width <= 0 || height <= 0)
+    if (!state || !pool || !detector || !segmenter || !config || width <= 0 || height <= 0)
         return -1;
     memset(state, 0, sizeof(*state));
     state->width = width;
     state->height = height;
-    state->frame_size = (size_t)width * height * 4U;
+    state->pool = pool;
     state->detector = detector;
     state->segmenter = segmenter;
     state->config = *config;
     state->always_segment = always_segment;
-    state->pending_slot = -1;
-    for (index = 0; index < CPLUS_ASYNC_SLOTS; ++index) {
-        state->slots[index] = malloc(state->frame_size);
-        if (!state->slots[index])
-            goto failed;
-    }
     state->rgb = malloc((size_t)width * height * 3U);
     state->detector_rgb = malloc((size_t)CPLUS_MODEL_WIDTH * CPLUS_MODEL_HEIGHT * 3U);
     state->segmenter_rgb = malloc((size_t)CPLUS_MODEL_WIDTH * CPLUS_MODEL_HEIGHT * 3U);
     state->mask = malloc((size_t)CPLUS_MODEL_WIDTH * CPLUS_MODEL_HEIGHT);
     if (!state->rgb || !state->detector_rgb || !state->segmenter_rgb || !state->mask)
         goto failed;
-    if (pthread_mutex_init(&state->lock, NULL) != 0 ||
-        pthread_mutex_init(&state->result_lock, NULL) != 0 ||
-        pthread_cond_init(&state->pending_cond, NULL) != 0 ||
-        pthread_cond_init(&state->idle_cond, NULL) != 0)
+    if (pthread_mutex_init(&state->result_lock, NULL) != 0) goto failed;
+    if (pthread_cond_init(&state->result_cond, NULL) != 0) {
+        pthread_mutex_destroy(&state->result_lock);
         goto failed;
-    state->running = true;
+    }
+    state->result_sync_initialized = 1;
+    if (cplus_latest_queue_init(&state->queue, pool) < 0) goto failed;
+    state->queue_initialized = 1;
     if (pthread_create(&state->thread, NULL, infer_thread_main, state) != 0)
-        goto failed_sync;
-    state->thread_started = true;
+        goto failed;
+    state->thread_started = 1;
     return 0;
 
-failed_sync:
-    state->running = false;
-    pthread_cond_destroy(&state->idle_cond);
-    pthread_cond_destroy(&state->pending_cond);
-    pthread_mutex_destroy(&state->result_lock);
-    pthread_mutex_destroy(&state->lock);
 failed:
-    for (index = 0; index < CPLUS_ASYNC_SLOTS; ++index)
-        free(state->slots[index]);
-    free(state->rgb);
-    free(state->detector_rgb);
-    free(state->segmenter_rgb);
-    free(state->mask);
-    memset(state, 0, sizeof(*state));
-    state->pending_slot = -1;
+    cplus_async_infer_stop(state);
     return -1;
 }
 
 void cplus_async_infer_stop(struct cplus_async_infer *state)
 {
-    int index;
     if (!state) return;
+    if (state->queue_initialized) cplus_latest_queue_stop(&state->queue);
     if (state->thread_started) {
-        pthread_mutex_lock(&state->lock);
-        state->running = false;
-        pthread_cond_broadcast(&state->pending_cond);
-        pthread_mutex_unlock(&state->lock);
         pthread_join(state->thread, NULL);
-        pthread_cond_destroy(&state->idle_cond);
-        pthread_cond_destroy(&state->pending_cond);
-        pthread_mutex_destroy(&state->result_lock);
-        pthread_mutex_destroy(&state->lock);
+        state->thread_started = 0;
     }
-    for (index = 0; index < CPLUS_ASYNC_SLOTS; ++index)
-        free(state->slots[index]);
+    if (state->queue_initialized) {
+        cplus_latest_queue_destroy(&state->queue);
+        state->queue_initialized = 0;
+    }
+    if (state->result_sync_initialized) {
+        pthread_cond_destroy(&state->result_cond);
+        pthread_mutex_destroy(&state->result_lock);
+        state->result_sync_initialized = 0;
+    }
     free(state->rgb);
     free(state->detector_rgb);
     free(state->segmenter_rgb);
     free(state->mask);
     memset(state, 0, sizeof(*state));
-    state->pending_slot = -1;
 }
 
-uint8_t *cplus_async_acquire_frame(struct cplus_async_infer *state, int *slot)
+int cplus_async_submit_frame(struct cplus_async_infer *state, int slot,
+                             uint64_t source_frame)
 {
-    int index;
-    if (!state || !slot) return NULL;
-    pthread_mutex_lock(&state->lock);
-    if (!state->running || state->failed) {
-        pthread_mutex_unlock(&state->lock);
-        return NULL;
-    }
-    for (index = 0; index < CPLUS_ASYNC_SLOTS; ++index) {
-        if (state->slot_state[index] == CPLUS_ASYNC_SLOT_FREE) {
-            state->slot_state[index] = CPLUS_ASYNC_SLOT_FILLING;
-            *slot = index;
-            pthread_mutex_unlock(&state->lock);
-            return state->slots[index];
-        }
-    }
-    pthread_mutex_unlock(&state->lock);
-    return NULL;
-}
-
-void cplus_async_discard_frame(struct cplus_async_infer *state, int slot)
-{
-    if (!state || slot < 0 || slot >= CPLUS_ASYNC_SLOTS) return;
-    pthread_mutex_lock(&state->lock);
-    if (state->slot_state[slot] == CPLUS_ASYNC_SLOT_FILLING)
-        state->slot_state[slot] = CPLUS_ASYNC_SLOT_FREE;
-    pthread_mutex_unlock(&state->lock);
-}
-
-int cplus_async_submit_frame(struct cplus_async_infer *state, int slot, uint64_t source_frame)
-{
-    int result = 0;
-    if (!state || slot < 0 || slot >= CPLUS_ASYNC_SLOTS) return -1;
-    pthread_mutex_lock(&state->lock);
-    if (!state->running || state->failed || state->slot_state[slot] != CPLUS_ASYNC_SLOT_FILLING) {
-        pthread_mutex_unlock(&state->lock);
+    if (!state || !state->thread_started || slot < 0 || slot >= CPLUS_FRAME_POOL_SLOTS)
         return -1;
-    }
-    if (state->pending_slot >= 0) {
-        state->slot_state[slot] = CPLUS_ASYNC_SLOT_FREE;
-        ++state->dropped;
-        result = 1;
-    } else {
-        state->slot_frame[slot] = source_frame;
-        state->slot_state[slot] = CPLUS_ASYNC_SLOT_PENDING;
-        state->pending_slot = slot;
-        ++state->submitted;
-        pthread_cond_signal(&state->pending_cond);
-    }
-    pthread_mutex_unlock(&state->lock);
-    return result;
+    state->slot_frame[slot] = source_frame;
+    return cplus_latest_queue_submit(&state->queue, slot);
 }
 
-bool cplus_async_get_result(struct cplus_async_infer *state, struct cplus_async_result *result)
+bool cplus_async_get_result(struct cplus_async_infer *state,
+                            struct cplus_async_result *result)
 {
     bool valid;
-    if (!state || !result) return false;
+    if (!state || !result || !state->result_sync_initialized) return false;
     pthread_mutex_lock(&state->result_lock);
     *result = state->result;
     valid = result->valid;
@@ -316,34 +231,40 @@ bool cplus_async_get_result(struct cplus_async_infer *state, struct cplus_async_
     return valid;
 }
 
-int cplus_async_wait_idle(struct cplus_async_infer *state)
+int cplus_async_wait_for_frame(struct cplus_async_infer *state,
+                               uint64_t source_frame)
 {
-    if (!state) return -1;
-    pthread_mutex_lock(&state->lock);
-    while (!state->failed && (state->busy || state->pending_slot >= 0))
-        pthread_cond_wait(&state->idle_cond, &state->lock);
-    pthread_mutex_unlock(&state->lock);
-    return state->failed ? -1 : 0;
+    int failed;
+    if (!state || !state->result_sync_initialized) return -1;
+    pthread_mutex_lock(&state->result_lock);
+    while (!state->failed && (!state->result.valid || state->result.source_frame < source_frame))
+        pthread_cond_wait(&state->result_cond, &state->result_lock);
+    failed = state->failed;
+    pthread_mutex_unlock(&state->result_lock);
+    return failed ? -1 : 0;
 }
 
 bool cplus_async_failed(struct cplus_async_infer *state)
 {
-    bool failed;
-    if (!state || !state->thread_started) return true;
-    pthread_mutex_lock(&state->lock);
+    int failed;
+    if (!state || !state->result_sync_initialized) return true;
+    pthread_mutex_lock(&state->result_lock);
     failed = state->failed;
-    pthread_mutex_unlock(&state->lock);
-    return failed;
+    pthread_mutex_unlock(&state->result_lock);
+    return failed != 0;
 }
 
-void cplus_async_get_stats(struct cplus_async_infer *state, struct cplus_async_stats *stats)
+void cplus_async_get_stats(struct cplus_async_infer *state,
+                           struct cplus_async_stats *stats)
 {
     if (!stats) return;
     memset(stats, 0, sizeof(*stats));
-    if (!state || !state->thread_started) return;
-    pthread_mutex_lock(&state->lock);
-    stats->submitted = state->submitted;
-    stats->dropped = state->dropped;
-    stats->completed = state->completed;
-    pthread_mutex_unlock(&state->lock);
+    if (!state) return;
+    if (state->queue_initialized)
+        cplus_latest_queue_stats(&state->queue, &stats->submitted, &stats->replaced);
+    if (state->result_sync_initialized) {
+        pthread_mutex_lock(&state->result_lock);
+        stats->completed = state->completed;
+        pthread_mutex_unlock(&state->result_lock);
+    }
 }

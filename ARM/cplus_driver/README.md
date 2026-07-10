@@ -21,9 +21,7 @@ pixels without an additional normalization step.
 make -C cplus_driver test
 ```
 
-The host test covers the two input mappings, `[1,84,8400]` YOLO decoding and
-class-aware suppression, rider filtering, final rule boundaries, and Candidate
-C mask cleanup.
+The host tests cover the two input mappings, `[1,84,8400]` YOLO decoding, class-aware suppression, rider filtering, final rule boundaries, and Candidate C mask cleanup. They also exercise shared-frame reference lifetimes, pending-frame replacement, shutdown draining, and concurrent producer/consumer delivery.
 
 ## Board build
 
@@ -45,11 +43,12 @@ Copy the executable and both `.rknn` files to the board. The driver shows the li
 sudo ./cplus-rk3568-driver \
   --det-model /userdata/model/yolov5nu_coco_rk3568_fp16_20260710.rknn \
   --seg-model /userdata/model/mapillary_cplus_ground_4class_v2_rk3568_fp16_20260710.rknn \
-  --device /dev/fpga_dma0 --frames 0 --display 1
+  --device /dev/fpga_dma0 --frames 0 --fps 30 --display 1
 ```
 
-`--frames 0` means continuous operation; press `Ctrl+C` to stop. A successful display startup prints the selected DRM connector and CRTC. The FPGA image size must be an available HDMI mode (the observed board stream is 1280x720). To use another DRM card or a specific connected HDMI connector, use `--drm-card PATH` and `--connector-id N`. Use `--display 0` for headless JSON-only operation.
-The live path follows the existing `pplcnet_bgp_live` latest-frame design: HDMI continuously presents fresh DMA frames while a background thread owns RKNN inference. At most one newer frame waits for inference; further inference submissions are dropped rather than delaying the display. The result boxes therefore describe the most recently completed inference, and can trail the displayed camera frame by one inference interval. Before that first result completes, the HDMI status is `CPLUS STARTING`. The exit summary reports how many inference submissions were completed or dropped.
+`--frames 0` means continuous operation and `--fps 30` sets the capture cadence; press `Ctrl+C` to stop. A successful display startup prints the selected DRM connector and CRTC. The FPGA image size must be an available HDMI mode (the observed board stream is 1280x720). To use another DRM card or a specific connected HDMI connector, use `--drm-card PATH` and `--connector-id N`. Use `--display 0` for headless JSON-only operation.
+
+The live path uses three independent stages: paced DMA capture, an asynchronous latest-frame HDMI thread, and an asynchronous latest-frame RKNN thread. Both worker queues replace an older pending frame with the newest submission, so a slow display or inference never blocks capture and does not build latency. The result boxes describe the most recently completed inference and may trail the current camera frame by one inference interval. Before the first result completes, HDMI shows `CPLUS STARTING`. The exit summary reports completed work and pending frames replaced by fresher frames.
 
 After an inference result, when a frame produces no targets, the HDMI image still appears with `CPLUS NO TARGET`; this distinguishes a display problem from an empty detector result. To retain the original, unannotated FPGA frame for inspection, add `--dump-bgrx /userdata/cplus_capture.bgrx --frames 1 --display 0`. The 1280x720 file can then be viewed on the host with:
 

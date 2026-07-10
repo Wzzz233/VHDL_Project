@@ -1,2 +1,4 @@
 test_cplus_engine
 cplus-rk3568-driver
+test_cplus_async_primitives
+test_cplus_async_tsan

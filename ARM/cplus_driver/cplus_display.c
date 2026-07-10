@@ -17,18 +17,18 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-static void set_pixel(uint8_t *pixels, int width, int height, int x, int y,
+static void set_pixel(uint8_t *pixels, int stride, int width, int height, int x, int y,
                       uint8_t red, uint8_t green, uint8_t blue)
 {
     uint8_t *pixel;
     if (x < 0 || x >= width || y < 0 || y >= height) return;
-    pixel = pixels + ((size_t)y * width + x) * 4U;
+    pixel = pixels + (size_t)y * (size_t)stride + (size_t)x * 4U;
     pixel[0] = blue;
     pixel[1] = green;
     pixel[2] = red;
 }
 
-static void draw_rect(uint8_t *pixels, int width, int height, const struct cplus_box *box,
+static void draw_rect(uint8_t *pixels, int stride, int width, int height, const struct cplus_box *box,
                       uint8_t red, uint8_t green, uint8_t blue)
 {
     int x1 = (int)lroundf(box->x1);
@@ -40,12 +40,12 @@ static void draw_rect(uint8_t *pixels, int width, int height, const struct cplus
     int y;
     for (thickness = 0; thickness < 3; ++thickness) {
         for (x = x1; x <= x2; ++x) {
-            set_pixel(pixels, width, height, x, y1 + thickness, red, green, blue);
-            set_pixel(pixels, width, height, x, y2 - thickness, red, green, blue);
+            set_pixel(pixels, stride, width, height, x, y1 + thickness, red, green, blue);
+            set_pixel(pixels, stride, width, height, x, y2 - thickness, red, green, blue);
         }
         for (y = y1; y <= y2; ++y) {
-            set_pixel(pixels, width, height, x1 + thickness, y, red, green, blue);
-            set_pixel(pixels, width, height, x2 - thickness, y, red, green, blue);
+            set_pixel(pixels, stride, width, height, x1 + thickness, y, red, green, blue);
+            set_pixel(pixels, stride, width, height, x2 - thickness, y, red, green, blue);
         }
     }
 }
@@ -96,7 +96,7 @@ static uint8_t glyph5x7(char character, int row)
     }
 }
 
-static void draw_text(uint8_t *pixels, int width, int height, int x, int y, const char *text,
+static void draw_text(uint8_t *pixels, int stride, int width, int height, int x, int y, const char *text,
                       uint8_t red, uint8_t green, uint8_t blue)
 {
     int cursor = x;
@@ -109,8 +109,8 @@ static void draw_text(uint8_t *pixels, int width, int height, int x, int y, cons
             int column;
             for (column = 0; column < 5; ++column) {
                 if (bits & (1U << (4 - column))) {
-                    set_pixel(pixels, width, height, cursor + column, y + row, red, green, blue);
-                    set_pixel(pixels, width, height, cursor + column + 1, y + row, red, green, blue);
+                    set_pixel(pixels, stride, width, height, cursor + column, y + row, red, green, blue);
+                    set_pixel(pixels, stride, width, height, cursor + column + 1, y + row, red, green, blue);
                 }
             }
         }
@@ -132,7 +132,7 @@ static const char *overlay_label(const struct cplus_person_result *result)
     }
 }
 
-void cplus_overlay_results(uint8_t *bgrx, int width, int height,
+void cplus_overlay_results(uint8_t *bgrx, int stride, int width, int height,
                            const struct cplus_person_result *results, int count,
                            bool result_available)
 {
@@ -150,13 +150,13 @@ void cplus_overlay_results(uint8_t *bgrx, int width, int height,
         } else if (result->detection.box.class_id != CPLUS_COCO_PERSON) {
             red = 250; green = 180; blue = 30;
         }
-        draw_rect(bgrx, width, height, &result->detection.box, red, green, blue);
+        draw_rect(bgrx, stride, width, height, &result->detection.box, red, green, blue);
         text_y = (int)lroundf(result->detection.box.y1) - 11;
         if (text_y < 1) text_y = (int)lroundf(result->detection.box.y2) + 3;
-        draw_text(bgrx, width, height, (int)lroundf(result->detection.box.x1), text_y,
+        draw_text(bgrx, stride, width, height, (int)lroundf(result->detection.box.x1), text_y,
                   overlay_label(result), red, green, blue);
     }
-    draw_text(bgrx, width, height, 12, 12, result_available ?
+    draw_text(bgrx, stride, width, height, 12, 12, result_available ?
               (count ? "CPLUS" : "CPLUS NO TARGET") : "CPLUS STARTING", 255, 255, 255);
 }
 
@@ -263,10 +263,12 @@ static int wait_for_page_flip(int fd, bool *waiting)
     events.page_flip_handler = page_flip_handler;
     while (*waiting) {
         fd_set descriptors;
+        struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
         int result;
         FD_ZERO(&descriptors);
         FD_SET(fd, &descriptors);
-        result = select(fd + 1, &descriptors, NULL, NULL, NULL);
+        result = select(fd + 1, &descriptors, NULL, NULL, &timeout);
+        if (result == 0) { errno = ETIMEDOUT; return -1; }
         if (result < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -327,13 +329,14 @@ int cplus_display_present(struct cplus_display *display, const uint8_t *bgrx,
     int row;
     bool waiting = true;
     struct cplus_drm_fb *framebuffer;
-    if (!display || !display->started || !bgrx) return -1;
+    if (!display || !display->started || !bgrx || count < 0 ||
+        count > CPLUS_MAX_DETECTIONS || (count > 0 && !results)) return -1;
     next = display->active_fb < 0 ? 0 : 1 - display->active_fb;
     framebuffer = &display->fb[next];
     for (row = 0; row < display->height; ++row)
         memcpy(framebuffer->map + (size_t)row * framebuffer->pitch,
                bgrx + (size_t)row * display->width * 4U, (size_t)display->width * 4U);
-    cplus_overlay_results(framebuffer->map, display->width, display->height,
+    cplus_overlay_results(framebuffer->map, (int)framebuffer->pitch, display->width, display->height,
                           results, count, result_available);
     if (display->active_fb < 0) {
         if (drmModeSetCrtc(display->fd, display->crtc_id, framebuffer->fb_id, 0, 0,

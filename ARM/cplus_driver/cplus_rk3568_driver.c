@@ -3,7 +3,8 @@
 /* FPGA/DMA entry point for the C+ pedestrian crossing driver. */
 
 #include "cplus_async.h"
-#include "cplus_display.h"
+#include "cplus_display_async.h"
+#include "cplus_frame_pool.h"
 #include "cplus_rknn.h"
 #include "../pcie_fpga_dma.h"
 
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 struct options {
@@ -29,6 +31,7 @@ struct options {
     int width;
     int height;
     int frames;
+    int fps;
     int always_segment;
 };
 
@@ -40,12 +43,31 @@ static void handle_signal(int signal_number)
     stop_requested = 1;
 }
 
+static int64_t monotonic_us(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000000LL + now.tv_nsec / 1000;
+}
+
+static void sleep_until_us(int64_t deadline_us)
+{
+    struct timespec deadline;
+    int result;
+    deadline.tv_sec = (time_t)(deadline_us / 1000000LL);
+    deadline.tv_nsec = (long)(deadline_us % 1000000LL) * 1000L;
+    do {
+        result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL);
+    } while (result == EINTR && !stop_requested);
+}
+
 static void usage(const char *program)
 {
     fprintf(stderr,
             "Usage: %s --det-model detector.rknn --seg-model segmenter.rknn [options]\n"
             "  --device PATH          FPGA DMA device (default /dev/fpga_dma0)\n"
-            "  --frames N             Frames to display; 0 means continuous (default 1)\n"
+            "  --frames N             Frames to capture; 0 means continuous (default 1)\n"
+            "  --fps N                Live capture/display rate, 1-120 (default 30)\n"
             "  --input-bgrx PATH      Offline BGRX8888 frame; needs --width and --height\n"
             "  --dump-bgrx PATH       Save the first captured BGRX8888 frame\n"
             "  --width N --height N   Offline BGRX frame dimensions\n"
@@ -63,6 +85,7 @@ static int parse_options(int argc, char **argv, struct options *options)
         {"seg-model", required_argument, NULL, 's'},
         {"device", required_argument, NULL, 'D'},
         {"frames", required_argument, NULL, 'n'},
+        {"fps", required_argument, NULL, 'F'},
         {"input-bgrx", required_argument, NULL, 'i'},
         {"dump-bgrx", required_argument, NULL, 'o'},
         {"width", required_argument, NULL, 'w'},
@@ -78,15 +101,18 @@ static int parse_options(int argc, char **argv, struct options *options)
     memset(options, 0, sizeof(*options));
     options->device_path = "/dev/fpga_dma0";
     options->frames = 1;
+    options->fps = 30;
     options->display = 1;
     options->drm_card_path = "/dev/dri/card0";
     options->connector_id = -1;
-    while ((argument = getopt_long(argc, argv, "d:s:D:n:i:o:w:h:ap:r:c:?", long_options, NULL)) != -1) {
+    while ((argument = getopt_long(argc, argv, "d:s:D:n:F:i:o:w:h:ap:r:c:?",
+                                   long_options, NULL)) != -1) {
         switch (argument) {
         case 'd': options->detector_model = optarg; break;
         case 's': options->segmenter_model = optarg; break;
         case 'D': options->device_path = optarg; break;
         case 'n': options->frames = atoi(optarg); break;
+        case 'F': options->fps = atoi(optarg); break;
         case 'i': options->input_bgrx_path = optarg; break;
         case 'o': options->dump_bgrx_path = optarg; break;
         case 'w': options->width = atoi(optarg); break;
@@ -99,6 +125,7 @@ static int parse_options(int argc, char **argv, struct options *options)
         }
     }
     if (!options->detector_model || !options->segmenter_model || options->frames < 0 ||
+        options->fps < 1 || options->fps > 120 ||
         (options->input_bgrx_path && (options->width <= 0 || options->height <= 0)) ||
         (options->display != 0 && options->display != 1))
         return -1;
@@ -150,35 +177,31 @@ static int read_dma_frame(int fd, uint8_t *frame, size_t size)
     return ioctl(fd, FPGA_DMA_READ_FRAME, &transfer) == 0 && transfer.result == 0 ? 0 : -1;
 }
 
-static int present_frame(struct cplus_display *display, const uint8_t *frame,
-                         const struct cplus_async_result *result, bool result_available)
-{
-    if (!display->started) return 0;
-    return cplus_display_present(display, frame,
-                                 result_available ? result->results : NULL,
-                                 result_available ? result->count : 0,
-                                 result_available);
-}
-
 int main(int argc, char **argv)
 {
     struct options options;
     struct cplus_runtime_config config;
     struct cplus_rknn_model detector = {0};
     struct cplus_rknn_model segmenter = {0};
-    struct cplus_display display = { .fd = -1, .active_fb = -1 };
-    struct cplus_async_infer infer = { .pending_slot = -1 };
+    struct cplus_frame_pool pool = {0};
+    struct cplus_display_async display = { .drm = { .fd = -1, .active_fb = -1 } };
+    struct cplus_async_infer infer = {0};
     struct cplus_async_result latest = {0};
-    struct cplus_async_stats stats = {0};
-    uint8_t *last_frame = NULL;
+    struct cplus_async_stats infer_stats = {0};
+    uint64_t display_presented = 0;
+    uint64_t display_replaced = 0;
     int fd = -1;
     int width;
     int height;
     int frame_count;
     int frame_index;
+    int final_slot = -1;
     size_t frame_size;
     bool dump_written = false;
+    int pool_initialized = 0;
     int status = 1;
+    int64_t next_frame_us;
+    int64_t frame_period_us;
 
     if (parse_options(argc, argv, &options) < 0) {
         usage(argv[0]);
@@ -197,6 +220,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "Cannot open BGRX8888 FPGA DMA source: %s\n", options.device_path);
         return 1;
     }
+    if (cplus_frame_pool_init(&pool, frame_size) < 0) {
+        fprintf(stderr, "Shared frame pool initialization failed\n");
+        goto done;
+    }
+    pool_initialized = 1;
     if (cplus_rknn_model_load(&detector, "detector", options.detector_model) < 0 ||
         cplus_rknn_model_load(&segmenter, "segmenter", options.segmenter_model) < 0) {
         fprintf(stderr, "Model initialization failed\n");
@@ -208,84 +236,120 @@ int main(int argc, char **argv)
         goto done;
     }
     cplus_default_runtime_config(&config);
-    if (options.display && cplus_display_start(&display, options.drm_card_path,
-                                                options.connector_id, width, height) < 0) {
-        fprintf(stderr, "HDMI display initialization failed: %s\n", strerror(errno));
+    if (options.display &&
+        cplus_display_async_start(&display, &pool, options.drm_card_path,
+                                  options.connector_id, width, height) < 0) {
+        fprintf(stderr, "Asynchronous HDMI display initialization failed: %s\n",
+                strerror(errno));
         goto done;
     }
-    if (cplus_async_infer_start(&infer, width, height, &detector, &segmenter,
+    if (cplus_async_infer_start(&infer, &pool, width, height, &detector, &segmenter,
                                 &config, options.always_segment != 0) < 0) {
         fprintf(stderr, "Background inference initialization failed\n");
         goto done;
     }
-    fprintf(stderr, "[async] display and inference started: frame=%dx%d queue=latest-only\n",
-            width, height);
+    fprintf(stderr, "[pipeline] asynchronous capture/display/inference started: "
+                    "frame=%dx%d fps=%d slots=%d\n",
+            width, height, options.fps, CPLUS_FRAME_POOL_SLOTS);
+    frame_period_us = 1000000LL / options.fps;
+    next_frame_us = monotonic_us();
 
     for (frame_index = 0; !stop_requested &&
          (frame_count == 0 || frame_index < frame_count); ++frame_index) {
+        struct cplus_async_result overlay = {0};
+        uint8_t *frame = NULL;
         int slot = -1;
-        int submit_status;
-        uint8_t *frame = cplus_async_acquire_frame(&infer, &slot);
+        int acquire_status;
         bool have_result;
+        bool keep_final;
 
-        if (!frame) {
-            fprintf(stderr, "Background inference stopped before frame %d\n", frame_index);
+        if (!options.input_bgrx_path && frame_index > 0) {
+            next_frame_us += frame_period_us;
+            sleep_until_us(next_frame_us);
+            if (stop_requested) break;
+            if (monotonic_us() > next_frame_us + frame_period_us)
+                next_frame_us = monotonic_us();
+        }
+        acquire_status = cplus_frame_pool_acquire(&pool, &slot, &frame);
+        if (acquire_status != 0) {
+            fprintf(stderr, "Shared frame pool exhausted at frame %d\n", frame_index);
             goto done;
         }
         if ((options.input_bgrx_path && read_file_exact(options.input_bgrx_path, frame, frame_size) < 0) ||
             (!options.input_bgrx_path && read_dma_frame(fd, frame, frame_size) < 0)) {
-            cplus_async_discard_frame(&infer, slot);
+            cplus_frame_pool_release(&pool, slot);
             fprintf(stderr, "Unable to read frame %d\n", frame_index);
             goto done;
         }
         if (options.dump_bgrx_path && !dump_written) {
             if (write_file_exact(options.dump_bgrx_path, frame, frame_size) < 0) {
-                cplus_async_discard_frame(&infer, slot);
+                cplus_frame_pool_release(&pool, slot);
                 fprintf(stderr, "Unable to save BGRX frame to %s\n", options.dump_bgrx_path);
                 goto done;
             }
             dump_written = true;
         }
-        have_result = cplus_async_get_result(&infer, &latest);
-        if (present_frame(&display, frame, &latest, have_result) < 0) {
-            cplus_async_discard_frame(&infer, slot);
-            fprintf(stderr, "HDMI display update failed: %s\n", strerror(errno));
+        have_result = cplus_async_get_result(&infer, &overlay);
+        if (cplus_async_submit_frame(&infer, slot, (uint64_t)frame_index) < 0 ||
+            (options.display && cplus_display_async_submit(&display, slot,
+                                                           overlay.results, overlay.count,
+                                                           have_result) < 0)) {
+            cplus_frame_pool_release(&pool, slot);
+            fprintf(stderr, "Unable to submit frame %d to asynchronous pipeline\n", frame_index);
             goto done;
         }
-        last_frame = frame;
-        submit_status = cplus_async_submit_frame(&infer, slot, (uint64_t)frame_index);
-        if (submit_status < 0) {
-            fprintf(stderr, "Unable to queue frame %d for background inference\n", frame_index);
-            goto done;
+        keep_final = frame_count > 0 && frame_index + 1 == frame_count;
+        if (keep_final) {
+            final_slot = slot;
+        } else {
+            cplus_frame_pool_release(&pool, slot);
         }
-        if (cplus_async_failed(&infer)) {
-            fprintf(stderr, "Background inference failed\n");
+        if (cplus_async_failed(&infer) ||
+            (options.display && cplus_display_async_failed(&display))) {
+            fprintf(stderr, "Asynchronous worker failed\n");
             goto done;
         }
     }
-    if (!stop_requested && cplus_async_wait_idle(&infer) < 0) {
-        fprintf(stderr, "Background inference failed\n");
-        goto done;
-    }
-    if (!stop_requested && cplus_async_get_result(&infer, &latest)) {
-        if (last_frame && latest.source_frame == (uint64_t)(frame_index - 1) &&
-            present_frame(&display, last_frame, &latest, true) < 0) {
-            fprintf(stderr, "Final HDMI display update failed: %s\n", strerror(errno));
+    if (!stop_requested && frame_count > 0 && frame_index > 0) {
+        uint64_t final_frame = (uint64_t)(frame_index - 1);
+        if (cplus_async_wait_for_frame(&infer, final_frame) < 0 ||
+            !cplus_async_get_result(&infer, &latest)) {
+            fprintf(stderr, "Final background inference failed\n");
+            goto done;
+        }
+        if (options.display &&
+            cplus_display_async_submit(&display, final_slot, latest.results,
+                                       latest.count, true) < 0) {
+            fprintf(stderr, "Unable to submit final result to HDMI display\n");
             goto done;
         }
     }
     status = 0;
+
 done:
-    cplus_async_get_stats(&infer, &stats);
-    if (infer.thread_started) {
-        fprintf(stderr, "[async] submitted=%llu completed=%llu dropped=%llu\n",
-                (unsigned long long)stats.submitted, (unsigned long long)stats.completed,
-                (unsigned long long)stats.dropped);
+    if (final_slot >= 0) {
+        cplus_frame_pool_release(&pool, final_slot);
+        final_slot = -1;
     }
+    cplus_async_get_stats(&infer, &infer_stats);
+    cplus_display_async_stats(&display, &display_presented, &display_replaced);
+    if (infer.thread_started) {
+        fprintf(stderr, "[pipeline] inference submitted=%llu completed=%llu replaced=%llu "
+                        "displayed=%llu display_replaced=%llu\n",
+                (unsigned long long)infer_stats.submitted,
+                (unsigned long long)infer_stats.completed,
+                (unsigned long long)infer_stats.replaced,
+                (unsigned long long)display_presented,
+                (unsigned long long)display_replaced);
+    }
+    cplus_display_async_stop(&display);
     cplus_async_infer_stop(&infer);
     if (fd >= 0) close(fd);
-    cplus_display_stop(&display);
     cplus_rknn_model_release(&detector);
     cplus_rknn_model_release(&segmenter);
+    if (pool_initialized && cplus_frame_pool_destroy(&pool) < 0) {
+        fprintf(stderr, "Shared frame pool still had outstanding references during shutdown\n");
+        status = 1;
+    }
     return status;
 }

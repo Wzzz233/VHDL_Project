@@ -37,7 +37,7 @@ int cplus_display_present(struct cplus_display *display, const uint8_t *bgrx,
                           const struct cplus_person_result *results, int count,
                           bool result_available);
 void cplus_display_stop(struct cplus_display *display);
-void cplus_overlay_results(uint8_t *bgrx, int width, int height,
+void cplus_overlay_results(uint8_t *bgrx, int stride, int width, int height,
                            const struct cplus_person_result *results, int count,
                            bool result_available);
 
