@@ -1,0 +1,16 @@
+# Build the board executable with the same RK3568 SDK layout as the existing ARM drivers.
+
+CROSS_COMPILE ?= aarch64-linux-gnu-
+SDK_SYSROOT ?= /home/hjf/SDK/debian/binary
+RKNN_RUNTIME_DIR ?= /home/hjf/SDK/external/rknpu2/runtime/Linux/librknn_api
+RKNN_INC_DIR ?= $(RKNN_RUNTIME_DIR)/include
+RKNN_LIB_DIR ?= $(RKNN_RUNTIME_DIR)/aarch64
+
+CC := $(CROSS_COMPILE)gcc
+CFLAGS := -Wall -Wextra -Werror -O2 -std=c11 --sysroot=$(SDK_SYSROOT) -I. -I.. -I$(RKNN_INC_DIR)
+LDFLAGS := -L$(RKNN_LIB_DIR) -lrknnrt -lm
+
+cplus-rk3568-driver: cplus_rk3568_driver.c cplus_rknn.c cplus_rknn.h cplus_engine.c cplus_core.h ../pcie_fpga_dma.h
+	$(CC) $(CFLAGS) -o $@ cplus_rk3568_driver.c cplus_rknn.c cplus_engine.c $(LDFLAGS)
+
+.PHONY: cplus-rk3568-driver
