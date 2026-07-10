@@ -195,6 +195,7 @@ int main(int argc, char **argv)
             goto done;
         }
         bgrx_to_rgb(frame, width, height, rgb);
+        fprintf(stderr, "[frame %d/%d] captured %dx%d\n", frame_index + 1, frame_count, width, height);
         cplus_prepare_detector_rgb(rgb, width, height, detector_rgb, &letterbox);
         if (cplus_rknn_infer_rgb(&detector, detector_rgb, CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT, &output, &output_count) < 0) {
             fprintf(stderr, "Detector inference failed\n"); goto done;
@@ -203,13 +204,17 @@ int main(int argc, char **argv)
         cplus_rknn_release_output(&detector);
         if (detection_count < 0) { fprintf(stderr, "Unexpected detector output shape\n"); goto done; }
         cplus_assign_riders(detections, detection_count, width, height, &config);
+        fprintf(stderr, "[frame %d/%d] detector targets=%d ordinary_pedestrians=%d\n",
+                frame_index + 1, frame_count, detection_count, ordinary_people_count(detections, detection_count));
         if (ordinary_people_count(detections, detection_count) || options.always_segment) {
+            fprintf(stderr, "[frame %d/%d] running segmenter and ground processing\n", frame_index + 1, frame_count);
             cplus_prepare_segmenter_rgb(rgb, width, height, segmenter_rgb);
             if (cplus_rknn_infer_rgb(&segmenter, segmenter_rgb, CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT, &output, &output_count) < 0 ||
                 cplus_mask_argmax(output, output_count, mask) < 0) {
                 fprintf(stderr, "Segmenter inference failed or had an unexpected output shape\n"); goto done;
             }
             cplus_rknn_release_output(&segmenter);
+            fprintf(stderr, "[frame %d/%d] segmenter done; applying Candidate C\n", frame_index + 1, frame_count);
             if (cplus_postprocess_mask_candidate_c(mask, CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT, &mask_stats) < 0) {
                 fprintf(stderr, "Candidate C mask processing failed\n"); goto done;
             }
@@ -221,6 +226,7 @@ int main(int argc, char **argv)
                                                  width, height, results, CPLUS_MAX_DETECTIONS);
         if (result_count < 0) { fprintf(stderr, "Rule evaluation failed\n"); goto done; }
         print_results(frame_index, results, result_count);
+        fflush(stdout);
     }
     status = 0;
 done:
