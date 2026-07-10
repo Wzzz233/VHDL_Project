@@ -33,9 +33,12 @@ struct cplus_display {
 
 int cplus_display_start(struct cplus_display *display, const char *drm_card,
                         int connector_id, int width, int height);
-int cplus_display_present(struct cplus_display *display, const uint8_t *bgrx);
+int cplus_display_present(struct cplus_display *display, const uint8_t *bgrx,
+                          const struct cplus_person_result *results, int count,
+                          bool result_available);
 void cplus_display_stop(struct cplus_display *display);
 void cplus_overlay_results(uint8_t *bgrx, int width, int height,
-                           const struct cplus_person_result *results, int count);
+                           const struct cplus_person_result *results, int count,
+                           bool result_available);
 
 #endif /* CPLUS_DRIVER_DISPLAY_H */

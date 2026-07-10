@@ -49,8 +49,9 @@ sudo ./cplus-rk3568-driver \
 ```
 
 `--frames 0` means continuous operation; press `Ctrl+C` to stop. A successful display startup prints the selected DRM connector and CRTC. The FPGA image size must be an available HDMI mode (the observed board stream is 1280x720). To use another DRM card or a specific connected HDMI connector, use `--drm-card PATH` and `--connector-id N`. Use `--display 0` for headless JSON-only operation.
+The live path follows the existing `pplcnet_bgp_live` latest-frame design: HDMI continuously presents fresh DMA frames while a background thread owns RKNN inference. At most one newer frame waits for inference; further inference submissions are dropped rather than delaying the display. The result boxes therefore describe the most recently completed inference, and can trail the displayed camera frame by one inference interval. Before that first result completes, the HDMI status is `CPLUS STARTING`. The exit summary reports how many inference submissions were completed or dropped.
 
-When a frame produces no targets, the HDMI image still appears with `CPLUS NO TARGET`; this distinguishes a display problem from an empty detector result. To retain the original, unannotated FPGA frame for inspection, add `--dump-bgrx /userdata/cplus_capture.bgrx --frames 1 --display 0`. The 1280x720 file can then be viewed on the host with:
+After an inference result, when a frame produces no targets, the HDMI image still appears with `CPLUS NO TARGET`; this distinguishes a display problem from an empty detector result. To retain the original, unannotated FPGA frame for inspection, add `--dump-bgrx /userdata/cplus_capture.bgrx --frames 1 --display 0`. The 1280x720 file can then be viewed on the host with:
 
 ```sh
 ffplay -f rawvideo -pixel_format bgr0 -video_size 1280x720 /userdata/cplus_capture.bgrx

@@ -133,7 +133,8 @@ static const char *overlay_label(const struct cplus_person_result *result)
 }
 
 void cplus_overlay_results(uint8_t *bgrx, int width, int height,
-                           const struct cplus_person_result *results, int count)
+                           const struct cplus_person_result *results, int count,
+                           bool result_available)
 {
     int index;
     for (index = 0; index < count; ++index) {
@@ -155,7 +156,8 @@ void cplus_overlay_results(uint8_t *bgrx, int width, int height,
         draw_text(bgrx, width, height, (int)lroundf(result->detection.box.x1), text_y,
                   overlay_label(result), red, green, blue);
     }
-    draw_text(bgrx, width, height, 12, 12, count ? "CPLUS" : "CPLUS NO TARGET", 255, 255, 255);
+    draw_text(bgrx, width, height, 12, 12, result_available ?
+              (count ? "CPLUS" : "CPLUS NO TARGET") : "CPLUS STARTING", 255, 255, 255);
 }
 
 static drmModeConnector *find_connector(int fd, drmModeRes *resources, int requested_id)
@@ -317,7 +319,9 @@ failed:
     return -1;
 }
 
-int cplus_display_present(struct cplus_display *display, const uint8_t *bgrx)
+int cplus_display_present(struct cplus_display *display, const uint8_t *bgrx,
+                          const struct cplus_person_result *results, int count,
+                          bool result_available)
 {
     int next;
     int row;
@@ -329,6 +333,8 @@ int cplus_display_present(struct cplus_display *display, const uint8_t *bgrx)
     for (row = 0; row < display->height; ++row)
         memcpy(framebuffer->map + (size_t)row * framebuffer->pitch,
                bgrx + (size_t)row * display->width * 4U, (size_t)display->width * 4U);
+    cplus_overlay_results(framebuffer->map, display->width, display->height,
+                          results, count, result_available);
     if (display->active_fb < 0) {
         if (drmModeSetCrtc(display->fd, display->crtc_id, framebuffer->fb_id, 0, 0,
                            &display->connector_id, 1, &display->mode) < 0) return -1;
