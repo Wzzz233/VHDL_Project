@@ -39,19 +39,24 @@ sudo docker run --rm --privileged -u root \
 ```
 
 The board must have a compatible `librknnrt.so` and a BGRX8888 FPGA DMA stream.
-Copy the executable and both `.rknn` files to the board, then run:
+Copy the executable and both `.rknn` files to the board. The driver shows the live FPGA image on HDMI by default and draws the retained targets directly on that image. Start a continuous board run with:
 
 ```sh
-./cplus-rk3568-driver \
-  --det-model yolov5nu_coco_rk3568_fp16_20260710.rknn \
-  --seg-model mapillary_cplus_ground_4class_v2_rk3568_fp16_20260710.rknn \
-  --device /dev/fpga_dma0 --frames 50
+sudo ./cplus-rk3568-driver \
+  --det-model /userdata/model/yolov5nu_coco_rk3568_fp16_20260710.rknn \
+  --seg-model /userdata/model/mapillary_cplus_ground_4class_v2_rk3568_fp16_20260710.rknn \
+  --device /dev/fpga_dma0 --frames 0 --display 1
 ```
 
-For a saved BGRX8888 frame, replace the DMA options with
-`--input-bgrx frame.bgrx --width 1280 --height 720`. Each output line is one
-JSON result containing retained targets, the decision, its reason, the original
-image box, and the road/sidewalk/zebra ratios.
+`--frames 0` means continuous operation; press `Ctrl+C` to stop. A successful display startup prints the selected DRM connector and CRTC. The FPGA image size must be an available HDMI mode (the observed board stream is 1280x720). To use another DRM card or a specific connected HDMI connector, use `--drm-card PATH` and `--connector-id N`. Use `--display 0` for headless JSON-only operation.
+
+When a frame produces no targets, the HDMI image still appears with `CPLUS NO TARGET`; this distinguishes a display problem from an empty detector result. To retain the original, unannotated FPGA frame for inspection, add `--dump-bgrx /userdata/cplus_capture.bgrx --frames 1 --display 0`. The 1280x720 file can then be viewed on the host with:
+
+```sh
+ffplay -f rawvideo -pixel_format bgr0 -video_size 1280x720 /userdata/cplus_capture.bgrx
+```
+
+For a saved BGRX8888 frame, replace the DMA options with `--input-bgrx frame.bgrx --width 1280 --height 720`. Each output line is one JSON result containing retained targets, the decision, its reason, the original image box, and the road/sidewalk/zebra ratios.
 
 The source handoff's model checksums are:
 
