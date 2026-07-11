@@ -926,7 +926,7 @@ infer_ready:
     if (!opt.no_infer && yellow_enabled) {
         routes[LPR_ROUTE_YELLOW].model = &ocr_yellow_model;
         routes[LPR_ROUTE_YELLOW].keys = &keys_yellow;
-        routes[LPR_ROUTE_YELLOW].decode_family = OCR_DECODE_FAMILY_NORMAL7;
+        routes[LPR_ROUTE_YELLOW].decode_family = OCR_DECODE_FAMILY_YELLOW7;
         routes[LPR_ROUTE_YELLOW].display_tag = 'Y';
         snprintf(routes[LPR_ROUTE_YELLOW].name, sizeof(routes[LPR_ROUTE_YELLOW].name), "yellow");
     } else {

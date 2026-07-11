@@ -105,6 +105,11 @@ static bool token_is_alnum(const char *token)
     return token_in_list(token, alnum, (int)(sizeof(alnum) / sizeof(alnum[0])));
 }
 
+static bool token_is_yellow_tail(const char *token)
+{
+    return token_is_alnum(token) || token_equals(token, "学") || token_equals(token, "挂");
+}
+
 static bool token_is_digit(const char *token)
 {
     static const char *const digits[] = {
@@ -159,6 +164,19 @@ static bool family_prefix_valid(enum ocr_decode_family family,
         }
         return true;
     }
+    if (family == OCR_DECODE_FAMILY_YELLOW7) {
+        if (token_count > 7)
+            return false;
+        for (i = 2; i < token_count; i++) {
+            if (i == 6) {
+                if (!token_is_yellow_tail(keys[token_ids[i]]))
+                    return false;
+            } else if (!token_is_alnum(keys[token_ids[i]])) {
+                return false;
+            }
+        }
+        return true;
+    }
     if (family == OCR_DECODE_FAMILY_POLICE7) {
         if (token_count > 7)
             return false;
@@ -178,6 +196,7 @@ static int family_max_token_count(enum ocr_decode_family family)
     if (family == OCR_DECODE_FAMILY_GREEN8)
         return 8;
     if (family == OCR_DECODE_FAMILY_NORMAL7 ||
+        family == OCR_DECODE_FAMILY_YELLOW7 ||
         family == OCR_DECODE_FAMILY_POLICE7 ||
         family == OCR_DECODE_FAMILY_EMBASSY7)
         return 7;
@@ -193,6 +212,8 @@ static bool family_full_valid(enum ocr_decode_family family,
     if (family == OCR_DECODE_FAMILY_GREEN8)
         return token_count == 8;
     if (family == OCR_DECODE_FAMILY_NORMAL7)
+        return token_count == 7;
+    if (family == OCR_DECODE_FAMILY_YELLOW7)
         return token_count == 7;
     if (family == OCR_DECODE_FAMILY_POLICE7)
         return token_count == 7;

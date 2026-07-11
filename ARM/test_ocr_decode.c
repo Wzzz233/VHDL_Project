@@ -247,6 +247,46 @@ static void test_embassy7_family_recovers_blank_greedy(void)
     expect_str_eq("embassy7_recovers_text", family_text, "使123456");
 }
 
+static void test_yellow7_family_allows_xue_and_gua_tail(void)
+{
+    static const char *const keys[] = {"鲁", "A", "1", "0", "学", "挂"};
+    const int blank_idx = ARRAY_LEN(keys);
+    const int c_size = blank_idx + 1;
+    const int t_size = 13;
+    const int tail_ids[] = {4, 5};
+    const char *const expected[] = {"鲁A1010学", "鲁A1010挂"};
+    int case_idx;
+
+    for (case_idx = 0; case_idx < (int)ARRAY_LEN(tail_ids); case_idx++) {
+        float logits[13 * 7];
+        char text[64];
+        float conf = 0.0f;
+        int ret;
+
+        set_row(logits, 0, c_size, 0, 8.0f, -1, 0.0f);
+        set_row(logits, 1, c_size, blank_idx, 8.0f, -1, 0.0f);
+        set_row(logits, 2, c_size, 1, 8.0f, -1, 0.0f);
+        set_row(logits, 3, c_size, blank_idx, 8.0f, -1, 0.0f);
+        set_row(logits, 4, c_size, 2, 8.0f, -1, 0.0f);
+        set_row(logits, 5, c_size, blank_idx, 8.0f, -1, 0.0f);
+        set_row(logits, 6, c_size, 3, 8.0f, -1, 0.0f);
+        set_row(logits, 7, c_size, blank_idx, 8.0f, -1, 0.0f);
+        set_row(logits, 8, c_size, 2, 8.0f, -1, 0.0f);
+        set_row(logits, 9, c_size, blank_idx, 8.0f, -1, 0.0f);
+        set_row(logits, 10, c_size, 3, 8.0f, -1, 0.0f);
+        set_row(logits, 11, c_size, blank_idx, 8.0f, -1, 0.0f);
+        set_row(logits, 12, c_size, tail_ids[case_idx], 8.0f, -1, 0.0f);
+
+        ret = ocr_decode_logits(logits, t_size, c_size, c_size, 1,
+                                keys, ARRAY_LEN(keys), blank_idx,
+                                OCR_DECODE_FAMILY_YELLOW7,
+                                text, sizeof(text), &conf, NULL);
+        if (ret != 0)
+            fail("yellow7 family decode returned non-zero");
+        expect_str_eq("yellow7_allows_special_tail", text, expected[case_idx]);
+    }
+}
+
 int main(void)
 {
     test_green8_relaxed_allows_aa02222();
@@ -255,5 +295,6 @@ int main(void)
     test_police7_family_forces_jing_tail();
     test_embassy7_family_recovers_blank_greedy();
     printf("[PASS] test_ocr_decode\n");
+    test_yellow7_family_allows_xue_and_gua_tail();
     return 0;
 }
