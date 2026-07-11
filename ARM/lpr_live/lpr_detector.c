@@ -452,6 +452,31 @@ static int decode_pose_outputs(const struct rknn_model *m, const rknn_output *ou
         bbox_from_quad(&d, img_w, img_h);
         if (d.x2 <= d.x1 || d.y2 <= d.y1)
             continue;
+        /* [det-diag] 多牌漏检诊断: 打印过阈值候选的各类原始分数。
+         * 用环境变量 LPR_DET_DIAG=<n> 开启, 打印前 n 条后静默(重启重置)。
+         * 用于判断黄/绿牌位置的 anchor 是被 argmax 盖掉(各类分数都高)
+         * 还是模型本身没检测到(只有蓝类分数高)。 */
+        {
+            static int det_diag_limit = -1;
+            static int det_diag_count = 0;
+            if (det_diag_limit < 0)
+                det_diag_limit = getenv("LPR_DET_DIAG") ? atoi(getenv("LPR_DET_DIAG")) : 0;
+            if (det_diag_limit > 0 && det_diag_count < det_diag_limit && pose_nc > 1) {
+                float mcx = (d.x1 + d.x2) * 0.5f;
+                float mcy = (d.y1 + d.y2) * 0.5f;
+                fprintf(stderr, "[det-diag] anc=%d cls=%d conf=%.3f cxy=(%.0f,%.0f) wh=(%.0fx%.0f) scores=[",
+                        i, best_cls, best_score, mcx, mcy,
+                        (float)(d.x2 - d.x1), (float)(d.y2 - d.y1));
+                for (int c = 0; c < pose_nc; c++) {
+                    float s = tensor_read(&tv, 4 + c, i);
+                    if (s < 0.0f || s > 1.0f)
+                        s = lpr_sigmoidf(s);
+                    fprintf(stderr, "%.2f%s", s, c < pose_nc - 1 ? "," : "");
+                }
+                fprintf(stderr, "]\n");
+                det_diag_count++;
+            }
+        }
         if (balance_classes)
             insert_candidate_balanced(out, &count, class_counts, pose_nc, per_class_cap, &d);
         else
