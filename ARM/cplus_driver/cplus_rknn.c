@@ -123,6 +123,7 @@ int cplus_rknn_infer_rgb(struct cplus_rknn_model *model, const uint8_t *rgb,
                          struct cplus_rknn_output_view *output)
 {
     rknn_input input;
+    rknn_perf_run performance;
     size_t element_size;
     size_t element_count;
     size_t required_size;
@@ -132,6 +133,7 @@ int cplus_rknn_infer_rgb(struct cplus_rknn_model *model, const uint8_t *rgb,
         model->input_channels != 3)
         return -1;
     memset(output, 0, sizeof(*output));
+    output->npu_duration_us = -1;
     cplus_rknn_release_output(model);
     memset(&input, 0, sizeof(input));
     input.index = 0;
@@ -179,5 +181,9 @@ int cplus_rknn_infer_rgb(struct cplus_rknn_model *model, const uint8_t *rgb,
     output->data = model->output.buf;
     output->element_count = element_count;
     output->type = model->output_attr.type;
+    memset(&performance, 0, sizeof(performance));
+    if (rknn_query(model->context, RKNN_QUERY_PERF_RUN, &performance,
+                   sizeof(performance)) == 0)
+        output->npu_duration_us = performance.run_duration;
     return 0;
 }

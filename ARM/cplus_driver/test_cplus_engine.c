@@ -244,6 +244,49 @@ static int test_candidate_c_mask_cleanup(void)
     return 0;
 }
 
+static int test_candidate_c_reference_hash(void)
+{
+    uint8_t *mask = malloc(CPLUS_MODEL_PIXELS);
+    struct cplus_mask_stats stats;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    int x, y;
+    size_t index;
+    CHECK(mask);
+    memset(mask, CPLUS_MASK_OTHER, CPLUS_MODEL_PIXELS);
+    for (y = 250; y < 640; ++y)
+        for (x = 40; x < 620; ++x)
+            mask[(size_t)y * 640 + x] = CPLUS_MASK_ROAD;
+    for (y = 310; y < 600; ++y)
+        for (x = 40; x < 145; ++x)
+            mask[(size_t)y * 640 + x] = CPLUS_MASK_SIDEWALK;
+    for (y = 390; y < 540; y += 24)
+        for (x = 180; x < 480; ++x) {
+            int stripe_y;
+            for (stripe_y = y; stripe_y < y + 10; ++stripe_y)
+                mask[(size_t)stripe_y * 640 + x] =
+                    CPLUS_MASK_CROSSWALK_ZEBRA;
+        }
+    for (y = 420; y < 430; ++y)
+        for (x = 300; x < 310; ++x)
+            mask[(size_t)y * 640 + x] = CPLUS_MASK_OTHER;
+    for (y = 350; y < 357; ++y)
+        for (x = 90; x < 97; ++x)
+            mask[(size_t)y * 640 + x] = CPLUS_MASK_OTHER;
+    CHECK(cplus_postprocess_mask_candidate_c(
+              mask, CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT, &stats) == 0);
+    for (index = 0; index < CPLUS_MODEL_PIXELS; ++index) {
+        hash ^= mask[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    CHECK(hash == UINT64_C(0x3cc78bc13041796c));
+    CHECK(stats.changed_pixels_total == 19918);
+    CHECK(stats.road_hole_pixels_filled == 9595);
+    CHECK(stats.sidewalk_hole_pixels_filled == 10223);
+    CHECK(stats.zebra_hole_pixels_filled == 100);
+    free(mask);
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_preprocessing_contracts() == 0);
@@ -255,6 +298,7 @@ int main(void)
     CHECK(test_fp16_mask_argmax() == 0);
     CHECK(test_mask_overlay_palette() == 0);
     CHECK(test_candidate_c_mask_cleanup() == 0);
+    CHECK(test_candidate_c_reference_hash() == 0);
     puts("cplus_engine tests passed");
     return 0;
 }

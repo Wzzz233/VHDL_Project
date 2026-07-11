@@ -19,6 +19,11 @@ static double elapsed_ms(int64_t start, int64_t end)
     return (double)(end - start) / 1000.0;
 }
 
+static double npu_duration_ms(int64_t duration_us)
+{
+    return duration_us >= 0 ? (double)duration_us / 1000.0 : -1.0;
+}
+
 static void mask_class_counts(const uint8_t *mask, uint64_t counts[4])
 {
     size_t index;
@@ -113,6 +118,8 @@ static int infer_frame(struct cplus_async_infer *state, const uint8_t *bgrx,
     int64_t detector_prepared;
     int64_t detector_done;
     int64_t detector_post_done;
+    int64_t detector_npu_us = -1;
+    int64_t segmenter_npu_us = -1;
     int64_t segmenter_prepared;
     int64_t segmenter_done;
     int64_t argmax_done;
@@ -135,6 +142,7 @@ static int infer_frame(struct cplus_async_infer *state, const uint8_t *bgrx,
                              CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT,
                              &output) < 0)
         return -1;
+    detector_npu_us = output.npu_duration_us;
     detector_done = monotonic_us();
     detection_count = decode_detector_output(&output, &letterbox,
                                                &state->config, detections);
@@ -158,6 +166,7 @@ static int infer_frame(struct cplus_async_infer *state, const uint8_t *bgrx,
                                  CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT,
                                  &output) < 0)
             return -1;
+        segmenter_npu_us = output.npu_duration_us;
         segmenter_done = monotonic_us();
         if (decode_segmenter_output(&output, state->mask) < 0) {
             cplus_rknn_release_output(state->segmenter);
@@ -188,16 +197,18 @@ static int infer_frame(struct cplus_async_infer *state, const uint8_t *bgrx,
     finished = monotonic_us();
     fprintf(stderr,
             "[infer] source_frame=%llu targets=%d ordinary_pedestrians=%d%s "
-            "timing_ms={rgb:%.1f,det_prep:%.1f,det_run:%.1f,det_post:%.1f,"
-            "seg_prep:%.1f,seg_run:%.1f,argmax:%.1f,mask_post:%.1f,rules:%.1f,total:%.1f}\n",
+            "timing_ms={rgb:%.1f,det_prep:%.1f,det_run:%.1f,det_npu:%.1f,det_post:%.1f,"
+            "seg_prep:%.1f,seg_run:%.1f,seg_npu:%.1f,argmax:%.1f,mask_post:%.1f,rules:%.1f,total:%.1f}\n",
             (unsigned long long)source_frame, result->count, ordinary_count,
             segmented ? " segmented" : "",
             elapsed_ms(started, rgb_done),
             elapsed_ms(rgb_done, detector_prepared),
             elapsed_ms(detector_prepared, detector_done),
+            npu_duration_ms(detector_npu_us),
             elapsed_ms(detector_done, detector_post_done),
             elapsed_ms(detector_post_done, segmenter_prepared),
             elapsed_ms(segmenter_prepared, segmenter_done),
+            npu_duration_ms(segmenter_npu_us),
             elapsed_ms(segmenter_done, argmax_done),
             elapsed_ms(argmax_done, mask_post_done),
             elapsed_ms(mask_post_done, finished),

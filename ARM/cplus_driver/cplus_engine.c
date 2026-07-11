@@ -3,7 +3,9 @@
 
 #include "cplus_core.h"
 
+#include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -477,35 +479,42 @@ int cplus_mask_argmax_fp16(const uint16_t *logits, size_t element_count,
 /* Exact circular morphology using a linear-time squared-distance transform. */
 #define CPLUS_EDT_INFINITY 0x10000000
 
+static int floor_divide_i64(int64_t numerator, int64_t denominator)
+{
+    if (numerator >= 0) return (int)(numerator / denominator);
+    return -(int)((-numerator + denominator - 1) / denominator);
+}
+
 static void squared_distance_1d(const int *input, int length, int *output,
-                                int *envelope, double *boundaries)
+                                int *envelope, int *boundaries)
 {
     int envelope_size = 0;
     int q;
     envelope[0] = 0;
-    boundaries[0] = -1.0e30;
-    boundaries[1] = 1.0e30;
+    boundaries[0] = INT_MIN / 4;
+    boundaries[1] = INT_MAX / 4;
     for (q = 1; q < length; ++q) {
-        double intersection;
+        int intersection;
         do {
             int previous = envelope[envelope_size];
-            intersection =
-                ((double)input[q] + (double)q * q -
-                 ((double)input[previous] + (double)previous * previous)) /
-                (2.0 * (q - previous));
+            int64_t numerator =
+                (int64_t)input[q] + (int64_t)q * q -
+                ((int64_t)input[previous] + (int64_t)previous * previous);
+            int64_t denominator = 2LL * (q - previous);
+            intersection = floor_divide_i64(numerator, denominator);
             if (intersection > boundaries[envelope_size]) break;
             --envelope_size;
         } while (envelope_size >= 0);
         if (envelope_size < 0) {
             envelope_size = 0;
             envelope[0] = q;
-            boundaries[0] = -1.0e30;
-            boundaries[1] = 1.0e30;
+            boundaries[0] = INT_MIN / 4;
+            boundaries[1] = INT_MAX / 4;
         } else {
             ++envelope_size;
             envelope[envelope_size] = q;
             boundaries[envelope_size] = intersection;
-            boundaries[envelope_size + 1] = 1.0e30;
+            boundaries[envelope_size + 1] = INT_MAX / 4;
         }
     }
     envelope_size = 0;
@@ -536,35 +545,102 @@ static bool radius45_boundary_hit(const uint8_t *source, int width, int height,
     return false;
 }
 
-static void circle_dilate(const uint8_t *source, uint8_t *dest, int width,
-                          int height, int radius, int *distance)
+struct circle_dilate_task {
+    const uint8_t *source;
+    uint8_t *dest;
+    int *distance;
+    int width;
+    int height;
+    int radius;
+    int start;
+    int end;
+    bool row_phase;
+};
+
+static void *circle_dilate_worker(void *argument)
 {
+    struct circle_dilate_task *task = argument;
     int line_input[CPLUS_MODEL_WIDTH];
     int line_output[CPLUS_MODEL_WIDTH];
     int envelope[CPLUS_MODEL_WIDTH];
-    double boundaries[CPLUS_MODEL_WIDTH + 1];
+    int boundaries[CPLUS_MODEL_WIDTH + 1];
     int x, y;
-    int radius_squared = radius * radius;
+    int radius_squared = task->radius * task->radius;
+    if (task->row_phase) {
+        for (y = task->start; y < task->end; ++y) {
+            for (x = 0; x < task->width; ++x)
+                line_input[x] =
+                    task->source[(size_t)y * task->width + x] ?
+                    0 : CPLUS_EDT_INFINITY;
+            squared_distance_1d(line_input, task->width, line_output,
+                                envelope, boundaries);
+            memcpy(task->distance + (size_t)y * task->width, line_output,
+                   (size_t)task->width * sizeof(*task->distance));
+        }
+    } else {
+        for (x = task->start; x < task->end; ++x) {
+            for (y = 0; y < task->height; ++y)
+                line_input[y] =
+                    task->distance[(size_t)y * task->width + x];
+            squared_distance_1d(line_input, task->height, line_output,
+                                envelope, boundaries);
+            for (y = 0; y < task->height; ++y) {
+                size_t pixel = (size_t)y * task->width + x;
+                if (line_output[y] < radius_squared)
+                    task->dest[pixel] = 1;
+                else if (line_output[y] > radius_squared)
+                    task->dest[pixel] = 0;
+                else
+                    task->dest[pixel] =
+                        task->radius != 45 ||
+                        radius45_boundary_hit(task->source, task->width,
+                                              task->height, x, y);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void run_circle_phase(struct circle_dilate_task tasks[4], int units,
+                             bool row_phase)
+{
+    pthread_t threads[3];
+    bool started[3] = {false};
+    int index;
+    for (index = 0; index < 4; ++index) {
+        tasks[index].start = units * index / 4;
+        tasks[index].end = units * (index + 1) / 4;
+        tasks[index].row_phase = row_phase;
+    }
+    for (index = 1; index < 4; ++index) {
+        if (pthread_create(&threads[index - 1], NULL,
+                           circle_dilate_worker, &tasks[index]) == 0)
+            started[index - 1] = true;
+        else
+            circle_dilate_worker(&tasks[index]);
+    }
+    circle_dilate_worker(&tasks[0]);
+    for (index = 0; index < 3; ++index)
+        if (started[index]) pthread_join(threads[index], NULL);
+}
+
+static void circle_dilate(const uint8_t *source, uint8_t *dest, int width,
+                          int height, int radius, int *distance)
+{
+    struct circle_dilate_task tasks[4];
+    int index;
     if (width > CPLUS_MODEL_WIDTH || height > CPLUS_MODEL_HEIGHT) return;
-    for (y = 0; y < height; ++y) {
-        for (x = 0; x < width; ++x)
-            line_input[x] = source[(size_t)y * width + x] ? 0 : CPLUS_EDT_INFINITY;
-        squared_distance_1d(line_input, width, line_output, envelope, boundaries);
-        memcpy(distance + (size_t)y * width, line_output, (size_t)width * sizeof(*distance));
+    memset(tasks, 0, sizeof(tasks));
+    for (index = 0; index < 4; ++index) {
+        tasks[index].source = source;
+        tasks[index].dest = dest;
+        tasks[index].distance = distance;
+        tasks[index].width = width;
+        tasks[index].height = height;
+        tasks[index].radius = radius;
     }
-    for (x = 0; x < width; ++x) {
-        for (y = 0; y < height; ++y)
-            line_input[y] = distance[(size_t)y * width + x];
-        squared_distance_1d(line_input, height, line_output, envelope, boundaries);
-        for (y = 0; y < height; ++y)
-            if (line_output[y] < radius_squared)
-                dest[(size_t)y * width + x] = 1;
-            else if (line_output[y] > radius_squared)
-                dest[(size_t)y * width + x] = 0;
-            else
-                dest[(size_t)y * width + x] =
-                    radius != 45 || radius45_boundary_hit(source, width, height, x, y);
-    }
+    run_circle_phase(tasks, height, true);
+    run_circle_phase(tasks, width, false);
 }
 
 static void ellipse_close_class(const uint8_t *mask, int class_id, int width, int height,

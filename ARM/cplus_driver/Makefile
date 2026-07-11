@@ -9,7 +9,7 @@ ASYNC_TEST := test_cplus_async_primitives
 all: $(CORE_TEST) $(ASYNC_TEST)
 
 $(CORE_TEST): test_cplus_engine.c cplus_engine.c cplus_core.h
-	$(CC) $(CFLAGS) -o $@ test_cplus_engine.c cplus_engine.c -lm
+	$(CC) $(CFLAGS) -pthread -o $@ test_cplus_engine.c cplus_engine.c -lm
 
 $(ASYNC_TEST): test_cplus_async_primitives.c cplus_frame_pool.c cplus_frame_pool.h cplus_latest_queue.c cplus_latest_queue.h
 	$(CC) $(CFLAGS) -pthread -o $@ test_cplus_async_primitives.c cplus_frame_pool.c cplus_latest_queue.c

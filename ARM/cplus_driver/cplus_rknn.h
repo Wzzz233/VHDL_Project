@@ -12,6 +12,7 @@ struct cplus_rknn_output_view {
     const void *data;
     size_t element_count;
     rknn_tensor_type type;
+    int64_t npu_duration_us;
 };
 
 struct cplus_rknn_model {

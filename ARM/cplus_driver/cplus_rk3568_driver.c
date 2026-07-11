@@ -177,6 +177,29 @@ static int read_dma_frame(int fd, uint8_t *frame, size_t size)
     return ioctl(fd, FPGA_DMA_READ_FRAME, &transfer) == 0 && transfer.result == 0 ? 0 : -1;
 }
 
+static void report_npu_frequency(void)
+{
+    static const char *paths[] = {
+        "/sys/kernel/debug/rknpu/freq",
+        "/proc/rknpu/freq",
+        "/sys/class/devfreq/fde40000.npu/cur_freq",
+    };
+    size_t index;
+    for (index = 0; index < sizeof(paths) / sizeof(paths[0]); ++index) {
+        FILE *file = fopen(paths[index], "r");
+        unsigned long frequency;
+        if (!file) continue;
+        if (fscanf(file, "%lu", &frequency) == 1) {
+            fprintf(stderr, "[npu] frequency=%.0fMHz source=%s\n",
+                    (double)frequency / 1000000.0, paths[index]);
+            fclose(file);
+            return;
+        }
+        fclose(file);
+    }
+    fprintf(stderr, "[npu] frequency unavailable from debugfs/procfs/devfreq\n");
+}
+
 static bool fp_output_type(rknn_tensor_type type)
 {
     return type == RKNN_TENSOR_FLOAT16 || type == RKNN_TENSOR_FLOAT32;
@@ -275,6 +298,7 @@ int main(int argc, char **argv)
         goto done;
     }
     if (validate_model_contracts(&detector, &segmenter) < 0) goto done;
+    report_npu_frequency();
     cplus_default_runtime_config(&config);
     if (options.display &&
         cplus_display_async_start(&display, &pool, options.drm_card_path,
