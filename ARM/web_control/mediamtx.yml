@@ -1,0 +1,28 @@
+# MediaMTX v1.19.2: signaling is private to the local HTTPS proxy, while the
+# WebRTC media UDP port remains reachable from phones on the LAN.
+logLevel: info
+logDestinations: [stdout]
+
+api: no
+metrics: no
+pprof: no
+playback: no
+
+rtmp: no
+hls: no
+srt: no
+moq: no
+
+rtsp: yes
+rtspAddress: 127.0.0.1:8554
+rtspTransports: [tcp]
+
+webrtc: yes
+webrtcAddress: 127.0.0.1:8889
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: ""
+webrtcAdditionalHosts: [pg2l50h.home.arpa]
+
+paths:
+  phone:
+    source: publisher

@@ -1,0 +1,19 @@
+# Build the board executable with the RK3568 SDK runtime.
+# It reuses the existing direct DRM/KMS display path and the RKNN runtime.
+
+
+CROSS_COMPILE ?= aarch64-linux-gnu-
+RKNN_RUNTIME_DIR ?= /home/hjf/SDK/external/rknpu2/runtime/Linux/librknn_api
+RKNN_INC_DIR ?= $(RKNN_RUNTIME_DIR)/include
+RKNN_LIB_DIR ?= $(RKNN_RUNTIME_DIR)/aarch64
+DRM_INC_DIR ?= /home/hjf/SDK/debian/binary/usr/include/libdrm
+DRM_LIB_DIR ?= /home/hjf/SDK/debian/binary/usr/lib/aarch64-linux-gnu
+
+CC := $(CROSS_COMPILE)gcc
+CFLAGS := -Wall -Wextra -Werror -O2 -std=c11 -pthread -I. -I.. -I$(RKNN_INC_DIR) -I$(DRM_INC_DIR)
+LDFLAGS := -L$(RKNN_LIB_DIR) -lrknnrt -L$(DRM_LIB_DIR) -ldrm -lm
+
+cplus-rk3568-driver: cplus_rk3568_driver.c cplus_async.c cplus_async.h cplus_display_async.c cplus_display_async.h cplus_frame_pool.c cplus_frame_pool.h cplus_latest_queue.c cplus_latest_queue.h cplus_rknn.c cplus_rknn.h cplus_engine.c cplus_core.h cplus_display.c cplus_display.h ../pcie_fpga_dma.h
+	$(CC) $(CFLAGS) -o $@ cplus_rk3568_driver.c cplus_async.c cplus_display_async.c cplus_frame_pool.c cplus_latest_queue.c cplus_rknn.c cplus_engine.c cplus_display.c $(LDFLAGS) -pthread
+
+.PHONY: cplus-rk3568-driver

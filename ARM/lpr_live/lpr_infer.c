@@ -89,46 +89,127 @@ static enum lpr_route_id pick_route(const struct lpr_route *routes, enum plate_c
     }
 }
 
-static void publish_result(struct infer_state *st, const struct live_result *res)
+static bool publish_result_locked(struct infer_state *st,
+                                  const struct live_result *res)
 {
+    if (res->source_generation !=
+        atomic_load(&st->accepted_source_generation))
+        return false;
     pthread_mutex_lock(&st->result_lock);
-    st->result = *res;
+    if (res->source_generation ==
+        atomic_load(&st->accepted_source_generation))
+        st->result = *res;
+    else {
+        pthread_mutex_unlock(&st->result_lock);
+        return false;
+    }
     pthread_mutex_unlock(&st->result_lock);
+    return true;
 }
+
+bool lpr_infer_publish_result(struct infer_state *st,
+                              const struct live_result *res)
+{
+    bool published;
+
+    if (!st || !res)
+        return false;
+    pthread_mutex_lock(&st->epoch_lock);
+    published = publish_result_locked(st, res);
+    pthread_mutex_unlock(&st->epoch_lock);
+    return published;
+}
+
+struct infer_plate_log {
+    bool warp_ok;
+    double warp_ms;
+    double color_ms;
+    double ptype_ms;
+    struct ocr_timing ocr;
+};
 
 bool lpr_infer_get_result(struct infer_state *st, struct live_result *res)
 {
     bool valid;
+
+    if (!st || !res)
+        return false;
     pthread_mutex_lock(&st->result_lock);
     *res = st->result;
-    valid = st->result.valid;
+    valid = st->result.valid && st->result.source_generation ==
+            atomic_load(&st->accepted_source_generation);
+    if (!valid)
+        res->valid = false;
     pthread_mutex_unlock(&st->result_lock);
     return valid;
 }
 
-void lpr_infer_submit_latest(struct infer_state *st, int slot, uint64_t generation)
+int lpr_infer_submit_latest(struct infer_state *st,
+                            const struct lpr_frame_ref *frame)
 {
+    struct lpr_frame_ref replacement = {0};
+    struct lpr_frame_ref displaced = {0};
+
+    if (!st || !frame || !lpr_frame_ref_is_valid(frame) ||
+        frame->meta.format != LPR_FRAME_FORMAT_BGRX8888 ||
+        frame->meta.width != (uint32_t)st->frame_w ||
+        frame->meta.height != (uint32_t)st->frame_h ||
+        frame->meta.stride < (uint32_t)st->frame_w * 4U ||
+        frame->meta.source_generation !=
+            atomic_load(&st->accepted_source_generation))
+        return -1;
+    if (lpr_frame_ref_clone(frame, &replacement) < 0)
+        return -1;
+
     pthread_mutex_lock(&st->lock);
-    if (st->has_new) {
-        /* Infer thread still has a pending submission. Drop this frame for
-         * inference only; the caller still owns the DMA slot and will release
-         * it after overlay/display work is done. */
-        st->overwrite_count++;
+    if (!st->running ||
+        frame->meta.source_generation !=
+            atomic_load(&st->accepted_source_generation)) {
         pthread_mutex_unlock(&st->lock);
-        return;
+        lpr_frame_ref_release(&replacement);
+        return -1;
     }
-    /* Addref the slot so the infer thread can copy it asynchronously without
-     * the display loop reclaiming it. No memcpy here — that is the whole point
-     * of keeping it off the display critical path. */
-    if (slot >= 0)
-        lpr_dma_slot_addref(st->dma, slot);
-    st->pending_slot = slot;
-    st->latest_generation = generation;
+    if (st->has_new) {
+        displaced = st->pending_frame;
+        memset(&st->pending_frame, 0, sizeof(st->pending_frame));
+        st->overwrite_count++;
+    }
+    st->pending_frame = replacement;
     st->latest_copy_ms = 0.0;
     st->seq++;
+    st->submit_count++;
     st->has_new = true;
     pthread_cond_signal(&st->cond);
     pthread_mutex_unlock(&st->lock);
+    lpr_frame_ref_release(&displaced);
+    return 0;
+}
+
+void lpr_infer_reset(struct infer_state *st, uint64_t source_generation)
+{
+    struct lpr_frame_ref pending = {0};
+
+    if (!st)
+        return;
+    pthread_mutex_lock(&st->epoch_lock);
+    pthread_mutex_lock(&st->lock);
+    atomic_store(&st->accepted_source_generation, source_generation);
+    if (st->has_new) {
+        pending = st->pending_frame;
+        memset(&st->pending_frame, 0, sizeof(st->pending_frame));
+        st->has_new = false;
+    }
+    st->latest_copy_ms = 0.0;
+    st->latest_infer_ms = 0.0;
+    pthread_mutex_unlock(&st->lock);
+
+    pthread_mutex_lock(&st->result_lock);
+    memset(&st->result, 0, sizeof(st->result));
+    st->result.frame_slot = -1;
+    st->result.source_generation = source_generation;
+    pthread_mutex_unlock(&st->result_lock);
+    pthread_mutex_unlock(&st->epoch_lock);
+    lpr_frame_ref_release(&pending);
 }
 
 static void *thread_main(void *arg)
@@ -139,13 +220,20 @@ static void *thread_main(void *arg)
     if (!det_input || !crop) {
         fprintf(stderr, "[bgp-live] infer thread alloc failed\n");
         free(det_input); free(crop);
+        pthread_mutex_lock(&st->lock);
+        st->running = false;
+        pthread_cond_broadcast(&st->cond);
+        pthread_mutex_unlock(&st->lock);
         return NULL;
     }
 
     while (1) {
         uint64_t seq;
-        uint64_t generation;
+        uint64_t slot_generation;
+        uint64_t overwritten;
         const uint8_t *bgrx;
+        struct lpr_frame_ref pending_frame = {0};
+        struct lpr_frame_meta frame_meta;
         struct det_box dets[MAX_DETS];
         int det_count = 0;
         int best = -1;
@@ -155,6 +243,7 @@ static void *thread_main(void *arg)
         double total_ocr_ms = 0.0, total_warp_ms = 0.0, total_color_ms = 0.0, total_ptype_ms = 0.0;
         int64_t t0, t1, t2;
         struct live_result res;
+        struct infer_plate_log plate_logs[MAX_LIVE_PLATES];
 
         pthread_mutex_lock(&st->lock);
         while (st->running && !st->has_new)
@@ -163,29 +252,38 @@ static void *thread_main(void *arg)
             pthread_mutex_unlock(&st->lock);
             break;
         }
-        generation = st->latest_generation;
         seq = st->seq;
-        int pending_slot = st->pending_slot;
-        st->pending_slot = -1;
+        pending_frame = st->pending_frame;
+        memset(&st->pending_frame, 0, sizeof(st->pending_frame));
         st->has_new = false;
+        overwritten = st->overwrite_count;
         pthread_mutex_unlock(&st->lock);
 
-        /* Copy the submitted DMA slot into our private buffer OUTSIDE the lock
-         * so the display loop is never blocked by this 3.6MB memcpy. The slot
-         * was addref'd at submit time; release it once the copy is done. */
-        const uint8_t *src = (pending_slot >= 0) ? lpr_dma_slot_data(st->dma, pending_slot) : NULL;
+        frame_meta = pending_frame.meta;
+        slot_generation = pending_frame.slot_generation;
+        const uint8_t *src = lpr_frame_ref_data(&pending_frame);
         int64_t tc0 = lpr_mono_us();
-        if (src)
-            memcpy(st->processing_bgrx, src, st->bgrx_size);
+        if (src) {
+            size_t row_size = (size_t)st->frame_w * 4U;
+
+            for (int y = 0; y < st->frame_h; y++)
+                memcpy(st->processing_bgrx + (size_t)y * row_size,
+                       src + (size_t)y * frame_meta.stride, row_size);
+        }
         int64_t tc1 = lpr_mono_us();
         copy_ms = (double)(tc1 - tc0) / 1000.0;
-        if (pending_slot >= 0)
-            lpr_dma_slot_release(st->dma, pending_slot);
+        lpr_frame_ref_release(&pending_frame);
+        if (!src || frame_meta.source_generation !=
+                    atomic_load(&st->accepted_source_generation))
+            continue;
         bgrx = st->processing_bgrx;
 
         memset(&res, 0, sizeof(res));
         res.frame_slot = -1;
-        res.frame_generation = generation;
+        res.frame_generation = slot_generation;
+        res.input_sequence = frame_meta.sequence;
+        res.source_generation = frame_meta.source_generation;
+        res.frame_monotonic_us = frame_meta.monotonic_us;
         res.seq = seq;
         t0 = lpr_mono_us();
         memset(&det_timing, 0, sizeof(det_timing));
@@ -194,7 +292,13 @@ static void *thread_main(void *arg)
                                         st->opt->min_conf, st->opt->det_score_scale,
                                         st->opt->nms_iou, st->opt->max_det,
                                         dets, &det_count, &det_timing) < 0) {
-            fprintf(stderr, "[bgp-live] infer seq=%" PRIu64 " detector failed\n", seq);
+            pthread_mutex_lock(&st->epoch_lock);
+            if (res.source_generation ==
+                atomic_load(&st->accepted_source_generation))
+                fprintf(stderr,
+                        "[bgp-live] infer seq=%" PRIu64 " detector failed\n",
+                        seq);
+            pthread_mutex_unlock(&st->epoch_lock);
             continue;
         }
         t1 = lpr_mono_us();
@@ -218,7 +322,8 @@ static void *thread_main(void *arg)
             memset(&diag, 0, sizeof(diag));
             memset(&ocr_timing, 0, sizeof(ocr_timing));
 
-            struct live_plate_result *plate = &res.plates[processed++];
+            int plate_index = processed++;
+            struct live_plate_result *plate = &res.plates[plate_index];
             plate->box = dets[i];
 
             int64_t tw0 = lpr_mono_us();
@@ -271,24 +376,57 @@ static void *thread_main(void *arg)
             snprintf(plate->text, sizeof(plate->text), "%s", text);
             plate->conf = conf;
             plate->blank_ratio = diag.blank_top1_ratio;
-
-            printf("[bgp-live] plate_seq=%" PRIu64 " idx=%d cls=%d det_conf=%.3f color=%s "
-                   "ptype=%s ptype_conf=%.3f ptype_apply=%d route=%s box=[%d,%d,%d,%d] crop=%dx%d warp_ok=%d "
-                   "text=%s conf=%.3f blank=%.3f warp_ms=%.1f color_ms=%.1f ptype_ms=%.1f "
-                   "prep_ms=%.1f in_ms=%.1f run_ms=%.1f out_ms=%.1f dec_ms=%.1f\n",
-                   seq, i, dets[i].cls, dets[i].conf, lpr_plate_color_str(color), lpr_ptype_class_str(ptype_cls),
-                   ptype_conf, ptype_applied ? 1 : 0, route_name,
-                   dets[i].x1, dets[i].y1, dets[i].x2, dets[i].y2,
-                   crop_w, crop_h, warp_ok ? 1 : 0, text, conf, diag.blank_top1_ratio,
-                   warp_ms, color_ms, ptype_ms, ocr_timing.prep_ms, ocr_timing.input_ms,
-                   ocr_timing.run_ms, ocr_timing.output_ms, ocr_timing.decode_ms);
+            plate_logs[plate_index].warp_ok = warp_ok;
+            plate_logs[plate_index].warp_ms = warp_ms;
+            plate_logs[plate_index].color_ms = color_ms;
+            plate_logs[plate_index].ptype_ms = ptype_ms;
+            plate_logs[plate_index].ocr = ocr_timing;
         }
 
         res.result_count = processed;
         res.valid = processed > 0;
         t2 = lpr_mono_us();
+        res.infer_ms = (double)(t2 - t0) / 1000.0;
+        pthread_mutex_lock(&st->epoch_lock);
+        if (res.source_generation !=
+            atomic_load(&st->accepted_source_generation)) {
+            pthread_mutex_unlock(&st->epoch_lock);
+            continue;
+        }
+        if (!publish_result_locked(st, &res)) {
+            pthread_mutex_unlock(&st->epoch_lock);
+            continue;
+        }
+        pthread_mutex_lock(&st->lock);
+        if (res.source_generation !=
+            atomic_load(&st->accepted_source_generation)) {
+            pthread_mutex_unlock(&st->lock);
+            pthread_mutex_unlock(&st->epoch_lock);
+            continue;
+        }
         st->infer_count++;
-        publish_result(st, &res);
+        st->latest_copy_ms = copy_ms;
+        st->latest_infer_ms = res.infer_ms;
+        pthread_mutex_unlock(&st->lock);
+        for (int i = 0; i < processed; i++) {
+            const struct live_plate_result *plate = &res.plates[i];
+            const struct infer_plate_log *log = &plate_logs[i];
+
+            printf("[bgp-live] plate_seq=%" PRIu64 " idx=%d cls=%d det_conf=%.3f color=%s "
+                   "ptype=%s ptype_conf=%.3f ptype_apply=%d route=%s box=[%d,%d,%d,%d] crop=%dx%d warp_ok=%d "
+                   "text=%s conf=%.3f blank=%.3f warp_ms=%.1f color_ms=%.1f ptype_ms=%.1f "
+                   "prep_ms=%.1f in_ms=%.1f run_ms=%.1f out_ms=%.1f dec_ms=%.1f\n",
+                   seq, i, plate->box.cls, plate->box.conf,
+                   lpr_plate_color_str(plate->color),
+                   lpr_ptype_class_str(plate->ptype_cls),
+                   plate->ptype_conf, plate->ptype_applied ? 1 : 0,
+                   plate->route_name, plate->box.x1, plate->box.y1,
+                   plate->box.x2, plate->box.y2, plate->crop_w, plate->crop_h,
+                   log->warp_ok ? 1 : 0, plate->text, plate->conf,
+                   plate->blank_ratio, log->warp_ms, log->color_ms,
+                   log->ptype_ms, log->ocr.prep_ms, log->ocr.input_ms,
+                   log->ocr.run_ms, log->ocr.output_ms, log->ocr.decode_ms);
+        }
         if (res.valid) {
             printf("[bgp-live] infer_seq=%" PRIu64 " det=%d results=%d best=%d copy_ms=%.1f detocr_ms=%.1f det_ms=%.1f "
                    "det_prep_ms=%.1f det_in_ms=%.1f det_run_ms=%.1f det_out_ms=%.1f det_dec_ms=%.1f det_nms_ms=%.1f "
@@ -299,16 +437,17 @@ static void *thread_main(void *arg)
                    det_timing.prep_ms, det_timing.input_ms, det_timing.run_ms,
                    det_timing.output_ms, det_timing.decode_ms, det_timing.nms_ms,
                    total_ocr_ms, total_warp_ms, total_color_ms, total_ptype_ms,
-                   st->overwrite_count);
+                   overwritten);
         } else {
             printf("[bgp-live] infer_seq=%" PRIu64 " det=%d results=%d best=%d copy_ms=%.1f det_ms=%.1f "
                    "det_prep_ms=%.1f det_in_ms=%.1f det_run_ms=%.1f det_out_ms=%.1f det_dec_ms=%.1f det_nms_ms=%.1f overwritten=%" PRIu64 "\n",
                    seq, det_count, processed, best, copy_ms, (double)(t1 - t0) / 1000.0,
                    det_timing.prep_ms, det_timing.input_ms, det_timing.run_ms,
                    det_timing.output_ms, det_timing.decode_ms, det_timing.nms_ms,
-                   st->overwrite_count);
+                   overwritten);
         }
         fflush(stdout);
+        pthread_mutex_unlock(&st->epoch_lock);
     }
 
     free(det_input); free(crop);
@@ -316,23 +455,22 @@ static void *thread_main(void *arg)
 }
 
 int lpr_infer_start(struct infer_state *st, const struct live_options *opt,
-                    struct dma_state *dma,
                     struct rknn_model *det_model,
                     struct rknn_model *ptype_model,
                     const struct lpr_route *routes_in,
                     int pose_nc, int class_filter,
-                    int frame_w, int frame_h)
+                    int frame_w, int frame_h,
+                    uint64_t source_generation)
 {
+    if (!st || !opt || !det_model || !det_model->ctx || !routes_in ||
+        frame_w <= 0 || frame_h <= 0 || source_generation == 0)
+        return -1;
     memset(st, 0, sizeof(*st));
     st->opt = opt;
-    st->dma = dma;
     st->bgrx_size = (size_t)frame_w * (size_t)frame_h * 4U;
-    st->pending_bgrx = malloc(st->bgrx_size);
     st->processing_bgrx = malloc(st->bgrx_size);
-    st->pending_slot = -1;
     st->result.frame_slot = -1;
-    if (!st->pending_bgrx || !st->processing_bgrx) {
-        free(st->pending_bgrx);
+    if (!st->processing_bgrx) {
         free(st->processing_bgrx);
         memset(st, 0, sizeof(*st));
         return -1;
@@ -348,27 +486,46 @@ int lpr_infer_start(struct infer_state *st, const struct live_options *opt,
     pthread_mutex_init(&st->lock, NULL);
     pthread_cond_init(&st->cond, NULL);
     pthread_mutex_init(&st->result_lock, NULL);
+    pthread_mutex_init(&st->epoch_lock, NULL);
+    atomic_init(&st->accepted_source_generation, source_generation);
+    st->result.source_generation = source_generation;
     st->running = true;
-    if (pthread_create(&st->thread, NULL, thread_main, st) != 0)
+    if (pthread_create(&st->thread, NULL, thread_main, st) != 0) {
+        st->running = false;
+        free(st->processing_bgrx);
+        pthread_mutex_destroy(&st->lock);
+        pthread_cond_destroy(&st->cond);
+        pthread_mutex_destroy(&st->result_lock);
+        pthread_mutex_destroy(&st->epoch_lock);
+        memset(st, 0, sizeof(*st));
         return -1;
+    }
     st->thread_started = true;
     return 0;
 }
 
 void lpr_infer_stop(struct infer_state *st)
 {
+    struct lpr_frame_ref pending = {0};
+
     if (!st || !st->thread_started)
         return;
     pthread_mutex_lock(&st->lock);
     st->running = false;
+    if (st->has_new) {
+        pending = st->pending_frame;
+        memset(&st->pending_frame, 0, sizeof(st->pending_frame));
+        st->has_new = false;
+    }
     pthread_cond_broadcast(&st->cond);
     pthread_mutex_unlock(&st->lock);
+    lpr_frame_ref_release(&pending);
     if (st->thread_started)
         pthread_join(st->thread, NULL);
-    free(st->pending_bgrx);
     free(st->processing_bgrx);
     pthread_mutex_destroy(&st->lock);
     pthread_cond_destroy(&st->cond);
     pthread_mutex_destroy(&st->result_lock);
+    pthread_mutex_destroy(&st->epoch_lock);
     memset(st, 0, sizeof(*st));
 }

@@ -5,8 +5,10 @@
 #define LPR_LIVE_LPR_DMA_H
 
 #include "lpr_common.h"
+#include "lpr_frame.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include "../pcie_fpga_dma.h"
@@ -18,32 +20,39 @@ struct dma_slot {
     uint8_t *data;
     size_t size;
     uint32_t index;
-    uint64_t generation;
-    int refs;
 };
 
 struct dma_state {
     int fd;
     struct dma_slot slots[LPR_DMA_MAX_SLOTS];
     int slot_count;
-    pthread_mutex_t lock;
-    pthread_cond_t cond;
-    bool lock_init;
+    struct lpr_frame_pool frame_pool;
+    struct lpr_frame_writer writers[LPR_DMA_MAX_SLOTS];
+    struct lpr_frame_ref refs[LPR_DMA_MAX_SLOTS];
+    bool writer_active[LPR_DMA_MAX_SLOTS];
+    bool ref_owned[LPR_DMA_MAX_SLOTS];
+    bool frame_pool_init;
     uint32_t frame_w;
     uint32_t frame_h;
     uint32_t frame_bpp;
     size_t frame_size;
     bool src_is_bgrx;
     bool zero_copy;
+    uint64_t capture_sequence;
+    _Atomic uint64_t source_generation;
+    _Atomic uint32_t fpga_caps;
 };
 
 int lpr_dma_init(struct dma_state *d, const struct live_options *opt);
 void lpr_dma_release(struct dma_state *d);
 int lpr_dma_acquire_slot(struct dma_state *d);
-void lpr_dma_slot_addref(struct dma_state *d, int slot);
 void lpr_dma_slot_release(struct dma_state *d, int slot);
 uint8_t *lpr_dma_slot_data(struct dma_state *d, int slot);
 uint64_t lpr_dma_slot_generation(struct dma_state *d, int slot);
+int lpr_dma_slot_ref_clone(struct dma_state *d, int slot,
+                           struct lpr_frame_ref *out);
+void lpr_dma_set_source_generation(struct dma_state *d,
+                                   uint64_t source_generation);
 int lpr_dma_read_frame_slot(struct dma_state *d, int slot);
 int lpr_dma_get_frame_status(struct dma_state *d, struct fpga_frame_status *status);
 int lpr_dma_wait_new_frame(struct dma_state *d, uint32_t *last_change_count, int timeout_ms);

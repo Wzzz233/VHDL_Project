@@ -3,7 +3,7 @@
  * Standalone blue/green/police/embassy/yellow PPLCNet live validation driver.
  *
  * Pipeline:
- *   FPGA DMA frame -> YOLOv8n-pose plate quad -> color route ->
+ *   OV5640 FPGA DMA or phone WebRTC/RTSP frame -> YOLOv8n-pose plate quad ->
  *   quad warp crop -> blue / green / police / embassy / yellow PPLCNet CTC ->
  *   HDMI/KMS display overlay.
  *
@@ -34,12 +34,18 @@
 
 #include "lpr_live/lpr_common.h"
 #include "lpr_live/lpr_color.h"
+#include "lpr_live/lpr_control.h"
 #include "lpr_live/lpr_detector.h"
 #include "lpr_live/lpr_display.h"
 #include "lpr_live/lpr_dma.h"
+#include "lpr_live/lpr_fpga_source.h"
+#include "lpr_live/lpr_frame.h"
 #include "lpr_live/lpr_infer.h"
 #include "lpr_live/lpr_ocr.h"
+#include "lpr_live/lpr_phone_source.h"
+#include "lpr_live/lpr_preview.h"
 #include "lpr_live/lpr_ptype.h"
+#include "lpr_live/lpr_source.h"
 #include "lpr_live/lpr_warp.h"
 #include "ocr_decode.h"
 #include "pcie_fpga_dma.h"
@@ -59,6 +65,10 @@
 
 #define DEFAULT_DEVICE   "/dev/" FPGA_DMA_DEV_NAME
 #define DEFAULT_DRM_CARD "/dev/dri/card0"
+#define DEFAULT_PHONE_RTSP "rtsp://127.0.0.1:8554/phone"
+#define DEFAULT_CONTROL_SOCKET "/run/pplcnet-bgp-live/control.sock"
+#define LIVE_FRAME_WIDTH 1280U
+#define LIVE_FRAME_HEIGHT 720U
 
 static volatile sig_atomic_t g_stop;
 
@@ -286,6 +296,10 @@ static void usage(const char *prog)
             "\n"
             "Display / capture options:\n"
             "  --device <path>               FPGA DMA device (default: /dev/fpga_dma0)\n"
+            "  --input-bgrx <path>           Repeat one 1280x720 BGRx image instead of DMA\n"
+            "  --source <fpga|phone>         Desired source at startup (default: fpga)\n"
+            "  --phone-rtsp <uri>            MediaMTX phone RTSP URI\n"
+            "  --control-socket <path|off>   Runtime JSON Unix socket\n"
             "  --drm-card <path>             DRM card (default: /dev/dri/card0)\n"
             "  --connector-id <id>           Optional KMS connector id\n"
             "  --no-display                  Disable HDMI/KMS display\n"
@@ -321,6 +335,9 @@ static void defaults(struct live_options *o)
 {
     memset(o, 0, sizeof(*o));
     o->device_path = DEFAULT_DEVICE;
+    o->phone_rtsp_uri = DEFAULT_PHONE_RTSP;
+    o->control_socket_path = DEFAULT_CONTROL_SOCKET;
+    o->initial_phone_source = false;
     o->drm_card_path = DEFAULT_DRM_CARD;
     o->frames = 0;
     o->fps = 10;
@@ -405,9 +422,17 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_DISPLAY_EVERY,
         OPT_WAIT_NEW_FRAME,
         OPT_FRAME_STAMP_CHECK,
+        OPT_SOURCE,
+        OPT_PHONE_RTSP,
+        OPT_CONTROL_SOCKET,
+        OPT_INPUT_BGRX,
     };
     static const struct option opts[] = {
         {"device",            required_argument, NULL, OPT_DEVICE},
+        {"input-bgrx",        required_argument, NULL, OPT_INPUT_BGRX},
+        {"source",            required_argument, NULL, OPT_SOURCE},
+        {"phone-rtsp",        required_argument, NULL, OPT_PHONE_RTSP},
+        {"control-socket",    required_argument, NULL, OPT_CONTROL_SOCKET},
         {"plate-model",       required_argument, NULL, OPT_PLATE_MODEL},
         {"ocr-green-model",   required_argument, NULL, OPT_OCR_GREEN_MODEL},
         {"ocr-keys",          required_argument, NULL, OPT_OCR_KEYS},
@@ -459,6 +484,25 @@ static int parse_options(int argc, char **argv, struct live_options *o)
     while ((c = getopt_long(argc, argv, "h", opts, NULL)) != -1) {
         switch (c) {
         case OPT_DEVICE:           o->device_path = optarg; break;
+        case OPT_INPUT_BGRX:       o->input_bgrx_path = optarg; break;
+        case OPT_SOURCE:
+            if (strcmp(optarg, "fpga") == 0 || strcmp(optarg, "ov5640") == 0)
+                o->initial_phone_source = false;
+            else if (strcmp(optarg, "phone") == 0)
+                o->initial_phone_source = true;
+            else
+                return -1;
+            break;
+        case OPT_PHONE_RTSP:
+            o->phone_rtsp_uri = optarg;
+            break;
+        case OPT_CONTROL_SOCKET:
+            if (strcmp(optarg, "off") == 0 ||
+                strcmp(optarg, "none") == 0)
+                o->control_socket_path = NULL;
+            else
+                o->control_socket_path = optarg;
+            break;
         case OPT_PLATE_MODEL:      o->plate_model_path = optarg; break;
         case OPT_OCR_GREEN_MODEL:  o->ocr_green_model_path = optarg; break;
         case OPT_OCR_KEYS:         /* shared keys path used as default for blue+green */
@@ -604,7 +648,17 @@ static int parse_options(int argc, char **argv, struct live_options *o)
 int main(int argc, char **argv)
 {
     struct live_options opt;
-    struct dma_state dma;
+    struct lpr_fpga_source fpga_source;
+    struct lpr_phone_source phone_source;
+    struct lpr_frame_source *fpga;
+    struct lpr_frame_source *phone;
+    struct dma_state *dma;
+    struct lpr_source_manager source_manager;
+    struct lpr_source_health fpga_health;
+    struct lpr_source_health phone_health;
+    struct lpr_control control;
+    struct lpr_preview preview;
+    struct live_result current_result;
     struct rknn_model det_model;
     struct rknn_model ocr_blue_model;
     struct rknn_model ocr_green_model;
@@ -628,6 +682,14 @@ int main(int argc, char **argv)
     bool embassy_enabled;
     bool yellow_enabled;
     bool ptype_enabled;
+    bool fpga_initialized = false;
+    bool fpga_opened = false;
+    bool phone_initialized = false;
+    bool phone_opened = false;
+    bool control_started = false;
+    bool preview_started = false;
+    bool pipeline_paused = false;
+    bool current_result_available = false;
     bool dump_disabled = false;
     int hash_seen = 0;
     int hash_adjacent_dups = 0;
@@ -635,7 +697,6 @@ int main(int argc, char **argv)
     int hash_longest_run = 0;
     int64_t hash_first_us = 0;
     int64_t hash_last_us = 0;
-    uint32_t frame_status_change_count = 0;
     uint8_t *hash_prev_frame = NULL;
     uint32_t stamp_samples = 0;
     uint32_t stamp_malformed = 0;
@@ -663,6 +724,15 @@ int main(int argc, char **argv)
     int64_t prev_dma_done_us = 0;
     int64_t prev_display_push_us = 0;
     uint64_t hash_prev = 0;
+    uint64_t preview_sequence = 0;
+    uint64_t last_phone_sequence = 0;
+    uint64_t input_frames = 0;
+    uint64_t previous_metric_input_frames = 0;
+    uint64_t previous_metric_infer_frames = 0;
+    int64_t metric_last_us = 0;
+    double active_input_fps = 0.0;
+    double active_infer_fps = 0.0;
+    int64_t latest_frame_us = 0;
 
     parsed = parse_options(argc, argv, &opt);
     if (parsed != 0) {
@@ -670,7 +740,17 @@ int main(int argc, char **argv)
         return parsed > 0 ? 0 : 1;
     }
 
-    memset(&dma, 0, sizeof(dma)); dma.fd = -1;
+    memset(&fpga_source, 0, sizeof(fpga_source));
+    memset(&phone_source, 0, sizeof(phone_source));
+    memset(&source_manager, 0, sizeof(source_manager));
+    memset(&fpga_health, 0, sizeof(fpga_health));
+    memset(&phone_health, 0, sizeof(phone_health));
+    memset(&control, 0, sizeof(control)); control.listen_fd = -1;
+    memset(&preview, 0, sizeof(preview));
+    memset(&current_result, 0, sizeof(current_result));
+    dma = NULL;
+    fpga = NULL;
+    phone = NULL;
     memset(&display, 0, sizeof(display)); display.drm_fd = -1;
     memset(&infer, 0, sizeof(infer));
     memset(&det_model, 0, sizeof(det_model));
@@ -688,8 +768,7 @@ int main(int argc, char **argv)
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    if (opt.display)
-        gst_init(NULL, NULL);
+    gst_init(NULL, NULL);
 
     police_enabled = (opt.ocr_police_model_path != NULL);
     embassy_enabled = (opt.ocr_embassy_model_path != NULL);
@@ -723,60 +802,90 @@ int main(int argc, char **argv)
         }
     }
 
-    if (lpr_dma_init(&dma, &opt) < 0) {
-        fprintf(stderr, "[bgp-live] failed to init DMA: %s: %s\n",
-                opt.device_path, strerror(errno));
+    if (lpr_source_manager_init(
+            &source_manager,
+            opt.initial_phone_source ? LPR_SOURCE_PHONE : LPR_SOURCE_FPGA,
+            LPR_SOURCE_FPGA, 1, lpr_mono_us()) < 0) {
+        fprintf(stderr, "[bgp-live] failed to initialize source manager\n");
         goto out;
     }
+    if (opt.initial_phone_source)
+        source_manager.reason = LPR_SOURCE_REASON_PHONE_UNAVAILABLE;
+    if (lpr_fpga_source_init(&fpga_source, &opt,
+                             source_manager.source_generation) < 0) {
+        fprintf(stderr, "[bgp-live] failed to initialize FPGA source\n");
+        goto out;
+    }
+    fpga_initialized = true;
+    fpga = lpr_fpga_source_as_frame_source(&fpga_source);
+    if (lpr_frame_source_open(fpga) < 0) {
+        fprintf(stderr, "[bgp-live] failed to open/start FPGA source: %s\n",
+                opt.device_path);
+        goto out;
+    }
+    fpga_opened = true;
+    if (lpr_frame_source_start(fpga) < 0) {
+        fprintf(stderr, "[bgp-live] failed to start FPGA source\n");
+        goto out;
+    }
+    dma = lpr_fpga_source_dma(&fpga_source);
+    if (!dma || dma->frame_w != LIVE_FRAME_WIDTH ||
+        dma->frame_h != LIVE_FRAME_HEIGHT || dma->frame_bpp != 4U) {
+        fprintf(stderr,
+                "[bgp-live] FPGA source must be 1280x720 BGRx8888\n");
+        goto out;
+    }
+    if (lpr_phone_source_init(&phone_source, opt.phone_rtsp_uri,
+                              source_manager.source_generation) < 0) {
+        fprintf(stderr, "[bgp-live] failed to initialize phone source\n");
+        goto out;
+    }
+    phone_initialized = true;
+    phone = lpr_phone_source_as_frame_source(&phone_source);
+    if (lpr_frame_source_open(phone) < 0) {
+        fprintf(stderr,
+                "[bgp-live] failed to open/start phone GStreamer source\n");
+        goto out;
+    }
+    phone_opened = true;
+    if (lpr_frame_source_start(phone) < 0) {
+        fprintf(stderr, "[bgp-live] failed to start phone source\n");
+        goto out;
+    }
+
     if (opt.hash_frames > 0 && !opt.hash_full) {
-        hash_prev_frame = malloc(dma.frame_size);
+        hash_prev_frame = malloc(dma->frame_size);
         if (!hash_prev_frame) {
-            fprintf(stderr, "[bgp-live] failed to allocate exact duplicate buffer (%zu bytes)\n", dma.frame_size);
+            fprintf(stderr, "[bgp-live] failed to allocate exact duplicate buffer (%zu bytes)\n", dma->frame_size);
             goto out;
         }
     }
-    if (opt.wait_new_frame) {
+    {
         struct fpga_frame_status status;
-        errno = 0;
-        if (lpr_dma_get_frame_status(&dma, &status) < 0) {
-            int saved_errno = errno;
-            fprintf(stderr,
-                    "[bgp-live] --wait-new-frame requested but FPGA frame status is unavailable; "
-                    "rebuild/reload the updated bitstream and pcie_fpga_dma.ko\n");
-            fprintf(stderr,
-                    "[bgp-live] frame-status probe raw counter=%u changes=%u flags=0x%08x "
-                    "magic=0x%08x expected=0x%08x ioctl_errno=%d (%s)\n",
-                    status.frame_counter, status.frame_change_count, status.flags,
-                    status.magic, FPGA_FRAME_STATUS_MAGIC, saved_errno,
-                    saved_errno ? strerror(saved_errno) : "none");
-            goto out;
-        }
-        frame_status_change_count = status.frame_change_count;
-        fprintf(stderr,
-                "[bgp-live] frame-status counter=%u changes=%u flags=0x%08x magic=0x%08x\n",
-                status.frame_counter, status.frame_change_count, status.flags, status.magic);
-        if (status.camera_magic == FPGA_CAMERA_STATUS_MAGIC) {
+
+        if (lpr_dma_get_frame_status(dma, &status) == 0 &&
+            status.camera_magic == FPGA_CAMERA_STATUS_MAGIC) {
             camera_status_seen = true;
             camera_frame_start = status.camera_frame_counter;
             camera_status_start_us = lpr_mono_us();
-            fprintf(stderr,
-                    "[bgp-live] camera-status frames=%u lines=%u words=%u hash=0x%08x magic=0x%08x\n",
-                    status.camera_frame_counter,
-                    lpr_camera_status_lines(&status),
-                    lpr_camera_status_words(&status),
-                    status.camera_hash,
-                    status.camera_magic);
-        } else {
-            fprintf(stderr,
-                    "[bgp-live] camera-status unavailable raw magic=0x%08x expected=0x%08x\n",
-                    status.camera_magic,
-                    FPGA_CAMERA_STATUS_MAGIC);
         }
     }
-    if (lpr_display_start(&display, &opt, dma.frame_w, dma.frame_h) < 0) {
+    if (lpr_display_start(&display, &opt, LIVE_FRAME_WIDTH,
+                          LIVE_FRAME_HEIGHT,
+                          source_manager.source_generation) < 0) {
         fprintf(stderr, "[bgp-live] failed to start display\n");
         goto out;
     }
+    if (opt.control_socket_path) {
+        if (lpr_control_start(&control, opt.control_socket_path) < 0)
+            goto out;
+        control_started = true;
+    }
+    if (lpr_preview_start(&preview, control_started) < 0) {
+        fprintf(stderr, "[bgp-live] failed to start JPEG preview\n");
+        goto out;
+    }
+    preview_started = true;
     if (opt.no_infer)
         goto infer_ready;
     det_model.input_zero_copy = opt.det_zero_copy;
@@ -869,7 +978,8 @@ infer_ready:
             "[bgp-live] start frame=%ux%u src=%s frames=%d fps=%d pose_nc=%d class_filter=%d "
             "det_resize=%s det_score_scale=%.1f blue_ocr=%ux%u green_ocr=%ux%u police_ocr=%s embassy_ocr=%s yellow_ocr=%s "
             "ptype=%s preproc=%s display=%d display_sync=%d display_atomic_flip=%d display_do_timestamp=%d auto_green_filter=%d no_infer=%d async_infer=%d dma_pre_delay_us=%d display_every=%d wait_new_frame=%d hash_frames=%d hash_mode=%s\n",
-            dma.frame_w, dma.frame_h, dma.src_is_bgrx ? "bgrx8888" : "bgr565",
+            dma->frame_w, dma->frame_h,
+            dma->src_is_bgrx ? "bgrx8888" : "bgr565",
             opt.frames, opt.fps, pose_nc, class_filter,
             opt.det_resize_mode == DET_RESIZE_LETTERBOX ? "letterbox" : "stretch",
             opt.det_score_scale,
@@ -926,16 +1036,18 @@ infer_ready:
     if (!opt.no_infer && yellow_enabled) {
         routes[LPR_ROUTE_YELLOW].model = &ocr_yellow_model;
         routes[LPR_ROUTE_YELLOW].keys = &keys_yellow;
-        routes[LPR_ROUTE_YELLOW].decode_family = OCR_DECODE_FAMILY_NORMAL7;
+        routes[LPR_ROUTE_YELLOW].decode_family = OCR_DECODE_FAMILY_YELLOW7;
         routes[LPR_ROUTE_YELLOW].display_tag = 'Y';
         snprintf(routes[LPR_ROUTE_YELLOW].name, sizeof(routes[LPR_ROUTE_YELLOW].name), "yellow");
     } else {
         routes[LPR_ROUTE_YELLOW].model = NULL;
     }
 
-    if (lpr_infer_start(&infer, &opt, &dma, &det_model, ptype_enabled ? &ptype_model : NULL, routes,
+    if (lpr_infer_start(&infer, &opt, &det_model,
+                        ptype_enabled ? &ptype_model : NULL, routes,
                         pose_nc, class_filter,
-                        (int)dma.frame_w, (int)dma.frame_h) < 0) {
+                        (int)LIVE_FRAME_WIDTH, (int)LIVE_FRAME_HEIGHT,
+                        source_manager.source_generation) < 0) {
         fprintf(stderr, "[bgp-live] failed to start infer thread\n");
         goto out;
     }
@@ -943,80 +1055,219 @@ infer_ready:
     }
 
     target_us = 1000000LL / opt.fps;
-    /* Absolute-deadline pacing: each capture starts at a fixed grid point
-     * (start + k*target_us), not "previous end + remaining". This keeps the
-     * capture cadence phase-locked to a steady clock instead of drifting with
-     * per-frame processing jitter, which is what produced the visible stutter
-     * when moving objects were captured at irregular intervals. Mirrors the
-     * pacing used by fpga_hdmi_display.c. */
     int64_t next_frame_us = lpr_mono_us();
-    /* Per-stage timing accumulators for a 1s cadence dump, to localize where
-     * wall-clock time goes when the display appears to drop frames. */
     int64_t stat_last_us = lpr_mono_us();
     int64_t stat_dma_us = 0, stat_overlay_us = 0, stat_push_us = 0, stat_sleep_us = 0;
     uint64_t stat_display_drop = display.dropped_frames;
     int stat_frames = 0;
-    for (int frame = 0; !g_stop && (opt.frames == 0 || frame < opt.frames); frame++) {
+    int frame = 0;
+    metric_last_us = stat_last_us;
+    while (!g_stop && (opt.frames == 0 || frame < opt.frames)) {
+        struct lpr_frame_ref phone_frame = {0};
+        struct lpr_frame_ref active_frame = {0};
         struct live_result latest;
-        bool has_overlay;
-        int slot;
-        uint8_t *slot_frame;
+        struct lpr_source_switch_event switch_event;
+        enum lpr_source_id active_before;
+        enum lpr_control_source requested_source;
+        enum lpr_pipeline_command pipeline_command;
+        const uint8_t *slot_frame = NULL;
+        size_t frame_size = (size_t)LIVE_FRAME_WIDTH *
+                            LIVE_FRAME_HEIGHT * 4U;
+        bool clear_queues = false;
+        uint64_t generation_before;
+        uint64_t infer_total = 0;
+        uint64_t infer_dropped = 0;
+        int phone_read_result;
+        int source_result;
         int64_t ts_a, ts_b, ts_c, ts_d;
 
         ts_a = lpr_mono_us();
         if (prev_capture_start_us > 0)
             lpr_interval_stats_update(&capture_start_intervals, ts_a - prev_capture_start_us);
         prev_capture_start_us = ts_a;
-        if (opt.wait_new_frame) {
-            if (lpr_dma_wait_new_frame(&dma, &frame_status_change_count, 1000) < 0) {
-                fprintf(stderr, "[bgp-live] wait for new FPGA frame failed\n");
+
+        phone_read_result = lpr_frame_source_read_latest(phone, &phone_frame);
+        if (phone_read_result < 0 && phone_read_result != -EAGAIN &&
+            phone_read_result != -ESHUTDOWN) {
+            fprintf(stderr, "[bgp-live] phone latest-frame read failed: %s\n",
+                    strerror(-phone_read_result));
+        }
+        lpr_frame_source_health(phone, ts_a, &phone_health);
+        lpr_frame_source_health(fpga, ts_a, &fpga_health);
+
+        generation_before = source_manager.source_generation;
+        active_before = source_manager.active;
+        requested_source = control_started ?
+            lpr_control_take_source(&control) : LPR_CONTROL_SOURCE_NONE;
+        if (requested_source != LPR_CONTROL_SOURCE_NONE) {
+            enum lpr_source_id desired =
+                requested_source == LPR_CONTROL_SOURCE_PHONE ?
+                    LPR_SOURCE_PHONE : LPR_SOURCE_FPGA;
+
+            source_result = lpr_source_manager_set_desired(
+                &source_manager, desired, &phone_health, ts_a,
+                &switch_event);
+            if (source_result < 0) {
+                fprintf(stderr, "[bgp-live] invalid source switch request\n");
+                lpr_frame_ref_release(&phone_frame);
                 goto out;
             }
-            if (camera_status_seen) {
-                struct fpga_frame_status status;
-                if (lpr_dma_get_frame_status(&dma, &status) == 0 &&
-                    status.camera_magic == FPGA_CAMERA_STATUS_MAGIC) {
-                    if (camera_hash_samples == 0) {
-                        camera_hash_current_run = 1;
-                    } else {
-                        uint32_t camera_counter_step =
-                            status.camera_frame_counter - camera_sample_prev_counter;
-
-                        if (camera_counter_step != 1U)
-                            camera_counter_nonunit_steps++;
-                        if (status.camera_hash == camera_sample_prev_hash) {
-                            camera_hash_adjacent_dups++;
-                            camera_hash_current_run++;
-                        } else {
-                            if (camera_hash_current_run > camera_hash_longest_run)
-                                camera_hash_longest_run = camera_hash_current_run;
-                            camera_hash_current_run = 1;
-                        }
-                    }
-                    camera_sample_prev_counter = status.camera_frame_counter;
-                    camera_sample_prev_hash = status.camera_hash;
-                    camera_hash_samples++;
-                } else {
-                    fprintf(stderr, "[bgp-live] camera-status sample failed\n");
-                    goto out;
-                }
-            }
         }
-        slot = lpr_dma_acquire_slot(&dma);
-        if (opt.dma_pre_delay_us > 0)
-            usleep((useconds_t)opt.dma_pre_delay_us);
-        if (lpr_dma_read_frame_slot(&dma, slot) < 0) {
-            lpr_dma_slot_release(&dma, slot);
-            fprintf(stderr, "[bgp-live] DMA frame read failed\n");
+
+        pipeline_command = control_started ?
+            lpr_control_take_pipeline_command(&control) :
+            LPR_PIPELINE_COMMAND_NONE;
+        if (pipeline_command == LPR_PIPELINE_COMMAND_PAUSE) {
+            if (lpr_source_manager_advance_generation(&source_manager,
+                                                      ts_a) < 0) {
+                fprintf(stderr,
+                        "[bgp-live] failed to advance generation for pause\n");
+                lpr_frame_ref_release(&phone_frame);
+                goto out;
+            }
+            pipeline_paused = true;
+            clear_queues = true;
+        } else if (pipeline_command == LPR_PIPELINE_COMMAND_RESUME) {
+            pipeline_paused = false;
+        } else if (pipeline_command == LPR_PIPELINE_COMMAND_RESTART) {
+            lpr_frame_source_stop(phone);
+            lpr_frame_source_stop(fpga);
+            if (lpr_frame_source_start(fpga) < 0 ||
+                lpr_frame_source_start(phone) < 0) {
+                fprintf(stderr, "[bgp-live] source restart failed\n");
+                lpr_frame_ref_release(&phone_frame);
+                goto out;
+            }
+            if (lpr_source_manager_restart(&source_manager, ts_a) < 0) {
+                fprintf(stderr,
+                        "[bgp-live] failed to advance generation for restart\n");
+                lpr_frame_ref_release(&phone_frame);
+                goto out;
+            }
+            pipeline_paused = false;
+            clear_queues = true;
+        }
+
+        source_result = lpr_source_manager_update(
+            &source_manager, &phone_health, ts_a, &switch_event);
+        if (source_result < 0) {
+            fprintf(stderr, "[bgp-live] source state update failed\n");
+            lpr_frame_ref_release(&phone_frame);
             goto out;
         }
-        slot_frame = lpr_dma_slot_data(&dma, slot);
-        if (!slot_frame) {
-            lpr_dma_slot_release(&dma, slot);
-            fprintf(stderr, "[bgp-live] DMA slot data missing\n");
+
+        if (source_manager.source_generation != generation_before) {
+            if (source_manager.active != active_before) {
+                fprintf(stderr,
+                        "[bgp-live] source switch %s -> %s reason=%s generation=%llu\n",
+                        lpr_source_id_string(active_before),
+                        lpr_source_id_string(source_manager.active),
+                        lpr_source_reason_string(source_manager.reason),
+                        (unsigned long long)source_manager.source_generation);
+            } else {
+                const char *action =
+                    pipeline_command == LPR_PIPELINE_COMMAND_PAUSE ?
+                        "pause" :
+                    pipeline_command == LPR_PIPELINE_COMMAND_RESTART ?
+                        "restart" : "epoch";
+
+                fprintf(stderr,
+                        "[bgp-live] pipeline %s active=%s reason=%s generation=%llu\n",
+                        action,
+                        lpr_source_id_string(source_manager.active),
+                        lpr_source_reason_string(source_manager.reason),
+                        (unsigned long long)source_manager.source_generation);
+            }
+            lpr_fpga_source_set_generation(
+                &fpga_source, source_manager.source_generation);
+            lpr_phone_source_set_generation(
+                &phone_source, source_manager.source_generation);
+            if (!opt.no_infer)
+                lpr_infer_reset(&infer,
+                                source_manager.source_generation);
+            lpr_display_reset(&display,
+                              source_manager.source_generation);
+            memset(&current_result, 0, sizeof(current_result));
+            current_result.source_generation =
+                source_manager.source_generation;
+            current_result_available = false;
+            last_phone_sequence = 0;
+            latest_frame_us = 0;
+            if (preview_started) {
+                if (lpr_preview_reset(&preview) < 0)
+                    fprintf(stderr, "[bgp-live] preview reset failed\n");
+                preview_sequence = 0;
+            }
+            if (control_started) {
+                lpr_control_update_results(
+                    &control, NULL,
+                    source_manager.source_generation);
+                lpr_control_clear_jpeg(&control);
+            }
+        } else if (clear_queues) {
+            if (!opt.no_infer)
+                lpr_infer_reset(&infer,
+                                source_manager.source_generation);
+            lpr_display_reset(&display,
+                              source_manager.source_generation);
+            memset(&current_result, 0, sizeof(current_result));
+            current_result.source_generation =
+                source_manager.source_generation;
+            current_result_available = false;
+            latest_frame_us = 0;
+            if (preview_started) {
+                if (lpr_preview_reset(&preview) < 0)
+                    fprintf(stderr, "[bgp-live] preview reset failed\n");
+                preview_sequence = 0;
+            }
+            if (control_started) {
+                lpr_control_update_results(
+                    &control, NULL,
+                    source_manager.source_generation);
+                lpr_control_clear_jpeg(&control);
+            }
+        }
+
+        if (pipeline_paused)
+            goto loop_status;
+
+        if (source_manager.active == LPR_SOURCE_PHONE) {
+            if (phone_read_result == 0 &&
+                phone_frame.meta.source_generation ==
+                    source_manager.source_generation &&
+                phone_frame.meta.sequence != last_phone_sequence) {
+                active_frame = phone_frame;
+                memset(&phone_frame, 0, sizeof(phone_frame));
+                last_phone_sequence = active_frame.meta.sequence;
+            } else {
+                goto loop_status;
+            }
+        } else {
+            source_result =
+                lpr_frame_source_read_latest(fpga, &active_frame);
+            if (source_result < 0) {
+                fprintf(stderr, "[bgp-live] FPGA frame read failed: %s\n",
+                        strerror(-source_result));
+                lpr_frame_ref_release(&phone_frame);
+                lpr_frame_ref_release(&active_frame);
+                goto out;
+            }
+        }
+
+        slot_frame = lpr_frame_ref_data(&active_frame);
+        if (!slot_frame ||
+            active_frame.meta.format != LPR_FRAME_FORMAT_BGRX8888 ||
+            active_frame.meta.width != LIVE_FRAME_WIDTH ||
+            active_frame.meta.height != LIVE_FRAME_HEIGHT ||
+            active_frame.meta.stride != LIVE_FRAME_WIDTH * 4U) {
+            fprintf(stderr, "[bgp-live] active source returned invalid frame\n");
+            lpr_frame_ref_release(&phone_frame);
+            lpr_frame_ref_release(&active_frame);
             goto out;
         }
         ts_b = lpr_mono_us();
+        input_frames++;
+        latest_frame_us = active_frame.meta.monotonic_us;
         if (prev_dma_done_us > 0)
             lpr_interval_stats_update(&dma_done_intervals, ts_b - prev_dma_done_us);
         prev_dma_done_us = ts_b;
@@ -1025,7 +1276,7 @@ infer_ready:
             uint64_t h = 0;
             bool duplicate = false;
             if (opt.hash_full)
-                h = lpr_frame_hash64_full(slot_frame, dma.frame_size);
+                h = lpr_frame_hash64_full(slot_frame, frame_size);
 
             hash_seen++;
             if (hash_seen == 1) {
@@ -1035,13 +1286,15 @@ infer_ready:
                 if (opt.hash_full)
                     duplicate = (h == hash_prev);
                 else
-                    duplicate = (memcmp(hash_prev_frame, slot_frame, dma.frame_size) == 0);
+                    duplicate = (memcmp(hash_prev_frame, slot_frame,
+                                        frame_size) == 0);
 
                 if (duplicate) {
                     hash_adjacent_dups++;
                     hash_current_run++;
                     if (!opt.hash_full)
-                        h = lpr_frame_fingerprint64_fast(slot_frame, dma.frame_size);
+                        h = lpr_frame_fingerprint64_fast(slot_frame,
+                                                         frame_size);
                     fprintf(stderr,
                             "[bgp-live] frame-hash duplicate mode=%s prev=%d frame=%d hash=0x%016llx\n",
                             opt.hash_full ? "strong-full" : "exact-adjacent", frame - 1, frame, (unsigned long long)h);
@@ -1054,14 +1307,19 @@ infer_ready:
             if (opt.hash_full)
                 hash_prev = h;
             else
-                memcpy(hash_prev_frame, slot_frame, dma.frame_size);
+                memcpy(hash_prev_frame, slot_frame, frame_size);
             hash_last_us = ts_b;
         }
 
-        if (opt.frame_stamp_check) {
+        if (opt.frame_stamp_check &&
+            (active_frame.meta.fpga_caps &
+             LPR_FRAME_FPGA_CAP_FRAME_STAMP)) {
             uint8_t head_cnt = 0, tail_cnt = 0;
-            int head_ok = frame_stamp_extract(slot_frame, dma.frame_w, 0, &head_cnt);
-            int tail_ok = frame_stamp_extract(slot_frame, dma.frame_w, dma.frame_h - 1, &tail_cnt);
+            int head_ok = frame_stamp_extract(
+                slot_frame, LIVE_FRAME_WIDTH, 0, &head_cnt);
+            int tail_ok = frame_stamp_extract(
+                slot_frame, LIVE_FRAME_WIDTH,
+                LIVE_FRAME_HEIGHT - 1U, &tail_cnt);
 
             stamp_samples++;
             if (head_ok < 0 || tail_ok < 0) {
@@ -1098,9 +1356,6 @@ infer_ready:
             }
         }
 
-        /* Optional raw-frame dump: write the captured BGRX frame verbatim,
-         * before any overlay drawing, so a stored frame reflects exactly what
-         * DMA delivered. Used to tell capture-side artifacts from display-side. */
         if (!dump_disabled && opt.dump_frames > 0 && frame < opt.dump_frames) {
             const char *dp = opt.dump_path ? opt.dump_path : "dump";
             char path[512];
@@ -1117,8 +1372,9 @@ infer_ready:
                 bool dump_ok = true;
                 int dump_errno = 0;
 
-                while (off < dma.frame_size) {
-                    ssize_t w = write(dfd, slot_frame + off, dma.frame_size - off);
+                while (off < frame_size) {
+                    ssize_t w = write(dfd, slot_frame + off,
+                                      frame_size - off);
                     if (w < 0) {
                         dump_ok = false;
                         dump_errno = errno;
@@ -1136,55 +1392,89 @@ infer_ready:
                     dump_errno = errno;
                 }
 
-                if (dump_ok && off == dma.frame_size) {
+                if (dump_ok && off == frame_size) {
                     fprintf(stderr, "[bgp-live] dumped %s (%zu bytes)\n", path, off);
                 } else {
                     if (dump_errno == 0)
                         dump_errno = EIO;
                     fprintf(stderr,
                             "[bgp-live] dump short write: %s wrote=%zu expected=%zu error=%s; disabling dump\n",
-                            path, off, dma.frame_size, strerror(dump_errno));
+                            path, off, frame_size, strerror(dump_errno));
                     unlink(path);
                     dump_disabled = true;
                 }
             }
         }
 
+        if (opt.wait_new_frame &&
+            source_manager.active == LPR_SOURCE_FPGA &&
+            camera_status_seen) {
+            struct fpga_frame_status status;
+
+            if (lpr_dma_get_frame_status(dma, &status) == 0 &&
+                status.camera_magic == FPGA_CAMERA_STATUS_MAGIC) {
+                if (camera_hash_samples == 0) {
+                    camera_hash_current_run = 1;
+                } else {
+                    uint32_t counter_step =
+                        status.camera_frame_counter -
+                        camera_sample_prev_counter;
+
+                    if (counter_step != 1U)
+                        camera_counter_nonunit_steps++;
+                    if (status.camera_hash ==
+                        camera_sample_prev_hash) {
+                        camera_hash_adjacent_dups++;
+                        camera_hash_current_run++;
+                    } else {
+                        if (camera_hash_current_run >
+                            camera_hash_longest_run)
+                            camera_hash_longest_run =
+                                camera_hash_current_run;
+                        camera_hash_current_run = 1;
+                    }
+                }
+                camera_sample_prev_counter =
+                    status.camera_frame_counter;
+                camera_sample_prev_hash = status.camera_hash;
+                camera_hash_samples++;
+            }
+        }
+
         if (!opt.no_infer) {
-            lpr_infer_submit_latest(&infer, slot, lpr_dma_slot_generation(&dma, slot));
-            has_overlay = lpr_infer_get_result(&infer, &latest);
-        } else {
-            has_overlay = false;
+            if (lpr_infer_submit_latest(&infer, &active_frame) < 0) {
+                fprintf(stderr, "[bgp-live] inference submit rejected\n");
+                lpr_frame_ref_release(&phone_frame);
+                lpr_frame_ref_release(&active_frame);
+                goto out;
+            }
+            memset(&latest, 0, sizeof(latest));
+            lpr_infer_get_result(&infer, &latest);
+            if (lpr_source_result_is_current(
+                    &source_manager, latest.source_generation)) {
+                current_result = latest;
+                current_result_available = latest.valid;
+            }
         }
         ts_c = lpr_mono_us();
         stat_dma_us += ts_b - ts_a;
         stat_overlay_us += ts_c - ts_b;
 
+        if (preview_started &&
+            lpr_preview_push(&preview, &active_frame) < 0) {
+            fprintf(stderr, "[bgp-live] preview push failed\n");
+            lpr_frame_ref_release(&phone_frame);
+            lpr_frame_ref_release(&active_frame);
+            goto out;
+        }
         if (opt.display && (frame % opt.display_every) == 0) {
-            if (has_overlay) {
-                for (int i = 0; i < latest.result_count && i < MAX_LIVE_PLATES; i++) {
-                    const struct live_plate_result *plate = &latest.plates[i];
-                    char overlay[96];
-                    int ty = plate->box.y1 - (16 * OVERLAY_TEXT_SCALE + 3);
-                    char tag = 'B';
-                    uint8_t r = 0, g = 255, bl = 255;
-                    if (plate->route_name[0] == 'g') { tag = 'G'; r = 0; g = 255; bl = 0; }
-                    else if (plate->route_name[0] == 'p') { tag = 'P'; r = 255; g = 255; bl = 255; }
-                    else if (plate->route_name[0] == 'e') { tag = 'E'; r = 255; g = 255; bl = 0; }
-                    else if (plate->route_name[0] == 'y') { tag = 'Y'; r = 255; g = 255; bl = 0; }
-                    else if (plate->route_name[0] == 'd') { tag = 'D'; r = 255; g = 0; bl = 255; }
-                    if (ty < 0) ty = plate->box.y1 + 3;
-                    snprintf(overlay, sizeof(overlay), "%s %c %.2f",
-                             plate->text[0] ? plate->text : "OCR", tag, plate->conf);
-                    lpr_draw_rect_bgrx(slot_frame, (int)dma.frame_w, (int)dma.frame_h,
-                                       &plate->box, r, g, bl);
-                    lpr_draw_text_bgrx(slot_frame, (int)dma.frame_w, (int)dma.frame_h,
-                                       plate->box.x1, ty, overlay, r, g, bl,
-                                       OVERLAY_TEXT_SCALE);
-                }
-            }
-            if (lpr_display_push_bgrx_slot(&display, &dma, slot) < 0)
+            if (lpr_display_push_frame(
+                    &display, &active_frame,
+                    current_result_available ? &current_result : NULL) < 0) {
+                lpr_frame_ref_release(&phone_frame);
+                lpr_frame_ref_release(&active_frame);
                 goto out;
+            }
             ts_d = lpr_mono_us();
             stat_push_us += ts_d - ts_c;
             if (prev_display_push_us > 0)
@@ -1194,37 +1484,137 @@ infer_ready:
             ts_d = ts_c;
         }
 
-        lpr_dma_slot_release(&dma, slot);
+        lpr_frame_ref_release(&active_frame);
         stat_frames++;
+        frame++;
+
+loop_status:
+        lpr_frame_ref_release(&phone_frame);
+        lpr_frame_ref_release(&active_frame);
         {
-            /* Advance the grid by exactly one frame period; if we fell behind
-             * by more than a whole period (slow frame), resync to now to avoid
-             * unbounded catch-up bursts. */
-            next_frame_us += target_us;
+            uint8_t *jpeg = NULL;
+            size_t jpeg_size = 0;
+            uint64_t jpeg_sequence = 0;
+
+            if (preview_started && control_started &&
+                lpr_preview_snapshot(
+                    &preview, preview_sequence, &jpeg, &jpeg_size,
+                    &jpeg_sequence) == 0) {
+                lpr_control_update_jpeg(
+                    &control, jpeg, jpeg_size, jpeg_sequence,
+                    source_manager.source_generation);
+                preview_sequence = jpeg_sequence;
+                free(jpeg);
+            }
+        }
+        {
             int64_t now = lpr_mono_us();
+
+            lpr_frame_source_health(phone, now, &phone_health);
+            lpr_frame_source_health(fpga, now, &fpga_health);
+            if (!opt.no_infer) {
+                pthread_mutex_lock(&infer.lock);
+                infer_total = infer.infer_count;
+                infer_dropped = infer.overwrite_count;
+                pthread_mutex_unlock(&infer.lock);
+            }
+            if (now - metric_last_us >= 1000000LL) {
+                double elapsed =
+                    (double)(now - metric_last_us) / 1000000.0;
+
+                active_input_fps =
+                    (double)(input_frames -
+                             previous_metric_input_frames) / elapsed;
+                active_infer_fps =
+                    (double)(infer_total -
+                             previous_metric_infer_frames) / elapsed;
+                previous_metric_input_frames = input_frames;
+                previous_metric_infer_frames = infer_total;
+                metric_last_us = now;
+            }
+            if (control_started) {
+                const struct lpr_source_health *active_health =
+                    source_manager.active == LPR_SOURCE_PHONE ?
+                        &phone_health : &fpga_health;
+                struct lpr_runtime_status status;
+
+                memset(&status, 0, sizeof(status));
+                status.desired_source =
+                    lpr_source_id_string(source_manager.desired);
+                status.active_source =
+                    lpr_source_id_string(source_manager.active);
+                status.failover_reason =
+                    lpr_source_reason_string(source_manager.reason);
+                status.source_generation =
+                    source_manager.source_generation;
+                status.paused = pipeline_paused;
+                status.fpga_healthy = fpga_health.healthy;
+                status.phone_healthy =
+                    lpr_source_phone_is_fresh(
+                        &phone_health, now);
+                status.width = LIVE_FRAME_WIDTH;
+                status.height = LIVE_FRAME_HEIGHT;
+                status.input_fps = active_input_fps;
+                status.decode_fps =
+                    source_manager.active == LPR_SOURCE_PHONE ?
+                        phone_health.input_fps : 0.0;
+                status.infer_fps = active_infer_fps;
+                status.frame_age_ms =
+                    latest_frame_us > 0 && now >= latest_frame_us ?
+                        (double)(now - latest_frame_us) / 1000.0 :
+                        -1.0;
+                status.input_frames = input_frames;
+                status.decoded_frames = phone_health.sequence;
+                status.inferred_frames = infer_total;
+                status.input_dropped =
+                    active_health->dropped_frames;
+                status.decode_dropped =
+                    phone_health.dropped_frames;
+                status.infer_dropped = infer_dropped;
+                status.display_dropped =
+                    display.dropped_frames;
+                lpr_control_update_status(&control, &status);
+                lpr_control_update_results(
+                    &control,
+                    current_result.source_generation ==
+                            source_manager.source_generation ?
+                        &current_result : NULL,
+                    source_manager.source_generation);
+            }
+
+            next_frame_us += target_us;
             if (now > next_frame_us + target_us)
                 next_frame_us = now + target_us;
             if (next_frame_us > now) {
                 int64_t pre = lpr_mono_us();
-                struct timespec ts;
-                ts.tv_sec = (time_t)(next_frame_us / 1000000LL);
-                ts.tv_nsec = (long)((next_frame_us % 1000000LL) * 1000LL);
-                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+                struct timespec sleep_until;
+
+                sleep_until.tv_sec =
+                    (time_t)(next_frame_us / 1000000LL);
+                sleep_until.tv_nsec =
+                    (long)((next_frame_us % 1000000LL) * 1000LL);
+                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME,
+                                &sleep_until, NULL);
                 stat_sleep_us += lpr_mono_us() - pre;
             }
         }
         int64_t now = lpr_mono_us();
         if (now - stat_last_us >= 1000000LL) {
             int64_t total = now - stat_last_us;
-            fprintf(stderr,
-                    "[bgp-live] cadence: frames=%d total=%.0fms dma=%.1fms overlay=%.1fms "
-                    "push=%.1fms sleep=%.1fms display_drop=%llu (per-frame avg)\n",
-                    stat_frames, total / 1000.0,
-                    (double)stat_dma_us / stat_frames / 1000.0,
-                    (double)stat_overlay_us / stat_frames / 1000.0,
-                    (double)stat_push_us / stat_frames / 1000.0,
-                    (double)stat_sleep_us / stat_frames / 1000.0,
-                    (unsigned long long)(display.dropped_frames - stat_display_drop));
+            if (stat_frames > 0) {
+                fprintf(stderr,
+                        "[bgp-live] cadence: source=%s frames=%d total=%.0fms capture=%.1fms submit=%.1fms "
+                        "push=%.1fms sleep=%.1fms display_drop=%llu (per-frame avg)\n",
+                        lpr_source_id_string(source_manager.active),
+                        stat_frames, total / 1000.0,
+                        (double)stat_dma_us / stat_frames / 1000.0,
+                        (double)stat_overlay_us / stat_frames / 1000.0,
+                        (double)stat_push_us / stat_frames / 1000.0,
+                        (double)stat_sleep_us / stat_frames / 1000.0,
+                        (unsigned long long)
+                            (display.dropped_frames -
+                             stat_display_drop));
+            }
             stat_last_us = now;
             stat_display_drop = display.dropped_frames;
             stat_dma_us = stat_overlay_us = stat_push_us = stat_sleep_us = 0;
@@ -1234,9 +1624,9 @@ infer_ready:
     ret = 0;
 
 out:
-    if (camera_status_seen && dma.fd >= 0) {
+    if (camera_status_seen && dma && dma->fd >= 0) {
         struct fpga_frame_status status;
-        if (lpr_dma_get_frame_status(&dma, &status) == 0 &&
+        if (lpr_dma_get_frame_status(dma, &status) == 0 &&
             status.camera_magic == FPGA_CAMERA_STATUS_MAGIC) {
             uint32_t camera_delta = status.camera_frame_counter - camera_frame_start;
             int64_t camera_elapsed_us = lpr_mono_us() - camera_status_start_us;
@@ -1311,9 +1701,23 @@ out:
                 stamp_duplicates, dup_pct, stamp_backward, stamp_skips, stamp_skipped_frames);
     }
     free(hash_prev_frame);
+    if (control_started)
+        lpr_control_stop(&control);
+    if (preview_started)
+        lpr_preview_stop(&preview);
     if (!opt.no_infer)
         lpr_infer_stop(&infer);
     lpr_display_stop(&display);
+    if (phone_initialized) {
+        if (phone_opened)
+            lpr_frame_source_stop(phone);
+        lpr_frame_source_close(phone);
+    }
+    if (fpga_initialized) {
+        if (fpga_opened)
+            lpr_frame_source_stop(fpga);
+        lpr_frame_source_close(fpga);
+    }
     if (!opt.no_infer) {
         lpr_model_release(&det_model);
         lpr_model_release(&ocr_blue_model);
@@ -1327,6 +1731,5 @@ out:
         lpr_model_release(&ocr_yellow_model);
     if (!opt.no_infer && ptype_enabled)
         lpr_model_release(&ptype_model);
-    lpr_dma_release(&dma);
     return ret;
 }

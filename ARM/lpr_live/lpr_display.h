@@ -5,12 +5,13 @@
 #define LPR_LIVE_LPR_DISPLAY_H
 
 #include "lpr_common.h"
-#include "lpr_dma.h"
+#include "lpr_frame.h"
 
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
 
 #include <pthread.h>
+#include <stdatomic.h>
 
 #define LPR_DISPLAY_COPY_SLOTS 6
 #define LPR_DISPLAY_RELEASE_DELAY_MS 0
@@ -47,20 +48,27 @@ struct display_state {
     bool running;
     bool has_new;
     bool display_error;
-    struct dma_state *dma;
-    int pending_slot;
-    uint64_t pending_generation;
+    struct lpr_frame_ref pending_frame;
+    struct live_result pending_result;
+    bool pending_has_result;
+    atomic_uint_fast64_t accepted_source_generation;
     struct display_copy_slot copy_slots[LPR_DISPLAY_COPY_SLOTS];
     pthread_mutex_t slots_lock;
     pthread_cond_t slots_cond;
     bool slots_lock_init;
-    uint64_t dropped_frames;
+    pthread_mutex_t pipeline_lock;
+    bool pipeline_lock_init;
+    atomic_uint_fast64_t dropped_frames;
 };
 
 int lpr_display_start(struct display_state *d, const struct live_options *opt,
-                      uint32_t w, uint32_t h);
+                      uint32_t w, uint32_t h,
+                      uint64_t source_generation);
 void lpr_display_stop(struct display_state *d);
-int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, int slot);
+int lpr_display_push_frame(struct display_state *d,
+                           const struct lpr_frame_ref *frame,
+                           const struct live_result *result);
+void lpr_display_reset(struct display_state *d, uint64_t source_generation);
 
 /* Drawing primitives operate directly on BGRX8888 or RGB565 frames. */
 void lpr_draw_rect_bgrx(uint8_t *pix, int w, int h, const struct det_box *b, uint8_t r, uint8_t g, uint8_t bl);

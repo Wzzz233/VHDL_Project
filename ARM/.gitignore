@@ -17,8 +17,12 @@ fpga_hdmi_display
 fpga_lpr_display
 pplcnet_green_live
 pplcnet_bgp_live
+cplus-rk3568-driver
 pplcnet_bg_live
 test_ocr_decode
+test_lpr_frame_source
+test_lpr_infer_generation
+test_lpr_control
 test_ocr_layout
 test_lpr_special_route
 test_pose_decoder

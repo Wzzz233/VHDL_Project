@@ -108,6 +108,10 @@ enum plate_color {
 
 struct live_options {
     const char *device_path;
+    const char *input_bgrx_path;
+    const char *phone_rtsp_uri;
+    const char *control_socket_path;
+    bool initial_phone_source;
     const char *plate_model_path;
     /* OCR model paths per plate type. blue + green are required;
      * police, embassy, yellow are optional and silently skipped if NULL. */
@@ -245,6 +249,10 @@ struct live_plate_result {
 struct live_result {
     bool valid;
     uint64_t seq;
+    uint64_t input_sequence;
+    uint64_t source_generation;
+    int64_t frame_monotonic_us;
+    double infer_ms;
     int det_count;
     int result_count;
     int best;

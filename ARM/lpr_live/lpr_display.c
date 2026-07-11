@@ -132,6 +132,8 @@ static const struct hanzi16_glyph hanzi16_glyphs[] = {
     {"新", {0x0000, 0x0C02, 0x3FBE, 0x1120, 0x1220, 0x0A20, 0x3FBF, 0x0424, 0x0424, 0x3FA4, 0x0424, 0x1724, 0x35A4, 0x2444, 0x44C4, 0x0C84}},
     {"使", {0x0820, 0x0820, 0x0BFE, 0x1820, 0x1020, 0x33FC, 0x7224, 0x5224, 0x13FC, 0x1020, 0x1320, 0x11C0, 0x10C0, 0x11B0, 0x120E, 0x0000}},
     {"警", {0x2440, 0xFF80, 0xA4F8, 0xFF70, 0xFA60, 0x7A70, 0x0F88, 0x0200, 0xFFF8, 0x3FE0, 0x3FE0, 0x0000, 0x3FE0, 0x3FE0, 0x2020, 0x0000}},
+    {"学", {0x1998, 0x0990, 0x0CB0, 0x7FFF, 0x4001, 0x5FF1, 0x0070, 0x00C0, 0x7FFF, 0x0080, 0x0080, 0x0080, 0x0080, 0x0300, 0x0000, 0x0000}},
+    {"挂", {0x1020, 0x1020, 0x11FE, 0xFC20, 0x1020, 0x11FE, 0x1C20, 0xF020, 0x91FE, 0x1020, 0x1020, 0x1020, 0x17FE, 0x7000, 0x0000, 0x0000}},
 };
 
 static const uint16_t *find_hanzi16_glyph(const char *s, size_t len)
@@ -375,20 +377,24 @@ void lpr_overlay_ascii_from_text(const char *text, char *out, size_t out_len)
 static void *display_thread_main(void *arg);
 
 int lpr_display_start(struct display_state *d, const struct live_options *opt,
-                      uint32_t w, uint32_t h)
+                      uint32_t w, uint32_t h,
+                      uint64_t source_generation)
 {
     GstCaps *caps;
     GstStateChangeReturn sret;
     memset(d, 0, sizeof(*d));
     d->enabled = opt->display;
     d->drm_fd = -1;
+    d->w = w;
+    d->h = h;
+    atomic_init(&d->accepted_source_generation, source_generation);
+    atomic_init(&d->dropped_frames, 0);
     if (!d->enabled) return 0;
-    d->w = w; d->h = h; d->fps = opt->fps; d->connector_id = opt->connector_id;
+    d->fps = opt->fps; d->connector_id = opt->connector_id;
     d->sync = opt->display_sync;
     d->atomic_flip = opt->display_atomic_flip;
     d->do_timestamp = opt->display_do_timestamp;
     d->frame_size = (size_t)w * (size_t)h * 4U;
-    d->pending_slot = -1;
     if (opt->drm_card_path && opt->drm_card_path[0]) {
         d->drm_fd = open(opt->drm_card_path, O_RDWR | O_CLOEXEC);
         if (d->drm_fd < 0)
@@ -437,6 +443,8 @@ int lpr_display_start(struct display_state *d, const struct live_options *opt,
     pthread_mutex_init(&d->slots_lock, NULL);
     pthread_cond_init(&d->slots_cond, NULL);
     d->slots_lock_init = true;
+    pthread_mutex_init(&d->pipeline_lock, NULL);
+    d->pipeline_lock_init = true;
     for (int i = 0; i < LPR_DISPLAY_COPY_SLOTS; i++) {
         d->copy_slots[i].data = malloc(d->frame_size);
         if (!d->copy_slots[i].data) {
@@ -475,9 +483,8 @@ void lpr_display_stop(struct display_state *d)
             pthread_join(d->thread, NULL);
             d->thread_started = false;
         }
-        if (d->has_new && d->pending_slot >= 0 && d->dma) {
-            lpr_dma_slot_release(d->dma, d->pending_slot);
-            d->pending_slot = -1;
+        if (d->has_new) {
+            lpr_frame_ref_release(&d->pending_frame);
             d->has_new = false;
         }
     }
@@ -494,6 +501,8 @@ void lpr_display_stop(struct display_state *d)
         pthread_cond_destroy(&d->slots_cond);
         pthread_mutex_destroy(&d->slots_lock);
     }
+    if (d->pipeline_lock_init)
+        pthread_mutex_destroy(&d->pipeline_lock);
     if (d->drm_fd >= 0) close(d->drm_fd);
     memset(d, 0, sizeof(*d));
     d->drm_fd = -1;
@@ -606,27 +615,62 @@ static uint64_t display_running_time_ns(struct display_state *d)
     return (uint64_t)(now - base);
 }
 
-static int display_copy_push_slot(struct display_state *d, int slot, uint64_t generation)
+static void display_draw_result(uint8_t *frame, int width, int height,
+                                const struct live_result *result)
+{
+    for (int i = 0;
+         result && i < result->result_count && i < MAX_LIVE_PLATES; i++) {
+        const struct live_plate_result *plate = &result->plates[i];
+        char overlay[96];
+        int text_y = plate->box.y1 - (16 * OVERLAY_TEXT_SCALE + 3);
+        char tag = 'B';
+        uint8_t red = 0, green = 255, blue = 255;
+
+        if (plate->route_name[0] == 'g') {
+            tag = 'G'; red = 0; green = 255; blue = 0;
+        } else if (plate->route_name[0] == 'p') {
+            tag = 'P'; red = 255; green = 255; blue = 255;
+        } else if (plate->route_name[0] == 'e') {
+            tag = 'E'; red = 255; green = 255; blue = 0;
+        } else if (plate->route_name[0] == 'y') {
+            tag = 'Y'; red = 255; green = 255; blue = 0;
+        } else if (plate->route_name[0] == 'd') {
+            tag = 'D'; red = 255; green = 0; blue = 255;
+        }
+        if (text_y < 0)
+            text_y = plate->box.y1 + 3;
+        snprintf(overlay, sizeof(overlay), "%s %c %.2f",
+                 plate->text[0] ? plate->text : "OCR", tag, plate->conf);
+        lpr_draw_rect_bgrx(frame, width, height, &plate->box,
+                           red, green, blue);
+        lpr_draw_text_bgrx(frame, width, height, plate->box.x1, text_y,
+                           overlay, red, green, blue, OVERLAY_TEXT_SCALE);
+    }
+}
+
+static int display_copy_push_frame(struct display_state *d,
+                                   const struct lpr_frame_ref *source_frame,
+                                   const struct live_result *result,
+                                   bool has_result)
 {
     struct display_slot_ticket ticket;
     struct display_frame_cookie *cookie;
     GstBuffer *buf;
     GstFlowReturn flow;
-    uint8_t *frame;
+    const uint8_t *frame;
+    uint8_t *display_frame;
+    size_t row_size;
 
-    if (!d || !d->enabled || !d->dma) return 0;
+    if (!d || !d->enabled || !source_frame) return 0;
     if (handle_bus(d) < 0) return -1;
-    frame = lpr_dma_slot_data(d->dma, slot);
-    if (!frame) return -1;
-
-    {
-        uint64_t actual_generation = lpr_dma_slot_generation(d->dma, slot);
-        if (actual_generation != generation) {
-            fprintf(stderr, "[display] DMA slot %d generation changed before copy: queued=%" PRIu64 " actual=%" PRIu64 "\n",
-                    slot, generation, actual_generation);
-            return -1;
-        }
-    }
+    if (source_frame->meta.source_generation !=
+        atomic_load(&d->accepted_source_generation))
+        return 0;
+    frame = lpr_frame_ref_data(source_frame);
+    if (!frame || source_frame->meta.width != d->w ||
+        source_frame->meta.height != d->h ||
+        source_frame->meta.stride < d->w * 4U)
+        return -1;
 
     {
         int ar = display_acquire_slot(d, &ticket);
@@ -637,19 +681,32 @@ static int display_copy_push_slot(struct display_state *d, int slot, uint64_t ge
             return 0;
         }
     }
-    memcpy(d->copy_slots[ticket.idx].data, frame, d->frame_size);
-    {
-        uint64_t actual_generation = lpr_dma_slot_generation(d->dma, slot);
-        if (actual_generation != generation) {
-            fprintf(stderr, "[display] DMA slot %d generation changed during copy: queued=%" PRIu64 " actual=%" PRIu64 "\n",
-                    slot, generation, actual_generation);
-            display_release_slot(d, &ticket);
-            return -1;
-        }
+    display_frame = d->copy_slots[ticket.idx].data;
+    row_size = (size_t)d->w * 4U;
+    for (uint32_t y = 0; y < d->h; y++)
+        memcpy(display_frame + (size_t)y * row_size,
+               frame + (size_t)y * source_frame->meta.stride, row_size);
+    if (!lpr_frame_ref_is_valid(source_frame) ||
+        source_frame->meta.source_generation !=
+            atomic_load(&d->accepted_source_generation)) {
+        display_release_slot(d, &ticket);
+        return 0;
+    }
+    if (has_result && result->source_generation ==
+                          source_frame->meta.source_generation)
+        display_draw_result(display_frame, (int)d->w, (int)d->h, result);
+
+    pthread_mutex_lock(&d->pipeline_lock);
+    if (source_frame->meta.source_generation !=
+        atomic_load(&d->accepted_source_generation)) {
+        pthread_mutex_unlock(&d->pipeline_lock);
+        display_release_slot(d, &ticket);
+        return 0;
     }
 
     cookie = g_new0(struct display_frame_cookie, 1);
     if (!cookie) {
+        pthread_mutex_unlock(&d->pipeline_lock);
         display_release_slot(d, &ticket);
         return -1;
     }
@@ -660,6 +717,7 @@ static int display_copy_push_slot(struct display_state *d, int slot, uint64_t ge
                                       d->frame_size, 0, d->frame_size,
                                       cookie, display_frame_release);
     if (!buf) {
+        pthread_mutex_unlock(&d->pipeline_lock);
         display_release_slot(d, &ticket);
         g_free(cookie);
         return -1;
@@ -686,6 +744,7 @@ static int display_copy_push_slot(struct display_state *d, int slot, uint64_t ge
         d->next_pts_ns += duration;
     }
     flow = gst_app_src_push_buffer(GST_APP_SRC(d->appsrc), buf);
+    pthread_mutex_unlock(&d->pipeline_lock);
     if (flow != GST_FLOW_OK)
         return -1;
     return 0;
@@ -696,8 +755,9 @@ static void *display_thread_main(void *arg)
     struct display_state *d = (struct display_state *)arg;
 
     for (;;) {
-        int slot;
-        uint64_t generation;
+        struct lpr_frame_ref frame = {0};
+        struct live_result result;
+        bool has_result;
 
         pthread_mutex_lock(&d->slots_lock);
         while (d->running && !d->has_new)
@@ -706,49 +766,102 @@ static void *display_thread_main(void *arg)
             pthread_mutex_unlock(&d->slots_lock);
             break;
         }
-        slot = d->pending_slot;
-        generation = d->pending_generation;
-        d->pending_slot = -1;
-        d->pending_generation = 0;
+        frame = d->pending_frame;
+        memset(&d->pending_frame, 0, sizeof(d->pending_frame));
+        result = d->pending_result;
+        has_result = d->pending_has_result;
+        d->pending_has_result = false;
         d->has_new = false;
         pthread_mutex_unlock(&d->slots_lock);
 
-        if (slot >= 0) {
-            if (display_copy_push_slot(d, slot, generation) < 0) {
+        if (lpr_frame_ref_is_valid(&frame)) {
+            if (display_copy_push_frame(d, &frame, &result,
+                                        has_result) < 0) {
                 pthread_mutex_lock(&d->slots_lock);
                 d->display_error = true;
                 pthread_mutex_unlock(&d->slots_lock);
             }
-            lpr_dma_slot_release(d->dma, slot);
+            lpr_frame_ref_release(&frame);
         }
     }
     return NULL;
 }
 
-int lpr_display_push_bgrx_slot(struct display_state *d, struct dma_state *dma, int slot)
+int lpr_display_push_frame(struct display_state *d,
+                           const struct lpr_frame_ref *frame,
+                           const struct live_result *result)
 {
+    struct lpr_frame_ref replacement = {0};
+    struct lpr_frame_ref displaced = {0};
+
     if (!d || !d->enabled) return 0;
-    if (!dma || slot < 0) return -1;
+    if (!frame || !lpr_frame_ref_is_valid(frame) ||
+        frame->meta.source_generation !=
+            atomic_load(&d->accepted_source_generation))
+        return -1;
+    if (lpr_frame_ref_clone(frame, &replacement) < 0)
+        return -1;
 
     pthread_mutex_lock(&d->slots_lock);
     if (d->display_error) {
         pthread_mutex_unlock(&d->slots_lock);
+        lpr_frame_ref_release(&replacement);
         return -1;
     }
     if (!d->thread_started) {
         pthread_mutex_unlock(&d->slots_lock);
+        lpr_frame_ref_release(&replacement);
         return -1;
     }
-    if (d->has_new && d->pending_slot >= 0) {
+    if (d->has_new) {
         d->dropped_frames++;
-        lpr_dma_slot_release(d->dma, d->pending_slot);
+        displaced = d->pending_frame;
+        memset(&d->pending_frame, 0, sizeof(d->pending_frame));
     }
-    lpr_dma_slot_addref(dma, slot);
-    d->dma = dma;
-    d->pending_slot = slot;
-    d->pending_generation = lpr_dma_slot_generation(dma, slot);
+    d->pending_frame = replacement;
+    d->pending_has_result =
+        result && result->source_generation ==
+                      frame->meta.source_generation;
+    if (d->pending_has_result)
+        d->pending_result = *result;
+    else
+        memset(&d->pending_result, 0, sizeof(d->pending_result));
     d->has_new = true;
     pthread_cond_signal(&d->slots_cond);
     pthread_mutex_unlock(&d->slots_lock);
+    lpr_frame_ref_release(&displaced);
     return 0;
+}
+
+void lpr_display_reset(struct display_state *d, uint64_t source_generation)
+{
+    struct lpr_frame_ref pending = {0};
+
+    if (!d)
+        return;
+    if (!d->enabled || !d->slots_lock_init || !d->pipeline_lock_init) {
+        atomic_store(&d->accepted_source_generation, source_generation);
+        return;
+    }
+    pthread_mutex_lock(&d->pipeline_lock);
+    atomic_store(&d->accepted_source_generation, source_generation);
+    pthread_mutex_lock(&d->slots_lock);
+    if (d->has_new) {
+        pending = d->pending_frame;
+        memset(&d->pending_frame, 0, sizeof(d->pending_frame));
+        memset(&d->pending_result, 0, sizeof(d->pending_result));
+        d->pending_has_result = false;
+        d->has_new = false;
+        d->dropped_frames++;
+    }
+    d->pts_initialized = false;
+    d->next_pts_ns = 0;
+    pthread_mutex_unlock(&d->slots_lock);
+    lpr_frame_ref_release(&pending);
+
+    if (d->pipeline) {
+        gst_element_send_event(d->pipeline, gst_event_new_flush_start());
+        gst_element_send_event(d->pipeline, gst_event_new_flush_stop(TRUE));
+    }
+    pthread_mutex_unlock(&d->pipeline_lock);
 }
