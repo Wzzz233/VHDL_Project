@@ -100,11 +100,11 @@ class ImageInferenceRunner:
     def _plate_command(self, raw_path: Path, socket_path: Path) -> list[str]:
         model = self.config.model_root
         plate_type_model = self.config.plate_type_model or (
-            model / "plate_type_classifier_5color_resnet18_warped_nocrop_rk3568_fp16_opt0.rknn"
+            model / "plate_type_classifier_5color_large_green_v2_rk3568_fp16_opt0.rknn"
         )
         return [
             str(self.config.plate_driver),
-            "--plate-model", str(model / "best_fp16.rknn"),
+            "--plate-model", str(model / "best_int8_5color_scorex256_rk3568.rknn"),
             "--ocr-blue-model", str(model / "pplcnet_blue_v3_rk3568_fp16.rknn"),
             "--ocr-green-model", str(model / "pplcnet_green_v2_b1plus_rk3568_fp16.rknn"),
             "--ocr-yellow-model", str(model / "pplcnet_yellow_all_single_v1_rk3568_fp16.rknn"),
@@ -119,11 +119,11 @@ class ImageInferenceRunner:
             "--ocr-keys", str(model / "special_keys.txt"),
             "--det-resize", "letterbox",
             "--ocr-preproc", "gray",
-            "--fps", "60",
-            "--det-score-scale", "1",
-            "--min-plate-conf", "0.25",
-            "--plate-nms-iou", "0.45",
-            "--plate-max-det", "16",
+            "--fps", "30",
+            "--det-score-scale", "256",
+            "--min-plate-conf", "0.35",
+            "--plate-nms-iou", "0.35",
+            "--plate-max-det", "9",
             "--source", "fpga",
             "--input-bgrx", str(raw_path),
             "--frames", "600",

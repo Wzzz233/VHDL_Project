@@ -10,7 +10,7 @@ ARM_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 RUNTIME_DIR=/run/pplcnet-board
 LOG_DIR=/var/log/pplcnet-board
 MODEL_DIR="${MODEL_DIR:-/userdata/model}"
-PLATE_TYPE_MODEL="${PLATE_TYPE_MODEL:-${MODEL_DIR}/plate_type_classifier_5color_resnet18_warped_nocrop_rk3568_fp16_opt0.rknn}"
+PLATE_TYPE_MODEL="${PLATE_TYPE_MODEL:-${MODEL_DIR}/plate_type_classifier_5color_large_green_v2_rk3568_fp16_opt0.rknn}"
 export PLATE_TYPE_MODEL
 BOARD_HOST="${BOARD_HOST:-pg2l50h.home.arpa}"
 MEDIAMTX_BIN="${MEDIAMTX_BIN:-/opt/mediamtx-v1.19.2/bin/mediamtx}"
@@ -40,7 +40,7 @@ chmod 0755 "${RUNTIME_DIR}" "${LOG_DIR}"
 required_files=(
     "${ARM_ROOT}/pplcnet_bgp_live"
     "${MEDIAMTX_BIN}"
-    "${MODEL_DIR}/best_fp16.rknn"
+    "${MODEL_DIR}/best_int8_5color_scorex256_rk3568.rknn"
     "${MODEL_DIR}/pplcnet_blue_v3_rk3568_fp16.rknn"
     "${MODEL_DIR}/pplcnet_green_v2_b1plus_rk3568_fp16.rknn"
     "${MODEL_DIR}/pplcnet_yellow_all_single_v1_rk3568_fp16.rknn"

@@ -26,14 +26,14 @@ Plate mode keeps the OV5640 live plate process running. Pedestrian mode stops
 that process and runs CPlus only for an uploaded still image. A plate still
 image temporarily pauses the live process and restores it after inference.
 
-Still-image plate inference uses a 0.25 detector threshold, 0.45 NMS, and a
-16-plate result capacity for collage-style QA images. The live OV5640 command
-keeps its existing 0.45 / 0.65 / 9 settings. Police OCR uses the v5 white-expand
-model; the embassy route now loads the unified black-plate model and keys.
+Live video and still-image plate inference now share the five-colour detector
+configuration: score scale 256, 0.35 detector threshold, 0.35 NMS, and up to
+9 plates. Police OCR uses the v5 white-expand model; the embassy route loads
+the unified black-plate model and keys.
 
-The web server never opens the FPGA DMA device, starts the live binary, changes
-model paths, or overrides inference/display defaults. Runtime commands go to an
-already-running live process through a Unix domain socket.
+The web server never opens the FPGA DMA device directly. Its driver manager starts
+the checked-in launch script, while runtime source commands go to the live process
+through a Unix domain socket.
 
 ## Components
 

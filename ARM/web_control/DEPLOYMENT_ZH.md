@@ -81,10 +81,10 @@ sudo docker run --rm --privileged -u root \
   make -B pplcnet-bgp-live cplus-rk3568-driver
 ```
 
-本次实际使用上述镜像完成了强制全量编译。当前产物为 161840 字节，SHA256 为：
+本次实际使用上述镜像完成了强制全量编译。当前产物为 165936 字节，SHA256 为：
 
 ```text
-63721ce3348a29d25832b123b693cdbbd28e17f5c27cd5bf293d57a0f184cc27
+40b3bc67f5e1fdc107737f37abba1f846f0fd028b34f1f28aefe83a3a6bd1a3b
 ```
 
 网页行人 mask 需要本次重新编译的 `cplus-rk3568-driver`。当前验证产物为 71472 字节，
@@ -333,7 +333,7 @@ chmod 0600 web_control/tls/generated/ca.key
 
 ```bash
 MODEL_DIR=/userdata/model
-test -r "${MODEL_DIR}/best_fp16.rknn"
+test -r "${MODEL_DIR}/best_int8_5color_scorex256_rk3568.rknn"
 test -r "${MODEL_DIR}/pplcnet_blue_v3_rk3568_fp16.rknn"
 test -r "${MODEL_DIR}/pplcnet_green_v2_b1plus_rk3568_fp16.rknn"
 test -r "${MODEL_DIR}/special_keys.txt"
@@ -346,29 +346,24 @@ test -r "${MODEL_DIR}/pplcnet_green_keys.txt"
 pplcnet_police_v5_whiteexpand_rk3568_fp16.rknn + police_keys.txt
 pplcnet_black_unified_v1_rk3568_fp16.rknn + black_unified_keys.txt
 pplcnet_yellow_all_single_v1_rk3568_fp16.rknn + yellow_keys.txt
-plate_type_classifier_6cls_resnet18_warped_nocrop_rk3568_fp16_opt0.rknn
+plate_type_classifier_5color_large_green_v2_rk3568_fp16_opt0.rknn
 ```
 
 黑牌统一模型通过现有 embassy 路由参数加载。黄色牌继续使用 Yellow7，包括末位“学/挂”。
 
-### 10.1 回退车牌类型分类器
+### 10.1 临时指定其他五色分类器
 
-新的分类器与旧版使用了相同的文件名，不能靠文件名判断版本。建议把已验证的旧版另存为：
-
-```text
-/userdata/model/plate_type_classifier_20260602.rknn
-```
-
-启动时明确指定旧版，实时车牌和网页单图识别会使用同一个分类器：
+启动脚本默认使用上面的 `large_green_v2` 分类器。需要对比其他兼容五色分类器时，
+可通过完整路径覆盖，实时车牌和网页单图识别会使用同一个文件：
 
 ```bash
 cd /home/linaro/ARM
-sudo env PLATE_TYPE_MODEL=/userdata/model/plate_type_classifier_20260602.rknn \
+sudo env PLATE_TYPE_MODEL=/userdata/model/other_compatible_5color.rknn \
   ./web_control/start_board.sh
 ```
 
-这只回退车牌类型分类器，不会回退新的警牌 OCR 和黑牌 OCR。取消变量后，脚本仍使用原来的默认文件名。
-
+覆盖模型必须保持 `blue, green, yellow, white, black` 的五类顺序。取消该变量后恢复
+`large_green_v2` 默认分类器。OCR 专家不会因这个变量发生变化。
 
 ## 11. 首次手动启动
 
@@ -386,38 +381,20 @@ sudo -u linaro /opt/mediamtx-v1.19.2/bin/mediamtx \
 
 ### 11.2 终端二：识别程序
 
-基础蓝牌/绿牌配置：
+网页服务与手动运行共用 `run_plate_live.sh`。单独验证最新五色车牌链路时执行：
 
 ```bash
 cd /home/linaro/ARM
-MODEL_DIR=/home/linaro/models
-
-sudo -g pplcnet ./pplcnet_bgp_live \
-  --plate-model "${MODEL_DIR}/plate_pose.rknn" \
-  --ocr-blue-model "${MODEL_DIR}/ocr_blue.rknn" \
-  --ocr-green-model "${MODEL_DIR}/ocr_green.rknn" \
-  --ocr-blue-keys "${MODEL_DIR}/keys_blue.txt" \
-  --ocr-green-keys "${MODEL_DIR}/keys_green.txt" \
-  --source fpga \
-  --phone-rtsp rtsp://127.0.0.1:8554/phone \
-  --control-socket /run/pplcnet-bgp-live/control.sock
+sudo env MODEL_DIR=/userdata/model ./web_control/run_plate_live.sh
 ```
 
-如需完整可选路由，在同一命令末尾追加：
+脚本固定加载 `best_int8_5color_scorex256_rk3568.rknn` 和
+`plate_type_classifier_5color_large_green_v2_rk3568_fp16_opt0.rknn`，并使用 30 fps、
+分数缩放 256、检测阈值 0.35、NMS 0.35、最多 9 个检测框。五路 OCR 模型与 keys
+也都由该脚本统一传入。
 
-```bash
-  --ocr-police-model "${MODEL_DIR}/ocr_police.rknn" \
-  --ocr-police-keys "${MODEL_DIR}/keys_police.txt" \
-  --ocr-embassy-model "${MODEL_DIR}/ocr_embassy.rknn" \
-  --ocr-embassy-keys "${MODEL_DIR}/keys_embassy.txt" \
-  --ocr-yellow-model "${MODEL_DIR}/ocr_yellow.rknn" \
-  --ocr-yellow-keys "${MODEL_DIR}/keys_yellow.txt" \
-  --plate-type-classifier-model "${MODEL_DIR}/plate_type_classifier.rknn"
-```
-
-不要把“追加参数”代码块单独执行。
-
-除专项实验外，不要覆盖现有默认值。当前默认包括 10 fps、检测阈值 0.50、NMS 0.45、最多 8 个检测框和 stretch 映射。
+完整网页服务不要先手动启动该命令，直接运行 `start_board.sh`，它会调用相同脚本并创建
+控制 socket、MediaMTX 和 HTTPS 服务。
 
 检查 socket：
 
@@ -894,9 +871,8 @@ sudo env BOARD_IP=192.168.10.50 ./web_control/start_board.sh
 车牌模式使用当前 `pplcnet_bgp_live` 的单图入口，并加载 `/userdata/model` 下的现有车牌
 检测、板型分类和五路 OCR 模型。行人模式使用：
 
-上传图片为多车牌拼图时，单图链路使用独立于 OV5640 实时链路的参数：检测阈值 0.25、
-NMS 0.45、最多保留 16 个检测框；结果和 OCR 容量也为 16。实时启动脚本仍保持阈值
-0.45、NMS 0.65 和最多 9 个检测框。
+实时视频与网页单图使用同一套五色检测参数：30 fps、分数缩放 256、检测阈值 0.35、
+NMS 0.35、最多保留 9 个检测框。这样同一张图片在本地命令和网页入口中的后处理行为一致。
 
 ```text
 /home/linaro/ARM/cplus-rk3568-driver
