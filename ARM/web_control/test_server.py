@@ -11,6 +11,7 @@ import os
 import socketserver
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -146,14 +147,66 @@ class FakeWhipServer(ThreadingHTTPServer):
 class FakeImageRunner:
     def __init__(self) -> None:
         self.requests: list[tuple[str, bytes, str]] = []
+        self.path_requests: list[tuple[str, str]] = []
 
-    def run(self, mode: str, image: bytes, media_type: str) -> dict[str, Any]:
+    def run(self, mode: str, image: bytes, media_type: str, attach_source_image: bool = False) -> dict[str, Any]:
         self.requests.append((mode, image, media_type))
-        return {
+        response = {
             "ok": True,
             "mode": mode,
             "frame": {"width": 1280, "height": 720},
             "results": {"detections": [{"text": "TEST001"}]},
+        }
+        if attach_source_image:
+            response["source_image"] = {
+                "content_type": "image/jpeg",
+                "base64": base64.b64encode(FAKE_JPEG).decode("ascii"),
+            }
+        return response
+
+    def run_from_path(self, mode: str, file_path: Path) -> dict[str, Any]:
+        self.path_requests.append((mode, str(file_path)))
+        return {
+            "ok": True,
+            "mode": mode,
+            "frame": {"width": 1280, "height": 720},
+            "results": {"targets": [{"decision": "not_suspected", "reason": "SIDEWALK_SUPPRESSED", "box": [1, 2, 3, 4]}]},
+            "source_image": {
+                "content_type": "image/jpeg",
+                "base64": base64.b64encode(FAKE_JPEG).decode("ascii"),
+            },
+        }
+
+
+class FakeVideoRunner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, float]] = []
+
+    def run_video(self, video_path, sample_fps, progress_callback=None):
+        self.calls.append((str(video_path), sample_fps))
+        if progress_callback is not None:
+            progress_callback(0, 0, "extracting")
+            progress_callback(1, 2, "frame 1/2")
+        return {
+            "events": [
+                {
+                    "frame_index": 0,
+                    "time_sec": 0.0,
+                    "decision": "suspected",
+                    "reason": "ROAD_DOMINANT_WITHOUT_ZEBRA",
+                    "keyframe_index": 0,
+                }
+            ],
+            "keyframes": [FAKE_JPEG],
+            "summary": {
+                "total_frames": 2,
+                "violation_frames": 1,
+                "violation_count": 1,
+                "skipped_frames": 0,
+                "decision_counts": {"suspected": 1},
+                "sample_fps": sample_fps,
+                "truncated": False,
+            },
         }
 
 
@@ -195,6 +248,18 @@ class WebControlTest(unittest.TestCase):
 
         self.image_runner = FakeImageRunner()
         self.driver_manager = FakeDriverManager()
+        self.video_runner = FakeVideoRunner()
+
+        self.sd_root = Path(self.tempdir.name) / "sdcard"
+        self.sd_root.mkdir()
+        (self.sd_root / "photo.jpg").write_bytes(FAKE_JPEG)
+        (self.sd_root / "clip.mp4").write_bytes(b"fakevideo")
+        (self.sd_root / "notes.txt").write_bytes(b"notes")
+        subdir = self.sd_root / "sub"
+        subdir.mkdir()
+        (subdir / "a.png").write_bytes(b"pngdata")
+
+        self.video_store = server.VideoJobStore(self.video_runner, self.driver_manager, self.sd_root)
 
         config = server.AppConfig(
             control_socket=self.socket_path,
@@ -205,8 +270,11 @@ class WebControlTest(unittest.TestCase):
             mediamtx_timeout=1.0,
             frame_max_fps=8.0,
             static_root=Path(__file__).resolve().parent / "static",
+            sd_root=self.sd_root,
             image_runner=self.image_runner,
             driver_manager=self.driver_manager,
+            video_runner=self.video_runner,
+            video_store=self.video_store,
         )
         self.web = server.create_server(("127.0.0.1", 0), server.AppState(config))
         self.web_thread = threading.Thread(target=self.web.serve_forever, daemon=True)
@@ -394,6 +462,113 @@ class WebControlTest(unittest.TestCase):
             {"Content-Type": "text/plain", "X-Inference-Mode": "plate"},
         )
         self.assertEqual(status, 415)
+
+    def test_sd_list_and_photo_inference(self) -> None:
+        status, _, body = self.request("GET", "/api/v1/sd/list")
+        self.assertEqual(status, 200)
+        listing = json.loads(body)
+        names = {entry["name"]: entry["type"] for entry in listing["entries"]}
+        self.assertEqual(names["photo.jpg"], "photo")
+        self.assertEqual(names["clip.mp4"], "video")
+        self.assertEqual(names["sub"], "dir")
+
+        status, _, body = self.request("GET", "/api/v1/sd/list?path=sub")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["path"], "sub")
+
+        status, _, _ = self.request("GET", "/api/v1/sd/list?path=../etc")
+        self.assertEqual(status, 400)
+
+        payload = json.dumps({"path": "photo.jpg", "mode": "pedestrian"}).encode("utf-8")
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/sd/photo-inference",
+            payload,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        response = json.loads(body)
+        self.assertEqual(response["mode"], "pedestrian")
+        self.assertIn("source_image", response)
+        self.assertEqual(self.driver_manager.sessions[-1], "pedestrian")
+
+        payload = json.dumps({"path": "photo.jpg", "mode": "unknown"}).encode("utf-8")
+        status, _, _ = self.request(
+            "POST",
+            "/api/v1/sd/photo-inference",
+            payload,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+
+        payload = json.dumps({"path": "nope.jpg", "mode": "plate"}).encode("utf-8")
+        status, _, _ = self.request(
+            "POST",
+            "/api/v1/sd/photo-inference",
+            payload,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 404)
+
+        payload = json.dumps({"path": "sub", "mode": "plate"}).encode("utf-8")
+        status, _, _ = self.request(
+            "POST",
+            "/api/v1/sd/photo-inference",
+            payload,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 404)
+
+    def test_sd_video_inference_job(self) -> None:
+        payload = json.dumps({"path": "clip.mp4", "sample_fps": 1}).encode("utf-8")
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/sd/video-inference",
+            payload,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 202)
+        job_id = json.loads(body)["job_id"]
+
+        deadline = time.monotonic() + 5
+        job = None
+        while time.monotonic() < deadline:
+            status, _, body = self.request("GET", f"/api/v1/sd/video-jobs/{job_id}")
+            self.assertEqual(status, 200)
+            job = json.loads(body)
+            if job["status"] != "running":
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(job)
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["summary"]["violation_count"], 1)
+        self.assertEqual(job["keyframe_count"], 1)
+        self.assertEqual(self.driver_manager.sessions[-1], "pedestrian")
+
+        status, headers, body = self.request(
+            "GET", f"/api/v1/sd/video-jobs/{job_id}/keyframes/0.jpg"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "image/jpeg")
+        self.assertEqual(body, FAKE_JPEG)
+
+        status, _, body = self.request("GET", "/api/v1/sd/video-jobs")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["jobs"][0]["id"], job_id)
+
+        status, _, _ = self.request(
+            "GET", f"/api/v1/sd/video-jobs/{job_id}/keyframes/99.jpg"
+        )
+        self.assertEqual(status, 404)
+
+        payload = json.dumps({"path": "clip.mp4", "sample_fps": 20}).encode("utf-8")
+        status, _, _ = self.request(
+            "POST",
+            "/api/v1/sd/video-inference",
+            payload,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
 
     def test_whip_post_patch_delete_and_location_rewrite(self) -> None:
         offer = b"v=0\r\na=fake-offer\r\n"

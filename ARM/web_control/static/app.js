@@ -34,6 +34,20 @@ const elements = {
   displayDrops: document.getElementById("displayDrops"),
   count: document.getElementById("detectionCount"),
   resultList: document.getElementById("resultList"),
+  sdCurrentPath: document.getElementById("sdCurrentPath"),
+  sdFileList: document.getElementById("sdFileList"),
+  sdBrowseState: document.getElementById("sdBrowseState"),
+  sdRefresh: document.getElementById("sdRefresh"),
+  sdSelectedName: document.getElementById("sdSelectedName"),
+  runSdPhotoInference: document.getElementById("runSdPhotoInference"),
+  runSdVideoInference: document.getElementById("runSdVideoInference"),
+  sdVideoFps: document.getElementById("sdVideoFps"),
+  sdVideoResult: document.getElementById("sdVideoResult"),
+  sdVideoProgressLabel: document.getElementById("sdVideoProgressLabel"),
+  sdVideoProgress: document.getElementById("sdVideoProgress"),
+  sdVideoSummary: document.getElementById("sdVideoSummary"),
+  sdVideoEvents: document.getElementById("sdVideoEvents"),
+  sdVideoEventCount: document.getElementById("sdVideoEventCount"),
 };
 
 const overlayContext = elements.canvas.getContext("2d");
@@ -49,6 +63,10 @@ let imageViewActive = false;
 let imageInferenceRunning = false;
 let currentDriverMode = "plate";
 let driverSwitching = false;
+let sdCurrentSubpath = "";
+let sdSelectedEntry = null;
+let sdVideoJobId = null;
+let sdVideoPolling = false;
 
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -771,6 +789,28 @@ async function showRenderedImage(rendered) {
   await elements.frame.decode().catch(() => {});
 }
 
+async function showBase64Image(image) {
+  if (!image || typeof image.base64 !== "string") return false;
+  const contentType = image.content_type || "image/jpeg";
+  if (!contentType.startsWith("image/")) return false;
+  const decoded = window.atob(image.base64);
+  const bytes = new Uint8Array(decoded.length);
+  for (let index = 0; index < decoded.length; index += 1) {
+    bytes[index] = decoded.charCodeAt(index);
+  }
+  const nextUrl = URL.createObjectURL(new Blob([bytes], {type: contentType}));
+  if (currentFrameUrl) URL.revokeObjectURL(currentFrameUrl);
+  currentFrameUrl = nextUrl;
+  elements.frame.src = nextUrl;
+  elements.frame.dataset.ready = "true";
+  elements.frameState.hidden = true;
+  elements.returnLiveView.hidden = false;
+  imageViewActive = true;
+  await elements.frame.decode().catch(() => {});
+  drawOverlay();
+  return true;
+}
+
 async function runImageInference() {
   const file = elements.imageFile.files?.[0];
   if (!file || imageInferenceRunning) return;
@@ -829,6 +869,306 @@ function returnToLiveView() {
   resetVisualEpoch();
 }
 
+function setSdBrowseState(state, label) {
+  elements.sdBrowseState.dataset.state = state;
+  elements.sdBrowseState.textContent = label;
+}
+
+function sdIconText(type) {
+  if (type === "parent") return "↩";
+  if (type === "dir") return "📁";
+  if (type === "photo") return "🖼";
+  if (type === "video") return "🎬";
+  return "📄";
+}
+
+function formatFileSize(bytes) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
+
+function renderSdList(listing) {
+  elements.sdCurrentPath.textContent = "/" + (listing.path || "");
+  elements.sdFileList.replaceChildren();
+  const entries = listing.entries || [];
+  if (!entries.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty-result";
+    empty.textContent = "目录为空";
+    elements.sdFileList.append(empty);
+    return;
+  }
+  for (const entry of entries) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "sd-file-row";
+    row.dataset.type = entry.type;
+    row.dataset.path = entry.path;
+    if (sdSelectedEntry && sdSelectedEntry.path === entry.path) {
+      row.dataset.selected = "true";
+    }
+    const icon = document.createElement("span");
+    icon.className = "sd-file-icon";
+    icon.textContent = sdIconText(entry.type);
+    const name = document.createElement("span");
+    name.className = "sd-file-name";
+    name.textContent = entry.name;
+    const meta = document.createElement("span");
+    meta.className = "sd-file-meta";
+    meta.textContent = entry.type === "dir" || entry.type === "parent" ? "" : formatFileSize(entry.size);
+    row.append(icon, name, meta);
+    elements.sdFileList.append(row);
+  }
+}
+
+async function loadSdList(subpath = "") {
+  setSdBrowseState("loading", "正在读取 SD 卡");
+  try {
+    const data = await fetchJson("/api/v1/sd/list?path=" + encodeURIComponent(subpath));
+    sdCurrentSubpath = data.path || "";
+    renderSdList(data);
+    setSdBrowseState(
+      "live",
+      data.truncated ? `已截断，显示前 ${data.entries.length} 项` : `共 ${data.entries.length} 项`,
+    );
+  } catch (error) {
+    elements.sdFileList.replaceChildren();
+    const empty = document.createElement("p");
+    empty.className = "empty-result";
+    empty.textContent = error?.message || "读取失败";
+    elements.sdFileList.append(empty);
+    setSdBrowseState("error", error?.message || "读取失败");
+  }
+}
+
+function selectSdEntry(entry) {
+  if (entry.type === "parent" || entry.type === "dir") {
+    void loadSdList(entry.path);
+    return;
+  }
+  if (entry.type !== "photo" && entry.type !== "video") {
+    setSdBrowseState("error", "该文件类型不支持推理");
+    return;
+  }
+  sdSelectedEntry = entry;
+  elements.sdSelectedName.textContent = entry.name;
+  for (const row of elements.sdFileList.querySelectorAll(".sd-file-row")) {
+    row.dataset.selected = row.dataset.path === entry.path ? "true" : "false";
+  }
+  setSdBrowseState("selected", `已选 ${entry.type === "photo" ? "照片" : "视频"}`);
+  updateSdActionButtons();
+}
+
+function updateSdActionButtons() {
+  const photo = Boolean(sdSelectedEntry && sdSelectedEntry.type === "photo");
+  const video = Boolean(sdSelectedEntry && sdSelectedEntry.type === "video");
+  const busy = imageInferenceRunning || sdVideoPolling;
+  elements.runSdPhotoInference.disabled = !photo || busy;
+  elements.runSdVideoInference.disabled = !video || busy;
+}
+
+const REASON_LABELS = {
+  ROAD_DOMINANT_WITHOUT_ZEBRA: "路面为主且无斑马线",
+  ROAD_DOMINANT_ZEBRA_NOISE_IGNORED: "路面为主，斑马噪声已忽略",
+  SIDEWALK_SUPPRESSED: "人行道（已排除）",
+  ZEBRA_SUPPRESSED: "斑马线区域（已排除）",
+};
+
+function reasonLabel(reason) {
+  const text = String(reason || "");
+  return REASON_LABELS[text] || text || "疑似违规";
+}
+
+function setSdVideoProgressLabel(state, label) {
+  elements.sdVideoProgressLabel.dataset.state = state;
+  elements.sdVideoProgressLabel.textContent = label;
+}
+
+function renderSdVideoSummary(summary) {
+  if (!summary) {
+    elements.sdVideoSummary.replaceChildren();
+    return;
+  }
+  const rows = [
+    ["采样帧数", summary.total_frames ?? "--"],
+    ["违规帧数", summary.violation_frames ?? 0],
+    ["违规事件", summary.violation_count ?? 0],
+    ["跳过帧数", summary.skipped_frames ?? 0],
+    ["采样率", `${summary.sample_fps ?? "--"} fps`],
+  ];
+  if (summary.truncated) rows.push(["提示", "已达帧数上限，已截断"]);
+  elements.sdVideoSummary.replaceChildren();
+  for (const [label, value] of rows) {
+    const row = document.createElement("div");
+    const dt = document.createElement("span");
+    dt.className = "sd-summary-label";
+    dt.textContent = label;
+    const dd = document.createElement("strong");
+    dd.textContent = value;
+    row.append(dt, dd);
+    elements.sdVideoSummary.append(row);
+  }
+}
+
+function renderSdVideoEvents(events) {
+  elements.sdVideoEventCount.textContent = String(events.length);
+  elements.sdVideoEvents.replaceChildren();
+  if (!events.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty-result";
+    empty.textContent = "未发现违规事件";
+    elements.sdVideoEvents.append(empty);
+    return;
+  }
+  for (const event of events) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "sd-video-event";
+    if (event.keyframe_index == null) row.disabled = true;
+    else row.dataset.keyframe = String(event.keyframe_index);
+    const time = document.createElement("span");
+    time.className = "ev-time";
+    time.textContent = `${Number(event.time_sec ?? 0).toFixed(1)}s`;
+    const reason = document.createElement("span");
+    reason.className = "ev-reason";
+    reason.textContent = reasonLabel(event.reason);
+    row.append(time, reason);
+    elements.sdVideoEvents.append(row);
+  }
+}
+
+function renderSdVideoJob(job) {
+  elements.sdVideoProgress.max = job.total || 1;
+  elements.sdVideoProgress.value = job.processed || 0;
+  if (job.status === "running") {
+    setSdVideoProgressLabel("loading", job.message || "进行中");
+  } else if (job.status === "done") {
+    setSdVideoProgressLabel("live", "完成");
+  } else if (job.status === "error") {
+    setSdVideoProgressLabel("error", job.error || "失败");
+  }
+  renderSdVideoEvents(job.events || []);
+  renderSdVideoSummary(job.summary);
+}
+
+async function showSdVideoKeyframe(index) {
+  if (!sdVideoJobId) return;
+  try {
+    const response = await fetchWithTimeout(
+      `/api/v1/sd/video-jobs/${encodeURIComponent(sdVideoJobId)}/keyframes/${index}.jpg`,
+      {},
+      10000,
+      async (res) => new Uint8Array(await res.arrayBuffer()),
+    );
+    const url = URL.createObjectURL(new Blob([response], {type: "image/jpeg"}));
+    if (currentFrameUrl) URL.revokeObjectURL(currentFrameUrl);
+    currentFrameUrl = url;
+    elements.frame.src = url;
+    elements.frame.dataset.ready = "true";
+    elements.frameState.hidden = true;
+    elements.returnLiveView.hidden = false;
+    imageViewActive = true;
+    latestResults = {frame: {width: 1280, height: 720}, detections: []};
+    drawOverlay();
+  } catch (error) {
+    setSdVideoProgressLabel("error", error?.message || "关键帧加载失败");
+  }
+}
+
+async function pollSdVideoJob() {
+  if (!sdVideoJobId) return;
+  try {
+    const job = await fetchJson(`/api/v1/sd/video-jobs/${encodeURIComponent(sdVideoJobId)}`);
+    renderSdVideoJob(job);
+    if (job.status === "running") {
+      window.setTimeout(pollSdVideoJob, 1000);
+    } else {
+      sdVideoPolling = false;
+      updateSdActionButtons();
+    }
+  } catch (error) {
+    setSdVideoProgressLabel("error", error?.message || "查询失败");
+    sdVideoPolling = false;
+    updateSdActionButtons();
+  }
+}
+
+async function runSdVideoInference() {
+  if (!sdSelectedEntry || sdSelectedEntry.type !== "video" || sdVideoPolling) return;
+  const fps = Number(elements.sdVideoFps.value);
+  if (!Number.isFinite(fps) || fps < 0.5 || fps > 10) {
+    setSdVideoProgressLabel("error", "采样率需在 0.5–10 之间");
+    return;
+  }
+  elements.sdVideoResult.hidden = false;
+  setSdVideoProgressLabel("loading", "正在提交任务");
+  elements.sdVideoProgress.value = 0;
+  renderSdVideoEvents([]);
+  renderSdVideoSummary(null);
+  try {
+    const data = await fetchJson("/api/v1/sd/video-inference", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({path: sdSelectedEntry.path, sample_fps: fps}),
+    });
+    sdVideoJobId = data.job_id;
+    sdVideoPolling = true;
+    updateSdActionButtons();
+    void pollSdVideoJob();
+  } catch (error) {
+    setSdVideoProgressLabel("error", error?.message || "视频推理提交失败");
+  }
+}
+
+async function runSdPhotoInference() {
+  if (!sdSelectedEntry || sdSelectedEntry.type !== "photo" || imageInferenceRunning) return;
+  const mode = selectedImageMode();
+  imageInferenceRunning = true;
+  updateSdActionButtons();
+  for (const button of elements.imageModeSelector.querySelectorAll("button")) button.disabled = true;
+  setImageInferenceState("starting", "正在识别 SD 照片");
+  try {
+    const response = await fetchWithTimeout(
+      "/api/v1/sd/photo-inference",
+      {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({path: sdSelectedEntry.path, mode}),
+      },
+      60000,
+      (result) => result.json(),
+    );
+    latestResults = {
+      ...(response.results || {}),
+      frame: response.frame || {width: 1280, height: 720},
+    };
+    const shown = (await showBase64Image(response.rendered_image)) || (await showBase64Image(response.source_image));
+    if (!shown) {
+      imageViewActive = true;
+      elements.returnLiveView.hidden = false;
+      hidePreview("仅结果，无预览图");
+    }
+    updateResultsView(latestResults);
+    const count = normalizedPlates(latestResults).length;
+    setImageInferenceState("live", count ? `识别完成，发现 ${count} 个目标` : "识别完成，未发现目标");
+  } catch (error) {
+    latestResults = {frame: {width: 1280, height: 720}, detections: []};
+    updateResultsView(latestResults);
+    setImageInferenceState("error", error?.message || "SD 照片识别失败");
+  } finally {
+    imageInferenceRunning = false;
+    updateSdActionButtons();
+    for (const button of elements.imageModeSelector.querySelectorAll("button")) button.disabled = false;
+  }
+}
+
 elements.sourceSelector.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-source]");
   if (button) void setDesiredSource(button.dataset.source);
@@ -858,6 +1198,31 @@ elements.imageFile.addEventListener("change", () => {
 
 elements.runImageInference.addEventListener("click", () => void runImageInference());
 elements.returnLiveView.addEventListener("click", returnToLiveView);
+
+elements.sdRefresh.addEventListener("click", () => {
+  void loadSdList(sdCurrentSubpath);
+});
+
+elements.sdFileList.addEventListener("click", (event) => {
+  const row = event.target.closest("button.sd-file-row");
+  if (!row) return;
+  const nameEl = row.querySelector(".sd-file-name");
+  selectSdEntry({
+    name: nameEl ? nameEl.textContent : row.dataset.path,
+    path: row.dataset.path,
+    type: row.dataset.type,
+  });
+});
+
+elements.runSdPhotoInference.addEventListener("click", () => void runSdPhotoInference());
+elements.runSdVideoInference.addEventListener("click", () => void runSdVideoInference());
+
+elements.sdVideoEvents.addEventListener("click", (event) => {
+  const row = event.target.closest("button.sd-video-event");
+  if (!row || row.disabled) return;
+  const index = Number(row.dataset.keyframe);
+  if (Number.isFinite(index)) void showSdVideoKeyframe(index);
+});
 
 for (const [id, action] of [["pausePipeline", "pause"], ["resumePipeline", "resume"], ["restartPipeline", "restart"]]) {
   const button = document.getElementById(id);
@@ -904,3 +1269,4 @@ void statusLoop();
 void resultsLoop();
 void frameLoop();
 void driverModeLoop();
+void loadSdList("");

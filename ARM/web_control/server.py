@@ -21,7 +21,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from driver_manager import DriverManager, DriverManagerError
 from image_inference import (
@@ -29,7 +29,9 @@ from image_inference import (
     ImageInferenceConfig,
     ImageInferenceError,
     ImageInferenceRunner,
+    VideoInferenceRunner,
 )
+from sd_browser import SdBrowserError, SdPathOutsideRoot, list_files, resolve_file
 
 
 ROOT = Path(__file__).resolve().parent
@@ -63,8 +65,11 @@ class AppConfig:
     mediamtx_timeout: float = 5.0
     frame_max_fps: float = 8.0
     static_root: Path = STATIC_ROOT
+    sd_root: Path = Path("/mnt/sdcard")
     image_runner: Any | None = None
     driver_manager: Any | None = None
+    video_runner: Any | None = None
+    video_store: Any | None = None
 
 
 class ControlClient:
@@ -158,12 +163,156 @@ class ControlClient:
             raise ControlUnavailable("live process did not complete the JPEG response") from exc
 
 
+class VideoJobStore:
+    """In-memory store for offline video inference jobs.
+
+    Only one video job may run at a time; the store also blocks on the image
+    runner lock so video and still-image inference never overlap.
+    """
+
+    def __init__(self, video_runner: Any, driver_manager: Any, sd_root: Path) -> None:
+        self.video_runner = video_runner
+        self.driver_manager = driver_manager
+        self.sd_root = sd_root
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._counter = 0
+
+    def _new_id(self) -> str:
+        with self._lock:
+            self._counter += 1
+            return f"vid-{int(time.time())}-{self._counter:04d}"
+
+    def _has_running_locked(self) -> bool:
+        return any(job["status"] == "running" for job in self._jobs.values())
+
+    def has_running(self) -> bool:
+        with self._lock:
+            return self._has_running_locked()
+
+    def start(self, path: str, sample_fps: float) -> str:
+        if self.video_runner is None:
+            raise ControlUnavailable("video inference is not configured")
+        if self.driver_manager is None:
+            raise ControlUnavailable("driver manager is not configured")
+        with self._lock:
+            if self._has_running_locked():
+                raise ImageInferenceBusy("已有一个视频推理任务在运行")
+            file_path = resolve_file(self.sd_root, path)
+            job_id = self._new_id()
+            job: dict[str, Any] = {
+                "id": job_id,
+                "status": "running",
+                "path": path,
+                "name": file_path.name,
+                "sample_fps": sample_fps,
+                "created_at": time.time(),
+                "finished_at": None,
+                "phase": "starting",
+                "processed": 0,
+                "total": 0,
+                "message": "正在启动",
+                "events": [],
+                "keyframes": [],
+                "summary": None,
+                "error": None,
+            }
+            self._jobs[job_id] = job
+        thread = threading.Thread(
+            target=self._run, args=(job_id, file_path, sample_fps), daemon=True
+        )
+        thread.start()
+        return job_id
+
+    def _run(self, job_id: str, file_path: Path, sample_fps: float) -> None:
+        job = self._jobs[job_id]
+
+        def progress(processed: int, total: int, message: str) -> None:
+            with self._lock:
+                job["processed"] = processed
+                job["total"] = total
+                job["message"] = message
+                job["phase"] = "extracting" if total == 0 else "inferencing"
+
+        try:
+            with self.driver_manager.image_session("pedestrian"):
+                result = self.video_runner.run_video(file_path, sample_fps, progress)
+            with self._lock:
+                job["events"] = result["events"]
+                job["keyframes"] = result["keyframes"]
+                job["summary"] = result["summary"]
+                job["status"] = "done"
+                job["phase"] = "done"
+                job["message"] = "完成"
+        except ImageInferenceBusy as exc:
+            with self._lock:
+                job["status"] = "error"
+                job["error"] = str(exc)
+                job["phase"] = "error"
+        except Exception as exc:
+            LOG.warning("video job %s failed: %s", job_id, exc)
+            with self._lock:
+                job["status"] = "error"
+                job["error"] = str(exc)
+                job["phase"] = "error"
+        finally:
+            with self._lock:
+                job["finished_at"] = time.time()
+
+    @staticmethod
+    def _public_view(job: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": job["id"],
+            "status": job["status"],
+            "path": job["path"],
+            "name": job["name"],
+            "sample_fps": job["sample_fps"],
+            "created_at": job["created_at"],
+            "finished_at": job["finished_at"],
+            "phase": job["phase"],
+            "processed": job["processed"],
+            "total": job["total"],
+            "message": job["message"],
+            "events": job["events"],
+            "summary": job["summary"],
+            "keyframe_count": len(job["keyframes"]),
+            "error": job["error"],
+        }
+
+    def get(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            return self._public_view(job)
+
+    def list_recent(self, limit: int = 10) -> list[dict[str, Any]]:
+        with self._lock:
+            jobs = sorted(
+                self._jobs.values(),
+                key=lambda job: job["created_at"],
+                reverse=True,
+            )[:limit]
+            return [self._public_view(job) for job in jobs]
+
+    def get_keyframe(self, job_id: str, index: int) -> bytes | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            keyframes = job["keyframes"]
+            if index < 0 or index >= len(keyframes):
+                return None
+            return keyframes[index]
+
+
 class AppState:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.control = ControlClient(config.control_socket, config.control_timeout)
         self.image_runner = config.image_runner
         self.driver_manager = config.driver_manager
+        self.video_store = config.video_store
         self._frame_lock = threading.Lock()
         self._frame_timestamp = 0.0
         self._frame_content_type = "image/jpeg"
@@ -321,6 +470,136 @@ class ControlHandler(BaseHTTPRequestHandler):
         status = HTTPStatus.OK if response.get("ok") is not False else HTTPStatus.CONFLICT
         self._send_json(status, response)
 
+    def _serve_sd_list(self, query: str) -> None:
+        params = parse_qs(query)
+        subpath_values = params.get("path", [])
+        subpath = subpath_values[0] if subpath_values else ""
+        try:
+            listing = list_files(self.state.config.sd_root, subpath)
+        except SdPathOutsideRoot as exc:
+            self._send_problem(HTTPStatus.BAD_REQUEST, "sd_path_outside_root", str(exc))
+        except SdBrowserError as exc:
+            self._send_problem(HTTPStatus.NOT_FOUND, "sd_browse_failed", str(exc))
+        else:
+            self._send_json(HTTPStatus.OK, listing)
+
+    def _serve_sd_photo_inference(self) -> None:
+        if not self._require_same_origin():
+            return
+        try:
+            value = self._read_json_object()
+        except TypeError as exc:
+            self._send_problem(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "content_type", str(exc))
+            return
+        except OverflowError as exc:
+            self._send_problem(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "body_too_large", str(exc))
+            return
+        except ValueError as exc:
+            self._send_problem(HTTPStatus.BAD_REQUEST, "invalid_json", str(exc))
+            return
+        if set(value) != {"path", "mode"} or value.get("mode") not in ("plate", "pedestrian"):
+            self._send_problem(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "body must contain path and mode (plate or pedestrian)",
+            )
+            return
+        if self.state.image_runner is None:
+            self._send_problem(HTTPStatus.SERVICE_UNAVAILABLE, "image_inference_unavailable", "image inference is not configured")
+            return
+        try:
+            file_path = resolve_file(self.state.config.sd_root, value["path"])
+        except SdPathOutsideRoot as exc:
+            self._send_problem(HTTPStatus.BAD_REQUEST, "sd_path_outside_root", str(exc))
+            return
+        except SdBrowserError as exc:
+            self._send_problem(HTTPStatus.NOT_FOUND, "sd_browse_failed", str(exc))
+            return
+        try:
+            if self.state.driver_manager is None:
+                raise DriverManagerError("driver manager is not configured")
+            with self.state.driver_manager.image_session(value["mode"]):
+                result = self.state.image_runner.run_from_path(value["mode"], file_path)
+        except ImageInferenceBusy as exc:
+            self._send_problem(HTTPStatus.CONFLICT, "image_inference_busy", str(exc))
+        except DriverManagerError as exc:
+            self._send_problem(HTTPStatus.CONFLICT, "driver_mode_failed", str(exc))
+        except ImageInferenceError as exc:
+            LOG.warning("SD photo inference failed: %s", exc)
+            self._send_problem(HTTPStatus.BAD_GATEWAY, "image_inference_failed", str(exc))
+        except Exception:
+            LOG.exception("unexpected SD photo inference failure")
+            self._send_problem(HTTPStatus.INTERNAL_SERVER_ERROR, "image_inference_failed", "unexpected SD photo inference failure")
+        else:
+            self._send_json(HTTPStatus.OK, result)
+
+    def _serve_sd_video_start(self) -> None:
+        if not self._require_same_origin():
+            return
+        try:
+            value = self._read_json_object()
+        except TypeError as exc:
+            self._send_problem(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "content_type", str(exc))
+            return
+        except OverflowError as exc:
+            self._send_problem(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "body_too_large", str(exc))
+            return
+        except ValueError as exc:
+            self._send_problem(HTTPStatus.BAD_REQUEST, "invalid_json", str(exc))
+            return
+        if set(value) - {"path", "sample_fps"} or not isinstance(value.get("path"), str) or not value["path"]:
+            self._send_problem(HTTPStatus.BAD_REQUEST, "invalid_request", "body must contain a non-empty path")
+            return
+        sample_fps = value.get("sample_fps", 1.0)
+        if isinstance(sample_fps, bool) or not isinstance(sample_fps, (int, float)) or not (0.1 <= float(sample_fps) <= 10.0):
+            self._send_problem(HTTPStatus.BAD_REQUEST, "invalid_fps", "sample_fps must be between 0.1 and 10")
+            return
+        if self.state.video_store is None:
+            self._send_problem(HTTPStatus.SERVICE_UNAVAILABLE, "video_inference_unavailable", "video inference is not configured")
+            return
+        try:
+            job_id = self.state.video_store.start(value["path"], float(sample_fps))
+        except ImageInferenceBusy as exc:
+            self._send_problem(HTTPStatus.CONFLICT, "image_inference_busy", str(exc))
+        except SdPathOutsideRoot as exc:
+            self._send_problem(HTTPStatus.BAD_REQUEST, "sd_path_outside_root", str(exc))
+        except SdBrowserError as exc:
+            self._send_problem(HTTPStatus.NOT_FOUND, "sd_browse_failed", str(exc))
+        except ControlUnavailable as exc:
+            self._send_problem(HTTPStatus.SERVICE_UNAVAILABLE, "video_inference_unavailable", str(exc))
+        else:
+            self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "job_id": job_id})
+
+    def _serve_sd_video_job(self, path: str) -> None:
+        if self.state.video_store is None:
+            self._send_problem(HTTPStatus.SERVICE_UNAVAILABLE, "video_inference_unavailable", "video inference is not configured")
+            return
+        rest = path[len("/api/v1/sd/video-jobs/") :]
+        parts = rest.split("/")
+        if len(parts) == 1 and parts[0] and "/" not in parts[0]:
+            job = self.state.video_store.get(parts[0])
+            if job is None:
+                self._send_problem(HTTPStatus.NOT_FOUND, "job_not_found", "video job not found")
+            else:
+                self._send_json(HTTPStatus.OK, job)
+        elif len(parts) == 3 and parts[1] == "keyframes":
+            index_token = parts[2]
+            if not index_token.endswith(".jpg"):
+                self._send_problem(HTTPStatus.NOT_FOUND, "not_found", "resource not found")
+                return
+            try:
+                index = int(index_token[:-4])
+            except ValueError:
+                self._send_problem(HTTPStatus.NOT_FOUND, "not_found", "resource not found")
+                return
+            data = self.state.video_store.get_keyframe(parts[0], index)
+            if data is None:
+                self._send_problem(HTTPStatus.NOT_FOUND, "keyframe_not_found", "keyframe not found")
+            else:
+                self._send_bytes(HTTPStatus.OK, data, "image/jpeg")
+        else:
+            self._send_problem(HTTPStatus.NOT_FOUND, "not_found", "resource not found")
+
     def _serve_static(self, path: str) -> bool:
         entry = STATIC_FILES.get(path)
         if entry is None:
@@ -474,6 +753,15 @@ class ControlHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, self.state.driver_manager.status())
             except DriverManagerError as exc:
                 self._send_problem(HTTPStatus.CONFLICT, "driver_mode_failed", str(exc))
+        elif parsed.path == "/api/v1/sd/list":
+            self._serve_sd_list(parsed.query)
+        elif parsed.path == "/api/v1/sd/video-jobs":
+            if self.state.video_store is None:
+                self._send_problem(HTTPStatus.SERVICE_UNAVAILABLE, "video_inference_unavailable", "video inference is not configured")
+            else:
+                self._send_json(HTTPStatus.OK, {"ok": True, "jobs": self.state.video_store.list_recent()})
+        elif parsed.path.startswith("/api/v1/sd/video-jobs/"):
+            self._serve_sd_video_job(parsed.path)
         else:
             self._send_problem(HTTPStatus.NOT_FOUND, "not_found", "resource not found")
 
@@ -580,6 +868,10 @@ class ControlHandler(BaseHTTPRequestHandler):
                 self._send_problem(HTTPStatus.INTERNAL_SERVER_ERROR, "image_inference_failed", "unexpected image inference failure")
             else:
                 self._send_json(HTTPStatus.OK, result)
+        elif parsed.path == "/api/v1/sd/photo-inference":
+            self._serve_sd_photo_inference()
+        elif parsed.path == "/api/v1/sd/video-inference":
+            self._serve_sd_video_start()
         elif parsed.path in pipeline_paths:
             if not self._require_same_origin():
                 return
@@ -721,6 +1013,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--frame-max-fps", type=float, default=8.0)
     parser.add_argument("--arm-root", type=Path, default=Path("/home/linaro/ARM"))
     parser.add_argument("--model-root", type=Path, default=Path("/userdata/model"))
+    parser.add_argument("--sd-root", type=Path, default=Path("/mnt/sdcard"), help="SD card root for photo/video inference")
     parser.add_argument("--plate-type-model", type=Path)
     parser.add_argument("--plate-image-driver", type=Path, default=Path("/home/linaro/ARM/pplcnet_bgp_live"))
     parser.add_argument("--pedestrian-image-driver", type=Path, default=Path("/home/linaro/ARM/cplus-rk3568-driver"))
@@ -770,6 +1063,8 @@ def main(argv: list[str] | None = None) -> int:
         log_dir=args.driver_log_dir,
         model_dir=args.model_root,
     )
+    video_runner = VideoInferenceRunner(image_runner)
+    video_store = VideoJobStore(video_runner, driver_manager, args.sd_root)
     config = AppConfig(
         control_socket=args.control_socket,
         control_timeout=args.control_timeout,
@@ -778,8 +1073,11 @@ def main(argv: list[str] | None = None) -> int:
         mediamtx_whip_path=args.mediamtx_whip_path,
         mediamtx_timeout=args.mediamtx_timeout,
         frame_max_fps=args.frame_max_fps,
+        sd_root=args.sd_root,
         image_runner=image_runner,
         driver_manager=driver_manager,
+        video_runner=video_runner,
+        video_store=video_store,
     )
     state = AppState(config)
 

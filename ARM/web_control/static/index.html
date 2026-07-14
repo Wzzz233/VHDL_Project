@@ -72,6 +72,40 @@
         <span id="imageInferenceState" class="inline-state" data-state="idle">未选择图片</span>
       </section>
 
+      <section class="control-section sd-section" aria-labelledby="sdHeading">
+        <h2 id="sdHeading">SD 卡文件</h2>
+        <div class="sd-path-bar">
+          <span class="status-label">当前路径</span>
+          <strong id="sdCurrentPath">/</strong>
+          <button id="sdRefresh" class="quiet-button" type="button">刷新</button>
+        </div>
+        <div id="sdFileList" class="sd-file-list" aria-live="polite">
+          <p class="empty-result">未加载</p>
+        </div>
+        <div class="sd-selection">
+          <span class="status-label">选中文件</span>
+          <strong id="sdSelectedName">--</strong>
+        </div>
+        <div class="sd-actions">
+          <label class="sd-fps">采样
+            <input id="sdVideoFps" type="number" min="0.5" max="10" step="0.5" value="1">
+            fps
+          </label>
+          <button id="runSdPhotoInference" class="primary-button" type="button" disabled>识别照片</button>
+          <button id="runSdVideoInference" class="primary-button" type="button" disabled>推理视频</button>
+        </div>
+        <span id="sdBrowseState" class="inline-state" data-state="idle">未加载</span>
+        <div id="sdVideoResult" class="sd-video-result" hidden>
+          <div class="sd-video-progress">
+            <span id="sdVideoProgressLabel" class="inline-state" data-state="idle">--</span>
+            <progress id="sdVideoProgress" max="1" value="0"></progress>
+          </div>
+          <div id="sdVideoSummary" class="sd-video-summary"></div>
+          <div class="sd-video-events-label">违规事件 <span id="sdVideoEventCount">0</span></div>
+          <div id="sdVideoEvents" class="sd-video-events" aria-live="polite"></div>
+        </div>
+      </section>
+
       <section class="control-section" aria-labelledby="metricsHeading">
         <h2 id="metricsHeading">运行状态</h2>
         <dl class="metrics">

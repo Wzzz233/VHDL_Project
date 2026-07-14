@@ -923,3 +923,90 @@ curl --cacert "${CA}" -X PUT \
 
 车牌模式正常状态应包含 `"plate_running":true`；行人模式应包含
 `"plate_running":false` 和 `"pedestrian_on_demand":true`。
+
+## 21. SD 卡照片/视频行人违法推理
+
+网页新增“SD 卡文件”区域，可直接浏览板端 SD 卡上的照片和视频并就地推理，无需通过
+手机上传。照片走与手机上传相同的单图入口；视频离线逐帧推理，输出违规事件时间线、
+关键违规帧和统计摘要。
+
+### 21.1 挂载 SD 卡并指定根目录
+
+板端默认从 `/mnt/sdcard` 读取。先确认 SD 卡已挂载：
+
+```bash
+lsblk        # 找到 SD 卡设备，例如 /dev/mmcblk1p1
+sudo mkdir -p /mnt/sdcard
+sudo mount /dev/mmcblk1p1 /mnt/sdcard
+ls /mnt/sdcard
+```
+
+若实际挂载点不同，用 `SD_ROOT` 覆盖（`start_board.sh` 会透传为 `--sd-root`）：
+
+```bash
+sudo SD_ROOT=/media/sd start_board.sh
+```
+
+`--sd-root` 决定浏览器可见的根目录；所有照片/视频路径都被强制限制在该根下，跨目录
+穿越会被拒绝。识别的照片后缀为 `.jpg/.jpeg/.png`，视频为
+`.mp4/.mov/.avi/.mkv/.m4v/.h264/.ts/.webm`。
+
+### 21.2 浏览 SD 卡
+
+```bash
+curl --cacert "${CA}" "${BASE}/api/v1/sd/list"
+curl --cacert "${CA}" "${BASE}/api/v1/sd/list?path=sub"
+```
+
+返回 `entries` 列表，每项含 `name`、`path`、`type`（`photo`/`video`/`dir`/`parent`）、
+`size`、`mtime`。目录条目可继续下钻，`..` 返回上一级。单次最多返回 2000 项，超出会
+标记 `truncated`。
+
+### 21.3 SD 卡照片推理
+
+```bash
+curl --cacert "${CA}" -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"photo.jpg","mode":"pedestrian"}' \
+  "${BASE}/api/v1/sd/photo-inference"
+```
+
+与手机上传一致：返回 `results`，行人模式额外返回 `rendered_image`（带 mask 的标注
+JPEG）和 `source_image`（1280x720 letterbox 源图）。`mode` 可为 `plate` 或
+`pedestrian`。任务与实时流程互斥，照片推理期间会临时停止实时车牌进程。
+
+### 21.4 SD 卡视频推理
+
+视频推理是异步任务。提交后返回 `job_id`，轮询状态直至完成：
+
+```bash
+JOB=$(curl --cacert "${CA}" -sX POST \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"clip.mp4","sample_fps":1}' \
+  "${BASE}/api/v1/sd/video-inference" | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
+
+curl --cacert "${CA}" "${BASE}/api/v1/sd/video-jobs/${JOB}"
+```
+
+`sample_fps` 取值 0.1–10，默认 1。低于 1 时按比例隔帧抽样（例如 0.5 即每 2 秒 1 帧），
+适合长视频。任务状态 `running` 时持续轮询；`done` 后 `summary` 给出采样帧数、违规帧
+数、违规事件数、跳过帧数和决策分布，`events` 列出每个违规事件的时间、原因和关联的
+关键帧索引；`error` 给出失败原因。
+
+关键帧为违规时刻的 mask 标注图：
+
+```bash
+curl --cacert "${CA}" "${BASE}/api/v1/sd/video-jobs/${JOB}/keyframes/0.jpg" -o kf0.jpg
+```
+
+### 21.5 限制与注意事项
+
+- 视频逐帧推理复用 CPlus 单帧离线入口，每帧都会重启 driver 并重新加载模型，属于离线
+  批处理路径，不是实时。30 秒 1fps 视频约需数十秒。
+- 同时只允许一个视频推理任务，且与照片/实时推理互斥。
+- 单任务最多采样 600 帧，超出会截断并在 `summary.truncated` 标记；最多保留 24 张关键
+  帧。需要更长视频可调高 `sample_fps` 或分段。
+- 抽帧使用 `decodebin ! videoconvert ! videoscale ! videorate ! multifilesink`，依赖板端
+  GStreamer 解码插件；硬解是否启用取决于 `mppvideodec` 是否被 `decodebin` 选中。
+- 临时帧文件在任务结束的临时目录中自动清理。
+

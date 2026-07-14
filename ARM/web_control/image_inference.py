@@ -243,7 +243,7 @@ class ImageInferenceRunner:
         detail = completed.stdout[-1000:]
         raise ImageInferenceError(f"行人检测没有返回 JSON 结果: {detail}")
 
-    def run(self, mode: str, image: bytes, media_type: str) -> dict[str, Any]:
+    def run(self, mode: str, image: bytes, media_type: str, attach_source_image: bool = False) -> dict[str, Any]:
         if mode not in ("plate", "pedestrian"):
             raise ImageInferenceError("识别模式必须是 plate 或 pedestrian")
         if media_type not in ("image/jpeg", "image/png"):
@@ -274,6 +274,223 @@ class ImageInferenceRunner:
                         "content_type": "image/jpeg",
                         "base64": base64.b64encode(rendered_jpeg).decode("ascii"),
                     }
+                if attach_source_image:
+                    source_jpeg = self._encode_bgrx_jpeg(raw_path, work / "source.jpg")
+                    response["source_image"] = {
+                        "content_type": "image/jpeg",
+                        "base64": base64.b64encode(source_jpeg).decode("ascii"),
+                    }
                 return response
         finally:
             self._lock.release()
+
+    def run_from_path(self, mode: str, file_path: Path) -> dict[str, Any]:
+        """Run inference on a photo already on the board (e.g. SD card)."""
+        if mode not in ("plate", "pedestrian"):
+            raise ImageInferenceError("识别模式必须是 plate 或 pedestrian")
+        if not file_path.is_file():
+            raise ImageInferenceError(f"照片文件不存在: {file_path}")
+        suffix = file_path.suffix.lower()
+        if suffix in (".jpg", ".jpeg"):
+            media_type = "image/jpeg"
+        elif suffix == ".png":
+            media_type = "image/png"
+        else:
+            raise ImageInferenceError("只支持 JPEG 或 PNG 照片")
+        try:
+            image = file_path.read_bytes()
+        except OSError as exc:
+            raise ImageInferenceError(f"读取照片失败: {exc}") from exc
+        if not image:
+            raise ImageInferenceError("照片文件为空")
+        return self.run(mode, image, media_type, attach_source_image=True)
+
+
+class VideoInferenceError(ImageInferenceError):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class VideoInferenceConfig:
+    sample_fps: float = 1.0
+    max_frames: int = 600
+    max_keyframes: int = 24
+    extract_timeout: float = 600.0
+
+
+class VideoInferenceRunner:
+    """Offline video inference.
+
+    Extracts BGRx frames with gstreamer at a reduced cadence, then runs the
+    cplus pedestrian driver on each frame in single-frame offline mode. The
+    driver is restarted per frame (model reload), so this is an offline batch
+    path, not a realtime one.
+    """
+
+    def __init__(
+        self,
+        image_runner: ImageInferenceRunner,
+        config: VideoInferenceConfig | None = None,
+    ) -> None:
+        self.image_runner = image_runner
+        self.config = config or VideoInferenceConfig()
+
+    def _frame_pipeline(self, video_path: Path, sample_fps: float, frames_dir: Path) -> list[str]:
+        framerate = max(1, int(round(sample_fps))) if sample_fps >= 1.0 else 1
+        location = str(frames_dir / "frame%05d.bgrx")
+        return [
+            self.image_runner.config.gst_launch,
+            "-q",
+            "filesrc",
+            f"location={video_path}",
+            "!",
+            "decodebin",
+            "!",
+            "videoconvert",
+            "!",
+            "videoscale",
+            "add-borders=true",
+            "!",
+            "video/x-raw,format=BGRx,width=1280,height=720",
+            "!",
+            "videorate",
+            "!",
+            f"video/x-raw,format=BGRx,width=1280,height=720,framerate={framerate}/1",
+            "!",
+            "multifilesink",
+            f"location={location}",
+        ]
+
+    def _extract_frames(
+        self,
+        video_path: Path,
+        sample_fps: float,
+        frames_dir: Path,
+        progress_callback,
+    ) -> tuple[list[Path], bool]:
+        if progress_callback:
+            progress_callback(0, 0, "正在抽取视频帧")
+        command = self._frame_pipeline(video_path, sample_fps, frames_dir)
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=self.config.extract_timeout,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise VideoInferenceError("视频抽帧启动或运行失败") from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", "replace").strip()[-800:]
+            raise VideoInferenceError(f"视频抽帧失败: {detail}")
+        expected = 1280 * 720 * 4
+        frames = sorted(frames_dir.glob("frame*.bgrx"))
+        valid = [frame for frame in frames if frame.stat().st_size == expected]
+        if not valid:
+            raise VideoInferenceError("视频没有抽到可用帧，可能格式不支持")
+        return valid, False
+
+    def run_video(
+        self,
+        video_path: Path,
+        sample_fps: float,
+        progress_callback=None,
+    ) -> dict[str, Any]:
+        if not video_path.is_file():
+            raise VideoInferenceError(f"视频文件不存在: {video_path}")
+        if sample_fps <= 0:
+            sample_fps = self.config.sample_fps
+        framerate = max(1, int(round(sample_fps))) if sample_fps >= 1.0 else 1
+        step = max(1, int(round(framerate / sample_fps))) if sample_fps < 1.0 else 1
+        if not self.image_runner._lock.acquire(blocking=False):
+            raise ImageInferenceBusy("已有推理任务正在运行，请稍后再试")
+        try:
+            with tempfile.TemporaryDirectory(prefix="cplus-video-") as directory:
+                work = Path(directory)
+                frames_dir = work / "frames"
+                frames_dir.mkdir()
+                frames, _ = self._extract_frames(
+                    video_path, sample_fps, frames_dir, progress_callback
+                )
+                sampled = frames[::step]
+                if len(sampled) > self.config.max_frames:
+                    sampled = sampled[: self.config.max_frames]
+                truncated = len(sampled) >= self.config.max_frames
+                total = len(sampled)
+                events: list[dict[str, Any]] = []
+                keyframes: list[bytes] = []
+                violation_frames = 0
+                skipped_frames = 0
+                decision_counts: dict[str, int] = {}
+                for index, frame_path in enumerate(sampled):
+                    if progress_callback:
+                        progress_callback(
+                            index,
+                            total,
+                            f"正在推理 {index + 1}/{total} 帧",
+                        )
+                    frame_work = work / f"frame{index:05d}"
+                    frame_work.mkdir()
+                    try:
+                        result, mask_jpeg = self.image_runner._run_pedestrian(
+                            frame_path, frame_work
+                        )
+                    except ImageInferenceError:
+                        skipped_frames += 1
+                        frame_path.unlink(missing_ok=True)
+                        continue
+                    finally:
+                        frame_path.unlink(missing_ok=True)
+                    targets = (
+                        result.get("targets")
+                        if isinstance(result, dict)
+                        else None
+                    )
+                    if not isinstance(targets, list):
+                        targets = []
+                    frame_events: list[dict[str, Any]] = []
+                    for target in targets:
+                        if not isinstance(target, dict):
+                            continue
+                        decision = str(target.get("decision", ""))
+                        reason = str(target.get("reason", ""))
+                        decision_counts[decision] = decision_counts.get(decision, 0) + 1
+                        if decision == "suspected":
+                            frame_events.append(
+                                {
+                                    "frame_index": index,
+                                    "time_sec": round(index / sample_fps, 3),
+                                    "type": target.get("type"),
+                                    "score": target.get("score"),
+                                    "decision": decision,
+                                    "reason": reason,
+                                    "box": target.get("box"),
+                                    "ground": target.get("ground"),
+                                }
+                            )
+                    if frame_events:
+                        violation_frames += 1
+                        if len(keyframes) < self.config.max_keyframes:
+                            keyframe_index = len(keyframes)
+                            keyframes.append(mask_jpeg)
+                            for event in frame_events:
+                                event["keyframe_index"] = keyframe_index
+                        events.extend(frame_events)
+                summary = {
+                    "total_frames": total,
+                    "violation_frames": violation_frames,
+                    "violation_count": len(events),
+                    "skipped_frames": skipped_frames,
+                    "decision_counts": decision_counts,
+                    "sample_fps": sample_fps,
+                    "truncated": truncated,
+                }
+                return {
+                    "events": events,
+                    "keyframes": keyframes,
+                    "summary": summary,
+                }
+        finally:
+            self.image_runner._lock.release()
+

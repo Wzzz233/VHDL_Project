@@ -12,6 +12,7 @@ LOG_DIR=/var/log/pplcnet-board
 MODEL_DIR="${MODEL_DIR:-/userdata/model}"
 PLATE_TYPE_MODEL="${PLATE_TYPE_MODEL:-${MODEL_DIR}/plate_type_classifier_5color_large_green_v2_rk3568_fp16_opt0.rknn}"
 export PLATE_TYPE_MODEL
+SD_ROOT="${SD_ROOT:-/mnt/sdcard}"
 BOARD_HOST="${BOARD_HOST:-pg2l50h.home.arpa}"
 MEDIAMTX_BIN="${MEDIAMTX_BIN:-/opt/mediamtx-v1.19.2/bin/mediamtx}"
 
@@ -116,6 +117,7 @@ web_command=(
     --mediamtx-port 8889
     --arm-root "${ARM_ROOT}"
     --model-root "${MODEL_DIR}"
+    --sd-root "${SD_ROOT}"
     --plate-type-model "${PLATE_TYPE_MODEL}"
     --plate-image-driver "${ARM_ROOT}/pplcnet_bgp_live"
     --pedestrian-image-driver "${ARM_ROOT}/cplus-rk3568-driver"

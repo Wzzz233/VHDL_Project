@@ -478,3 +478,255 @@ h2 {
     flex-direction: column;
   }
 }
+
+.sd-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sd-path-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.sd-path-bar strong {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.sd-path-bar .quiet-button {
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.sd-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+}
+
+.sd-file-list .empty-result {
+  padding: 12px;
+  text-align: center;
+}
+
+.sd-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font-size: 13px;
+}
+
+.sd-file-row:hover {
+  background: var(--surface-raised);
+}
+
+.sd-file-row[data-type="dir"],
+.sd-file-row[data-type="parent"] {
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.sd-file-row[data-selected="true"] {
+  border-color: var(--accent);
+  background: rgba(33, 180, 198, 0.14);
+}
+
+.sd-file-icon {
+  flex: 0 0 auto;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.sd-file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sd-file-meta {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sd-selection {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.sd-selection strong {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.inline-state[data-state="selected"]::before {
+  background: var(--accent);
+}
+
+.sd-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.sd-fps {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.sd-fps input {
+  width: 56px;
+  min-height: 34px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.sd-video-result {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+.sd-video-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sd-video-progress progress {
+  flex: 1;
+  min-width: 0;
+  height: 10px;
+}
+
+.sd-video-summary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 12px;
+  font-size: 12px;
+}
+
+.sd-video-summary > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sd-summary-label {
+  color: var(--muted);
+}
+
+.sd-video-events-label {
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sd-video-events-label span {
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.sd-video-events {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 2px;
+}
+
+.sd-video-events .empty-result {
+  padding: 8px;
+  text-align: center;
+}
+
+.sd-video-event {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  font-size: 12px;
+}
+
+.sd-video-event:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--surface-raised);
+}
+
+.sd-video-event:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.sd-video-event .ev-time {
+  flex: 0 0 auto;
+  color: var(--accent-strong);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.sd-video-event .ev-reason {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inline-state[data-state="loading"]::before {
+  background: var(--warning);
+}
