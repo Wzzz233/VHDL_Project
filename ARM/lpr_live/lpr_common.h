@@ -58,7 +58,7 @@
 
 /* Detection ring sizes. */
 #define MAX_DETS         1024
-#define MAX_LIVE_PLATES  8
+#define MAX_LIVE_PLATES  16
 #define MAX_OCR_KEYS     128
 #define MAX_OCR_KEY_LEN  16
 

@@ -33,6 +33,7 @@ class ImageInferenceConfig:
     arm_root: Path = Path("/home/linaro/ARM")
     model_root: Path = Path("/userdata/model")
     plate_driver: Path = Path("/home/linaro/ARM/pplcnet_bgp_live")
+    plate_type_model: Path | None = None
     pedestrian_driver: Path = Path("/home/linaro/ARM/cplus-rk3568-driver")
     gst_launch: str = "gst-launch-1.0"
     timeout: float = 45.0
@@ -98,28 +99,31 @@ class ImageInferenceRunner:
 
     def _plate_command(self, raw_path: Path, socket_path: Path) -> list[str]:
         model = self.config.model_root
+        plate_type_model = self.config.plate_type_model or (
+            model / "plate_type_classifier_5color_resnet18_warped_nocrop_rk3568_fp16_opt0.rknn"
+        )
         return [
             str(self.config.plate_driver),
             "--plate-model", str(model / "best_fp16.rknn"),
             "--ocr-blue-model", str(model / "pplcnet_blue_v3_rk3568_fp16.rknn"),
             "--ocr-green-model", str(model / "pplcnet_green_v2_b1plus_rk3568_fp16.rknn"),
             "--ocr-yellow-model", str(model / "pplcnet_yellow_all_single_v1_rk3568_fp16.rknn"),
-            "--ocr-police-model", str(model / "pplcnet_police_v4_warmblue_rk3568_fp16.rknn"),
-            "--ocr-embassy-model", str(model / "pplcnet_embassy_v1_rk3568_fp16.rknn"),
-            "--plate-type-classifier-model", str(model / "plate_type_classifier_6cls_resnet18_warped_nocrop_rk3568_fp16_opt0.rknn"),
+            "--ocr-police-model", str(model / "pplcnet_police_v5_whiteexpand_rk3568_fp16.rknn"),
+            "--ocr-embassy-model", str(model / "pplcnet_black_unified_v1_rk3568_fp16.rknn"),
+            "--plate-type-classifier-model", str(plate_type_model),
             "--ocr-blue-keys", str(model / "special_keys.txt"),
             "--ocr-green-keys", str(model / "pplcnet_green_keys.txt"),
             "--ocr-yellow-keys", str(model / "yellow_keys.txt"),
             "--ocr-police-keys", str(model / "police_keys.txt"),
-            "--ocr-embassy-keys", str(model / "embassy_keys.txt"),
+            "--ocr-embassy-keys", str(model / "black_unified_keys.txt"),
             "--ocr-keys", str(model / "special_keys.txt"),
             "--det-resize", "letterbox",
             "--ocr-preproc", "gray",
             "--fps", "60",
             "--det-score-scale", "1",
-            "--min-plate-conf", "0.45",
-            "--plate-nms-iou", "0.65",
-            "--plate-max-det", "9",
+            "--min-plate-conf", "0.25",
+            "--plate-nms-iou", "0.45",
+            "--plate-max-det", "16",
             "--source", "fpga",
             "--input-bgrx", str(raw_path),
             "--frames", "600",

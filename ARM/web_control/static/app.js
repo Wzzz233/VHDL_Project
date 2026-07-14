@@ -1,6 +1,6 @@
 "use strict";
 
-const FRAME_PERIOD_MS = 200;
+const FRAME_PERIOD_MS = 125;
 const STATUS_PERIOD_MS = 1000;
 const RESULTS_PERIOD_MS = 400;
 const STALE_FRAME_ERROR = "stale_frame_generation";

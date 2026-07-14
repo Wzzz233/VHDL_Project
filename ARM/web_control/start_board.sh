@@ -10,6 +10,8 @@ ARM_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 RUNTIME_DIR=/run/pplcnet-board
 LOG_DIR=/var/log/pplcnet-board
 MODEL_DIR="${MODEL_DIR:-/userdata/model}"
+PLATE_TYPE_MODEL="${PLATE_TYPE_MODEL:-${MODEL_DIR}/plate_type_classifier_5color_resnet18_warped_nocrop_rk3568_fp16_opt0.rknn}"
+export PLATE_TYPE_MODEL
 BOARD_HOST="${BOARD_HOST:-pg2l50h.home.arpa}"
 MEDIAMTX_BIN="${MEDIAMTX_BIN:-/opt/mediamtx-v1.19.2/bin/mediamtx}"
 
@@ -42,14 +44,14 @@ required_files=(
     "${MODEL_DIR}/pplcnet_blue_v3_rk3568_fp16.rknn"
     "${MODEL_DIR}/pplcnet_green_v2_b1plus_rk3568_fp16.rknn"
     "${MODEL_DIR}/pplcnet_yellow_all_single_v1_rk3568_fp16.rknn"
-    "${MODEL_DIR}/pplcnet_police_v4_warmblue_rk3568_fp16.rknn"
-    "${MODEL_DIR}/pplcnet_embassy_v1_rk3568_fp16.rknn"
-    "${MODEL_DIR}/plate_type_classifier_6cls_resnet18_warped_nocrop_rk3568_fp16_opt0.rknn"
+    "${MODEL_DIR}/pplcnet_police_v5_whiteexpand_rk3568_fp16.rknn"
+    "${MODEL_DIR}/pplcnet_black_unified_v1_rk3568_fp16.rknn"
+    "${PLATE_TYPE_MODEL}"
     "${MODEL_DIR}/special_keys.txt"
     "${MODEL_DIR}/pplcnet_green_keys.txt"
     "${MODEL_DIR}/yellow_keys.txt"
     "${MODEL_DIR}/police_keys.txt"
-    "${MODEL_DIR}/embassy_keys.txt"
+    "${MODEL_DIR}/black_unified_keys.txt"
 )
 for file in "${required_files[@]}"; do
     if [[ ! -r ${file} ]]; then
@@ -98,7 +100,8 @@ nohup "${MEDIAMTX_BIN}" "${RUNTIME_DIR}/mediamtx.yml" \
 echo $! >"${RUNTIME_DIR}/mediamtx.pid"
 
 echo plate >"${RUNTIME_DIR}/mode"
-MODEL_DIR="${MODEL_DIR}" nohup "${SCRIPT_DIR}/run_plate_live.sh" \
+MODEL_DIR="${MODEL_DIR}" PLATE_TYPE_MODEL="${PLATE_TYPE_MODEL}" \
+    nohup "${SCRIPT_DIR}/run_plate_live.sh" \
     >"${LOG_DIR}/plate.log" 2>&1 &
 echo $! >"${RUNTIME_DIR}/plate.pid"
 
@@ -113,6 +116,7 @@ web_command=(
     --mediamtx-port 8889
     --arm-root "${ARM_ROOT}"
     --model-root "${MODEL_DIR}"
+    --plate-type-model "${PLATE_TYPE_MODEL}"
     --plate-image-driver "${ARM_ROOT}/pplcnet_bgp_live"
     --pedestrian-image-driver "${ARM_ROOT}/cplus-rk3568-driver"
     --driver-runtime-dir "${RUNTIME_DIR}"

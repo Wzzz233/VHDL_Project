@@ -18,7 +18,7 @@ static bool route_enabled(const struct lpr_route *routes, enum lpr_route_id id)
     return id >= 0 && id < LPR_ROUTE_COUNT && routes[id].model != NULL;
 }
 
-/* Choose a route from the optional 6-class plate-type classifier output. */
+/* Choose a route from the optional 5-colour plate-type classifier output. */
 static enum lpr_route_id pick_ptype_route(const struct lpr_route *routes, int cls)
 {
     switch (cls) {
@@ -32,11 +32,11 @@ static enum lpr_route_id pick_ptype_route(const struct lpr_route *routes, int cl
         if (route_enabled(routes, LPR_ROUTE_POLICE))
             return LPR_ROUTE_POLICE;
         return LPR_ROUTE_BLUE;
-    case LPR_PTYPE_POLICE:
+    case LPR_PTYPE_WHITE:
         if (route_enabled(routes, LPR_ROUTE_POLICE))
             return LPR_ROUTE_POLICE;
         return LPR_ROUTE_BLUE;
-    case LPR_PTYPE_EMBASSY:
+    case LPR_PTYPE_BLACK:
         if (route_enabled(routes, LPR_ROUTE_EMBASSY))
             return LPR_ROUTE_EMBASSY;
         if (route_enabled(routes, LPR_ROUTE_POLICE))
@@ -50,9 +50,9 @@ static enum lpr_route_id pick_ptype_route(const struct lpr_route *routes, int cl
 
 static bool ptype_should_apply(const struct live_options *opt, int cls, float conf)
 {
-    if (cls < LPR_PTYPE_BLUE || cls > LPR_PTYPE_EMBASSY)
+    if (cls < LPR_PTYPE_BLUE || cls > LPR_PTYPE_BLACK)
         return false;
-    if ((cls == LPR_PTYPE_POLICE || cls == LPR_PTYPE_EMBASSY) &&
+    if ((cls == LPR_PTYPE_WHITE || cls == LPR_PTYPE_BLACK) &&
         conf >= opt->plate_type_classifier_special_min_conf)
         return true;
     return conf >= opt->plate_type_classifier_min_conf;

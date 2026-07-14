@@ -203,7 +203,7 @@ class WebControlTest(unittest.TestCase):
             mediamtx_port=self.whip.server_address[1],
             mediamtx_whip_path="/phone/whip",
             mediamtx_timeout=1.0,
-            frame_max_fps=5.0,
+            frame_max_fps=8.0,
             static_root=Path(__file__).resolve().parent / "static",
             image_runner=self.image_runner,
             driver_manager=self.driver_manager,
@@ -264,7 +264,7 @@ class WebControlTest(unittest.TestCase):
         self.request("GET", "/api/v1/frame.jpg")
 
         frame_requests = [item for item in self.control.requests if item.get("op") == "frame"]
-        self.assertEqual(len(frame_requests), 1, "server-side cache must cap upstream preview at 5fps")
+        self.assertEqual(len(frame_requests), 1, "server-side cache must cap upstream preview at the configured rate")
 
         self.control.source_generation = 8
         status, _, body = self.request("GET", "/api/v1/status")

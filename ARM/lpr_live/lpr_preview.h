@@ -12,10 +12,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define LPR_PREVIEW_WIDTH 640U
-#define LPR_PREVIEW_HEIGHT 360U
-#define LPR_PREVIEW_MAX_FPS 5
-#define LPR_PREVIEW_JPEG_QUALITY 75
+#define LPR_PREVIEW_WIDTH 480U
+#define LPR_PREVIEW_HEIGHT 270U
+#define LPR_PREVIEW_MAX_FPS 8
+#define LPR_PREVIEW_JPEG_QUALITY 55
 
 struct lpr_preview {
     GstElement *pipeline;

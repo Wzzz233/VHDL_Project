@@ -1016,7 +1016,7 @@ infer_ready:
     if (!opt.no_infer && police_enabled) {
         routes[LPR_ROUTE_POLICE].model = &ocr_police_model;
         routes[LPR_ROUTE_POLICE].keys = &keys_police;
-        routes[LPR_ROUTE_POLICE].decode_family = OCR_DECODE_FAMILY_POLICE7;
+        routes[LPR_ROUTE_POLICE].decode_family = OCR_DECODE_FAMILY_WHITE7;
         routes[LPR_ROUTE_POLICE].display_tag = 'P';
         snprintf(routes[LPR_ROUTE_POLICE].name, sizeof(routes[LPR_ROUTE_POLICE].name), "police");
     } else {
@@ -1026,9 +1026,9 @@ infer_ready:
     if (!opt.no_infer && embassy_enabled) {
         routes[LPR_ROUTE_EMBASSY].model = &ocr_embassy_model;
         routes[LPR_ROUTE_EMBASSY].keys = &keys_embassy;
-        routes[LPR_ROUTE_EMBASSY].decode_family = OCR_DECODE_FAMILY_EMBASSY7;
-        routes[LPR_ROUTE_EMBASSY].display_tag = 'E';
-        snprintf(routes[LPR_ROUTE_EMBASSY].name, sizeof(routes[LPR_ROUTE_EMBASSY].name), "embassy");
+        routes[LPR_ROUTE_EMBASSY].decode_family = OCR_DECODE_FAMILY_BLACK_UNIFIED;
+        routes[LPR_ROUTE_EMBASSY].display_tag = 'K';
+        snprintf(routes[LPR_ROUTE_EMBASSY].name, sizeof(routes[LPR_ROUTE_EMBASSY].name), "black");
     } else {
         routes[LPR_ROUTE_EMBASSY].model = NULL;
     }

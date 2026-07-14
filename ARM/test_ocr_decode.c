@@ -287,6 +287,59 @@ static void test_yellow7_family_allows_xue_and_gua_tail(void)
     }
 }
 
+static void test_unified_specialist_families(void)
+{
+    static const char *const keys[] = {
+        "粤", "A", "1", "2", "3", "4", "5", "港", "澳", "领", "使",
+        "W", "J", "G", "Z", "鲁", "警", "0", "6"
+    };
+    struct test_case {
+        const char *name;
+        enum ocr_decode_family family;
+        const int *token_ids;
+        int token_count;
+        const char *expected;
+    };
+    static const int gangao[] = {0, 1, 2, 3, 4, 5, 7};
+    static const int ling[] = {0, 1, 2, 3, 4, 5, 6, 9};
+    static const int embassy[] = {10, 17, 2, 3, 4, 5, 18};
+    static const int police[] = {15, 1, 2, 17, 2, 17, 16};
+    static const int army[] = {13, 14, 5, 2, 4, 2, 3};
+    static const int armed_police[] = {11, 12, 2, 18, 3, 17, 18};
+    static const struct test_case cases[] = {
+        {"black_gangao", OCR_DECODE_FAMILY_BLACK_UNIFIED, gangao, ARRAY_LEN(gangao), "粤A1234港"},
+        {"black_ling", OCR_DECODE_FAMILY_BLACK_UNIFIED, ling, ARRAY_LEN(ling), "粤A12345领"},
+        {"black_embassy", OCR_DECODE_FAMILY_BLACK_UNIFIED, embassy, ARRAY_LEN(embassy), "使012346"},
+        {"white_police", OCR_DECODE_FAMILY_WHITE7, police, ARRAY_LEN(police), "鲁A1010警"},
+        {"white_army", OCR_DECODE_FAMILY_WHITE7, army, ARRAY_LEN(army), "GZ41312"},
+        {"white_armed_police", OCR_DECODE_FAMILY_WHITE7, armed_police, ARRAY_LEN(armed_police), "WJ16206"},
+    };
+    const int blank_idx = ARRAY_LEN(keys);
+    const int c_size = blank_idx + 1;
+    int case_idx;
+
+    for (case_idx = 0; case_idx < ARRAY_LEN(cases); case_idx++) {
+        const struct test_case *tc = &cases[case_idx];
+        const int t_size = tc->token_count * 2 - 1;
+        float logits[15 * 20];
+        char text[64];
+        float conf = 0.0f;
+        int t;
+        int ret;
+
+        for (t = 0; t < t_size; t++) {
+            int token_id = (t & 1) ? blank_idx : tc->token_ids[t / 2];
+            set_row(logits, t, c_size, token_id, 8.0f, -1, 0.0f);
+        }
+        ret = ocr_decode_logits(logits, t_size, c_size, c_size, 1,
+                                keys, ARRAY_LEN(keys), blank_idx,
+                                tc->family, text, sizeof(text), &conf, NULL);
+        if (ret != 0)
+            fail(tc->name);
+        expect_str_eq(tc->name, text, tc->expected);
+    }
+}
+
 int main(void)
 {
     test_green8_relaxed_allows_aa02222();
@@ -294,7 +347,8 @@ int main(void)
     test_none_family_beam_matches_greedy();
     test_police7_family_forces_jing_tail();
     test_embassy7_family_recovers_blank_greedy();
-    printf("[PASS] test_ocr_decode\n");
     test_yellow7_family_allows_xue_and_gua_tail();
+    test_unified_specialist_families();
+    printf("[PASS] test_ocr_decode\n");
     return 0;
 }

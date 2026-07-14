@@ -61,7 +61,7 @@ class AppConfig:
     mediamtx_port: int = 8889
     mediamtx_whip_path: str = "/phone/whip"
     mediamtx_timeout: float = 5.0
-    frame_max_fps: float = 5.0
+    frame_max_fps: float = 8.0
     static_root: Path = STATIC_ROOT
     image_runner: Any | None = None
     driver_manager: Any | None = None
@@ -718,9 +718,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mediamtx-port", type=int, default=8889)
     parser.add_argument("--mediamtx-whip-path", default="/phone/whip")
     parser.add_argument("--mediamtx-timeout", type=float, default=5.0)
-    parser.add_argument("--frame-max-fps", type=float, default=5.0)
+    parser.add_argument("--frame-max-fps", type=float, default=8.0)
     parser.add_argument("--arm-root", type=Path, default=Path("/home/linaro/ARM"))
     parser.add_argument("--model-root", type=Path, default=Path("/userdata/model"))
+    parser.add_argument("--plate-type-model", type=Path)
     parser.add_argument("--plate-image-driver", type=Path, default=Path("/home/linaro/ARM/pplcnet_bgp_live"))
     parser.add_argument("--pedestrian-image-driver", type=Path, default=Path("/home/linaro/ARM/cplus-rk3568-driver"))
     parser.add_argument("--image-inference-timeout", type=float, default=45.0)
@@ -743,8 +744,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or args.image_inference_timeout <= 0
     ):
         parser.error("timeouts must be positive")
-    if args.frame_max_fps <= 0 or args.frame_max_fps > 5:
-        parser.error("--frame-max-fps must be greater than zero and no more than 5")
+    if args.frame_max_fps <= 0 or args.frame_max_fps > 8:
+        parser.error("--frame-max-fps must be greater than zero and no more than 8")
     if not args.mediamtx_whip_path.startswith("/"):
         parser.error("--mediamtx-whip-path must begin with /")
     return args
@@ -757,6 +758,7 @@ def main(argv: list[str] | None = None) -> int:
         ImageInferenceConfig(
             arm_root=args.arm_root,
             model_root=args.model_root,
+            plate_type_model=args.plate_type_model,
             plate_driver=args.plate_image_driver,
             pedestrian_driver=args.pedestrian_image_driver,
             timeout=args.image_inference_timeout,

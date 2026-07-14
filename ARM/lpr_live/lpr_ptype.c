@@ -11,7 +11,7 @@
 const char *lpr_ptype_class_str(int cls)
 {
     static const char *const names[LPR_PTYPE_CLASS_COUNT] = {
-        "blue", "green", "yellow", "police", "embassy", "other"
+        "blue", "green", "yellow", "white", "black"
     };
     if (cls >= 0 && cls < LPR_PTYPE_CLASS_COUNT)
         return names[cls];

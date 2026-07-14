@@ -77,8 +77,8 @@ int lpr_preview_start(struct lpr_preview *preview, bool enabled)
         "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
         "leaky=downstream ! "
         "videoconvert ! videoscale add-borders=true ! "
-        "video/x-raw,format=I420,width=640,height=360,pixel-aspect-ratio=1/1 ! "
-        "jpegenc quality=75 ! "
+        "video/x-raw,format=I420,width=480,height=270,pixel-aspect-ratio=1/1 ! "
+        "jpegenc quality=55 ! "
         "appsink name=preview_sink max-buffers=1 drop=true sync=false "
         "emit-signals=true";
     GstCaps *caps;
@@ -130,7 +130,7 @@ int lpr_preview_start(struct lpr_preview *preview, bool enabled)
                                          5 * GST_SECOND);
     if (state_result == GST_STATE_CHANGE_FAILURE)
         goto fail;
-    fprintf(stderr, "[preview] started 640x360 JPEG quality=75 max_fps=5\n");
+    fprintf(stderr, "[preview] started 480x270 JPEG quality=55 max_fps=8\n");
     return 0;
 
 fail:

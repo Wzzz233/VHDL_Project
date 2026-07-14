@@ -84,7 +84,7 @@ sudo docker run --rm --privileged -u root \
 本次实际使用上述镜像完成了强制全量编译。当前产物为 161840 字节，SHA256 为：
 
 ```text
-8ba814203e3610580fa282b9cbe3508258fe3b06a64f60dceea92a334c3c49ea
+63721ce3348a29d25832b123b693cdbbd28e17f5c27cd5bf293d57a0f184cc27
 ```
 
 网页行人 mask 需要本次重新编译的 `cplus-rk3568-driver`。当前验证产物为 71472 字节，
@@ -94,8 +94,9 @@ SHA256 为：
 2ab1fd8190906c8eca19305f74103806bccbdfd3754a6c182cccc3aeba551b98
 ```
 
-同一容器内的 `make test` 已实际执行：7 个测试程序全部通过，其中姿态解码测试汇总为
-`21 tests, 0 failures`。编译姿态解码测试时有未使用参数警告，但没有编译错误或测试失败。
+同一容器内的 `make test` 已实际执行：C 测试、CPlus 测试和 9 项网页/驱动管理测试全部
+通过，其中姿态解码测试汇总为 `21 tests, 0 failures`。编译姿态解码测试时有未使用参数
+警告，但没有编译错误或测试失败。
 
 源代码、编译器或依赖变化后校验值也会变化，这是正常的；部署时应记录实际生成文件的值。
 
@@ -328,27 +329,46 @@ chmod 0600 web_control/tls/generated/ca.key
 
 ## 10. 模型参数
 
-蓝牌和绿牌模型及 keys 必需：
+当前板端模型目录与必需文件：
 
 ```bash
-MODEL_DIR=/home/linaro/models
-test -r "${MODEL_DIR}/plate_pose.rknn"
-test -r "${MODEL_DIR}/ocr_blue.rknn"
-test -r "${MODEL_DIR}/ocr_green.rknn"
-test -r "${MODEL_DIR}/keys_blue.txt"
-test -r "${MODEL_DIR}/keys_green.txt"
+MODEL_DIR=/userdata/model
+test -r "${MODEL_DIR}/best_fp16.rknn"
+test -r "${MODEL_DIR}/pplcnet_blue_v3_rk3568_fp16.rknn"
+test -r "${MODEL_DIR}/pplcnet_green_v2_b1plus_rk3568_fp16.rknn"
+test -r "${MODEL_DIR}/special_keys.txt"
+test -r "${MODEL_DIR}/pplcnet_green_keys.txt"
 ```
 
-警牌、使馆牌、黄色牌和板型分类器可选。启用某个 OCR 模型时必须同时提供对应 keys。
+完整路由还使用：
 
-Yellow7 应成对启用：
+```text
+pplcnet_police_v5_whiteexpand_rk3568_fp16.rknn + police_keys.txt
+pplcnet_black_unified_v1_rk3568_fp16.rknn + black_unified_keys.txt
+pplcnet_yellow_all_single_v1_rk3568_fp16.rknn + yellow_keys.txt
+plate_type_classifier_6cls_resnet18_warped_nocrop_rk3568_fp16_opt0.rknn
+```
+
+黑牌统一模型通过现有 embassy 路由参数加载。黄色牌继续使用 Yellow7，包括末位“学/挂”。
+
+### 10.1 回退车牌类型分类器
+
+新的分类器与旧版使用了相同的文件名，不能靠文件名判断版本。建议把已验证的旧版另存为：
+
+```text
+/userdata/model/plate_type_classifier_20260602.rknn
+```
+
+启动时明确指定旧版，实时车牌和网页单图识别会使用同一个分类器：
 
 ```bash
-test -r "${MODEL_DIR}/ocr_yellow.rknn"
-test -r "${MODEL_DIR}/keys_yellow.txt"
+cd /home/linaro/ARM
+sudo env PLATE_TYPE_MODEL=/userdata/model/plate_type_classifier_20260602.rknn \
+  ./web_control/start_board.sh
 ```
 
-这样黄色牌会使用 Yellow7，包括末位“学/挂”。
+这只回退车牌类型分类器，不会回退新的警牌 OCR 和黑牌 OCR。取消变量后，脚本仍使用原来的默认文件名。
+
 
 ## 11. 首次手动启动
 
@@ -716,6 +736,17 @@ sudo -u linaro -g pplcnet test -r /run/pplcnet-bgp-live/control.sock
 
 socket 不存在表示识别程序未启动；不可访问时检查组是否为 `pplcnet`。
 
+### 网页画面卡顿
+
+当前平衡档为 480x270、JPEG 质量 55、最高 8 帧/秒。它用更小的单帧换取更连续的画面，通常不会增加局域网流量。更新程序后必须同时替换 `pplcnet_bgp_live`、`web_control/server.py` 和 `web_control/static/app.js`，然后重启；只更新网页文件或只更新 C 程序都仍会受到旧的 5 帧/秒限制。
+
+可在板端确认新预览已启动：
+
+```bash
+grep -F "[preview] started 480x270 JPEG quality=55 max_fps=8" \
+  /var/log/pplcnet-board/plate.log
+```
+
 ### 网页没有预览图
 
 ```bash
@@ -862,6 +893,10 @@ sudo env BOARD_IP=192.168.10.50 ./web_control/start_board.sh
 
 车牌模式使用当前 `pplcnet_bgp_live` 的单图入口，并加载 `/userdata/model` 下的现有车牌
 检测、板型分类和五路 OCR 模型。行人模式使用：
+
+上传图片为多车牌拼图时，单图链路使用独立于 OV5640 实时链路的参数：检测阈值 0.25、
+NMS 0.45、最多保留 16 个检测框；结果和 OCR 容量也为 16。实时启动脚本仍保持阈值
+0.45、NMS 0.65 和最多 9 个检测框。
 
 ```text
 /home/linaro/ARM/cplus-rk3568-driver

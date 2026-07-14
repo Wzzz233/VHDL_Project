@@ -91,7 +91,7 @@ Usage: $0 [--offline-image <path>] --plate-model <path> --ocr-blue-model <path> 
   --green-firstchar-min-share <v> Min vote share before replacement (default: ${GREEN_FIRSTCHAR_MIN_SHARE})
   --plate-type-classifier-model <path|off> Plate type classifier RKNN, RGB 224x72 (default: off)
   --plate-type-classifier-min-conf <v> Min confidence for route override (default: ${PLATE_TYPE_CLASSIFIER_MIN_CONF})
-  --plate-type-classifier-special-min-conf <v> Min police/embassy override confidence (default: ${PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF})
+  --plate-type-classifier-special-min-conf <v> Min white/black override confidence (default: ${PLATE_TYPE_CLASSIFIER_SPECIAL_MIN_CONF})
   --quad-refiner-model <path|off> Quad refiner RKNN path; pass off to disable
   --labels <path>            Labels file (required for live camera mode)
   --pred-log <path>          Prediction CSV output path (optional)

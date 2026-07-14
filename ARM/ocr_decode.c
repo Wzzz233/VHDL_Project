@@ -110,6 +110,11 @@ static bool token_is_yellow_tail(const char *token)
     return token_is_alnum(token) || token_equals(token, "学") || token_equals(token, "挂");
 }
 
+static bool token_is_black_gangao_tail(const char *token)
+{
+    return token_equals(token, "港") || token_equals(token, "澳");
+}
+
 static bool token_is_digit(const char *token)
 {
     static const char *const digits[] = {
@@ -130,6 +135,79 @@ static bool family_prefix_valid(enum ocr_decode_family family,
     for (i = 0; i < token_count; i++) {
         if (token_ids[i] < 0 || token_ids[i] >= key_count)
             return false;
+    }
+    if (family == OCR_DECODE_FAMILY_BLACK_UNIFIED) {
+        bool embassy_ok = false;
+        bool gangao_ok = false;
+        bool ling_ok = false;
+
+        if (token_count <= 7 && token_equals(keys[token_ids[0]], "使")) {
+            embassy_ok = true;
+            for (i = 1; i < token_count; i++) {
+                if (!token_is_digit(keys[token_ids[i]])) {
+                    embassy_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if (token_count <= 7 && token_equals(keys[token_ids[0]], "粤")) {
+            gangao_ok = true;
+            if (token_count >= 2 && !token_is_alpha(keys[token_ids[1]]))
+                gangao_ok = false;
+            for (i = 2; gangao_ok && i < token_count; i++) {
+                if (i == 6) {
+                    if (!token_is_black_gangao_tail(keys[token_ids[i]]))
+                        gangao_ok = false;
+                } else if (!token_is_alnum(keys[token_ids[i]])) {
+                    gangao_ok = false;
+                }
+            }
+        }
+
+        if (token_count <= 8 && token_is_province(keys[token_ids[0]])) {
+            ling_ok = true;
+            if (token_count >= 2 && !token_is_alpha(keys[token_ids[1]]))
+                ling_ok = false;
+            for (i = 2; ling_ok && i < token_count; i++) {
+                if (i == 7) {
+                    if (!token_equals(keys[token_ids[i]], "领"))
+                        ling_ok = false;
+                } else if (!token_is_digit(keys[token_ids[i]])) {
+                    ling_ok = false;
+                }
+            }
+        }
+        return embassy_ok || gangao_ok || ling_ok;
+    }
+    if (family == OCR_DECODE_FAMILY_WHITE7) {
+        bool police_ok = false;
+        bool army_ok = false;
+
+        if (token_count <= 7 && token_is_province(keys[token_ids[0]])) {
+            police_ok = true;
+            if (token_count >= 2 && !token_is_alpha(keys[token_ids[1]]))
+                police_ok = false;
+            for (i = 2; police_ok && i < token_count; i++) {
+                if (i == 6) {
+                    if (!token_equals(keys[token_ids[i]], "警"))
+                        police_ok = false;
+                } else if (!token_is_alnum(keys[token_ids[i]])) {
+                    police_ok = false;
+                }
+            }
+        }
+
+        if (token_count <= 7 && token_is_alpha(keys[token_ids[0]])) {
+            army_ok = true;
+            if (token_count >= 2 && !token_is_alpha(keys[token_ids[1]]))
+                army_ok = false;
+            for (i = 2; army_ok && i < token_count; i++) {
+                if (!token_is_digit(keys[token_ids[i]]))
+                    army_ok = false;
+            }
+        }
+        return police_ok || army_ok;
     }
     if (family == OCR_DECODE_FAMILY_EMBASSY7) {
         if (token_count > 7)
@@ -193,12 +271,14 @@ static bool family_prefix_valid(enum ocr_decode_family family,
 
 static int family_max_token_count(enum ocr_decode_family family)
 {
-    if (family == OCR_DECODE_FAMILY_GREEN8)
+    if (family == OCR_DECODE_FAMILY_GREEN8 ||
+        family == OCR_DECODE_FAMILY_BLACK_UNIFIED)
         return 8;
     if (family == OCR_DECODE_FAMILY_NORMAL7 ||
         family == OCR_DECODE_FAMILY_YELLOW7 ||
         family == OCR_DECODE_FAMILY_POLICE7 ||
-        family == OCR_DECODE_FAMILY_EMBASSY7)
+        family == OCR_DECODE_FAMILY_EMBASSY7 ||
+        family == OCR_DECODE_FAMILY_WHITE7)
         return 7;
     return OCR_DECODE_MAX_TOKENS;
 }
@@ -219,6 +299,16 @@ static bool family_full_valid(enum ocr_decode_family family,
         return token_count == 7;
     if (family == OCR_DECODE_FAMILY_EMBASSY7)
         return token_count == 7;
+    if (family == OCR_DECODE_FAMILY_WHITE7)
+        return token_count == 7;
+    if (family == OCR_DECODE_FAMILY_BLACK_UNIFIED) {
+        if (token_equals(keys[token_ids[0]], "使"))
+            return token_count == 7;
+        if (token_equals(keys[token_ids[0]], "粤") && token_count == 7 &&
+            token_is_black_gangao_tail(keys[token_ids[6]]))
+            return true;
+        return token_count == 8 && token_equals(keys[token_ids[7]], "领");
+    }
     return true;
 }
 
