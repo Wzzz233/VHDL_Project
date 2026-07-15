@@ -104,7 +104,7 @@ class ImageInferenceRunner:
         )
         return [
             str(self.config.plate_driver),
-            "--plate-model", str(model / "best_int8_5color_scorex256_rk3568.rknn"),
+            "--plate-model", str(model / "best_fp16_5color_largegreen_scorex256_rk3568.rknn"),
             "--ocr-blue-model", str(model / "pplcnet_blue_v3_rk3568_fp16.rknn"),
             "--ocr-green-model", str(model / "pplcnet_green_v2_b1plus_rk3568_fp16.rknn"),
             "--ocr-yellow-model", str(model / "pplcnet_yellow_all_single_v1_rk3568_fp16.rknn"),
@@ -123,7 +123,7 @@ class ImageInferenceRunner:
             "--det-score-scale", "256",
             "--min-plate-conf", "0.35",
             "--plate-nms-iou", "0.35",
-            "--plate-max-det", "9",
+            "--plate-max-det", "24",
             "--source", "fpga",
             "--input-bgrx", str(raw_path),
             "--frames", "600",

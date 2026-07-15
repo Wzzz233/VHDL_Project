@@ -27,7 +27,7 @@ class ImageInferenceTest(unittest.TestCase):
             )
             command = runner._plate_command(root / "input.bgrx", root / "control.sock")
         joined = " ".join(command)
-        self.assertIn("best_int8_5color_scorex256_rk3568.rknn", joined)
+        self.assertIn("best_fp16_5color_largegreen_scorex256_rk3568.rknn", joined)
         self.assertIn("plate_type_classifier_5color_large_green_v2_rk3568_fp16_opt0.rknn", joined)
         self.assertIn("pplcnet_police_v5_whiteexpand_rk3568_fp16.rknn", joined)
         self.assertIn("pplcnet_black_unified_v1_rk3568_fp16.rknn", joined)
@@ -36,7 +36,7 @@ class ImageInferenceTest(unittest.TestCase):
         self.assertEqual(command[command.index("--det-score-scale") + 1], "256")
         self.assertEqual(command[command.index("--min-plate-conf") + 1], "0.35")
         self.assertEqual(command[command.index("--plate-nms-iou") + 1], "0.35")
-        self.assertEqual(command[command.index("--plate-max-det") + 1], "9")
+        self.assertEqual(command[command.index("--plate-max-det") + 1], "24")
 
     def test_plate_upload_accepts_classifier_override(self) -> None:
         classifier = Path("/userdata/model/plate_type_classifier_20260602.rknn")

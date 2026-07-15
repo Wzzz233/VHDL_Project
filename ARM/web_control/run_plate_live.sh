@@ -7,7 +7,7 @@ MODEL_DIR="${MODEL_DIR:-/userdata/model}"
 PLATE_TYPE_MODEL="${PLATE_TYPE_MODEL:-${MODEL_DIR}/plate_type_classifier_5color_large_green_v2_rk3568_fp16_opt0.rknn}"
 
 exec "${ARM_ROOT}/pplcnet_bgp_live" \
-  --plate-model "${MODEL_DIR}/best_int8_5color_scorex256_rk3568.rknn" \
+  --plate-model "${MODEL_DIR}/best_fp16_5color_largegreen_scorex256_rk3568.rknn" \
   --ocr-blue-model "${MODEL_DIR}/pplcnet_blue_v3_rk3568_fp16.rknn" \
   --ocr-green-model "${MODEL_DIR}/pplcnet_green_v2_b1plus_rk3568_fp16.rknn" \
   --ocr-yellow-model "${MODEL_DIR}/pplcnet_yellow_all_single_v1_rk3568_fp16.rknn" \
@@ -27,7 +27,7 @@ exec "${ARM_ROOT}/pplcnet_bgp_live" \
   --det-score-scale 256 \
   --min-plate-conf 0.35 \
   --plate-nms-iou 0.35 \
-  --plate-max-det 9 \
+  --plate-max-det 24 \
   --source fpga \
   --phone-rtsp rtsp://127.0.0.1:8554/phone \
   --control-socket /run/pplcnet-bgp-live/control.sock

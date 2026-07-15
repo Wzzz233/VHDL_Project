@@ -333,7 +333,7 @@ chmod 0600 web_control/tls/generated/ca.key
 
 ```bash
 MODEL_DIR=/userdata/model
-test -r "${MODEL_DIR}/best_int8_5color_scorex256_rk3568.rknn"
+test -r "${MODEL_DIR}/best_fp16_5color_largegreen_scorex256_rk3568.rknn"
 test -r "${MODEL_DIR}/pplcnet_blue_v3_rk3568_fp16.rknn"
 test -r "${MODEL_DIR}/pplcnet_green_v2_b1plus_rk3568_fp16.rknn"
 test -r "${MODEL_DIR}/special_keys.txt"
@@ -388,9 +388,9 @@ cd /home/linaro/ARM
 sudo env MODEL_DIR=/userdata/model ./web_control/run_plate_live.sh
 ```
 
-脚本固定加载 `best_int8_5color_scorex256_rk3568.rknn` 和
+脚本固定加载 `best_fp16_5color_largegreen_scorex256_rk3568.rknn` 和
 `plate_type_classifier_5color_large_green_v2_rk3568_fp16_opt0.rknn`，并使用 30 fps、
-分数缩放 256、检测阈值 0.35、NMS 0.35、最多 9 个检测框。五路 OCR 模型与 keys
+分数缩放 256、检测阈值 0.35、NMS 0.35、最多 24 个检测框。五路 OCR 模型与 keys
 也都由该脚本统一传入。
 
 完整网页服务不要先手动启动该命令，直接运行 `start_board.sh`，它会调用相同脚本并创建
@@ -872,7 +872,7 @@ sudo env BOARD_IP=192.168.10.50 ./web_control/start_board.sh
 检测、板型分类和五路 OCR 模型。行人模式使用：
 
 实时视频与网页单图使用同一套五色检测参数：30 fps、分数缩放 256、检测阈值 0.35、
-NMS 0.35、最多保留 9 个检测框。这样同一张图片在本地命令和网页入口中的后处理行为一致。
+NMS 0.35、最多保留 24 个检测框。这样同一张图片在本地命令和网页入口中的后处理行为一致。
 
 ```text
 /home/linaro/ARM/cplus-rk3568-driver

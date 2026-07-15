@@ -41,7 +41,7 @@ chmod 0755 "${RUNTIME_DIR}" "${LOG_DIR}"
 required_files=(
     "${ARM_ROOT}/pplcnet_bgp_live"
     "${MEDIAMTX_BIN}"
-    "${MODEL_DIR}/best_int8_5color_scorex256_rk3568.rknn"
+    "${MODEL_DIR}/best_fp16_5color_largegreen_scorex256_rk3568.rknn"
     "${MODEL_DIR}/pplcnet_blue_v3_rk3568_fp16.rknn"
     "${MODEL_DIR}/pplcnet_green_v2_b1plus_rk3568_fp16.rknn"
     "${MODEL_DIR}/pplcnet_yellow_all_single_v1_rk3568_fp16.rknn"
