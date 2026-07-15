@@ -58,8 +58,20 @@ class DriverManagerTest(unittest.TestCase):
                 self.assertFalse(manager.running)
             self.assertTrue(manager.running)
 
+            # A one-shot pedestrian inference from the plate live state must
+            # restore the plate live pipeline afterwards, otherwise the preview
+            # freezes when returning to the camera.
             with manager.image_session("pedestrian"):
                 self.assertFalse(manager.running)
+            self.assertTrue(manager.running)
+            self.assertEqual(manager._read_mode(), "plate")
+
+            # When already in pedestrian mode, a pedestrian one-shot must not
+            # start the plate live pipeline.
+            manager.set_mode("pedestrian")
+            with manager.image_session("pedestrian"):
+                self.assertFalse(manager.running)
+            self.assertFalse(manager.running)
             self.assertEqual(manager._read_mode(), "pedestrian")
 
 

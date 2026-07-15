@@ -164,17 +164,30 @@ class DriverManager:
             raise DriverManagerError("模式必须是 plate 或 pedestrian")
         with self._lock:
             current = self._read_mode()
+            plate_was_running = self._alive(self._read_pid())
             if current != mode:
                 if mode == "plate":
                     self._start_plate_locked()
                 else:
                     self._stop_plate_locked()
                 self._write_mode(mode)
-            restart_plate = mode == "plate" and self._alive(self._read_pid())
-            if restart_plate:
+            # plate single-image inference needs the plate process stopped so
+            # it does not hold the FPGA/DMA stream during the one-shot.
+            stop_plate_for_oneshot = mode == "plate" and self._alive(self._read_pid())
+            if stop_plate_for_oneshot:
                 self._stop_plate_locked()
             try:
                 yield
             finally:
-                if restart_plate and self._read_mode() == "plate":
+                # Restore the live state present on entry. Without this a
+                # one-shot pedestrian inference leaves the plate live pipeline
+                # stopped and the mode stuck on pedestrian, freezing the
+                # preview after returning to the camera.
+                if self._read_mode() != current:
+                    self._write_mode(current)
+                if (
+                    current == "plate"
+                    and plate_was_running
+                    and not self._alive(self._read_pid())
+                ):
                     self._start_plate_locked()
