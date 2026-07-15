@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#define LPR_STATIC_INPUT_MAX 64U
+
 static int fpga_open(void *ctx);
 static int fpga_start(void *ctx);
 static int fpga_read_latest(void *ctx, struct lpr_frame_ref *out);
@@ -59,6 +61,76 @@ static int read_exact_file(const char *path, uint8_t *data, size_t size)
     }
 }
 
+static void free_file_paths(struct lpr_fpga_source *source)
+{
+    if (!source)
+        return;
+    for (size_t i = 0; i < source->file_count; i++)
+        free(source->file_paths[i]);
+    free(source->file_paths);
+    source->file_paths = NULL;
+    source->file_count = 0;
+}
+
+static int append_file_path(struct lpr_fpga_source *source, const char *path)
+{
+    char **paths;
+    char *copy;
+    size_t length;
+
+    if (source->file_count >= LPR_STATIC_INPUT_MAX)
+        return -E2BIG;
+    length = strlen(path);
+    copy = malloc(length + 1U);
+    if (!copy)
+        return -ENOMEM;
+    memcpy(copy, path, length + 1U);
+    paths = realloc(source->file_paths,
+                    (source->file_count + 1U) * sizeof(*paths));
+    if (!paths) {
+        free(copy);
+        return -ENOMEM;
+    }
+    source->file_paths = paths;
+    source->file_paths[source->file_count++] = copy;
+    return 0;
+}
+
+static int load_file_list(struct lpr_fpga_source *source, const char *path)
+{
+    char line[4098];
+    FILE *stream = fopen(path, "r");
+
+    if (!stream)
+        return -errno;
+    while (fgets(line, sizeof(line), stream)) {
+        size_t length = strlen(line);
+        int rc;
+
+        if (length == sizeof(line) - 1U && line[length - 1U] != '\n') {
+            fclose(stream);
+            return -ENAMETOOLONG;
+        }
+        while (length > 0U &&
+               (line[length - 1U] == '\n' || line[length - 1U] == '\r'))
+            line[--length] = '\0';
+        if (length == 0U)
+            continue;
+        rc = append_file_path(source, line);
+        if (rc < 0) {
+            fclose(stream);
+            return rc;
+        }
+    }
+    if (ferror(stream)) {
+        int rc = errno ? -errno : -EIO;
+        fclose(stream);
+        return rc;
+    }
+    fclose(stream);
+    return source->file_count > 0U ? 0 : -EINVAL;
+}
+
 static int file_open(struct lpr_fpga_source *source)
 {
     const size_t frame_size = (size_t)LPR_FPGA_FRAME_WIDTH *
@@ -68,8 +140,14 @@ static int file_open(struct lpr_fpga_source *source)
     source->file_pixels = malloc(frame_size);
     if (!source->file_pixels)
         return -ENOMEM;
-    rc = read_exact_file(source->options->input_bgrx_path,
-                         source->file_pixels, frame_size);
+    if (source->options->input_bgrx_list_path)
+        rc = load_file_list(source, source->options->input_bgrx_list_path);
+    else
+        rc = append_file_path(source, source->options->input_bgrx_path);
+    if (rc < 0)
+        goto fail;
+    rc = read_exact_file(source->file_paths[0], source->file_pixels,
+                         frame_size);
     if (rc < 0)
         goto fail;
     rc = lpr_frame_pool_init_heap(&source->file_pool, 3, frame_size);
@@ -77,17 +155,21 @@ static int file_open(struct lpr_fpga_source *source)
         goto fail;
     source->file_pool_init = true;
     source->file_size = frame_size;
+    source->file_current_index = 0;
     source->file_mode = true;
     source->dma.frame_w = LPR_FPGA_FRAME_WIDTH;
     source->dma.frame_h = LPR_FPGA_FRAME_HEIGHT;
     source->dma.frame_bpp = 4U;
     source->dma.frame_size = frame_size;
     source->dma.src_is_bgrx = true;
-    fprintf(stderr, "[image-source] loaded %s (%zu bytes BGRx)\n",
-            source->options->input_bgrx_path, frame_size);
+    fprintf(stderr,
+            "[image-source] loaded %zu image(s), first=%s (%zu bytes BGRx, repeat=%d)\n",
+            source->file_count, source->file_paths[0], frame_size,
+            source->options->input_bgrx_repeat);
     return 0;
 
 fail:
+    free_file_paths(source);
     free(source->file_pixels);
     source->file_pixels = NULL;
     return rc;
@@ -170,7 +252,8 @@ static int fpga_open(void *ctx)
     }
     pthread_mutex_unlock(&source->lock);
 
-    if (source->options->input_bgrx_path) {
+    if (source->options->input_bgrx_path ||
+        source->options->input_bgrx_list_path) {
         int rc = file_open(source);
         if (rc < 0)
             return rc;
@@ -283,6 +366,25 @@ static int fpga_read_latest(void *ctx, struct lpr_frame_ref *out)
         struct lpr_frame_writer writer = {0};
         struct lpr_frame_meta meta = {0};
         uint8_t *destination;
+        uint64_t next_sequence;
+        size_t input_index;
+
+        pthread_mutex_lock(&source->lock);
+        source_generation = source->source_generation;
+        next_sequence = source->sequence + 1U;
+        pthread_mutex_unlock(&source->lock);
+        input_index = (size_t)(((next_sequence - 1U) /
+                                (uint64_t)source->options->input_bgrx_repeat) %
+                               source->file_count);
+        if (input_index != source->file_current_index) {
+            rc = read_exact_file(source->file_paths[input_index],
+                                 source->file_pixels, source->file_size);
+            if (rc < 0)
+                goto fail;
+            source->file_current_index = input_index;
+            fprintf(stderr, "[image-source] input_index=%zu path=%s\n",
+                    input_index, source->file_paths[input_index]);
+        }
 
         rc = lpr_frame_pool_acquire(&source->file_pool, &writer, true);
         if (rc < 0)
@@ -295,10 +397,7 @@ static int fpga_read_latest(void *ctx, struct lpr_frame_ref *out)
             goto fail;
         }
         memcpy(destination, source->file_pixels, source->file_size);
-        pthread_mutex_lock(&source->lock);
-        source_generation = source->source_generation;
-        meta.sequence = ++source->sequence;
-        pthread_mutex_unlock(&source->lock);
+        meta.sequence = next_sequence;
         meta.format = LPR_FRAME_FORMAT_BGRX8888;
         meta.width = LPR_FPGA_FRAME_WIDTH;
         meta.height = LPR_FPGA_FRAME_HEIGHT;
@@ -436,6 +535,7 @@ static void fpga_close(void *ctx)
         }
         free(source->file_pixels);
         source->file_pixels = NULL;
+        free_file_paths(source);
     } else if (was_opened || source->dma.fd >= 0 ||
                source->dma.frame_pool_init) {
         lpr_dma_release(&source->dma);

@@ -297,6 +297,8 @@ static void usage(const char *prog)
             "Display / capture options:\n"
             "  --device <path>               FPGA DMA device (default: /dev/fpga_dma0)\n"
             "  --input-bgrx <path>           Repeat one 1280x720 BGRx image instead of DMA\n"
+            "  --input-bgrx-list <path>      Cycle newline-listed 1280x720 BGRx images\n"
+            "  --input-bgrx-repeat <n>       Captures per listed image (default: 75)\n"
             "  --source <fpga|phone>         Desired source at startup (default: fpga)\n"
             "  --phone-rtsp <uri>            MediaMTX phone RTSP URI\n"
             "  --control-socket <path|off>   Runtime JSON Unix socket\n"
@@ -340,6 +342,7 @@ static void defaults(struct live_options *o)
     o->initial_phone_source = false;
     o->drm_card_path = DEFAULT_DRM_CARD;
     o->frames = 0;
+    o->input_bgrx_repeat = 75;
     o->fps = 10;
     o->min_conf = 0.50f;
     o->det_score_scale = 1.0f;
@@ -426,10 +429,14 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         OPT_PHONE_RTSP,
         OPT_CONTROL_SOCKET,
         OPT_INPUT_BGRX,
+        OPT_INPUT_BGRX_LIST,
+        OPT_INPUT_BGRX_REPEAT,
     };
     static const struct option opts[] = {
         {"device",            required_argument, NULL, OPT_DEVICE},
         {"input-bgrx",        required_argument, NULL, OPT_INPUT_BGRX},
+        {"input-bgrx-list",   required_argument, NULL, OPT_INPUT_BGRX_LIST},
+        {"input-bgrx-repeat", required_argument, NULL, OPT_INPUT_BGRX_REPEAT},
         {"source",            required_argument, NULL, OPT_SOURCE},
         {"phone-rtsp",        required_argument, NULL, OPT_PHONE_RTSP},
         {"control-socket",    required_argument, NULL, OPT_CONTROL_SOCKET},
@@ -485,6 +492,8 @@ static int parse_options(int argc, char **argv, struct live_options *o)
         switch (c) {
         case OPT_DEVICE:           o->device_path = optarg; break;
         case OPT_INPUT_BGRX:       o->input_bgrx_path = optarg; break;
+        case OPT_INPUT_BGRX_LIST:  o->input_bgrx_list_path = optarg; break;
+        case OPT_INPUT_BGRX_REPEAT:o->input_bgrx_repeat = atoi(optarg); break;
         case OPT_SOURCE:
             if (strcmp(optarg, "fpga") == 0 || strcmp(optarg, "ov5640") == 0)
                 o->initial_phone_source = false;
@@ -635,6 +644,10 @@ static int parse_options(int argc, char **argv, struct live_options *o)
     if (o->det_score_scale <= 0.0f)
         return -1;
     if (o->fps <= 0 || o->fps > 120 || o->frames < 0 || o->max_det <= 0 || o->max_det > MAX_DETS)
+        return -1;
+    if (o->input_bgrx_path && o->input_bgrx_list_path)
+        return -1;
+    if (o->input_bgrx_repeat <= 0 || o->input_bgrx_repeat > 3600)
         return -1;
     if (o->hash_frames < 0)
         return -1;

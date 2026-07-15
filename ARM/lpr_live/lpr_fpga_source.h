@@ -17,6 +17,9 @@ struct lpr_fpga_source {
     struct dma_state dma;
     struct lpr_frame_pool file_pool;
     uint8_t *file_pixels;
+    char **file_paths;
+    size_t file_count;
+    size_t file_current_index;
     size_t file_size;
     const struct live_options *options;
     pthread_mutex_t lock;

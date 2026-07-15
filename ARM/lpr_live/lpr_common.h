@@ -109,6 +109,8 @@ enum plate_color {
 struct live_options {
     const char *device_path;
     const char *input_bgrx_path;
+    const char *input_bgrx_list_path;
+    int input_bgrx_repeat;
     const char *phone_rtsp_uri;
     const char *control_socket_path;
     bool initial_phone_source;
