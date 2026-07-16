@@ -820,21 +820,33 @@ class ImageInferenceRunner:
             "--display", "0",
             "--always-segment",
         ]
+        frame_count_hint = 0
+        try:
+            frame_count_hint = sum(1 for _ in frames_dir.glob("frame*.bgrx"))
+        except OSError:
+            frame_count_hint = 0
+        # Single-image timeout (45 s) is too short for a batch: allow startup
+        # plus per-frame inference. 8 s startup + 3 s per frame is generous.
+        batch_timeout = max(self.config.timeout, 8.0 + 3.0 * max(1, frame_count_hint))
         try:
             completed = subprocess.run(
                 command,
                 cwd=self.config.arm_root,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=self.config.timeout,
+                timeout=batch_timeout,
                 check=False,
                 text=True,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ImageInferenceError("行人批量检测程序启动或运行失败") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ImageInferenceError(
+                f"行人批量检测超时（{batch_timeout:.0f}s，约 {frame_count_hint} 帧）"
+            ) from exc
+        except OSError as exc:
+            raise ImageInferenceError(f"行人批量检测程序无法启动: {exc}") from exc
         if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout)[-1000:]
-            raise ImageInferenceError(f"行人批量检测失败: {detail}")
+            detail = (completed.stderr or completed.stdout or "")[-1000:]
+            raise ImageInferenceError(f"行人批量检测失败(return {completed.returncode}): {detail}")
         # Parse every JSON line keyed by frame index.
         results_by_frame: dict[int, dict[str, Any]] = {}
         for line in completed.stdout.splitlines():
