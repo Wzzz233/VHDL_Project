@@ -798,6 +798,71 @@ class ImageInferenceRunner:
         detail = completed.stdout[-1000:]
         raise ImageInferenceError(f"行人检测没有返回 JSON 结果: {detail}")
 
+    def _run_pedestrian_batch(
+        self, frames_dir: Path, output_dir: Path, work: Path
+    ) -> list[dict[str, Any]]:
+        """Run the cplus driver once over a directory of BGRX frames.
+
+        Loads the models a single time and processes every frame, which is
+        much faster than restarting the driver per frame. Returns a list of
+        {result, mask_jpeg} ordered by frame index.
+        """
+        model = self.config.model_root
+        output_dir.mkdir(parents=True, exist_ok=True)
+        command = [
+            str(self.config.pedestrian_driver),
+            "--det-model", str(model / "yolov5nu_coco_rk3568_fp16_20260710.rknn"),
+            "--seg-model", str(model / "mapillary_cplus_ground_4class_v2_rk3568_fp16_20260710.rknn"),
+            "--input-frames-dir", str(frames_dir),
+            "--output-frames-dir", str(output_dir),
+            "--width", "1280",
+            "--height", "720",
+            "--display", "0",
+            "--always-segment",
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self.config.arm_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=self.config.timeout,
+                check=False,
+                text=True,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ImageInferenceError("行人批量检测程序启动或运行失败") from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout)[-1000:]
+            raise ImageInferenceError(f"行人批量检测失败: {detail}")
+        # Parse every JSON line keyed by frame index.
+        results_by_frame: dict[int, dict[str, Any]] = {}
+        for line in completed.stdout.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and isinstance(value.get("frame"), int):
+                results_by_frame[value["frame"]] = value
+        if not results_by_frame:
+            detail = completed.stdout[-1000:]
+            raise ImageInferenceError(f"行人批量检测没有返回 JSON 结果: {detail}")
+        expected = 1280 * 720 * 4
+        ordered: list[dict[str, Any]] = []
+        for index in sorted(results_by_frame):
+            result = results_by_frame[index]
+            bgrx_path = output_dir / f"frame{index:05d}.bgrx"
+            jpeg_path = output_dir / f"frame{index:05d}.jpg"
+            if not bgrx_path.is_file() or bgrx_path.stat().st_size != expected:
+                # Skip frames without a rendered overlay but keep the JSON.
+                ordered.append({"result": result, "mask_jpeg": None})
+                continue
+            ordered.append({"result": result, "mask_jpeg": self._encode_bgrx_jpeg(bgrx_path, jpeg_path)})
+        return ordered
+
     def run(self, mode: str, image: bytes, media_type: str, attach_source_image: bool = False) -> dict[str, Any]:
         if mode not in ("plate", "pedestrian"):
             raise ImageInferenceError("识别模式必须是 plate 或 pedestrian")
@@ -1081,46 +1146,51 @@ class VideoInferenceRunner:
                     sampled = sampled[: self.config.max_frames]
                 truncated = len(sampled) >= self.config.max_frames
                 total = len(sampled)
+                # Batch inference: one driver process loads the models once and
+                # processes every frame, instead of restarting per frame.
+                if progress_callback:
+                    progress_callback(0, total, f"正在批量推理 {total} 帧")
+                batch = self.image_runner._run_pedestrian_batch(
+                    frames_dir, work / "out", work
+                )
                 events: list[dict[str, Any]] = []
-                keyframes: list[bytes] = []
+                frames_out: list[dict[str, Any]] = []
                 violation_frames = 0
                 skipped_frames = 0
                 decision_counts: dict[str, int] = {}
-                for index, frame_path in enumerate(sampled):
-                    if progress_callback:
-                        progress_callback(
-                            index,
-                            total,
-                            f"正在推理 {index + 1}/{total} 帧",
-                        )
-                    frame_work = work / f"frame{index:05d}"
-                    frame_work.mkdir()
-                    try:
-                        result, mask_jpeg = self.image_runner._run_pedestrian(
-                            frame_path, frame_work
-                        )
-                    except ImageInferenceError:
-                        skipped_frames += 1
-                        frame_path.unlink(missing_ok=True)
-                        continue
-                    finally:
-                        frame_path.unlink(missing_ok=True)
-                    targets = (
-                        result.get("targets")
-                        if isinstance(result, dict)
-                        else None
-                    )
+                # batch is ordered by frame index; align with sampled[].
+                for index, entry in enumerate(batch):
+                    if index >= total:
+                        break
+                    result = entry.get("result", {})
+                    mask_jpeg = entry.get("mask_jpeg")
+                    targets = result.get("targets") if isinstance(result, dict) else None
                     if not isinstance(targets, list):
                         targets = []
-                    frame_events: list[dict[str, Any]] = []
+                    if mask_jpeg is None:
+                        skipped_frames += 1
+                    frame_targets: list[dict[str, Any]] = []
+                    frame_violation = False
                     for target in targets:
                         if not isinstance(target, dict):
                             continue
                         decision = str(target.get("decision", ""))
                         reason = str(target.get("reason", ""))
                         decision_counts[decision] = decision_counts.get(decision, 0) + 1
-                        if is_suspected_decision(decision):
-                            frame_events.append(
+                        suspected = is_suspected_decision(decision)
+                        frame_target = {
+                            "type": target.get("type"),
+                            "score": target.get("score"),
+                            "decision": decision,
+                            "reason": reason,
+                            "box": target.get("box"),
+                            "ground": target.get("ground"),
+                            "suspected": suspected,
+                        }
+                        frame_targets.append(frame_target)
+                        if suspected:
+                            frame_violation = True
+                            events.append(
                                 {
                                     "frame_index": index,
                                     "time_sec": round(index / sample_fps, 3),
@@ -1132,14 +1202,23 @@ class VideoInferenceRunner:
                                     "ground": target.get("ground"),
                                 }
                             )
-                    if frame_events:
+                    if frame_violation:
                         violation_frames += 1
-                        if len(keyframes) < self.config.max_keyframes:
-                            keyframe_index = len(keyframes)
-                            keyframes.append(mask_jpeg)
-                            for event in frame_events:
-                                event["keyframe_index"] = keyframe_index
-                        events.extend(frame_events)
+                    frames_out.append(
+                        {
+                            "frame_index": index,
+                            "time_sec": round(index / sample_fps, 3),
+                            "violation": frame_violation,
+                            "jpeg": mask_jpeg,
+                            "targets": frame_targets,
+                        }
+                    )
+                    if progress_callback:
+                        progress_callback(
+                            index + 1,
+                            total,
+                            f"正在推理 {index + 1}/{total} 帧",
+                        )
                 summary = {
                     "total_frames": total,
                     "violation_frames": violation_frames,
@@ -1151,7 +1230,7 @@ class VideoInferenceRunner:
                 }
                 return {
                     "events": events,
-                    "keyframes": keyframes,
+                    "frames": frames_out,
                     "summary": summary,
                 }
         finally:

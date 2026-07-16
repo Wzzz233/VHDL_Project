@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Tests for the offline video inference runner.
 
-These exercise the per-frame aggregation, frame sampling, keyframe linkage,
+These exercise the per-frame aggregation, frame sampling, batch inference,
 truncation, and skip-on-error logic without touching gstreamer or the board
 driver: _extract_frames is replaced with a stub that writes valid BGRx files,
-and _run_pedestrian is replaced with a stub that returns scripted results.
+and _run_pedestrian_batch is replaced with a stub that returns scripted results.
 """
 
 from __future__ import annotations
@@ -53,14 +53,18 @@ class VideoInferenceTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _wire_results(self, results_map) -> None:
-        def run(self, raw_path, work):
-            index = int(raw_path.stem.replace("frame", ""))
-            item = results_map.get(index, [])
-            if isinstance(item, Exception):
-                raise item
-            return {"frame": index, "targets": item}, b"\xff\xd8fake-jpeg"
+        def run(self, frames_dir, output_dir, work):
+            ordered = []
+            for index in sorted(results_map):
+                item = results_map[index]
+                if isinstance(item, Exception):
+                    raise item
+                ordered.append(
+                    {"result": {"frame": index, "targets": item}, "mask_jpeg": b"\xff\xd8fake-jpeg"}
+                )
+            return ordered
 
-        self.image_runner._run_pedestrian = types.MethodType(run, self.image_runner)
+        self.image_runner._run_pedestrian_batch = types.MethodType(run, self.image_runner)
 
     def _runner(self, frame_count, max_frames=600, max_keyframes=24) -> _VideoRunner:
         return _VideoRunner(
@@ -70,14 +74,14 @@ class VideoInferenceTest(unittest.TestCase):
         )
 
     def test_half_fps_samples_every_other_frame(self) -> None:
-        self._wire_results({})
+        self._wire_results({0: [], 1: [], 2: [], 3: []})
         runner = self._runner(frame_count=4)
         result = runner.run_video(self.video_path, sample_fps=0.5)
         # 4 frames at 1fps, step 2 -> sampled frames 0 and 2
         self.assertEqual(result["summary"]["total_frames"], 2)
         self.assertFalse(result["summary"]["truncated"])
 
-    def test_events_link_keyframe(self) -> None:
+    def test_events_and_frames_recorded(self) -> None:
         targets = {
             0: [{"type": "pedestrian", "score": 0.9, "decision": "suspected_crossing_road_outside_zebra",
                  "reason": "road_dominant_without_zebra", "box": [1, 2, 3, 4],
@@ -91,28 +95,35 @@ class VideoInferenceTest(unittest.TestCase):
         result = runner.run_video(self.video_path, sample_fps=1.0)
         self.assertEqual(result["summary"]["violation_count"], 1)
         self.assertEqual(result["summary"]["violation_frames"], 1)
-        self.assertEqual(len(result["keyframes"]), 1)
-        self.assertEqual(result["events"][0]["keyframe_index"], 0)
+        # All frames are stored now (not just violation keyframes).
+        self.assertEqual(len(result["frames"]), 2)
+        self.assertTrue(result["frames"][0]["violation"])
+        self.assertFalse(result["frames"][1]["violation"])
+        self.assertEqual(result["events"][0]["frame_index"], 0)
         self.assertEqual(result["events"][0]["time_sec"], 0.0)
 
     def test_max_frames_truncates(self) -> None:
-        self._wire_results({})
+        self._wire_results({i: [] for i in range(5)})
         runner = self._runner(frame_count=5, max_frames=3)
         result = runner.run_video(self.video_path, sample_fps=1.0)
         self.assertEqual(result["summary"]["total_frames"], 3)
         self.assertTrue(result["summary"]["truncated"])
 
-    def test_skipped_frame_does_not_abort(self) -> None:
-        targets = {0: ImageInferenceError("driver failed"), 1: []}
-        self._wire_results(targets)
+    def test_skipped_frame_when_batch_missing_output(self) -> None:
+        # A batch entry with mask_jpeg=None counts as skipped.
+        def run(self, frames_dir, output_dir, work):
+            return [
+                {"result": {"frame": 0, "targets": []}, "mask_jpeg": None},
+                {"result": {"frame": 1, "targets": []}, "mask_jpeg": b"\xff\xd8"},
+            ]
+        self.image_runner._run_pedestrian_batch = types.MethodType(run, self.image_runner)
         runner = self._runner(frame_count=2)
         result = runner.run_video(self.video_path, sample_fps=1.0)
         self.assertEqual(result["summary"]["skipped_frames"], 1)
         self.assertEqual(result["summary"]["total_frames"], 2)
         self.assertEqual(result["summary"]["violation_count"], 0)
 
-    def test_keyframe_cap(self) -> None:
-        # every frame is a violation, but only max_keyframes are stored
+    def test_all_violation_frames_stored(self) -> None:
         targets = {
             i: [{"type": "pedestrian", "score": 0.9, "decision": "suspected_crossing_road_outside_zebra",
                  "reason": "road_dominant_without_zebra", "box": [1, 2, 3, 4],
@@ -123,10 +134,8 @@ class VideoInferenceTest(unittest.TestCase):
         runner = self._runner(frame_count=4, max_keyframes=2)
         result = runner.run_video(self.video_path, sample_fps=1.0)
         self.assertEqual(result["summary"]["violation_count"], 4)
-        self.assertEqual(len(result["keyframes"]), 2)
-        # only the first two violation frames carry a keyframe_index
-        linked = [event for event in result["events"] if "keyframe_index" in event]
-        self.assertEqual(len(linked), 2)
+        # No keyframe cap anymore: all frames stored.
+        self.assertEqual(len(result["frames"]), 4)
 
 
 if __name__ == "__main__":

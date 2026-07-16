@@ -213,7 +213,7 @@ class VideoJobStore:
                 "total": 0,
                 "message": "正在启动",
                 "events": [],
-                "keyframes": [],
+                "frames": [],
                 "summary": None,
                 "error": None,
             }
@@ -239,7 +239,7 @@ class VideoJobStore:
                 result = self.video_runner.run_video(file_path, sample_fps, progress)
             with self._lock:
                 job["events"] = result["events"]
-                job["keyframes"] = result["keyframes"]
+                job["frames"] = result["frames"]
                 job["summary"] = result["summary"]
                 job["status"] = "done"
                 job["phase"] = "done"
@@ -261,6 +261,19 @@ class VideoJobStore:
 
     @staticmethod
     def _public_view(job: dict[str, Any]) -> dict[str, Any]:
+        # frames carry JPEG bytes; expose only a lightweight summary so the
+        # job status response stays small. JPEG/targets are fetched per frame.
+        frames = job.get("frames") or []
+        frame_summary = [
+            {
+                "frame_index": f.get("frame_index"),
+                "time_sec": f.get("time_sec"),
+                "violation": f.get("violation"),
+                "target_count": len(f.get("targets") or []),
+                "has_image": f.get("jpeg") is not None,
+            }
+            for f in frames
+        ]
         return {
             "id": job["id"],
             "status": job["status"],
@@ -275,7 +288,8 @@ class VideoJobStore:
             "message": job["message"],
             "events": job["events"],
             "summary": job["summary"],
-            "keyframe_count": len(job["keyframes"]),
+            "frames": frame_summary,
+            "frame_count": len(frames),
             "error": job["error"],
         }
 
@@ -295,15 +309,33 @@ class VideoJobStore:
             )[:limit]
             return [self._public_view(job) for job in jobs]
 
-    def get_keyframe(self, job_id: str, index: int) -> bytes | None:
+    def _get_frame(self, job_id: str, index: int) -> dict[str, Any] | None:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 return None
-            keyframes = job["keyframes"]
-            if index < 0 or index >= len(keyframes):
+            frames = job.get("frames") or []
+            if index < 0 or index >= len(frames):
                 return None
-            return keyframes[index]
+            return frames[index]
+
+    def get_frame_jpeg(self, job_id: str, index: int) -> bytes | None:
+        frame = self._get_frame(job_id, index)
+        if frame is None:
+            return None
+        jpeg = frame.get("jpeg")
+        return jpeg if isinstance(jpeg, (bytes, bytearray)) else None
+
+    def get_frame_result(self, job_id: str, index: int) -> dict[str, Any] | None:
+        frame = self._get_frame(job_id, index)
+        if frame is None:
+            return None
+        return {
+            "frame_index": frame.get("frame_index"),
+            "time_sec": frame.get("time_sec"),
+            "violation": frame.get("violation"),
+            "targets": frame.get("targets") or [],
+        }
 
 
 class AppState:
@@ -582,21 +614,29 @@ class ControlHandler(BaseHTTPRequestHandler):
                 self._send_problem(HTTPStatus.NOT_FOUND, "job_not_found", "video job not found")
             else:
                 self._send_json(HTTPStatus.OK, job)
-        elif len(parts) == 3 and parts[1] == "keyframes":
+        elif len(parts) == 3 and parts[1] == "frames" and parts[2].endswith(".jpg"):
             index_token = parts[2]
-            if not index_token.endswith(".jpg"):
-                self._send_problem(HTTPStatus.NOT_FOUND, "not_found", "resource not found")
-                return
             try:
                 index = int(index_token[:-4])
             except ValueError:
                 self._send_problem(HTTPStatus.NOT_FOUND, "not_found", "resource not found")
                 return
-            data = self.state.video_store.get_keyframe(parts[0], index)
+            data = self.state.video_store.get_frame_jpeg(parts[0], index)
             if data is None:
-                self._send_problem(HTTPStatus.NOT_FOUND, "keyframe_not_found", "keyframe not found")
+                self._send_problem(HTTPStatus.NOT_FOUND, "frame_not_found", "frame not found")
             else:
                 self._send_bytes(HTTPStatus.OK, data, "image/jpeg")
+        elif len(parts) == 4 and parts[1] == "frames" and parts[3] == "result":
+            try:
+                index = int(parts[2])
+            except ValueError:
+                self._send_problem(HTTPStatus.NOT_FOUND, "not_found", "resource not found")
+                return
+            data = self.state.video_store.get_frame_result(parts[0], index)
+            if data is None:
+                self._send_problem(HTTPStatus.NOT_FOUND, "frame_not_found", "frame not found")
+            else:
+                self._send_json(HTTPStatus.OK, data)
         else:
             self._send_problem(HTTPStatus.NOT_FOUND, "not_found", "resource not found")
 

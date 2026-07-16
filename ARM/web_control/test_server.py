@@ -192,12 +192,29 @@ class FakeVideoRunner:
                 {
                     "frame_index": 0,
                     "time_sec": 0.0,
-                    "decision": "suspected",
-                    "reason": "ROAD_DOMINANT_WITHOUT_ZEBRA",
-                    "keyframe_index": 0,
+                    "decision": "suspected_crossing_road_outside_zebra",
+                    "reason": "road_dominant_without_zebra",
                 }
             ],
-            "keyframes": [FAKE_JPEG],
+            "frames": [
+                {
+                    "frame_index": 0,
+                    "time_sec": 0.0,
+                    "violation": True,
+                    "jpeg": FAKE_JPEG,
+                    "targets": [
+                        {"decision": "suspected_crossing_road_outside_zebra",
+                         "reason": "road_dominant_without_zebra", "suspected": True},
+                    ],
+                },
+                {
+                    "frame_index": 1,
+                    "time_sec": 1.0,
+                    "violation": False,
+                    "jpeg": FAKE_JPEG,
+                    "targets": [],
+                },
+            ],
             "summary": {
                 "total_frames": 2,
                 "violation_frames": 1,
@@ -542,22 +559,30 @@ class WebControlTest(unittest.TestCase):
         self.assertIsNotNone(job)
         self.assertEqual(job["status"], "done")
         self.assertEqual(job["summary"]["violation_count"], 1)
-        self.assertEqual(job["keyframe_count"], 1)
+        self.assertEqual(job["frame_count"], 2)
         self.assertEqual(self.driver_manager.sessions[-1], "pedestrian")
 
         status, headers, body = self.request(
-            "GET", f"/api/v1/sd/video-jobs/{job_id}/keyframes/0.jpg"
+            "GET", f"/api/v1/sd/video-jobs/{job_id}/frames/0.jpg"
         )
         self.assertEqual(status, 200)
         self.assertEqual(headers["content-type"], "image/jpeg")
         self.assertEqual(body, FAKE_JPEG)
+
+        status, _, body = self.request(
+            "GET", f"/api/v1/sd/video-jobs/{job_id}/frames/0/result"
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertTrue(result["violation"])
+        self.assertEqual(len(result["targets"]), 1)
 
         status, _, body = self.request("GET", "/api/v1/sd/video-jobs")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["jobs"][0]["id"], job_id)
 
         status, _, _ = self.request(
-            "GET", f"/api/v1/sd/video-jobs/{job_id}/keyframes/99.jpg"
+            "GET", f"/api/v1/sd/video-jobs/{job_id}/frames/99.jpg"
         )
         self.assertEqual(status, 404)
 

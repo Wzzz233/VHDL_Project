@@ -992,23 +992,24 @@ curl --cacert "${CA}" "${BASE}/api/v1/sd/video-jobs/${JOB}"
 
 `sample_fps` 取值 0.1–10，默认 1。低于 1 时按比例隔帧抽样（例如 0.5 即每 2 秒 1 帧），
 适合长视频。任务状态 `running` 时持续轮询；`done` 后 `summary` 给出采样帧数、违规帧
-数、违规事件数、跳过帧数和决策分布，`events` 列出每个违规事件的时间、原因和关联的
-关键帧索引；`error` 给出失败原因。
+数、违规事件数、跳过帧数和决策分布，`events` 列出每个违规事件的时间、原因和帧索引；
+`frames` 给出每帧概要（索引、时间、是否违规、是否有图）；`error` 给出失败原因。
 
-关键帧为违规时刻的 mask 标注图：
+视频推理一次性加载模型批量处理所有采样帧（不再逐帧重启驱动），速度比单帧模式快数倍。
+每帧的标注图（mask + 目标框 + 判定标签）按帧索引获取：
 
 ```bash
-curl --cacert "${CA}" "${BASE}/api/v1/sd/video-jobs/${JOB}/keyframes/0.jpg" -o kf0.jpg
+curl --cacert "${CA}" "${BASE}/api/v1/sd/video-jobs/${JOB}/frames/0.jpg" -o f0.jpg
 ```
 
 ### 21.5 限制与注意事项
 
-- 视频逐帧推理复用 CPlus 单帧离线入口，每帧都会重启 driver 并重新加载模型，属于离线
-  批处理路径，不是实时。30 秒 1fps 视频约需数十秒。
+- 视频推理批量加载模型一次处理所有采样帧（不再逐帧重启），速度比单帧模式快数倍。
+  1080P 视频抽帧用 `videorate` 先降帧再缩放，避免每帧 1080P 软转换。
 - 同时只允许一个视频推理任务，且与照片/实时推理互斥。
-- 单任务最多采样 600 帧，超出会截断并在 `summary.truncated` 标记；最多保留 24 张关键
-  帧。需要更长视频可调高 `sample_fps` 或分段。
-- 抽帧使用 `decodebin ! videoconvert ! videoscale ! videorate ! multifilesink`，依赖板端
+- 单任务最多采样 600 帧，超出会截断并在 `summary.truncated` 标记。需要更长视频可调高
+  `sample_fps` 或分段。
+- 抽帧使用 `decodebin ! videorate ! videoconvert ! videoscale ! multifilesink`，依赖板端
   GStreamer 解码插件；硬解是否启用取决于 `mppvideodec` 是否被 `decodebin` 选中。
 - 临时帧文件在任务结束的临时目录中自动清理。
 

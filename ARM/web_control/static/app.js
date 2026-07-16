@@ -48,6 +48,8 @@ const elements = {
   sdVideoSummary: document.getElementById("sdVideoSummary"),
   sdVideoEvents: document.getElementById("sdVideoEvents"),
   sdVideoEventCount: document.getElementById("sdVideoEventCount"),
+  sdFrameList: document.getElementById("sdFrameList"),
+  sdFrameCount: document.getElementById("sdFrameCount"),
 };
 
 const overlayContext = elements.canvas.getContext("2d");
@@ -1075,8 +1077,8 @@ function renderSdVideoEvents(events) {
     const row = document.createElement("button");
     row.type = "button";
     row.className = "sd-video-event";
-    if (event.keyframe_index == null) row.disabled = true;
-    else row.dataset.keyframe = String(event.keyframe_index);
+    if (event.frame_index == null) row.disabled = true;
+    else row.dataset.frame = String(event.frame_index);
     const time = document.createElement("span");
     time.className = "ev-time";
     time.textContent = `${Number(event.time_sec ?? 0).toFixed(1)}s`;
@@ -1085,6 +1087,34 @@ function renderSdVideoEvents(events) {
     reason.textContent = pedestrianReasonText(event.reason, true);
     row.append(time, reason);
     elements.sdVideoEvents.append(row);
+  }
+}
+
+function renderSdVideoFrames(frames) {
+  elements.sdFrameCount.textContent = String(frames ? frames.length : 0);
+  elements.sdFrameList.replaceChildren();
+  if (!frames || !frames.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty-result";
+    empty.textContent = "无帧";
+    elements.sdFrameList.append(empty);
+    return;
+  }
+  for (const frame of frames) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "sd-frame-thumb";
+    if (frame.violation) row.dataset.violation = "true";
+    if (!frame.has_image) row.disabled = true;
+    else row.dataset.frame = String(frame.frame_index);
+    const time = document.createElement("span");
+    time.className = "ev-time";
+    time.textContent = `${Number(frame.time_sec ?? 0).toFixed(1)}s`;
+    const mark = document.createElement("span");
+    mark.className = "ev-reason";
+    mark.textContent = frame.violation ? "⚠ 违法" : "正常";
+    row.append(time, mark);
+    elements.sdFrameList.append(row);
   }
 }
 
@@ -1099,19 +1129,23 @@ function renderSdVideoJob(job) {
     setSdVideoProgressLabel("error", job.error || "失败");
   }
   renderSdVideoEvents(job.events || []);
+  renderSdVideoFrames(job.frames || []);
   renderSdVideoSummary(job.summary);
 }
 
-async function showSdVideoKeyframe(index) {
+async function showSdVideoFrame(index) {
   if (!sdVideoJobId) return;
   try {
-    const response = await fetchWithTimeout(
-      `/api/v1/sd/video-jobs/${encodeURIComponent(sdVideoJobId)}/keyframes/${index}.jpg`,
-      {},
-      10000,
-      async (res) => new Uint8Array(await res.arrayBuffer()),
-    );
-    const url = URL.createObjectURL(new Blob([response], {type: "image/jpeg"}));
+    const [imgResp, result] = await Promise.all([
+      fetchWithTimeout(
+        `/api/v1/sd/video-jobs/${encodeURIComponent(sdVideoJobId)}/frames/${index}.jpg`,
+        {},
+        10000,
+        async (res) => new Uint8Array(await res.arrayBuffer()),
+      ),
+      fetchJson(`/api/v1/sd/video-jobs/${encodeURIComponent(sdVideoJobId)}/frames/${index}/result`),
+    ]);
+    const url = URL.createObjectURL(new Blob([imgResp], {type: "image/jpeg"}));
     if (currentFrameUrl) URL.revokeObjectURL(currentFrameUrl);
     currentFrameUrl = url;
     elements.frame.src = url;
@@ -1119,10 +1153,14 @@ async function showSdVideoKeyframe(index) {
     elements.frameState.hidden = true;
     elements.returnLiveView.hidden = false;
     imageViewActive = true;
-    latestResults = {frame: {width: 1280, height: 720}, detections: []};
+    latestResults = {
+      frame: {width: 1280, height: 720},
+      targets: result.targets || [],
+    };
+    updateResultsView(latestResults);
     drawOverlay();
   } catch (error) {
-    setSdVideoProgressLabel("error", error?.message || "关键帧加载失败");
+    setSdVideoProgressLabel("error", error?.message || "帧加载失败");
   }
 }
 
@@ -1155,6 +1193,7 @@ async function runSdVideoInference() {
   setSdVideoProgressLabel("loading", "正在提交任务");
   elements.sdVideoProgress.value = 0;
   renderSdVideoEvents([]);
+  renderSdVideoFrames([]);
   renderSdVideoSummary(null);
   try {
     const data = await fetchJson("/api/v1/sd/video-inference", {
@@ -1264,8 +1303,15 @@ elements.runSdVideoInference.addEventListener("click", () => void runSdVideoInfe
 elements.sdVideoEvents.addEventListener("click", (event) => {
   const row = event.target.closest("button.sd-video-event");
   if (!row || row.disabled) return;
-  const index = Number(row.dataset.keyframe);
-  if (Number.isFinite(index)) void showSdVideoKeyframe(index);
+  const index = Number(row.dataset.frame);
+  if (Number.isFinite(index)) void showSdVideoFrame(index);
+});
+
+elements.sdFrameList.addEventListener("click", (event) => {
+  const row = event.target.closest("button.sd-frame-thumb");
+  if (!row || row.disabled) return;
+  const index = Number(row.dataset.frame);
+  if (Number.isFinite(index)) void showSdVideoFrame(index);
 });
 
 for (const [id, action] of [["pausePipeline", "pause"], ["resumePipeline", "resume"], ["restartPipeline", "restart"]]) {

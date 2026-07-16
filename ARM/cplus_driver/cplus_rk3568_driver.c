@@ -8,6 +8,7 @@
 #include "cplus_rknn.h"
 #include "../pcie_fpga_dma.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -24,8 +25,10 @@ struct options {
     const char *segmenter_model;
     const char *device_path;
     const char *input_bgrx_path;
+    const char *input_frames_dir;
     const char *dump_bgrx_path;
     const char *output_mask_bgrx_path;
+    const char *output_frames_dir;
     const char *drm_card_path;
     int connector_id;
     int display;
@@ -70,8 +73,12 @@ static void usage(const char *program)
             "  --frames N             Frames to capture; 0 means continuous (default 1)\n"
             "  --fps N                Live capture/display rate, 1-120 (default 30)\n"
             "  --input-bgrx PATH      Offline BGRX8888 frame; needs --width and --height\n"
+            "  --input-frames-dir PATH Offline BGRX8888 frame directory (frameNNNNN.bgrx);\n"
+            "                          loads models once and processes every frame\n"
             "  --dump-bgrx PATH       Save the first captured BGRX8888 frame\n"
             "  --output-mask-bgrx PATH  Save the offline frame with the colored mask overlay\n"
+            "  --output-frames-dir PATH  Save every processed frame with mask+box overlay\n"
+            "                            as frameNNNNN.bgrx (one file per input frame)\n"
             "  --width N --height N   Offline BGRX frame dimensions\n"
             "  --always-segment       Run segmenter even when no ordinary person remains\n"
             "  --display 0|1          HDMI display with result overlay (default 1)\n"
@@ -89,8 +96,10 @@ static int parse_options(int argc, char **argv, struct options *options)
         {"frames", required_argument, NULL, 'n'},
         {"fps", required_argument, NULL, 'F'},
         {"input-bgrx", required_argument, NULL, 'i'},
+        {"input-frames-dir", required_argument, NULL, 'I'},
         {"dump-bgrx", required_argument, NULL, 'o'},
         {"output-mask-bgrx", required_argument, NULL, 'O'},
+        {"output-frames-dir", required_argument, NULL, 'E'},
         {"width", required_argument, NULL, 'w'},
         {"height", required_argument, NULL, 'h'},
         {"always-segment", no_argument, NULL, 'a'},
@@ -108,7 +117,7 @@ static int parse_options(int argc, char **argv, struct options *options)
     options->display = 1;
     options->drm_card_path = "/dev/dri/card0";
     options->connector_id = -1;
-    while ((argument = getopt_long(argc, argv, "d:s:D:n:F:i:o:O:w:h:ap:r:c:?",
+    while ((argument = getopt_long(argc, argv, "d:s:D:n:F:i:I:o:O:E:w:h:ap:r:c:?",
                                    long_options, NULL)) != -1) {
         switch (argument) {
         case 'd': options->detector_model = optarg; break;
@@ -117,8 +126,10 @@ static int parse_options(int argc, char **argv, struct options *options)
         case 'n': options->frames = atoi(optarg); break;
         case 'F': options->fps = atoi(optarg); break;
         case 'i': options->input_bgrx_path = optarg; break;
+        case 'I': options->input_frames_dir = optarg; break;
         case 'o': options->dump_bgrx_path = optarg; break;
         case 'O': options->output_mask_bgrx_path = optarg; break;
+        case 'E': options->output_frames_dir = optarg; break;
         case 'w': options->width = atoi(optarg); break;
         case 'h': options->height = atoi(optarg); break;
         case 'a': options->always_segment = 1; break;
@@ -131,7 +142,10 @@ static int parse_options(int argc, char **argv, struct options *options)
     if (!options->detector_model || !options->segmenter_model || options->frames < 0 ||
         options->fps < 1 || options->fps > 120 ||
         (options->input_bgrx_path && (options->width <= 0 || options->height <= 0)) ||
+        (options->input_frames_dir && (options->width <= 0 || options->height <= 0)) ||
+        (options->input_bgrx_path && options->input_frames_dir) ||
         (options->output_mask_bgrx_path && !options->input_bgrx_path) ||
+        (options->output_frames_dir && !options->input_frames_dir) ||
         (options->display != 0 && options->display != 1))
         return -1;
     return 0;
@@ -155,6 +169,61 @@ static int write_file_exact(const char *path, const uint8_t *buffer, size_t size
     if (fwrite(buffer, 1, size, file) == size && fflush(file) == 0) result = 0;
     fclose(file);
     return result;
+}
+
+/* Collect sorted frame*.bgrx entries from dir into names[] (capacity cap).
+ * Returns the count, or -1 on error. Names are heap-allocated and owned by
+ * the caller; free with free_frame_names. */
+static int collect_frame_files(const char *dir, char **names, int cap)
+{
+    DIR *handle = opendir(dir);
+    struct dirent *entry;
+    int count = 0;
+    if (!handle) return -1;
+    while ((entry = readdir(handle)) != NULL) {
+        const char *dot = strrchr(entry->d_name, '.');
+        if (!dot || strcmp(dot, ".bgrx") != 0) continue;
+        if (strncmp(entry->d_name, "frame", 5) != 0) continue;
+        if (count >= cap) {
+            closedir(handle);
+            return -1;
+        }
+        {
+            size_t need = strlen(dir) + 1 + strlen(entry->d_name) + 1;
+            char *full = (char *)malloc(need);
+            if (!full) {
+                closedir(handle);
+                return -1;
+            }
+            snprintf(full, need, "%s/%s", dir, entry->d_name);
+            names[count++] = full;
+        }
+    }
+    closedir(handle);
+    /* Simple insertion sort by filename so frame00000 < frame00001 < ... */
+    {
+        int i, j;
+        for (i = 1; i < count; ++i) {
+            char *value = names[i];
+            const char *base_i = strrchr(value, '/') ? strrchr(value, '/') + 1 : value;
+            for (j = i - 1; j >= 0; --j) {
+                const char *base_j = strrchr(names[j], '/') ? strrchr(names[j], '/') + 1 : names[j];
+                if (strcmp(base_j, base_i) > 0) {
+                    names[j + 1] = names[j];
+                } else {
+                    break;
+                }
+            }
+            names[j + 1] = value;
+        }
+    }
+    return count;
+}
+
+static void free_frame_names(char **names, int count)
+{
+    int i;
+    for (i = 0; i < count; ++i) free(names[i]);
 }
 
 static int open_dma_frame(const char *path, int *fd, int *width, int *height, size_t *size)
@@ -265,6 +334,8 @@ int main(int argc, char **argv)
     int status = 1;
     int64_t next_frame_us;
     int64_t frame_period_us;
+    char *frame_names[1024];
+    int frame_names_count = 0;
 
     if (parse_options(argc, argv, &options) < 0) {
         usage(argv[0]);
@@ -277,6 +348,17 @@ int main(int argc, char **argv)
         height = options.height;
         frame_size = (size_t)width * height * 4U;
         frame_count = 1;
+    } else if (options.input_frames_dir) {
+        width = options.width;
+        height = options.height;
+        frame_size = (size_t)width * height * 4U;
+        frame_names_count = collect_frame_files(options.input_frames_dir,
+                                                 frame_names, 1024);
+        if (frame_names_count <= 0) {
+            fprintf(stderr, "No frame*.bgrx files found in %s\n", options.input_frames_dir);
+            return 1;
+        }
+        frame_count = frame_names_count;
     } else if (open_dma_frame(options.device_path, &fd, &width, &height, &frame_size) == 0) {
         frame_count = options.frames;
     } else {
@@ -331,7 +413,7 @@ int main(int argc, char **argv)
         bool have_result;
         bool keep_final;
 
-        if (!options.input_bgrx_path && frame_index > 0) {
+        if (!options.input_bgrx_path && !options.input_frames_dir && frame_index > 0) {
             next_frame_us += frame_period_us;
             sleep_until_us(next_frame_us);
             if (stop_requested) break;
@@ -344,7 +426,8 @@ int main(int argc, char **argv)
             goto done;
         }
         if ((options.input_bgrx_path && read_file_exact(options.input_bgrx_path, frame, frame_size) < 0) ||
-            (!options.input_bgrx_path && read_dma_frame(fd, frame, frame_size) < 0)) {
+            (options.input_frames_dir && read_file_exact(frame_names[frame_index], frame, frame_size) < 0) ||
+            (!options.input_bgrx_path && !options.input_frames_dir && read_dma_frame(fd, frame, frame_size) < 0)) {
             cplus_frame_pool_release(&pool, slot);
             fprintf(stderr, "Unable to read frame %d\n", frame_index);
             goto done;
@@ -367,11 +450,50 @@ int main(int argc, char **argv)
             fprintf(stderr, "Unable to submit frame %d to asynchronous pipeline\n", frame_index);
             goto done;
         }
-        keep_final = frame_count > 0 && frame_index + 1 == frame_count;
-        if (keep_final) {
-            final_slot = slot;
-        } else {
+        if (options.input_frames_dir) {
+            /* Offline batch mode: wait for this frame's result now, render the
+             * annotated overlay, and release the slot. Models stay loaded. */
+            if (cplus_async_wait_for_frame(&infer, (uint64_t)frame_index) < 0 ||
+                !cplus_async_get_result(&infer, &latest)) {
+                cplus_frame_pool_release(&pool, slot);
+                fprintf(stderr, "Frame %d inference failed\n", frame_index);
+                goto done;
+            }
+            if (options.output_frames_dir) {
+                const uint8_t *source = cplus_frame_pool_data(&pool, slot);
+                uint8_t *rendered = source ? malloc(frame_size) : NULL;
+                char out_path[4096];
+                if (!rendered) {
+                    cplus_frame_pool_release(&pool, slot);
+                    fprintf(stderr, "Unable to allocate output frame %d\n", frame_index);
+                    goto done;
+                }
+                memcpy(rendered, source, frame_size);
+                if (latest.mask_valid) {
+                    cplus_overlay_mask_bgrx(rendered, width * 4, width, height,
+                                            latest.mask, CPLUS_MODEL_WIDTH,
+                                            CPLUS_MODEL_HEIGHT);
+                }
+                cplus_overlay_results(rendered, width * 4, width, height,
+                                       latest.results, latest.count, latest.count > 0);
+                snprintf(out_path, sizeof(out_path), "%s/frame%05d.bgrx",
+                         options.output_frames_dir, frame_index);
+                if (write_file_exact(out_path, rendered, frame_size) < 0) {
+                    free(rendered);
+                    cplus_frame_pool_release(&pool, slot);
+                    fprintf(stderr, "Unable to write output frame %d\n", frame_index);
+                    goto done;
+                }
+                free(rendered);
+            }
             cplus_frame_pool_release(&pool, slot);
+        } else {
+            keep_final = frame_count > 0 && frame_index + 1 == frame_count;
+            if (keep_final) {
+                final_slot = slot;
+            } else {
+                cplus_frame_pool_release(&pool, slot);
+            }
         }
         if (cplus_async_failed(&infer) ||
             (options.display && cplus_display_async_failed(&display))) {
@@ -379,7 +501,7 @@ int main(int argc, char **argv)
             goto done;
         }
     }
-    if (!stop_requested && frame_count > 0 && frame_index > 0) {
+    if (!stop_requested && !options.input_frames_dir && frame_count > 0 && frame_index > 0) {
         uint64_t final_frame = (uint64_t)(frame_index - 1);
         if (cplus_async_wait_for_frame(&infer, final_frame) < 0 ||
             !cplus_async_get_result(&infer, &latest)) {
@@ -452,5 +574,6 @@ done:
         fprintf(stderr, "Shared frame pool still had outstanding references during shutdown\n");
         status = 1;
     }
+    if (frame_names_count > 0) free_frame_names(frame_names, frame_names_count);
     return status;
 }

@@ -741,6 +741,44 @@ h2 {
   white-space: nowrap;
 }
 
+.sd-frame-list {
+  max-height: 160px;
+}
+
+.sd-frame-thumb {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  font-size: 12px;
+}
+
+.sd-frame-thumb:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--surface-raised);
+}
+
+.sd-frame-thumb[data-violation="true"] {
+  border-color: var(--danger);
+  background: rgba(223, 100, 100, 0.14);
+}
+
+.sd-frame-thumb[data-violation="true"] .ev-time {
+  color: var(--danger);
+}
+
+.sd-frame-thumb[data-violation="true"] .ev-reason {
+  color: var(--danger);
+  font-weight: 600;
+}
+
 .inline-state[data-state="loading"]::before {
   background: var(--warning);
 }
