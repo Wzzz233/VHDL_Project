@@ -818,7 +818,9 @@ class ImageInferenceRunner:
             "--width", "1280",
             "--height", "720",
             "--display", "0",
-            "--always-segment",
+            # No --always-segment: the segmenter takes ~1 s/frame on the NPU,
+            # so only segment frames that actually have an ordinary pedestrian.
+            # Empty/rider-only frames skip segmentation and finish in ~0.2 s.
         ]
         frame_count_hint = 0
         try:
@@ -826,8 +828,9 @@ class ImageInferenceRunner:
         except OSError:
             frame_count_hint = 0
         # Single-image timeout (45 s) is too short for a batch: allow startup
-        # plus per-frame inference. 8 s startup + 3 s per frame is generous.
-        batch_timeout = max(self.config.timeout, 8.0 + 3.0 * max(1, frame_count_hint))
+        # plus per-frame inference. Worst case (every frame has a pedestrian)
+        # is ~1.6 s/frame on the NPU; budget 2.5 s/frame plus 10 s startup.
+        batch_timeout = max(self.config.timeout, 10.0 + 2.5 * max(1, frame_count_hint))
         try:
             completed = subprocess.run(
                 command,
