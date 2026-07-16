@@ -409,6 +409,20 @@ h2 {
   font-variant-numeric: tabular-nums;
 }
 
+.result-row.violation-row {
+  padding-left: 10px;
+  border-left: 3px solid var(--danger);
+  background: rgba(223, 100, 100, 0.12);
+}
+
+.result-row.violation-row strong {
+  color: var(--danger);
+}
+
+.result-row.violation-row span {
+  color: var(--danger);
+}
+
 .empty-result {
   padding: 16px 0;
   color: var(--muted);

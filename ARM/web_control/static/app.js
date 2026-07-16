@@ -211,6 +211,29 @@ function updateStatusView(status) {
   elements.displayDrops.textContent = integerText(firstValue(status, ["dropped.display", "display_drops", "display_drop_total", "metrics.display_drops"]));
 }
 
+const PED_REASON_TEXT = {
+  road_dominant_without_zebra: "路面横穿",
+  road_dominant_zebra_noise_ignored: "路面横穿",
+  sidewalk_suppressed: "人行道",
+  zebra_suppressed: "斑马线上",
+  weak_ground_evidence: "地面不明",
+  road_not_dominant: "非路面",
+  rider_filtered: "骑行者",
+  two_wheel_filtered: "骑行者",
+};
+
+function isPedestrianTarget(target) {
+  return target != null && typeof target === "object" && "decision" in target;
+}
+
+function isSuspectedDecision(decision) {
+  return String(decision || "").startsWith("suspected");
+}
+
+function pedestrianReasonText(reason, suspected) {
+  return PED_REASON_TEXT[String(reason || "")] || (suspected ? "疑似违规" : "正常");
+}
+
 function normalizedPlates(results) {
   const candidates = firstValue(results || {}, ["plates", "detections", "targets", "results"], []);
   return Array.isArray(candidates) ? candidates : [];
@@ -261,14 +284,28 @@ function drawOverlay() {
     const y = offsetY + box.y1 * scale;
     const width = (box.x2 - box.x1) * scale;
     const height = (box.y2 - box.y1) * scale;
-    const route = String(plate.route || plate.route_name || plate.type || "").toLowerCase();
-    const color = colors[route] || "#21b4c6";
-    const confidence = Number(plate.ocr_conf ?? plate.conf ?? plate.confidence);
-    const confidenceText = Number.isFinite(confidence) ? ` ${confidence.toFixed(2)}` : "";
-    const label = `${plate.text || plate.type || "目标"}${confidenceText}`;
+    let color;
+    let label;
+    if (isPedestrianTarget(plate)) {
+      const suspected = isSuspectedDecision(plate.decision);
+      color = suspected ? "#df6464" : "#48bf84";
+      const reason = pedestrianReasonText(plate.reason, suspected);
+      const score = Number(plate.score);
+      const scoreText = Number.isFinite(score) ? ` ${Math.round(score * 100)}%` : "";
+      label = `${suspected ? "⚠ 违法" : "正常"} ${reason}${scoreText}`;
+    } else {
+      const route = String(plate.route || plate.route_name || plate.type || "").toLowerCase();
+      color = colors[route] || "#21b4c6";
+      const confidence = Number(plate.ocr_conf ?? plate.conf ?? plate.confidence);
+      const confidenceText = Number.isFinite(confidence) ? ` ${confidence.toFixed(2)}` : "";
+      label = `${plate.text || plate.type || "目标"}${confidenceText}`;
+    }
 
+    const suspectedPed = isPedestrianTarget(plate) && isSuspectedDecision(plate.decision);
     overlayContext.strokeStyle = color;
+    overlayContext.lineWidth = suspectedPed ? 4 : 2;
     overlayContext.strokeRect(x, y, width, height);
+    overlayContext.lineWidth = 2;
     const labelWidth = Math.min(rect.width, overlayContext.measureText(label).width + 12);
     const labelY = y >= 25 ? y - 23 : Math.min(rect.height - 23, y + height);
     overlayContext.fillStyle = "rgba(9, 11, 13, 0.88)";
@@ -280,24 +317,43 @@ function drawOverlay() {
 
 function updateResultsView(results) {
   const plates = resultIsCurrent() ? normalizedPlates(results) : [];
-  elements.count.textContent = String(plates.length);
+  const hasPed = plates.some(isPedestrianTarget);
+  let ordered = plates;
+  let violationCount = 0;
+  if (hasPed) {
+    violationCount = plates.filter((t) => isSuspectedDecision(t.decision)).length;
+    ordered = [...plates].sort((a, b) => {
+      const sa = isSuspectedDecision(a.decision) ? 0 : 1;
+      const sb = isSuspectedDecision(b.decision) ? 0 : 1;
+      return sa - sb;
+    });
+  }
+  elements.count.textContent = hasPed ? `违法 ${violationCount}/${plates.length}` : String(plates.length);
   elements.resultList.replaceChildren();
-  if (!plates.length) {
+  if (!ordered.length) {
     const empty = document.createElement("p");
     empty.className = "empty-result";
     empty.textContent = imageViewActive ? "未检测到目标" : "暂无车牌";
     elements.resultList.append(empty);
   } else {
-    for (const plate of plates) {
+    for (const plate of ordered) {
       const item = document.createElement("div");
-      item.className = "result-row";
+      const suspected = isPedestrianTarget(plate) && isSuspectedDecision(plate.decision);
+      item.className = suspected ? "result-row violation-row" : "result-row";
       const text = document.createElement("strong");
-      text.textContent = plate.text || plate.type || "未识别";
       const meta = document.createElement("span");
-      const route = plate.route || plate.route_name || plate.decision || "--";
-      const confidence = Number(plate.ocr_conf ?? plate.conf ?? plate.confidence ?? plate.score);
-      const reason = plate.reason ? ` · ${plate.reason}` : "";
-      meta.textContent = Number.isFinite(confidence) ? `${route}  ${confidence.toFixed(3)}${reason}` : `${route}${reason}`;
+      if (isPedestrianTarget(plate)) {
+        const reason = pedestrianReasonText(plate.reason, suspected);
+        text.textContent = suspected ? "⚠ 违法横穿" : "正常";
+        const score = Number(plate.score);
+        meta.textContent = `${reason}${Number.isFinite(score) ? `  ${Math.round(score * 100)}%` : ""}`;
+      } else {
+        text.textContent = plate.text || plate.type || "未识别";
+        const route = plate.route || plate.route_name || plate.decision || "--";
+        const confidence = Number(plate.ocr_conf ?? plate.conf ?? plate.confidence ?? plate.score);
+        const reason = plate.reason ? ` · ${plate.reason}` : "";
+        meta.textContent = Number.isFinite(confidence) ? `${route}  ${confidence.toFixed(3)}${reason}` : `${route}${reason}`;
+      }
       item.append(text, meta);
       elements.resultList.append(item);
     }
@@ -974,18 +1030,6 @@ function updateSdActionButtons() {
   elements.runSdVideoInference.disabled = !video || busy;
 }
 
-const REASON_LABELS = {
-  ROAD_DOMINANT_WITHOUT_ZEBRA: "路面为主且无斑马线",
-  ROAD_DOMINANT_ZEBRA_NOISE_IGNORED: "路面为主，斑马噪声已忽略",
-  SIDEWALK_SUPPRESSED: "人行道（已排除）",
-  ZEBRA_SUPPRESSED: "斑马线区域（已排除）",
-};
-
-function reasonLabel(reason) {
-  const text = String(reason || "");
-  return REASON_LABELS[text] || text || "疑似违规";
-}
-
 function setSdVideoProgressLabel(state, label) {
   elements.sdVideoProgressLabel.dataset.state = state;
   elements.sdVideoProgressLabel.textContent = label;
@@ -1038,7 +1082,7 @@ function renderSdVideoEvents(events) {
     time.textContent = `${Number(event.time_sec ?? 0).toFixed(1)}s`;
     const reason = document.createElement("span");
     reason.className = "ev-reason";
-    reason.textContent = reasonLabel(event.reason);
+    reason.textContent = pedestrianReasonText(event.reason, true);
     row.append(time, reason);
     elements.sdVideoEvents.append(row);
   }

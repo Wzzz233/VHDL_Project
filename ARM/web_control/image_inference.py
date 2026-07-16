@@ -28,6 +28,15 @@ def completed_plate_result(result: dict[str, Any]) -> bool:
     return isinstance(sequence, int) and not isinstance(sequence, bool) and sequence > 0
 
 
+def is_suspected_decision(decision: Any) -> bool:
+    """A target decision is a suspected violation when it starts with 'suspected'.
+
+    The cplus driver emits the full string 'suspected_crossing_road_outside_zebra'
+    (not the bare 'suspected'), so an equality check would never match.
+    """
+    return isinstance(decision, str) and decision.startswith("suspected")
+
+
 def plate_input_index(input_sequence: int, input_count: int, repeat: int) -> int:
     if input_sequence <= 0 or input_count <= 0 or repeat <= 0:
         raise ValueError("invalid static plate input sequence")
@@ -1080,7 +1089,7 @@ class VideoInferenceRunner:
                         decision = str(target.get("decision", ""))
                         reason = str(target.get("reason", ""))
                         decision_counts[decision] = decision_counts.get(decision, 0) + 1
-                        if decision == "suspected":
+                        if is_suspected_decision(decision):
                             frame_events.append(
                                 {
                                     "frame_index": index,

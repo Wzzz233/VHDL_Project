@@ -79,11 +79,11 @@ class VideoInferenceTest(unittest.TestCase):
 
     def test_events_link_keyframe(self) -> None:
         targets = {
-            0: [{"type": "pedestrian", "score": 0.9, "decision": "suspected",
-                 "reason": "ROAD_DOMINANT_WITHOUT_ZEBRA", "box": [1, 2, 3, 4],
+            0: [{"type": "pedestrian", "score": 0.9, "decision": "suspected_crossing_road_outside_zebra",
+                 "reason": "road_dominant_without_zebra", "box": [1, 2, 3, 4],
                  "ground": {"road": 0.7, "sidewalk": 0.1, "zebra": 0.0}}],
-            1: [{"type": "pedestrian", "score": 0.8, "decision": "not_suspected",
-                 "reason": "SIDEWALK_SUPPRESSED", "box": [5, 6, 7, 8],
+            1: [{"type": "pedestrian", "score": 0.8, "decision": "not_suspected_crossing_road",
+                 "reason": "sidewalk_suppressed", "box": [5, 6, 7, 8],
                  "ground": {}}],
         }
         self._wire_results(targets)
@@ -114,8 +114,8 @@ class VideoInferenceTest(unittest.TestCase):
     def test_keyframe_cap(self) -> None:
         # every frame is a violation, but only max_keyframes are stored
         targets = {
-            i: [{"type": "pedestrian", "score": 0.9, "decision": "suspected",
-                 "reason": "ROAD_DOMINANT_WITHOUT_ZEBRA", "box": [1, 2, 3, 4],
+            i: [{"type": "pedestrian", "score": 0.9, "decision": "suspected_crossing_road_outside_zebra",
+                 "reason": "road_dominant_without_zebra", "box": [1, 2, 3, 4],
                  "ground": {}}]
             for i in range(4)
         }

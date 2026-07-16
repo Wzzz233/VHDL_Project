@@ -12,6 +12,7 @@ from image_inference import (
     PlateImagePass,
     completed_plate_result,
     image_dimensions,
+    is_suspected_decision,
     map_plate_box,
     merge_plate_results,
     plate_input_index,
@@ -20,6 +21,13 @@ from image_inference import (
 
 
 class ImageInferenceTest(unittest.TestCase):
+    def test_is_suspected_decision_matches_driver_strings(self) -> None:
+        self.assertTrue(is_suspected_decision("suspected_crossing_road_outside_zebra"))
+        self.assertTrue(is_suspected_decision("suspected"))
+        self.assertFalse(is_suspected_decision("not_suspected_crossing_road"))
+        self.assertFalse(is_suspected_decision(""))
+        self.assertFalse(is_suspected_decision(None))
+        self.assertFalse(is_suspected_decision(123))
     def test_reads_png_and_jpeg_dimensions_without_image_library(self) -> None:
         png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8 + (321).to_bytes(4, "big") + (654).to_bytes(4, "big")
         jpeg = (
