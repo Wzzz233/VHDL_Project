@@ -407,6 +407,11 @@ int main(int argc, char **argv)
                                         latest.mask, CPLUS_MODEL_WIDTH,
                                         CPLUS_MODEL_HEIGHT);
             }
+            /* Draw person boxes, foot regions and decision labels so the
+             * saved JPEG/web preview shows which targets are suspected
+             * violations, not just the ground mask. */
+            cplus_overlay_results(rendered, width * 4, width, height,
+                                  latest.results, latest.count, latest.count > 0);
             if (write_file_exact(options.output_mask_bgrx_path, rendered,
                                  frame_size) < 0) {
                 free(rendered);
@@ -415,9 +420,9 @@ int main(int argc, char **argv)
                 goto done;
             }
             free(rendered);
-            fprintf(stderr, "[mask] wrote overlay frame %s valid=%d\n",
+            fprintf(stderr, "[mask] wrote overlay frame %s valid=%d targets=%d\n",
                     options.output_mask_bgrx_path,
-                    latest.mask_valid ? 1 : 0);
+                    latest.mask_valid ? 1 : 0, latest.count);
         }
     }
     status = 0;
