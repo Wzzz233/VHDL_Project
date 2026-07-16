@@ -948,7 +948,7 @@ class VideoInferenceConfig:
     sample_fps: float = 1.0
     max_frames: int = 600
     max_keyframes: int = 24
-    extract_timeout: float = 600.0
+    extract_timeout: float = 300.0
 
 
 class VideoInferenceRunner:
@@ -969,6 +969,11 @@ class VideoInferenceRunner:
         self.config = config or VideoInferenceConfig()
 
     def _frame_pipeline(self, video_path: Path, sample_fps: float, frames_dir: Path) -> list[str]:
+        # Order matters for 1080p sources on RK3568: decodebin already selects
+        # mppvideodec (hardware H.264 decode), but a full-resolution
+        # videoconvert+videoscale on every 30 fps frame is CPU-bound. We drop
+        # the frame rate FIRST (videorate on NV12 straight from the decoder),
+        # so the expensive convert/scale only runs on the sampled frames.
         framerate = max(1, int(round(sample_fps))) if sample_fps >= 1.0 else 1
         location = str(frames_dir / "frame%05d.bgrx")
         return [
@@ -979,16 +984,16 @@ class VideoInferenceRunner:
             "!",
             "decodebin",
             "!",
+            "videorate",
+            "!",
+            f"video/x-raw,framerate={framerate}/1",
+            "!",
             "videoconvert",
             "!",
             "videoscale",
             "add-borders=true",
             "!",
             "video/x-raw,format=BGRx,width=1280,height=720",
-            "!",
-            "videorate",
-            "!",
-            f"video/x-raw,format=BGRx,width=1280,height=720,framerate={framerate}/1",
             "!",
             "multifilesink",
             f"location={location}",
@@ -1001,27 +1006,52 @@ class VideoInferenceRunner:
         frames_dir: Path,
         progress_callback,
     ) -> tuple[list[Path], bool]:
+        # Stream the gstreamer pipeline so the caller sees extraction progress
+        # instead of blocking for the whole timeout. multifilesink writes one
+        # file per frame, so we count files in frames_dir as a progress signal.
         if progress_callback:
             progress_callback(0, 0, "正在抽取视频帧")
         command = self._frame_pipeline(video_path, sample_fps, frames_dir)
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=self.config.extract_timeout,
-                check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise VideoInferenceError("视频抽帧启动或运行失败") from exc
-        if completed.returncode != 0:
-            detail = completed.stderr.decode("utf-8", "replace").strip()[-800:]
+        except OSError as exc:
+            raise VideoInferenceError("视频抽帧启动失败") from exc
+        deadline = time.monotonic() + self.config.extract_timeout
+        last_seen = 0
+        while True:
+            if process.poll() is not None:
+                break
+            if time.monotonic() > deadline:
+                process.kill()
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    pass
+                stderr = process.stderr.read() if process.stderr else b""
+                detail = stderr.decode("utf-8", "replace").strip()[-800:]
+                raise VideoInferenceError(f"视频抽帧超时（已抽 {last_seen} 帧）: {detail}")
+            seen = sum(1 for _ in frames_dir.glob("frame*.bgrx"))
+            if seen != last_seen:
+                last_seen = seen
+                if progress_callback:
+                    progress_callback(seen, 0, f"正在抽取视频帧，已抽 {seen} 帧")
+            time.sleep(0.5)
+        stderr = process.stderr.read() if process.stderr else b""
+        if process.returncode != 0:
+            detail = stderr.decode("utf-8", "replace").strip()[-800:]
             raise VideoInferenceError(f"视频抽帧失败: {detail}")
         expected = 1280 * 720 * 4
         frames = sorted(frames_dir.glob("frame*.bgrx"))
         valid = [frame for frame in frames if frame.stat().st_size == expected]
         if not valid:
-            raise VideoInferenceError("视频没有抽到可用帧，可能格式不支持")
+            detail = stderr.decode("utf-8", "replace").strip()[-800:]
+            raise VideoInferenceError(
+                f"视频没有抽到可用帧，可能格式不支持: {detail}" if detail else "视频没有抽到可用帧，可能格式不支持"
+            )
         return valid, False
 
     def run_video(
