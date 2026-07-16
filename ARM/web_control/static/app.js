@@ -1135,16 +1135,18 @@ function renderSdVideoJob(job) {
 
 async function showSdVideoFrame(index) {
   if (!sdVideoJobId) return;
+  const base = `/api/v1/sd/video-jobs/${encodeURIComponent(sdVideoJobId)}/frames/${index}`;
   try {
-    const [imgResp, result] = await Promise.all([
-      fetchWithTimeout(
-        `/api/v1/sd/video-jobs/${encodeURIComponent(sdVideoJobId)}/frames/${index}.jpg`,
-        {},
-        10000,
-        async (res) => new Uint8Array(await res.arrayBuffer()),
-      ),
-      fetchJson(`/api/v1/sd/video-jobs/${encodeURIComponent(sdVideoJobId)}/frames/${index}/result`),
-    ]);
+    // Fetch the result JSON first (small), then the JPEG. Serial avoids one
+    // slow request aborting the other, and both get a generous timeout since
+    // the server reads frame data from an in-memory job under a lock.
+    const result = await fetchWithTimeout(`${base}/result`, {}, 15000, (r) => r.json());
+    const imgResp = await fetchWithTimeout(
+      `${base}.jpg`,
+      {},
+      15000,
+      async (res) => new Uint8Array(await res.arrayBuffer()),
+    );
     const url = URL.createObjectURL(new Blob([imgResp], {type: "image/jpeg"}));
     if (currentFrameUrl) URL.revokeObjectURL(currentFrameUrl);
     currentFrameUrl = url;
@@ -1160,7 +1162,10 @@ async function showSdVideoFrame(index) {
     updateResultsView(latestResults);
     drawOverlay();
   } catch (error) {
-    setSdVideoProgressLabel("error", error?.message || "帧加载失败");
+    const msg = error?.name === "AbortError"
+      ? `帧加载超时（请求被中止）`
+      : error?.message || "帧加载失败";
+    setSdVideoProgressLabel("error", msg);
   }
 }
 
