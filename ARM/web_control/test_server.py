@@ -220,6 +220,8 @@ class FakeVideoRunner:
                 "violation_frames": 1,
                 "violation_count": 1,
                 "skipped_frames": 0,
+                "full_analysis_frames": 1,
+                "fast_path_frames": 1,
                 "decision_counts": {"suspected": 1},
                 "sample_fps": sample_fps,
                 "truncated": False,

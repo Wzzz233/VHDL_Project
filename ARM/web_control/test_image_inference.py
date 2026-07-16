@@ -216,6 +216,29 @@ class ImageInferenceTest(unittest.TestCase):
         self.assertEqual(len(run_batch.call_args.args[0]), 9)
         self.assertEqual(response["results"]["pass_count"], 9)
 
+    def test_pedestrian_batch_uses_person_gated_ground_segmentation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pedestrian-batch-test-") as directory:
+            root = Path(directory)
+            frames = root / "frames"
+            frames.mkdir()
+            (frames / "frame00000.bgrx").write_bytes(b"frame")
+            runner = ImageInferenceRunner(ImageInferenceConfig(arm_root=root))
+            completed = mock.Mock(
+                returncode=0,
+                stdout='{"frame":0,"targets":[]}\n',
+                stderr="",
+            )
+            with mock.patch(
+                "image_inference.subprocess.run", return_value=completed
+            ) as run:
+                results = runner._run_pedestrian_batch(
+                    frames, root / "output", root
+                )
+
+        command = run.call_args.args[0]
+        self.assertNotIn("--always-segment", command)
+        self.assertEqual(len(results), 1)
+
     def test_plate_upload_uses_five_color_pipeline(self) -> None:
         with tempfile.TemporaryDirectory(prefix="image-command-test-") as directory:
             root = Path(directory)

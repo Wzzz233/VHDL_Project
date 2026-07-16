@@ -770,7 +770,6 @@ class ImageInferenceRunner:
             "--width", "1280",
             "--height", "720",
             "--display", "0",
-            "--always-segment",
             "--output-mask-bgrx", str(mask_bgrx_path),
         ]
         try:
@@ -818,19 +817,15 @@ class ImageInferenceRunner:
             "--width", "1280",
             "--height", "720",
             "--display", "0",
-            # No --always-segment: the segmenter takes ~1 s/frame on the NPU,
-            # so only segment frames that actually have an ordinary pedestrian.
-            # Empty/rider-only frames skip segmentation and finish in ~0.2 s.
         ]
         frame_count_hint = 0
         try:
             frame_count_hint = sum(1 for _ in frames_dir.glob("frame*.bgrx"))
         except OSError:
             frame_count_hint = 0
-        # Single-image timeout (45 s) is too short for a batch: allow startup
-        # plus per-frame inference. Worst case (every frame has a pedestrian)
-        # is ~1.6 s/frame on the NPU; budget 2.5 s/frame plus 10 s startup.
-        batch_timeout = max(self.config.timeout, 10.0 + 2.5 * max(1, frame_count_hint))
+        # Empty and rider-only frames use the detector-only fast path. Frames
+        # with an ordinary pedestrian still run full ground segmentation.
+        batch_timeout = max(self.config.timeout, 10.0 + 3.0 * max(1, frame_count_hint))
         try:
             completed = subprocess.run(
                 command,
@@ -1157,21 +1152,28 @@ class VideoInferenceRunner:
                     video_path, sample_fps, frames_dir, progress_callback
                 )
                 sampled = frames[::step]
-                if len(sampled) > self.config.max_frames:
+                truncated = len(sampled) > self.config.max_frames
+                if truncated:
                     sampled = sampled[: self.config.max_frames]
-                truncated = len(sampled) >= self.config.max_frames
                 total = len(sampled)
-                # Batch inference: one driver process loads the models once and
-                # processes every frame, instead of restarting per frame.
+                batch_frames_dir = work / "sampled_frames"
+                batch_frames_dir.mkdir()
+                for index, frame_path in enumerate(sampled):
+                    (batch_frames_dir / f"frame{index:05d}.bgrx").hardlink_to(
+                        frame_path
+                    )
+                # Batch inference loads the models once, but receives only the
+                # frames selected by the requested sampling rate and limit.
                 if progress_callback:
                     progress_callback(0, total, f"正在批量推理 {total} 帧")
                 batch = self.image_runner._run_pedestrian_batch(
-                    frames_dir, work / "out", work
+                    batch_frames_dir, work / "out", work
                 )
                 events: list[dict[str, Any]] = []
                 frames_out: list[dict[str, Any]] = []
                 violation_frames = 0
                 skipped_frames = 0
+                full_analysis_frames = 0
                 decision_counts: dict[str, int] = {}
                 # batch is ordered by frame index; align with sampled[].
                 for index, entry in enumerate(batch):
@@ -1186,10 +1188,13 @@ class VideoInferenceRunner:
                         skipped_frames += 1
                     frame_targets: list[dict[str, Any]] = []
                     frame_violation = False
+                    frame_full_analysis = False
                     for target in targets:
                         if not isinstance(target, dict):
                             continue
                         decision = str(target.get("decision", ""))
+                        if target.get("type") == "pedestrian":
+                            frame_full_analysis = True
                         reason = str(target.get("reason", ""))
                         decision_counts[decision] = decision_counts.get(decision, 0) + 1
                         suspected = is_suspected_decision(decision)
@@ -1217,6 +1222,8 @@ class VideoInferenceRunner:
                                     "ground": target.get("ground"),
                                 }
                             )
+                    if frame_full_analysis:
+                        full_analysis_frames += 1
                     if frame_violation:
                         violation_frames += 1
                     frames_out.append(
@@ -1238,6 +1245,8 @@ class VideoInferenceRunner:
                     "total_frames": total,
                     "violation_frames": violation_frames,
                     "violation_count": len(events),
+                    "full_analysis_frames": full_analysis_frames,
+                    "fast_path_frames": len(frames_out) - full_analysis_frames,
                     "skipped_frames": skipped_frames,
                     "decision_counts": decision_counts,
                     "sample_fps": sample_fps,

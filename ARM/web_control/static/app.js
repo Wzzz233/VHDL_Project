@@ -66,6 +66,7 @@ let imageInferenceRunning = false;
 let currentDriverMode = "plate";
 let driverSwitching = false;
 let sdCurrentSubpath = "";
+let sdFrameRequestEpoch = 0;
 let sdSelectedEntry = null;
 let sdVideoJobId = null;
 let sdVideoPolling = false;
@@ -456,12 +457,14 @@ async function frameLoop() {
         );
         const blob = frameResponse.blob;
         if (blob.type && blob.type !== "image/jpeg") throw new Error("preview is not JPEG");
+        if (requestEpoch !== visualEpoch) {
+          throw new Error(STALE_FRAME_ERROR);
+        }
         if (
-          requestEpoch !== visualEpoch ||
           latestStatusGeneration === null ||
           frameResponse.generation !== latestStatusGeneration
         ) {
-          hidePreview("等待新源画面");
+          if (!imageViewActive) hidePreview("等待新源画面");
           throw new Error(STALE_FRAME_ERROR);
         }
         const nextUrl = URL.createObjectURL(blob);
@@ -481,7 +484,7 @@ async function frameLoop() {
           frameResponse.generation !== latestStatusGeneration
         ) {
           URL.revokeObjectURL(nextUrl);
-          hidePreview("等待新源画面");
+          if (!imageViewActive) hidePreview("等待新源画面");
           throw new Error(STALE_FRAME_ERROR);
         }
         const previousUrl = currentFrameUrl;
@@ -492,8 +495,8 @@ async function frameLoop() {
         elements.frameState.hidden = true;
         drawOverlay();
       } catch (error) {
-        elements.frameState.hidden = false;
-        if (error?.message !== STALE_FRAME_ERROR) {
+        if (!imageViewActive && error?.message !== STALE_FRAME_ERROR) {
+          elements.frameState.hidden = false;
           elements.frameState.textContent = "画面暂不可用";
         }
       }
@@ -919,6 +922,7 @@ async function runImageInference() {
 function returnToLiveView() {
   if (currentDriverMode !== "plate") return;
   imageViewActive = false;
+  sdFrameRequestEpoch += 1;
   latestResults = null;
   elements.returnLiveView.hidden = true;
   elements.imageFile.value = "";
@@ -1046,7 +1050,9 @@ function renderSdVideoSummary(summary) {
     ["采样帧数", summary.total_frames ?? "--"],
     ["违规帧数", summary.violation_frames ?? 0],
     ["违规事件", summary.violation_count ?? 0],
-    ["跳过帧数", summary.skipped_frames ?? 0],
+    ["完整分析帧", summary.full_analysis_frames ?? "--"],
+    ["快速跳过帧", summary.fast_path_frames ?? "--"],
+    ["结果缺失帧", summary.skipped_frames ?? 0],
     ["采样率", `${summary.sample_fps ?? "--"} fps`],
   ];
   if (summary.truncated) rows.push(["提示", "已达帧数上限，已截断"]);
@@ -1135,36 +1141,82 @@ function renderSdVideoJob(job) {
 
 async function showSdVideoFrame(index) {
   if (!sdVideoJobId) return;
+  const requestEpoch = ++sdFrameRequestEpoch;
   const base = `/api/v1/sd/video-jobs/${encodeURIComponent(sdVideoJobId)}/frames/${index}`;
-  try {
-    // Fetch the result JSON first (small), then the JPEG. Serial avoids one
-    // slow request aborting the other, and both get a generous timeout since
-    // the server reads frame data from an in-memory job under a lock.
-    const result = await fetchWithTimeout(`${base}/result`, {}, 15000, (r) => r.json());
-    const imgResp = await fetchWithTimeout(
-      `${base}.jpg`,
-      {},
+  imageViewActive = true;
+  visualEpoch += 1;
+  elements.returnLiveView.hidden = currentDriverMode !== "plate";
+  elements.frame.dataset.ready = "false";
+  elements.frameState.textContent = "正在加载视频帧";
+  elements.frameState.hidden = false;
+  setSdVideoProgressLabel("loading", "正在加载视频帧");
+
+  if (currentFrameUrl) URL.revokeObjectURL(currentFrameUrl);
+  currentFrameUrl = null;
+  const imageUrl = `${base}.jpg?t=${Date.now()}`;
+  const imageReady = new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      elements.frame.removeEventListener("load", onLoad);
+      elements.frame.removeEventListener("error", onError);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onLoad = () => finish();
+    const onError = () => finish(new Error("帧图片加载失败"));
+    const timeout = window.setTimeout(
+      () => finish(new Error("帧图片加载超时")),
       15000,
-      async (res) => new Uint8Array(await res.arrayBuffer()),
     );
-    const url = URL.createObjectURL(new Blob([imgResp], {type: "image/jpeg"}));
-    if (currentFrameUrl) URL.revokeObjectURL(currentFrameUrl);
-    currentFrameUrl = url;
-    elements.frame.src = url;
-    elements.frame.dataset.ready = "true";
-    elements.frameState.hidden = true;
-    elements.returnLiveView.hidden = false;
-    imageViewActive = true;
+    elements.frame.addEventListener("load", onLoad);
+    elements.frame.addEventListener("error", onError);
+    elements.frame.src = imageUrl;
+  });
+  const imageVisible = imageReady.then(() => {
+    if (requestEpoch === sdFrameRequestEpoch) {
+      elements.frame.dataset.ready = "true";
+      elements.frameState.hidden = true;
+    }
+  });
+
+  try {
+    const [imageOutcome, resultOutcome] = await Promise.allSettled([
+      imageVisible,
+      fetchWithTimeout(`${base}/result`, {}, 15000, (response) => response.json()),
+    ]);
+    if (requestEpoch !== sdFrameRequestEpoch) return;
+    if (imageOutcome.status === "rejected") throw imageOutcome.reason;
+
+    if (resultOutcome.status === "rejected") {
+      latestResults = {frame: {width: 1280, height: 720}, targets: []};
+      updateResultsView(latestResults);
+      const detail = resultOutcome.reason?.name === "AbortError"
+        ? "检测详情加载超时"
+        : resultOutcome.reason?.message || "检测详情加载失败";
+      setSdVideoProgressLabel("error", `结果图已显示，${detail}`);
+      return;
+    }
+
+    const result = resultOutcome.value;
     latestResults = {
       frame: {width: 1280, height: 720},
       targets: result.targets || [],
     };
     updateResultsView(latestResults);
     drawOverlay();
+    setSdVideoProgressLabel("live", `已显示 ${Number(result.time_sec ?? 0).toFixed(1)}s 帧`);
   } catch (error) {
+    if (requestEpoch !== sdFrameRequestEpoch) return;
     const msg = error?.name === "AbortError"
       ? `帧加载超时（请求被中止）`
       : error?.message || "帧加载失败";
+    elements.frame.removeAttribute("src");
+    elements.frame.dataset.ready = "false";
+    elements.frameState.textContent = msg;
+    elements.frameState.hidden = false;
     setSdVideoProgressLabel("error", msg);
   }
 }

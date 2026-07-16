@@ -36,7 +36,7 @@ class _VideoRunner(VideoInferenceRunner):
         frames = []
         for index in range(self.frame_count):
             frame_path = frames_dir / f"frame{index:05d}.bgrx"
-            frame_path.write_bytes(b"\0" * EXPECTED_BGRX_SIZE)
+            frame_path.write_bytes(bytes([index % 256]) + b"\0" * (EXPECTED_BGRX_SIZE - 1))
             frames.append(frame_path)
         return frames, False
 
@@ -52,11 +52,16 @@ class VideoInferenceTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def _wire_results(self, results_map) -> None:
+    def _wire_results(self, results_map, seen_source_indices=None) -> None:
         def run(self, frames_dir, output_dir, work):
+            frame_paths = sorted(frames_dir.glob("frame*.bgrx"))
+            if seen_source_indices is not None:
+                for frame_path in frame_paths:
+                    with frame_path.open("rb") as stream:
+                        seen_source_indices.append(stream.read(1)[0])
             ordered = []
-            for index in sorted(results_map):
-                item = results_map[index]
+            for index, _frame_path in enumerate(frame_paths):
+                item = results_map.get(index, [])
                 if isinstance(item, Exception):
                     raise item
                 ordered.append(
@@ -74,12 +79,16 @@ class VideoInferenceTest(unittest.TestCase):
         )
 
     def test_half_fps_samples_every_other_frame(self) -> None:
-        self._wire_results({0: [], 1: [], 2: [], 3: []})
+        seen_source_indices = []
+        self._wire_results({0: [], 1: []}, seen_source_indices)
         runner = self._runner(frame_count=4)
         result = runner.run_video(self.video_path, sample_fps=0.5)
         # 4 frames at 1fps, step 2 -> sampled frames 0 and 2
         self.assertEqual(result["summary"]["total_frames"], 2)
         self.assertFalse(result["summary"]["truncated"])
+        self.assertEqual(seen_source_indices, [0, 2])
+        self.assertEqual(result["summary"]["full_analysis_frames"], 0)
+        self.assertEqual(result["summary"]["fast_path_frames"], 2)
 
     def test_events_and_frames_recorded(self) -> None:
         targets = {
@@ -94,6 +103,8 @@ class VideoInferenceTest(unittest.TestCase):
         runner = self._runner(frame_count=2)
         result = runner.run_video(self.video_path, sample_fps=1.0)
         self.assertEqual(result["summary"]["violation_count"], 1)
+        self.assertEqual(result["summary"]["full_analysis_frames"], 2)
+        self.assertEqual(result["summary"]["fast_path_frames"], 0)
         self.assertEqual(result["summary"]["violation_frames"], 1)
         # All frames are stored now (not just violation keyframes).
         self.assertEqual(len(result["frames"]), 2)
