@@ -1,9 +1,6 @@
 "use strict";
 
-const FRAME_PERIOD_MS = 125;
 const STATUS_PERIOD_MS = 1000;
-const RESULTS_PERIOD_MS = 400;
-const STALE_FRAME_ERROR = "stale_frame_generation";
 
 const elements = {
   connection: document.getElementById("connectionState"),
@@ -23,7 +20,6 @@ const elements = {
   runImageInference: document.getElementById("runImageInference"),
   returnLiveView: document.getElementById("returnLiveView"),
   imageInferenceState: document.getElementById("imageInferenceState"),
-  driverModeState: document.getElementById("driverModeState"),
   inputFps: document.getElementById("inputFps"),
   decodeFps: document.getElementById("decodeFps"),
   inferFps: document.getElementById("inferFps"),
@@ -41,35 +37,26 @@ const elements = {
   sdSelectedName: document.getElementById("sdSelectedName"),
   runSdPhotoInference: document.getElementById("runSdPhotoInference"),
   runSdVideoInference: document.getElementById("runSdVideoInference"),
-  sdVideoFps: document.getElementById("sdVideoFps"),
+  generateSdVideoMask: document.getElementById("generateSdVideoMask"),
   sdVideoResult: document.getElementById("sdVideoResult"),
   sdVideoProgressLabel: document.getElementById("sdVideoProgressLabel"),
   sdVideoProgress: document.getElementById("sdVideoProgress"),
-  sdVideoSummary: document.getElementById("sdVideoSummary"),
-  sdVideoEvents: document.getElementById("sdVideoEvents"),
-  sdVideoEventCount: document.getElementById("sdVideoEventCount"),
-  sdFrameList: document.getElementById("sdFrameList"),
-  sdFrameCount: document.getElementById("sdFrameCount"),
 };
 
 const overlayContext = elements.canvas.getContext("2d");
 let latestStatus = null;
 let latestResults = null;
-let latestStatusGeneration = null;
-let visualEpoch = 0;
 let currentFrameUrl = null;
 let publisher = null;
 let cameraStarting = false;
 let phoneCameraIntent = false;
 let imageViewActive = false;
 let imageInferenceRunning = false;
-let currentDriverMode = "plate";
-let driverSwitching = false;
 let sdCurrentSubpath = "";
-let sdFrameRequestEpoch = 0;
 let sdSelectedEntry = null;
-let sdVideoJobId = null;
 let sdVideoPolling = false;
+let sdFixedVideoJobId = null;
+let sdFixedVideoReadyPath = null;
 
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -95,20 +82,6 @@ function unwrapPayload(data, key) {
   if (data && typeof data[key] === "object" && data[key] !== null) return data[key];
   if (data && typeof data.data === "object" && data.data !== null) return data.data;
   return data;
-}
-
-function normalizedGeneration(value) {
-  if (value === null || value === undefined || value === "") return null;
-  const text = String(value);
-  return /^[1-9][0-9]*$/.test(text) ? text : null;
-}
-
-function statusGeneration(status) {
-  return normalizedGeneration(firstValue(status || {}, ["source_generation", "source.generation"]));
-}
-
-function resultsGeneration(results) {
-  return normalizedGeneration(firstValue(results || {}, ["source_generation", "generation"]));
 }
 
 async function fetchWithTimeout(
@@ -254,9 +227,7 @@ function plateBox(plate) {
 }
 
 function resultIsCurrent() {
-  if (imageViewActive) return Boolean(latestResults);
-  if (!latestResults || latestStatusGeneration === null) return false;
-  return resultsGeneration(latestResults) === latestStatusGeneration;
+  return imageViewActive && Boolean(latestResults);
 }
 
 function drawOverlay() {
@@ -266,14 +237,15 @@ function drawOverlay() {
   elements.canvas.height = Math.max(1, Math.round(rect.height * dpr));
   overlayContext.setTransform(dpr, 0, 0, dpr, 0, 0);
   overlayContext.clearRect(0, 0, rect.width, rect.height);
-  if (!latestResults || !resultIsCurrent()) return;
-
-  const frameWidth = Number(firstValue(latestResults, ["frame.width", "frame_w", "frame_width", "width"], 1280));
-  const frameHeight = Number(firstValue(latestResults, ["frame.height", "frame_h", "frame_height", "height"], 720));
+  const frameSource = latestResults || latestStatus || {};
+  const frameWidth = Number(firstValue(frameSource, ["frame.width", "frame_w", "frame_width", "width"], 1280));
+  const frameHeight = Number(firstValue(frameSource, ["frame.height", "frame_h", "frame_height", "height"], 720));
   if (!(frameWidth > 0 && frameHeight > 0)) return;
   const scale = Math.min(rect.width / frameWidth, rect.height / frameHeight);
   const offsetX = (rect.width - frameWidth * scale) / 2;
   const offsetY = (rect.height - frameHeight * scale) / 2;
+
+  if (!latestResults || !resultIsCurrent()) return;
 
   const colors = {blue: "#38bdf8", green: "#48bf84", yellow: "#f2c14e", police: "#f4f5f6", embassy: "#df6464"};
   overlayContext.lineWidth = 2;
@@ -336,7 +308,7 @@ function updateResultsView(results) {
   if (!ordered.length) {
     const empty = document.createElement("p");
     empty.className = "empty-result";
-    empty.textContent = imageViewActive ? "未检测到目标" : "暂无车牌";
+    empty.textContent = imageViewActive ? "未检测到目标" : "等待图片识别";
     elements.resultList.append(empty);
   } else {
     for (const plate of ordered) {
@@ -375,133 +347,19 @@ function hidePreview(label) {
   overlayContext.clearRect(0, 0, rect.width, rect.height);
 }
 
-function resetVisualEpoch() {
-  visualEpoch += 1;
-  latestResults = null;
-  updateResultsView({detections: []});
-  hidePreview("等待新源画面");
-}
-
 async function statusLoop() {
   while (true) {
     const started = performance.now();
-    if (currentDriverMode === "pedestrian") {
-      updateStatusView({
-        desired_source: "none",
-        active_source: "none",
-        failover_reason: "pedestrian_image_mode",
-        fps: {input: 0, decode: 0, infer: 0},
-        frame: {age_ms: -1},
-        dropped: {input: 0, decode: 0, infer: 0, display: 0},
-      });
-      setConnection(true, "已连接");
-      await sleep(Math.max(100, STATUS_PERIOD_MS - (performance.now() - started)));
-      continue;
-    }
     try {
       const data = await fetchJson("/api/v1/status");
       const nextStatus = unwrapPayload(data, "status");
-      const nextGeneration = statusGeneration(nextStatus);
-      const generationChanged = (
-        latestStatusGeneration !== null &&
-        nextGeneration !== null &&
-        nextGeneration !== latestStatusGeneration
-      );
       latestStatus = nextStatus;
-      if (nextGeneration !== null) latestStatusGeneration = nextGeneration;
-      if (generationChanged && !imageViewActive) resetVisualEpoch();
       updateStatusView(latestStatus);
       setConnection(true, "已连接");
     } catch (error) {
       setConnection(false, "连接中断");
     }
     await sleep(Math.max(100, STATUS_PERIOD_MS - (performance.now() - started)));
-  }
-}
-
-async function resultsLoop() {
-  while (true) {
-    const started = performance.now();
-    if (imageViewActive) {
-      await sleep(RESULTS_PERIOD_MS);
-      continue;
-    }
-    try {
-      const data = await fetchJson("/api/v1/results");
-      latestResults = unwrapPayload(data, "results");
-      updateResultsView(latestResults);
-    } catch (_) {
-      latestResults = null;
-      updateResultsView({plates: []});
-    }
-    await sleep(Math.max(100, RESULTS_PERIOD_MS - (performance.now() - started)));
-  }
-}
-
-async function frameLoop() {
-  while (true) {
-    const started = performance.now();
-    if (!document.hidden && !imageViewActive) {
-      const requestEpoch = visualEpoch;
-      try {
-        const frameResponse = await fetchWithTimeout(
-          "/api/v1/frame.jpg?t=" + Date.now(),
-          {},
-          3000,
-          async (response) => ({
-            blob: await response.blob(),
-            generation: normalizedGeneration(
-              response.headers.get("X-Source-Generation"),
-            ),
-          }),
-        );
-        const blob = frameResponse.blob;
-        if (blob.type && blob.type !== "image/jpeg") throw new Error("preview is not JPEG");
-        if (requestEpoch !== visualEpoch) {
-          throw new Error(STALE_FRAME_ERROR);
-        }
-        if (
-          latestStatusGeneration === null ||
-          frameResponse.generation !== latestStatusGeneration
-        ) {
-          if (!imageViewActive) hidePreview("等待新源画面");
-          throw new Error(STALE_FRAME_ERROR);
-        }
-        const nextUrl = URL.createObjectURL(blob);
-        try {
-          await new Promise((resolve, reject) => {
-            const image = new Image();
-            image.onload = resolve;
-            image.onerror = reject;
-            image.src = nextUrl;
-          });
-        } catch (error) {
-          URL.revokeObjectURL(nextUrl);
-          throw error;
-        }
-        if (
-          requestEpoch !== visualEpoch ||
-          frameResponse.generation !== latestStatusGeneration
-        ) {
-          URL.revokeObjectURL(nextUrl);
-          if (!imageViewActive) hidePreview("等待新源画面");
-          throw new Error(STALE_FRAME_ERROR);
-        }
-        const previousUrl = currentFrameUrl;
-        elements.frame.src = nextUrl;
-        currentFrameUrl = nextUrl;
-        if (previousUrl) URL.revokeObjectURL(previousUrl);
-        elements.frame.dataset.ready = "true";
-        elements.frameState.hidden = true;
-        drawOverlay();
-      } catch (error) {
-        if (!imageViewActive && error?.message !== STALE_FRAME_ERROR) {
-          elements.frameState.hidden = false;
-          elements.frameState.textContent = "画面暂不可用";
-        }
-      }
-    }
-    await sleep(Math.max(20, FRAME_PERIOD_MS - (performance.now() - started)));
   }
 }
 
@@ -525,7 +383,7 @@ function setPhoneState(state, label) {
   elements.phoneState.dataset.state = state;
   elements.phoneState.textContent = label;
   elements.phoneToggle.textContent = publisher ? "停止手机摄像头" : "启动手机摄像头";
-  elements.phoneToggle.disabled = cameraStarting || currentDriverMode !== "plate";
+  elements.phoneToggle.disabled = cameraStarting;
 }
 
 function preferH264(transceiver) {
@@ -731,85 +589,9 @@ function selectedImageMode() {
   return selected?.dataset.imageMode || "plate";
 }
 
-function updateDriverModeView(status) {
-  const mode = status?.mode === "pedestrian" ? "pedestrian" : "plate";
-  currentDriverMode = mode;
+function selectImageMode(mode) {
   for (const button of elements.imageModeSelector.querySelectorAll("button")) {
     button.setAttribute("aria-checked", button.dataset.imageMode === mode ? "true" : "false");
-    button.disabled = driverSwitching || imageInferenceRunning;
-  }
-  const plateRunning = Boolean(status?.plate_running);
-  elements.driverModeState.dataset.state = mode === "plate" && plateRunning ? "live" : "idle";
-  elements.driverModeState.textContent = mode === "plate"
-    ? (plateRunning ? "车牌实时运行" : "车牌驱动正在启动")
-    : "行人图片模式";
-  for (const button of elements.sourceSelector.querySelectorAll("button")) {
-    button.disabled = mode !== "plate";
-  }
-  elements.phoneToggle.disabled = mode !== "plate" || cameraStarting;
-}
-
-async function setDriverMode(mode) {
-  if (driverSwitching || imageInferenceRunning || mode === currentDriverMode) return;
-  driverSwitching = true;
-  updateDriverModeView({mode, plate_running: false});
-  elements.driverModeState.dataset.state = "starting";
-  elements.driverModeState.textContent = "正在切换";
-  try {
-    if (publisher && mode === "pedestrian") await stopPhoneCamera();
-    const status = await fetchWithTimeout(
-      "/api/v1/mode",
-      {
-        method: "PUT",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({mode}),
-      },
-      15000,
-      (response) => response.json(),
-    );
-    updateDriverModeView(status);
-    if (mode === "plate") {
-      returnToLiveView();
-    } else {
-      imageViewActive = true;
-      latestResults = {frame: {width: 1280, height: 720}, detections: []};
-      updateResultsView(latestResults);
-      hidePreview("行人模式：请选择图片");
-      elements.returnLiveView.hidden = true;
-      setImageInferenceState("idle", "等待选择行人图片");
-    }
-  } catch (error) {
-    setImageInferenceState("error", error?.message || "模式切换失败");
-    try {
-      const status = await fetchJson("/api/v1/mode");
-      updateDriverModeView(status);
-    } catch (_) {
-      elements.driverModeState.dataset.state = "error";
-      elements.driverModeState.textContent = "模式状态不可用";
-    }
-  } finally {
-    driverSwitching = false;
-    for (const button of elements.imageModeSelector.querySelectorAll("button")) {
-      button.disabled = imageInferenceRunning;
-    }
-    for (const button of elements.sourceSelector.querySelectorAll("button")) {
-      button.disabled = currentDriverMode !== "plate";
-    }
-    elements.phoneToggle.disabled = currentDriverMode !== "plate" || cameraStarting;
-  }
-}
-
-async function driverModeLoop() {
-  while (true) {
-    if (!driverSwitching && !imageInferenceRunning) {
-      try {
-        updateDriverModeView(await fetchJson("/api/v1/mode"));
-      } catch (_) {
-        elements.driverModeState.dataset.state = "error";
-        elements.driverModeState.textContent = "模式状态不可用";
-      }
-    }
-    await sleep(1000);
   }
 }
 
@@ -920,15 +702,14 @@ async function runImageInference() {
 }
 
 function returnToLiveView() {
-  if (currentDriverMode !== "plate") return;
   imageViewActive = false;
-  sdFrameRequestEpoch += 1;
   latestResults = null;
   elements.returnLiveView.hidden = true;
   elements.imageFile.value = "";
   elements.runImageInference.disabled = true;
   setImageInferenceState("idle", "未选择图片");
-  resetVisualEpoch();
+  updateResultsView({detections: []});
+  hidePreview("请选择图片进行识别");
 }
 
 function setSdBrowseState(state, label) {
@@ -1020,6 +801,10 @@ function selectSdEntry(entry) {
     return;
   }
   sdSelectedEntry = entry;
+  if (entry.path !== sdFixedVideoReadyPath) {
+    sdFixedVideoJobId = null;
+    sdFixedVideoReadyPath = null;
+  }
   elements.sdSelectedName.textContent = entry.name;
   for (const row of elements.sdFileList.querySelectorAll(".sd-file-row")) {
     row.dataset.selected = row.dataset.path === entry.path ? "true" : "false";
@@ -1033,7 +818,9 @@ function updateSdActionButtons() {
   const video = Boolean(sdSelectedEntry && sdSelectedEntry.type === "video");
   const busy = imageInferenceRunning || sdVideoPolling;
   elements.runSdPhotoInference.disabled = !photo || busy;
-  elements.runSdVideoInference.disabled = !video || busy;
+  elements.generateSdVideoMask.disabled = !video || busy;
+  elements.runSdVideoInference.disabled = !video || busy ||
+    !sdFixedVideoJobId || sdFixedVideoReadyPath !== sdSelectedEntry?.path;
 }
 
 function setSdVideoProgressLabel(state, label) {
@@ -1041,193 +828,29 @@ function setSdVideoProgressLabel(state, label) {
   elements.sdVideoProgressLabel.textContent = label;
 }
 
-function renderSdVideoSummary(summary) {
-  if (!summary) {
-    elements.sdVideoSummary.replaceChildren();
-    return;
-  }
-  const rows = [
-    ["采样帧数", summary.total_frames ?? "--"],
-    ["违规帧数", summary.violation_frames ?? 0],
-    ["违规事件", summary.violation_count ?? 0],
-    ["完整分析帧", summary.full_analysis_frames ?? "--"],
-    ["快速跳过帧", summary.fast_path_frames ?? "--"],
-    ["结果缺失帧", summary.skipped_frames ?? 0],
-    ["采样率", `${summary.sample_fps ?? "--"} fps`],
-  ];
-  if (summary.truncated) rows.push(["提示", "已达帧数上限，已截断"]);
-  elements.sdVideoSummary.replaceChildren();
-  for (const [label, value] of rows) {
-    const row = document.createElement("div");
-    const dt = document.createElement("span");
-    dt.className = "sd-summary-label";
-    dt.textContent = label;
-    const dd = document.createElement("strong");
-    dd.textContent = value;
-    row.append(dt, dd);
-    elements.sdVideoSummary.append(row);
-  }
-}
-
-function renderSdVideoEvents(events) {
-  elements.sdVideoEventCount.textContent = String(events.length);
-  elements.sdVideoEvents.replaceChildren();
-  if (!events.length) {
-    const empty = document.createElement("p");
-    empty.className = "empty-result";
-    empty.textContent = "未发现违规事件";
-    elements.sdVideoEvents.append(empty);
-    return;
-  }
-  for (const event of events) {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = "sd-video-event";
-    if (event.frame_index == null) row.disabled = true;
-    else row.dataset.frame = String(event.frame_index);
-    const time = document.createElement("span");
-    time.className = "ev-time";
-    time.textContent = `${Number(event.time_sec ?? 0).toFixed(1)}s`;
-    const reason = document.createElement("span");
-    reason.className = "ev-reason";
-    reason.textContent = pedestrianReasonText(event.reason, true);
-    row.append(time, reason);
-    elements.sdVideoEvents.append(row);
-  }
-}
-
-function renderSdVideoFrames(frames) {
-  elements.sdFrameCount.textContent = String(frames ? frames.length : 0);
-  elements.sdFrameList.replaceChildren();
-  if (!frames || !frames.length) {
-    const empty = document.createElement("p");
-    empty.className = "empty-result";
-    empty.textContent = "无帧";
-    elements.sdFrameList.append(empty);
-    return;
-  }
-  for (const frame of frames) {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = "sd-frame-thumb";
-    if (frame.violation) row.dataset.violation = "true";
-    if (!frame.has_image) row.disabled = true;
-    else row.dataset.frame = String(frame.frame_index);
-    const time = document.createElement("span");
-    time.className = "ev-time";
-    time.textContent = `${Number(frame.time_sec ?? 0).toFixed(1)}s`;
-    const mark = document.createElement("span");
-    mark.className = "ev-reason";
-    mark.textContent = frame.violation ? "⚠ 违法" : "正常";
-    row.append(time, mark);
-    elements.sdFrameList.append(row);
-  }
-}
-
 function renderSdVideoJob(job) {
-  elements.sdVideoProgress.max = job.total || 1;
-  elements.sdVideoProgress.value = job.processed || 0;
   if (job.status === "running") {
+    elements.sdVideoProgress.removeAttribute("value");
     setSdVideoProgressLabel("loading", job.message || "进行中");
   } else if (job.status === "done") {
-    setSdVideoProgressLabel("live", "完成");
+    elements.sdVideoProgress.value = 1;
+    setSdVideoProgressLabel("live", job.message || "完成");
   } else if (job.status === "error") {
+    elements.sdVideoProgress.value = 0;
     setSdVideoProgressLabel("error", job.error || "失败");
-  }
-  renderSdVideoEvents(job.events || []);
-  renderSdVideoFrames(job.frames || []);
-  renderSdVideoSummary(job.summary);
-}
-
-async function showSdVideoFrame(index) {
-  if (!sdVideoJobId) return;
-  const requestEpoch = ++sdFrameRequestEpoch;
-  const base = `/api/v1/sd/video-jobs/${encodeURIComponent(sdVideoJobId)}/frames/${index}`;
-  imageViewActive = true;
-  visualEpoch += 1;
-  elements.returnLiveView.hidden = currentDriverMode !== "plate";
-  elements.frame.dataset.ready = "false";
-  elements.frameState.textContent = "正在加载视频帧";
-  elements.frameState.hidden = false;
-  setSdVideoProgressLabel("loading", "正在加载视频帧");
-
-  if (currentFrameUrl) URL.revokeObjectURL(currentFrameUrl);
-  currentFrameUrl = null;
-  const imageUrl = `${base}.jpg?t=${Date.now()}`;
-  const imageReady = new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (error) => {
-      if (settled) return;
-      settled = true;
-      window.clearTimeout(timeout);
-      elements.frame.removeEventListener("load", onLoad);
-      elements.frame.removeEventListener("error", onError);
-      if (error) reject(error);
-      else resolve();
-    };
-    const onLoad = () => finish();
-    const onError = () => finish(new Error("帧图片加载失败"));
-    const timeout = window.setTimeout(
-      () => finish(new Error("帧图片加载超时")),
-      15000,
-    );
-    elements.frame.addEventListener("load", onLoad);
-    elements.frame.addEventListener("error", onError);
-    elements.frame.src = imageUrl;
-  });
-  const imageVisible = imageReady.then(() => {
-    if (requestEpoch === sdFrameRequestEpoch) {
-      elements.frame.dataset.ready = "true";
-      elements.frameState.hidden = true;
-    }
-  });
-
-  try {
-    const [imageOutcome, resultOutcome] = await Promise.allSettled([
-      imageVisible,
-      fetchWithTimeout(`${base}/result`, {}, 15000, (response) => response.json()),
-    ]);
-    if (requestEpoch !== sdFrameRequestEpoch) return;
-    if (imageOutcome.status === "rejected") throw imageOutcome.reason;
-
-    if (resultOutcome.status === "rejected") {
-      latestResults = {frame: {width: 1280, height: 720}, targets: []};
-      updateResultsView(latestResults);
-      const detail = resultOutcome.reason?.name === "AbortError"
-        ? "检测详情加载超时"
-        : resultOutcome.reason?.message || "检测详情加载失败";
-      setSdVideoProgressLabel("error", `结果图已显示，${detail}`);
-      return;
-    }
-
-    const result = resultOutcome.value;
-    latestResults = {
-      frame: {width: 1280, height: 720},
-      targets: result.targets || [],
-    };
-    updateResultsView(latestResults);
-    drawOverlay();
-    setSdVideoProgressLabel("live", `已显示 ${Number(result.time_sec ?? 0).toFixed(1)}s 帧`);
-  } catch (error) {
-    if (requestEpoch !== sdFrameRequestEpoch) return;
-    const msg = error?.name === "AbortError"
-      ? `帧加载超时（请求被中止）`
-      : error?.message || "帧加载失败";
-    elements.frame.removeAttribute("src");
-    elements.frame.dataset.ready = "false";
-    elements.frameState.textContent = msg;
-    elements.frameState.hidden = false;
-    setSdVideoProgressLabel("error", msg);
+  } else {
+    elements.sdVideoProgress.value = 0;
+    setSdVideoProgressLabel("live", job.message || "Mask 已生成");
   }
 }
 
 async function pollSdVideoJob() {
-  if (!sdVideoJobId) return;
+  if (!sdFixedVideoJobId) return;
   try {
-    const job = await fetchJson(`/api/v1/sd/video-jobs/${encodeURIComponent(sdVideoJobId)}`);
+    const job = await fetchJson(`/api/v1/sd/fixed-video/${encodeURIComponent(sdFixedVideoJobId)}`);
     renderSdVideoJob(job);
     if (job.status === "running") {
-      window.setTimeout(pollSdVideoJob, 1000);
+      window.setTimeout(pollSdVideoJob, 300);
     } else {
       sdVideoPolling = false;
       updateSdActionButtons();
@@ -1239,30 +862,57 @@ async function pollSdVideoJob() {
   }
 }
 
-async function runSdVideoInference() {
+async function generateSdVideoMask() {
   if (!sdSelectedEntry || sdSelectedEntry.type !== "video" || sdVideoPolling) return;
-  const fps = Number(elements.sdVideoFps.value);
-  if (!Number.isFinite(fps) || fps < 0.5 || fps > 10) {
-    setSdVideoProgressLabel("error", "采样率需在 0.5–10 之间");
-    return;
-  }
+  sdVideoPolling = true;
+  updateSdActionButtons();
   elements.sdVideoResult.hidden = false;
-  setSdVideoProgressLabel("loading", "正在提交任务");
-  elements.sdVideoProgress.value = 0;
-  renderSdVideoEvents([]);
-  renderSdVideoFrames([]);
-  renderSdVideoSummary(null);
+  elements.sdVideoProgress.removeAttribute("value");
+  setSdVideoProgressLabel("loading", "正在生成 Mask，结果将显示在板载屏幕");
   try {
-    const data = await fetchJson("/api/v1/sd/video-inference", {
+    const job = await fetchWithTimeout(
+      "/api/v1/sd/fixed-video/prepare",
+      {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({path: sdSelectedEntry.path}),
+      },
+      90000,
+      (response) => response.json(),
+    );
+    sdFixedVideoJobId = job.id;
+    sdFixedVideoReadyPath = sdSelectedEntry.path;
+    elements.sdVideoProgress.value = 0;
+    setSdVideoProgressLabel("live", job.message || "Mask 已生成，第一帧已显示在板载屏幕");
+  } catch (error) {
+    sdFixedVideoJobId = null;
+    sdFixedVideoReadyPath = null;
+    elements.sdVideoProgress.value = 0;
+    setSdVideoProgressLabel("error", error?.message || "Mask 生成失败");
+  } finally {
+    sdVideoPolling = false;
+    updateSdActionButtons();
+  }
+}
+
+async function runSdVideoInference() {
+  if (!sdSelectedEntry || sdSelectedEntry.type !== "video" || sdVideoPolling ||
+      !sdFixedVideoJobId || sdFixedVideoReadyPath !== sdSelectedEntry.path) return;
+  elements.sdVideoResult.hidden = false;
+  elements.sdVideoProgress.removeAttribute("value");
+  setSdVideoProgressLabel("loading", "正在切换板载屏幕并启动推理");
+  sdVideoPolling = true;
+  updateSdActionButtons();
+  try {
+    await fetchJson(`/api/v1/sd/fixed-video/${encodeURIComponent(sdFixedVideoJobId)}/infer`, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({path: sdSelectedEntry.path, sample_fps: fps}),
+      body: "{}",
     });
-    sdVideoJobId = data.job_id;
-    sdVideoPolling = true;
-    updateSdActionButtons();
     void pollSdVideoJob();
   } catch (error) {
+    sdVideoPolling = false;
+    updateSdActionButtons();
     setSdVideoProgressLabel("error", error?.message || "视频推理提交失败");
   }
 }
@@ -1322,7 +972,7 @@ elements.phoneToggle.addEventListener("click", () => {
 elements.imageModeSelector.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-image-mode]");
   if (!button || imageInferenceRunning) return;
-  void setDriverMode(button.dataset.imageMode);
+  selectImageMode(button.dataset.imageMode);
 });
 
 elements.imageFile.addEventListener("change", () => {
@@ -1355,21 +1005,8 @@ elements.sdFileList.addEventListener("click", (event) => {
 });
 
 elements.runSdPhotoInference.addEventListener("click", () => void runSdPhotoInference());
+elements.generateSdVideoMask.addEventListener("click", () => void generateSdVideoMask());
 elements.runSdVideoInference.addEventListener("click", () => void runSdVideoInference());
-
-elements.sdVideoEvents.addEventListener("click", (event) => {
-  const row = event.target.closest("button.sd-video-event");
-  if (!row || row.disabled) return;
-  const index = Number(row.dataset.frame);
-  if (Number.isFinite(index)) void showSdVideoFrame(index);
-});
-
-elements.sdFrameList.addEventListener("click", (event) => {
-  const row = event.target.closest("button.sd-frame-thumb");
-  if (!row || row.disabled) return;
-  const index = Number(row.dataset.frame);
-  if (Number.isFinite(index)) void showSdVideoFrame(index);
-});
 
 for (const [id, action] of [["pausePipeline", "pause"], ["resumePipeline", "resume"], ["restartPipeline", "restart"]]) {
   const button = document.getElementById(id);
@@ -1406,14 +1043,10 @@ window.setInterval(() => {
     recoverFailedPublisher(session);
   }
 }, 500);
-
 if (!window.isSecureContext) {
   elements.phoneToggle.disabled = true;
   setPhoneState("error", "需要 HTTPS");
 }
 
 void statusLoop();
-void resultsLoop();
-void frameLoop();
-void driverModeLoop();
 void loadSdList("");

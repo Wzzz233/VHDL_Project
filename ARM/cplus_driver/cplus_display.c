@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -324,6 +325,9 @@ int cplus_display_start(struct cplus_display *display, const char *drm_card,
     display->saved_crtc = drmModeGetCrtc(display->fd, display->crtc_id);
     display->width = width;
     display->height = height;
+    display->render_size = (size_t)width * (size_t)height * 4U;
+    display->render_buffer = malloc(display->render_size);
+    if (!display->render_buffer) goto failed;
     if (create_framebuffer(display->fd, width, height, &display->fb[0]) < 0 ||
         create_framebuffer(display->fd, width, height, &display->fb[1]) < 0) goto failed;
     display->started = true;
@@ -347,21 +351,28 @@ int cplus_display_present(struct cplus_display *display, const uint8_t *bgrx,
     int next;
     int row;
     bool waiting = true;
+    uint8_t *rendered;
     struct cplus_drm_fb *framebuffer;
     if (!display || !display->started || !bgrx || count < 0 ||
         count > CPLUS_MAX_DETECTIONS || (count > 0 && !results) ||
         (mask_available && !mask)) return -1;
     next = display->active_fb < 0 ? 0 : 1 - display->active_fb;
     framebuffer = &display->fb[next];
+    rendered = display->render_buffer;
     for (row = 0; row < display->height; ++row)
-        memcpy(framebuffer->map + (size_t)row * framebuffer->pitch,
-               bgrx + (size_t)row * display->width * 4U, (size_t)display->width * 4U);
+        memcpy(rendered + (size_t)row * display->width * 4U,
+               bgrx + (size_t)row * display->width * 4U,
+               (size_t)display->width * 4U);
     if (mask_available)
-        cplus_overlay_mask_bgrx(framebuffer->map, (int)framebuffer->pitch,
+        cplus_overlay_mask_bgrx(rendered, display->width * 4,
                                 display->width, display->height, mask,
                                 CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT);
-    cplus_overlay_results(framebuffer->map, (int)framebuffer->pitch, display->width, display->height,
+    cplus_overlay_results(rendered, display->width * 4, display->width, display->height,
                           results, count, result_available);
+    for (row = 0; row < display->height; ++row)
+        memcpy(framebuffer->map + (size_t)row * framebuffer->pitch,
+               rendered + (size_t)row * display->width * 4U,
+               (size_t)display->width * 4U);
     if (display->active_fb < 0) {
         if (drmModeSetCrtc(display->fd, display->crtc_id, framebuffer->fb_id, 0, 0,
                            &display->connector_id, 1, &display->mode) < 0) return -1;
@@ -389,6 +400,7 @@ void cplus_display_stop(struct cplus_display *display)
         destroy_framebuffer(display->fd, &display->fb[1]);
         close(display->fd);
     }
+    free(display->render_buffer);
     memset(display, 0, sizeof(*display));
     display->fd = -1;
     display->active_fb = -1;

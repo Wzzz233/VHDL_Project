@@ -4,6 +4,7 @@
 #define CPLUS_DRIVER_DISPLAY_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include <xf86drmMode.h>
@@ -26,6 +27,8 @@ struct cplus_display {
     int height;
     int active_fb;
     bool started;
+    uint8_t *render_buffer;
+    size_t render_size;
     drmModeCrtc *saved_crtc;
     drmModeModeInfo mode;
     struct cplus_drm_fb fb[2];

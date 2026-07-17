@@ -47,6 +47,8 @@ required_files=(
     "${MODEL_DIR}/pplcnet_yellow_all_single_v1_rk3568_fp16.rknn"
     "${MODEL_DIR}/pplcnet_police_v5_whiteexpand_rk3568_fp16.rknn"
     "${MODEL_DIR}/pplcnet_black_unified_v1_rk3568_fp16.rknn"
+    "${MODEL_DIR}/yolov5nu_coco_rk3568_fp16_20260710.rknn"
+    "${MODEL_DIR}/mapillary_cplus_ground_4class_v2_rk3568_fp16_20260710.rknn"
     "${PLATE_TYPE_MODEL}"
     "${MODEL_DIR}/special_keys.txt"
     "${MODEL_DIR}/pplcnet_green_keys.txt"

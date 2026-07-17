@@ -19,7 +19,10 @@ struct cplus_async_result {
     int count;
     uint64_t sequence;
     uint64_t source_frame;
+    uint64_t source_generation;
     bool mask_valid;
+    bool mask_updated;
+    bool fixed_mask_ready;
     bool valid;
     uint8_t mask[CPLUS_MODEL_PIXELS];
 };
@@ -41,16 +44,24 @@ struct cplus_async_infer {
     int width;
     int height;
     bool always_segment;
+    bool fixed_mask_mode;
+    bool mask_generate_requested;
+    bool mask_generation_in_progress;
+    bool fixed_mask_ready;
+    uint64_t fixed_mask_sequence;
+    uint64_t fixed_mask_source_generation;
     struct cplus_runtime_config config;
     struct cplus_rknn_model *detector;
     struct cplus_rknn_model *segmenter;
     struct cplus_frame_pool *pool;
     struct cplus_latest_queue queue;
     uint64_t slot_frame[CPLUS_FRAME_POOL_SLOTS];
+    uint64_t slot_source_generation[CPLUS_FRAME_POOL_SLOTS];
     uint8_t *rgb;
     uint8_t *detector_rgb;
     uint8_t *segmenter_rgb;
     uint8_t *mask;
+    uint8_t *fixed_mask;
     struct cplus_mask_workspace mask_workspace;
     int mask_workspace_initialized;
     bool mask_all_other_reported;
@@ -64,10 +75,27 @@ int cplus_async_infer_start(struct cplus_async_infer *state,
                             struct cplus_rknn_model *detector,
                             struct cplus_rknn_model *segmenter,
                             const struct cplus_runtime_config *config,
-                            bool always_segment);
+                            bool always_segment,
+                            bool fixed_mask_mode);
 uint64_t cplus_async_infer_stop(struct cplus_async_infer *state);
 int cplus_async_submit_frame(struct cplus_async_infer *state, int slot,
                              uint64_t source_frame);
+int cplus_async_submit_frame_epoch(struct cplus_async_infer *state, int slot,
+                                   uint64_t source_frame,
+                                   uint64_t source_generation);
+int cplus_async_request_fixed_mask(struct cplus_async_infer *state);
+int cplus_async_set_fixed_mask(struct cplus_async_infer *state,
+                               const uint8_t *mask, size_t mask_size,
+                               uint64_t source_generation);
+void cplus_async_clear_fixed_mask(struct cplus_async_infer *state);
+bool cplus_async_fixed_mask_status(struct cplus_async_infer *state,
+                                   bool *generating,
+                                   uint64_t *sequence,
+                                   uint64_t *source_generation);
+int cplus_async_copy_fixed_mask(struct cplus_async_infer *state,
+                                uint8_t *mask, size_t mask_size,
+                                uint64_t *sequence,
+                                uint64_t *source_generation);
 bool cplus_async_get_result(struct cplus_async_infer *state,
                             struct cplus_async_result *result);
 bool cplus_async_refresh_result(struct cplus_async_infer *state,

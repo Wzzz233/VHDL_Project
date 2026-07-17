@@ -5,8 +5,11 @@
 ```text
 iPhone Safari -> HTTPS 页面 -> WHIP/WebRTC -> MediaMTX
   -> rtsp://127.0.0.1:8554/phone -> GStreamer/MPP
-  -> 1280x720 BGRx -> RKNN 推理 -> HDMI 与网页预览
+  -> 1280x720 BGRx -> RKNN 推理 -> HDMI
 ```
+
+网页只负责控制，并显示手机/电脑上传图片和 SD 卡照片的识别结果。实时车牌画面和 SD
+卡行人违法视频均只在板载 HDMI 屏幕显示，网页不传输或播放这些动态画面。
 
 OV5640 继续使用现有 FPGA PCIe DMA。手机 2 秒没有新帧时回退 OV5640；手机连续恢复 3 秒后，如果期望来源仍为手机，则自动切回手机。
 
@@ -87,16 +90,17 @@ sudo docker run --rm --privileged -u root \
 40b3bc67f5e1fdc107737f37abba1f846f0fd028b34f1f28aefe83a3a6bd1a3b
 ```
 
-网页行人 mask 需要本次重新编译的 `cplus-rk3568-driver`。当前验证产物为 71472 字节，
+网页行人图片识别和 SD 视频固定 Mask 推理需要本次重新编译的
+`cplus-rk3568-driver`。当前验证产物为 76368 字节，
 SHA256 为：
 
 ```text
-2ab1fd8190906c8eca19305f74103806bccbdfd3754a6c182cccc3aeba551b98
+106801aff1b73854110677a274f3a77eac40d5dcef24df6cdb7c29976c7a17ad
 ```
 
-同一容器内的 `make test` 已实际执行：C 测试、CPlus 测试和 9 项网页/驱动管理测试全部
-通过，其中姿态解码测试汇总为 `21 tests, 0 failures`。编译姿态解码测试时有未使用参数
-警告，但没有编译错误或测试失败。
+同一容器内的 `make test` 已实际执行：C 测试、CPlus 测试和 27 项网页/驱动管理测试全部
+通过；另有 8 项视频流程测试通过，其中姿态解码测试汇总为 `21 tests, 0 failures`。编译
+姿态解码测试时有未使用参数警告，但没有编译错误或测试失败。
 
 源代码、编译器或依赖变化后校验值也会变化，这是正常的；部署时应记录实际生成文件的值。
 
@@ -461,12 +465,12 @@ curl --cacert "$CA" -X POST "$BASE/api/v1/pipeline/restart" \
 
 打开 `https://pg2l50h.home.arpa:8443`：
 
-1. 页面应显示“已连接”，初始画面为 OV5640。
+1. 页面应显示“已连接”，HDMI 初始画面为 OV5640。
 2. 点击“启动手机摄像头”并允许权限。
 3. 页面只请求视频，不应请求麦克风。
 4. 状态变为“正在发送”后选择“手机”。
 5. `desired source` 和 `active source` 应先后变为手机。
-6. HDMI 与网页画面都应切换到手机。
+6. HDMI 画面应切换到手机；网页只显示状态，不显示实时画面。
 
 页面请求后摄、理想 1280x720、最高 15 fps。WebRTC 可能降低实际分辨率；板端会保持比例并补黑边到 1280x720。
 
@@ -713,27 +717,10 @@ sudo -u linaro -g pplcnet test -r /run/pplcnet-bgp-live/control.sock
 
 socket 不存在表示识别程序未启动；不可访问时检查组是否为 `pplcnet`。
 
-### 网页画面卡顿
+### 网页不显示实时画面
 
-当前平衡档为 480x270、JPEG 质量 55、最高 8 帧/秒。它用更小的单帧换取更连续的画面，通常不会增加局域网流量。更新程序后必须同时替换 `pplcnet_bgp_live`、`web_control/server.py` 和 `web_control/static/app.js`，然后重启；只更新网页文件或只更新 C 程序都仍会受到旧的 5 帧/秒限制。
-
-可在板端确认新预览已启动：
-
-```bash
-grep -F "[preview] started 480x270 JPEG quality=55 max_fps=8" \
-  /var/log/pplcnet-board/plate.log
-```
-
-### 网页没有预览图
-
-```bash
-gst-inspect-1.0 jpegenc
-curl --cacert /path/to/ca.crt -o /tmp/frame.jpg \
-  https://pg2l50h.home.arpa:8443/api/v1/frame.jpg
-file /tmp/frame.jpg
-```
-
-切换、暂停或重启时旧 JPEG 会被清除，短暂显示“等待新源画面”是正常的。
+这是当前设计。实时车牌与 SD 卡行人视频只在 HDMI 显示，网页只显示控制状态和静态图片
+识别结果，因此不会持续占用局域网带宽传输视频帧。
 
 ### HDMI 无显示
 
@@ -929,8 +916,9 @@ curl --cacert "${CA}" -X PUT \
 ## 21. SD 卡照片/视频行人违法推理
 
 网页新增“SD 卡文件”区域，可直接浏览板端 SD 卡上的照片和视频并就地推理，无需通过
-手机上传。照片走与手机上传相同的单图入口；视频离线逐帧推理，输出违规事件时间线、
-关键违规帧和统计摘要。
+手机上传。照片走与手机上传相同的单图入口，并在网页显示结果。视频先根据第一帧生成固定
+Mask；之后由板载 HDMI 屏幕播放视频，YOLO 在后台按最新帧异步检测，并用固定 Mask 判定
+违法。网页只显示准备、运行和完成状态，不接收视频画面或检测框。
 
 ### 21.1 挂载 SD 卡并指定根目录
 
@@ -977,39 +965,45 @@ curl --cacert "${CA}" -X POST \
 JPEG）和 `source_image`（1280x720 letterbox 源图）。`mode` 可为 `plate` 或
 `pedestrian`。任务与实时流程互斥，照片推理期间会临时停止实时车牌进程。
 
-### 21.4 SD 卡视频推理
+### 21.4 SD 卡视频固定 Mask 推理
 
-视频推理是异步任务。提交后返回 `job_id`，轮询状态直至完成：
+先根据视频第一帧生成 Mask：
 
 ```bash
 JOB=$(curl --cacert "${CA}" -sX POST \
   -H 'Content-Type: application/json' \
-  -d '{"path":"clip.mp4","sample_fps":1}' \
-  "${BASE}/api/v1/sd/video-inference" | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
-
-curl --cacert "${CA}" "${BASE}/api/v1/sd/video-jobs/${JOB}"
+  -d '{"path":"clip.mp4"}' \
+  "${BASE}/api/v1/sd/fixed-video/prepare" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
 ```
 
-`sample_fps` 取值 0.1–10，默认 1。低于 1 时按比例隔帧抽样（例如 0.5 即每 2 秒 1 帧），
-适合长视频。任务状态 `running` 时持续轮询；`done` 后 `summary` 给出采样帧数、违规帧
-数、违规事件数、跳过帧数和决策分布，`events` 列出每个违规事件的时间、原因和帧索引；
-`frames` 给出每帧概要（索引、时间、是否违规、是否有图）；`error` 给出失败原因。
+生成完成后，带 Mask 的视频第一帧会停留在 HDMI 屏幕上；网页不下载该帧或 Mask。
 
-视频推理一次性加载模型批量处理所有采样帧（不再逐帧重启驱动），速度比单帧模式快数倍。
-每帧的标注图（mask + 目标框 + 判定标签）按帧索引获取：
+再启动只跑 YOLO 的异步检测，并轮询结果：
 
 ```bash
-curl --cacert "${CA}" "${BASE}/api/v1/sd/video-jobs/${JOB}/frames/0.jpg" -o f0.jpg
+curl --cacert "${CA}" -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{}' \
+  "${BASE}/api/v1/sd/fixed-video/${JOB}/infer"
+
+curl --cacert "${CA}" "${BASE}/api/v1/sd/fixed-video/${JOB}"
 ```
+
+网页操作不需要上述命令：选择视频后依次点击“生成 Mask”和“开始屏幕推理”即可。生成
+完成后 HDMI 显示带 Mask 的第一帧；推理开始后 HDMI 保留原视频帧率和时间戳按原速播放，
+持续显示固定彩色 Mask，并叠加最近一次 YOLO 检测框和违法判定。视频结束后自动恢复
+实时车牌显示。
 
 ### 21.5 限制与注意事项
 
-- 视频推理批量加载模型一次处理所有采样帧（不再逐帧重启），速度比单帧模式快数倍。
-  1080P 视频抽帧用 `videorate` 先降帧再缩放，避免每帧 1080P 软转换。
+- Mask 只在点击“生成 Mask”时运行一次分割；播放推理阶段只运行 YOLO 行人检测。
+- 模型只加载一次；视频播放不再降到固定帧率，保留源视频节奏做颜色转换和缩放。
+- 显示按视频时间连续播放；YOLO 来不及处理时会自动跳过旧帧，屏幕使用最近一次检测结果，
+  不会因为推理速度降低而暂停视频。
+- 解码优先使用 `mppvideodec`，解码和送显队列都只保留最新帧；慢端不会让旧帧持续积压。
+- 文件流在进入最新帧队列前按原视频时间戳定速；末端不再重复等待，避免只保留首尾帧。
+- 网页运行状态每约 2 秒显示实际输入、屏幕和推理 FPS，可直接确认三者是否已经解耦。
 - 同时只允许一个视频推理任务，且与照片/实时推理互斥。
-- 单任务最多采样 600 帧，超出会截断并在 `summary.truncated` 标记。需要更长视频可调高
-  `sample_fps` 或分段。
-- 抽帧使用 `decodebin ! videorate ! videoconvert ! videoscale ! multifilesink`，依赖板端
-  GStreamer 解码插件；硬解是否启用取决于 `mppvideodec` 是否被 `decodebin` 选中。
-- 临时帧文件在任务结束的临时目录中自动清理。
-
+- 视频流使用 `decodebin ! identity sync=true ! leaky queue ! videoconvert ! videoscale !
+  leaky queue`，依赖板端 GStreamer 解码插件；服务会把 `mppvideodec` 的选择优先级提高到
+  软件解码器之上。

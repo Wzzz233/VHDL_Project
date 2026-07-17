@@ -21,10 +21,13 @@ The control panel also accepts JPEG/PNG uploads at
 preview contains the same green road, blue sidewalk, and red zebra mask blend
 as the HDMI path.
 
-`GET /api/v1/mode` and `PUT /api/v1/mode` manage exclusive driver modes.
-Plate mode keeps the OV5640 live plate process running. Pedestrian mode stops
-that process and runs CPlus only for an uploaded still image. A plate still
-image temporarily pauses the live process and restores it after inference.
+`GET /api/v1/mode` and `PUT /api/v1/mode` manage the existing plate live and
+pedestrian still-image modes. SD-card videos use a separate stored-video flow:
+the user selects a video, generates a four-class ground mask from its first
+frame, then starts HDMI playback with asynchronous person detection. The saved
+mask is reused for every detection, so segmentation runs only during mask
+generation. Dynamic plate and pedestrian-video pictures are HDMI-only; the web
+page displays only uploaded-image and SD-photo results.
 
 Live video and still-image plate inference now share the five-colour detector
 configuration: score scale 256, 0.35 detector threshold, 0.35 NMS, and up to
@@ -39,7 +42,7 @@ through a Unix domain socket.
 
 - `server.py`: HTTPS static/API server, live-process Unix socket proxy, and
   same-origin MediaMTX WHIP proxy.
-- `static/`: iPhone-ready control panel and 480x270 JPEG/canvas preview.
+- `static/`: iPhone-ready control panel and still-image result canvas.
 - `mediamtx.yml`: one publisher path named `phone`; RTSP and WHIP signaling are
   loopback-only, while WebRTC media uses UDP port 8189 on the LAN.
 - `install_mediamtx.sh`: installs MediaMTX v1.19.2 Linux ARM64 after checking
@@ -156,12 +159,15 @@ plate-type classifier without changing the police, black, or yellow OCR models.
 
 ```text
 GET  /api/v1/status
-GET  /api/v1/results
-GET  /api/v1/frame.jpg
+GET  /api/v1/mode
+PUT  /api/v1/mode                           {"mode":"plate"|"pedestrian"}
 PUT  /api/v1/source                         {"source":"fpga"|"phone"}
 POST /api/v1/pipeline/pause                 {}
 POST /api/v1/pipeline/resume                {}
 POST /api/v1/pipeline/restart               {}
+POST /api/v1/sd/fixed-video/prepare         {"path":"clip.mp4"}
+POST /api/v1/sd/fixed-video/<id>/infer      {}
+GET  /api/v1/sd/fixed-video/<id>
 POST /whip/phone                            WHIP SDP offer
 PATCH/DELETE /whip/phone/<session>          WHIP session lifecycle
 ```

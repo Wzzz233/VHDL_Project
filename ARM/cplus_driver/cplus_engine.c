@@ -932,6 +932,7 @@ void cplus_overlay_mask_bgrx(uint8_t *bgrx, int stride, int width, int height,
     uint64_t y_step;
     uint64_t x_offset;
     uint64_t y_offset;
+    uint64_t y_position;
     int x, y;
     if (!bgrx || !mask || width <= 0 || height <= 0 || mask_w <= 0 || mask_h <= 0 ||
         stride < width * 4)
@@ -942,13 +943,16 @@ void cplus_overlay_mask_bgrx(uint8_t *bgrx, int stride, int width, int height,
              (uint32_t)height;
     x_offset = x_step / 2;
     y_offset = y_step / 2;
+    y_position = y_offset;
     for (y = 0; y < height; ++y) {
-        int mask_y = (int)(((uint64_t)y * y_step + y_offset) >> 32);
+        int mask_y = (int)(y_position >> 32);
+        uint64_t x_position = x_offset;
         uint8_t *row = bgrx + (size_t)y * stride;
         for (x = 0; x < width; ++x) {
-            int mask_x = (int)(((uint64_t)x * x_step + x_offset) >> 32);
+            int mask_x = (int)(x_position >> 32);
             uint8_t class_id = mask[(size_t)mask_y * mask_w + mask_x];
             uint8_t *pixel;
+            x_position += x_step;
             if (class_id == CPLUS_MASK_OTHER || class_id > CPLUS_MASK_CROSSWALK_ZEBRA)
                 continue;
             pixel = row + (size_t)x * 4U;
@@ -956,6 +960,7 @@ void cplus_overlay_mask_bgrx(uint8_t *bgrx, int stride, int width, int height,
             pixel[1] = (uint8_t)((pixel[1] + palette_bgr[class_id][1]) / 2);
             pixel[2] = (uint8_t)((pixel[2] + palette_bgr[class_id][2]) / 2);
         }
+        y_position += y_step;
     }
 }
 

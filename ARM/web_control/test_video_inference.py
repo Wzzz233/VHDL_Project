@@ -9,10 +9,12 @@ and _run_pedestrian_batch is replaced with a stub that returns scripted results.
 
 from __future__ import annotations
 
+import io
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from image_inference import (
     ImageInferenceConfig,
@@ -147,6 +149,89 @@ class VideoInferenceTest(unittest.TestCase):
         self.assertEqual(result["summary"]["violation_count"], 4)
         # No keyframe cap anymore: all frames stored.
         self.assertEqual(len(result["frames"]), 4)
+
+    def test_first_frame_pipeline_uses_compatible_multifilesink(self) -> None:
+        runner = self._runner(frame_count=1)
+        frames_dir = self.work / "first"
+        command = runner._first_frame_pipeline(self.video_path, frames_dir)
+        self.assertIn("multifilesink", command)
+        self.assertIn(str(frames_dir / "frame%05d.bgrx"), command[-1])
+        self.assertNotIn("identity", command)
+        self.assertFalse(any("eos-after" in argument for argument in command))
+
+    def test_fixed_video_stream_runs_to_eof_on_hdmi(self) -> None:
+        runner = self._runner(frame_count=1)
+        gst_command, driver_command = runner._fixed_stream_commands(
+            self.video_path, self.work / "fixed-mask.bin"
+        )
+
+        self.assertNotIn("videorate", gst_command)
+        self.assertFalse(any("framerate=" in argument for argument in gst_command))
+        self.assertNotIn("videoconvert", gst_command)
+        self.assertNotIn("videoscale", gst_command)
+        decode_index = gst_command.index("decodebin")
+        self.assertEqual(gst_command[decode_index + 2], "capsfilter")
+        self.assertEqual(gst_command[decode_index + 3], "caps=video/x-raw,format=NV12")
+        identity_index = gst_command.index("identity")
+        self.assertGreater(identity_index, decode_index)
+        self.assertEqual(gst_command[identity_index + 1], "sync=true")
+        self.assertLess(identity_index, gst_command.index("queue"))
+        self.assertEqual(gst_command.count("leaky=downstream"), 1)
+        self.assertEqual(gst_command.count("max-size-buffers=1"), 1)
+        self.assertIn("sync=false", gst_command)
+        self.assertIn("--input-nv12-stream", driver_command)
+        self.assertIn("--src-width", driver_command)
+        self.assertIn("--src-height", driver_command)
+        self.assertIn("--fixed-mask", driver_command)
+        frames_index = driver_command.index("--frames")
+        self.assertEqual(driver_command[frames_index + 1], "0")
+        display_index = driver_command.index("--display")
+        self.assertEqual(driver_command[display_index + 1], "1")
+        mask_index = driver_command.index("--display-mask")
+        self.assertEqual(driver_command[mask_index + 1], "1")
+
+    def test_first_frame_extraction_keeps_complete_frame_and_stops_decoder(self) -> None:
+        runner = self._runner(frame_count=1)
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.running = True
+                self.terminated = False
+                self.stderr = io.BytesIO()
+
+            def poll(self):
+                return None if self.running else -15
+
+            def terminate(self) -> None:
+                self.running = False
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                del timeout
+                self.running = False
+                return -15
+
+            def kill(self) -> None:
+                self.running = False
+
+        process = FakeProcess()
+
+        def start_decoder(command, **kwargs):
+            del kwargs
+            location = command[-1].removeprefix("location=")
+            Path(location.replace("%05d", "00000")).write_bytes(
+                b"\0" * EXPECTED_BGRX_SIZE
+            )
+            return process
+
+        extract_work = self.work / "extract"
+        extract_work.mkdir()
+        with mock.patch("image_inference.subprocess.Popen", side_effect=start_decoder):
+            first_frame = runner._extract_first_frame(self.video_path, extract_work)
+
+        self.assertEqual(first_frame, extract_work / "first-frame.bgrx")
+        self.assertEqual(first_frame.stat().st_size, EXPECTED_BGRX_SIZE)
+        self.assertTrue(process.terminated)
 
 
 if __name__ == "__main__":

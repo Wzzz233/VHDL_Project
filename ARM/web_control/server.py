@@ -13,8 +13,10 @@ import dataclasses
 import http.client
 import json
 import logging
+import shutil
 import socket
 import ssl
+import tempfile
 import threading
 import time
 from http import HTTPStatus
@@ -70,6 +72,7 @@ class AppConfig:
     driver_manager: Any | None = None
     video_runner: Any | None = None
     video_store: Any | None = None
+    fixed_video_store: Any | None = None
 
 
 class ControlClient:
@@ -106,7 +109,7 @@ class ControlClient:
         while remaining:
             chunk = stream.read(remaining)
             if not chunk:
-                raise ControlProtocolError("truncated JPEG response from live process")
+                raise ControlProtocolError("truncated binary response from live process")
             chunks.append(chunk)
             remaining -= len(chunk)
         return b"".join(chunks)
@@ -161,7 +164,6 @@ class ControlClient:
             raise
         except (socket.timeout, OSError) as exc:
             raise ControlUnavailable("live process did not complete the JPEG response") from exc
-
 
 class VideoJobStore:
     """In-memory store for offline video inference jobs.
@@ -338,6 +340,166 @@ class VideoJobStore:
         }
 
 
+class FixedVideoStore:
+    """Controls HDMI-only stored-video inference without returning video results."""
+
+    def __init__(self, video_runner: Any, driver_manager: Any, sd_root: Path) -> None:
+        self.video_runner = video_runner
+        self.driver_manager = driver_manager
+        self.sd_root = sd_root
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._counter = 0
+
+    def _new_id(self) -> str:
+        self._counter += 1
+        return f"fixed-{int(time.time())}-{self._counter:04d}"
+
+    def _release_resources(self, job: dict[str, Any]) -> None:
+        process = job.get("preview_process")
+        if process is not None:
+            self.video_runner._stop_process(process)
+            job["preview_process"] = None
+        if job.get("lock_held"):
+            self.video_runner.image_runner._lock.release()
+            job["lock_held"] = False
+        shutil.rmtree(job["work"], ignore_errors=True)
+
+    def prepare(self, path: str) -> dict[str, Any]:
+        video_path = resolve_file(self.sd_root, path)
+        with self._lock:
+            if any(job["status"] in ("preparing", "running") for job in self._jobs.values()):
+                raise ImageInferenceBusy("已有固定 Mask 视频任务正在运行")
+            stale_jobs = list(self._jobs.values())
+            self._jobs.clear()
+            job_id = self._new_id()
+            job = {
+                "id": job_id,
+                "path": path,
+                "name": video_path.name,
+                "video_path": video_path,
+                "work": Path(tempfile.mkdtemp(prefix="cplus-fixed-video-")),
+                "status": "preparing",
+                "message": "正在生成 Mask",
+                "processed": 0,
+                "error": None,
+                "mask_ready": False,
+                "mask_path": None,
+                "preview_process": None,
+                "lock_held": False,
+            }
+            self._jobs[job_id] = job
+        for stale in stale_jobs:
+            self._release_resources(stale)
+
+        inference_lock = self.video_runner.image_runner._lock
+        if not inference_lock.acquire(blocking=False):
+            with self._lock:
+                self._jobs.pop(job_id, None)
+            shutil.rmtree(job["work"], ignore_errors=True)
+            raise ImageInferenceBusy("已有推理任务正在运行，请稍后再试")
+        job["lock_held"] = True
+        try:
+            self.driver_manager.set_mode("pedestrian")
+            prepared = self.video_runner.prepare_fixed_video(video_path, job["work"])
+            with self._lock:
+                job["mask_path"] = prepared["mask_path"]
+                job["preview_process"] = prepared["preview_process"]
+                job["mask_ready"] = True
+                job["status"] = "ready"
+                job["message"] = "Mask 已生成，第一帧显示在板载屏幕"
+                return self.public(job)
+        except Exception:
+            with self._lock:
+                self._jobs.pop(job_id, None)
+            self._release_resources(job)
+            try:
+                self.driver_manager.set_mode("plate")
+            except DriverManagerError:
+                LOG.exception("failed to restore plate display after mask generation")
+            raise
+
+    def start(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(job_id)
+            if job["status"] != "ready" or not job["mask_ready"]:
+                raise ImageInferenceBusy("请先完成 Mask 生成")
+            preview_process = job["preview_process"]
+            job["preview_process"] = None
+            job["status"] = "running"
+            job["message"] = "视频正在板载屏幕播放并推理"
+            job["processed"] = 0
+        if preview_process is not None:
+            self.video_runner._stop_process(preview_process)
+        threading.Thread(target=self._run, args=(job_id,), daemon=True).start()
+        return self.public(job)
+
+    def _run(self, job_id: str) -> None:
+        job = self._jobs[job_id]
+        inference_error: Exception | None = None
+        restore_error: Exception | None = None
+
+        def result_callback(result: dict[str, Any], time_sec: float) -> None:
+            del result, time_sec
+            with self._lock:
+                job["processed"] += 1
+
+        def progress(processed: int, total: int, message: str) -> None:
+            del total
+            with self._lock:
+                job["processed"] = processed
+                job["message"] = f"板载屏幕播放中，{message}"
+
+        try:
+            self.video_runner.run_fixed_video_stream(
+                job["video_path"], job["mask_path"],
+                result_callback, progress, acquire_lock=False,
+            )
+        except Exception as exc:
+            LOG.warning("fixed video job %s failed: %s", job_id, exc)
+            inference_error = exc
+        finally:
+            self._release_resources(job)
+            try:
+                self.driver_manager.set_mode("plate")
+            except DriverManagerError as exc:
+                restore_error = exc
+                LOG.exception("failed to restore plate display after video inference")
+            with self._lock:
+                if inference_error is not None:
+                    job["status"] = "error"
+                    job["error"] = str(inference_error)
+                    job["message"] = "视频推理失败，已尝试恢复实时车牌显示"
+                elif restore_error is not None:
+                    job["status"] = "error"
+                    job["error"] = str(restore_error)
+                    job["message"] = "视频推理完成，但恢复实时车牌显示失败"
+                else:
+                    job["status"] = "done"
+                    job["message"] = "视频推理完成，已恢复实时车牌显示"
+
+    @staticmethod
+    def public(job: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": job["id"],
+            "path": job["path"],
+            "name": job["name"],
+            "status": job["status"],
+            "message": job["message"],
+            "processed": job["processed"],
+            "mask_ready": job["mask_ready"],
+            "display": "hdmi",
+            "error": job["error"],
+        }
+
+    def get(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return self.public(job) if job else None
+
+
 class AppState:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -345,6 +507,7 @@ class AppState:
         self.image_runner = config.image_runner
         self.driver_manager = config.driver_manager
         self.video_store = config.video_store
+        self.fixed_video_store = config.fixed_video_store
         self._frame_lock = threading.Lock()
         self._frame_timestamp = 0.0
         self._frame_content_type = "image/jpeg"
@@ -514,6 +677,76 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._send_problem(HTTPStatus.NOT_FOUND, "sd_browse_failed", str(exc))
         else:
             self._send_json(HTTPStatus.OK, listing)
+
+    def _serve_fixed_video_get(self, path: str) -> None:
+        store = self.state.fixed_video_store
+        if store is None:
+            self._send_problem(HTTPStatus.SERVICE_UNAVAILABLE, "fixed_video_unavailable", "fixed video inference is not configured")
+            return
+        parts = path.removeprefix("/api/v1/sd/fixed-video/").split("/")
+        job = store.get(parts[0]) if parts and parts[0] else None
+        if job is None:
+            self._send_problem(HTTPStatus.NOT_FOUND, "job_not_found", "fixed video job not found")
+        elif len(parts) == 1:
+            self._send_json(HTTPStatus.OK, job)
+        else:
+            self._send_problem(HTTPStatus.NOT_FOUND, "not_found", "resource not found")
+
+    def _prepare_fixed_video(self) -> None:
+        if not self._require_same_origin():
+            return
+        if self.state.fixed_video_store is None:
+            self._send_problem(HTTPStatus.SERVICE_UNAVAILABLE, "fixed_video_unavailable", "fixed video inference is not configured")
+            return
+        try:
+            value = self._read_json_object()
+        except TypeError as exc:
+            self._send_problem(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "content_type", str(exc)); return
+        except OverflowError as exc:
+            self._send_problem(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "body_too_large", str(exc)); return
+        except ValueError as exc:
+            self._send_problem(HTTPStatus.BAD_REQUEST, "invalid_json", str(exc)); return
+        if set(value) != {"path"} or not isinstance(value.get("path"), str):
+            self._send_problem(HTTPStatus.BAD_REQUEST, "invalid_request", "body must contain video path")
+            return
+        try:
+            result = self.state.fixed_video_store.prepare(value["path"])
+        except ImageInferenceBusy as exc:
+            self._send_problem(HTTPStatus.CONFLICT, "inference_busy", str(exc))
+        except (ImageInferenceError, SdBrowserError) as exc:
+            self._send_problem(HTTPStatus.BAD_GATEWAY, "mask_generation_failed", str(exc))
+        else:
+            self._send_json(HTTPStatus.OK, result)
+
+    def _start_fixed_video(self, path: str) -> None:
+        if not self._require_same_origin():
+            return
+        if self.state.fixed_video_store is None:
+            self._send_problem(HTTPStatus.SERVICE_UNAVAILABLE, "fixed_video_unavailable", "fixed video inference is not configured")
+            return
+        job_id = path.removeprefix("/api/v1/sd/fixed-video/").removesuffix("/infer").strip("/")
+        try:
+            value = self._read_json_object()
+        except TypeError as exc:
+            self._send_problem(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "content_type", str(exc))
+            return
+        except OverflowError as exc:
+            self._send_problem(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "body_too_large", str(exc))
+            return
+        except ValueError as exc:
+            self._send_problem(HTTPStatus.BAD_REQUEST, "invalid_json", str(exc))
+            return
+        if value:
+            self._send_problem(HTTPStatus.BAD_REQUEST, "unexpected_body", "video inference takes no request fields")
+            return
+        try:
+            result = self.state.fixed_video_store.start(job_id)
+        except KeyError:
+            self._send_problem(HTTPStatus.NOT_FOUND, "job_not_found", "fixed video job not found")
+        except ImageInferenceBusy as exc:
+            self._send_problem(HTTPStatus.CONFLICT, "inference_busy", str(exc))
+        else:
+            self._send_json(HTTPStatus.OK, result)
 
     def _serve_sd_photo_inference(self) -> None:
         if not self._require_same_origin():
@@ -795,6 +1028,8 @@ class ControlHandler(BaseHTTPRequestHandler):
                 self._send_problem(HTTPStatus.CONFLICT, "driver_mode_failed", str(exc))
         elif parsed.path == "/api/v1/sd/list":
             self._serve_sd_list(parsed.query)
+        elif parsed.path.startswith("/api/v1/sd/fixed-video/"):
+            self._serve_fixed_video_get(parsed.path)
         elif parsed.path == "/api/v1/sd/video-jobs":
             if self.state.video_store is None:
                 self._send_problem(HTTPStatus.SERVICE_UNAVAILABLE, "video_inference_unavailable", "video inference is not configured")
@@ -912,6 +1147,10 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._serve_sd_photo_inference()
         elif parsed.path == "/api/v1/sd/video-inference":
             self._serve_sd_video_start()
+        elif parsed.path == "/api/v1/sd/fixed-video/prepare":
+            self._prepare_fixed_video()
+        elif parsed.path.startswith("/api/v1/sd/fixed-video/") and parsed.path.endswith("/infer"):
+            self._start_fixed_video(parsed.path)
         elif parsed.path in pipeline_paths:
             if not self._require_same_origin():
                 return
@@ -1105,6 +1344,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     video_runner = VideoInferenceRunner(image_runner)
     video_store = VideoJobStore(video_runner, driver_manager, args.sd_root)
+    fixed_video_store = FixedVideoStore(video_runner, driver_manager, args.sd_root)
     config = AppConfig(
         control_socket=args.control_socket,
         control_timeout=args.control_timeout,
@@ -1118,6 +1358,7 @@ def main(argv: list[str] | None = None) -> int:
         driver_manager=driver_manager,
         video_runner=video_runner,
         video_store=video_store,
+        fixed_video_store=fixed_video_store,
     )
     state = AppState(config)
 

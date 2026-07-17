@@ -12,6 +12,7 @@ import socketserver
 import tempfile
 import threading
 import time
+import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -253,6 +254,58 @@ class FakeDriverManager:
         yield
 
 
+class FakeFixedVideoStore:
+    def __init__(self) -> None:
+        self.started = []
+        self.prepared = []
+        self.job = {
+            "id": "fixed-1", "path": "clip.mp4", "name": "clip.mp4",
+            "status": "ready", "message": "Mask 已生成", "processed": 0,
+            "mask_ready": True, "display": "hdmi", "error": None,
+        }
+
+    def prepare(self, path):
+        self.prepared.append(path)
+        self.job["path"] = path
+        return dict(self.job)
+
+    def start(self, job_id):
+        self.started.append(job_id)
+        self.job["status"] = "running"
+        return dict(self.job)
+
+    def get(self, job_id):
+        return dict(self.job) if job_id == "fixed-1" else None
+
+
+class FakeHdmiVideoRunner:
+    def __init__(self) -> None:
+        self.image_runner = types.SimpleNamespace(_lock=threading.Lock())
+        self.preview_process = object()
+        self.stopped = []
+        self.stream_calls = []
+        self.stream_error = None
+
+    def prepare_fixed_video(self, video_path, work):
+        mask_path = work / "fixed-mask.bin"
+        mask_path.write_bytes(b"mask")
+        return {"mask_path": mask_path, "preview_process": self.preview_process}
+
+    def _stop_process(self, process):
+        self.stopped.append(process)
+
+    def run_fixed_video_stream(
+        self, video_path, mask_path, result_callback, progress_callback,
+        acquire_lock=True,
+    ):
+        self.stream_calls.append((video_path, mask_path, acquire_lock))
+        if self.stream_error is not None:
+            raise self.stream_error
+        result_callback({"frame": 0}, 0.0)
+        progress_callback(1, 0, "done")
+        return {"processed": 1, "truncated": False}
+
+
 class WebControlTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory(prefix="bgp-web-test-")
@@ -268,6 +321,7 @@ class WebControlTest(unittest.TestCase):
         self.image_runner = FakeImageRunner()
         self.driver_manager = FakeDriverManager()
         self.video_runner = FakeVideoRunner()
+        self.fixed_video_store = FakeFixedVideoStore()
 
         self.sd_root = Path(self.tempdir.name) / "sdcard"
         self.sd_root.mkdir()
@@ -294,6 +348,7 @@ class WebControlTest(unittest.TestCase):
             driver_manager=self.driver_manager,
             video_runner=self.video_runner,
             video_store=self.video_store,
+            fixed_video_store=self.fixed_video_store,
         )
         self.web = server.create_server(("127.0.0.1", 0), server.AppState(config))
         self.web_thread = threading.Thread(target=self.web.serve_forever, daemon=True)
@@ -420,6 +475,90 @@ class WebControlTest(unittest.TestCase):
             "POST", "/api/v1/pipeline/start", b"{}", {"Content-Type": "application/json"}
         )
         self.assertEqual(status, 404)
+
+    def test_fixed_video_is_hdmi_control_only(self) -> None:
+        payload = json.dumps({"path": "clip.mp4"}).encode("utf-8")
+        status, _, body = self.request(
+            "POST", "/api/v1/sd/fixed-video/prepare", payload,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["id"], "fixed-1")
+        self.assertEqual(json.loads(body)["display"], "hdmi")
+        self.assertEqual(self.fixed_video_store.prepared, ["clip.mp4"])
+
+        status, _, body = self.request("GET", "/api/v1/sd/fixed-video/fixed-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["status"], "ready")
+
+        status, _, _ = self.request("GET", "/api/v1/sd/fixed-video/fixed-1/first.jpg")
+        self.assertEqual(status, 404)
+
+        status, _, _ = self.request("GET", "/api/v1/sd/fixed-video/fixed-1/mask")
+        self.assertEqual(status, 404)
+
+        payload = b"{}"
+        status, _, body = self.request(
+            "POST", "/api/v1/sd/fixed-video/fixed-1/infer", payload,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fixed_video_store.started, ["fixed-1"])
+
+        status, _, _ = self.request("GET", "/api/v1/sd/media?path=clip.mp4")
+        self.assertEqual(status, 404)
+
+    def test_fixed_video_holds_hdmi_then_restores_plate(self) -> None:
+        runner = FakeHdmiVideoRunner()
+        manager = FakeDriverManager()
+        store = server.FixedVideoStore(runner, manager, self.sd_root)
+
+        ready = store.prepare("clip.mp4")
+        self.assertEqual(ready["status"], "ready")
+        self.assertEqual(ready["display"], "hdmi")
+        self.assertEqual(manager.mode, "pedestrian")
+        self.assertTrue(runner.image_runner._lock.locked())
+
+        running = store.start(ready["id"])
+        self.assertEqual(running["status"], "running")
+        final = None
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            final = store.get(ready["id"])
+            if final and final["status"] != "running":
+                break
+            time.sleep(0.01)
+
+        self.assertIsNotNone(final)
+        self.assertEqual(final["status"], "done")
+        self.assertEqual(final["processed"], 1)
+        self.assertEqual(manager.mode, "plate")
+        self.assertEqual(runner.stopped, [runner.preview_process])
+        self.assertEqual(len(runner.stream_calls), 1)
+        self.assertFalse(runner.stream_calls[0][2])
+        self.assertFalse(runner.image_runner._lock.locked())
+
+    def test_fixed_video_failure_still_restores_plate(self) -> None:
+        runner = FakeHdmiVideoRunner()
+        runner.stream_error = server.ImageInferenceError("video stalled")
+        manager = FakeDriverManager()
+        store = server.FixedVideoStore(runner, manager, self.sd_root)
+
+        ready = store.prepare("clip.mp4")
+        store.start(ready["id"])
+        final = None
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            final = store.get(ready["id"])
+            if final and final["status"] != "running":
+                break
+            time.sleep(0.01)
+
+        self.assertIsNotNone(final)
+        self.assertEqual(final["status"], "error")
+        self.assertIn("video stalled", final["error"])
+        self.assertEqual(manager.mode, "plate")
+        self.assertFalse(runner.image_runner._lock.locked())
 
         status, _, _ = self.request(
             "POST", "/api/v1/pipeline/pause", b"", {"Content-Length": "0"}

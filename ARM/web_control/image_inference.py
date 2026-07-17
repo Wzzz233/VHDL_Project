@@ -6,6 +6,8 @@ from __future__ import annotations
 import dataclasses
 import base64
 import json
+import os
+import select
 import socket
 import subprocess
 import tempfile
@@ -1027,13 +1029,7 @@ class VideoInferenceConfig:
 
 
 class VideoInferenceRunner:
-    """Offline video inference.
-
-    Extracts BGRx frames with gstreamer at a reduced cadence, then runs the
-    cplus pedestrian driver on each frame in single-frame offline mode. The
-    driver is restarted per frame (model reload), so this is an offline batch
-    path, not a realtime one.
-    """
+    """Reduced-cadence video inference for stored SD-card videos."""
 
     def __init__(
         self,
@@ -1073,6 +1069,288 @@ class VideoInferenceRunner:
             "multifilesink",
             f"location={location}",
         ]
+
+    def _first_frame_pipeline(self, video_path: Path, frames_dir: Path) -> list[str]:
+        return [
+            self.image_runner.config.gst_launch,
+            "-q",
+            "filesrc",
+            f"location={video_path}",
+            "!",
+            "decodebin",
+            "!",
+            "videoconvert",
+            "!",
+            "videoscale",
+            "add-borders=true",
+            "!",
+            "video/x-raw,format=BGRx,width=1280,height=720",
+            "!",
+            "multifilesink",
+            f"location={frames_dir / 'frame%05d.bgrx'}",
+        ]
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3.0)
+
+    def _extract_first_frame(self, video_path: Path, work: Path) -> Path:
+        frames_dir = work / "first-frame-extract"
+        frames_dir.mkdir()
+        command = self._first_frame_pipeline(video_path, frames_dir)
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise VideoInferenceError(f"视频第一帧提取启动失败: {exc}") from exc
+
+        expected = 1280 * 720 * 4
+        deadline = time.monotonic() + min(self.config.extract_timeout, 30.0)
+        selected: Path | None = None
+        failure = ""
+        while time.monotonic() < deadline:
+            for candidate in sorted(frames_dir.glob("frame*.bgrx")):
+                try:
+                    if candidate.stat().st_size == expected:
+                        selected = candidate
+                        break
+                except OSError:
+                    continue
+            if selected is not None:
+                break
+            if process.poll() is not None:
+                failure = "视频解码流程提前结束"
+                break
+            time.sleep(0.05)
+
+        self._stop_process(process)
+        stderr = process.stderr.read() if process.stderr else b""
+        detail = stderr.decode("utf-8", "replace").strip()[-800:]
+        if selected is None:
+            message = failure or "等待第一帧超时"
+            if detail:
+                message = f"{message}: {detail}"
+            raise VideoInferenceError(f"视频第一帧提取失败: {message}")
+
+        raw_path = work / "first-frame.bgrx"
+        selected.replace(raw_path)
+        for extra in frames_dir.glob("frame*.bgrx"):
+            extra.unlink(missing_ok=True)
+        frames_dir.rmdir()
+        return raw_path
+
+    def prepare_fixed_video(self, video_path: Path, work: Path) -> dict[str, Any]:
+        if not video_path.is_file():
+            raise VideoInferenceError(f"视频文件不存在: {video_path}")
+        raw_path = self._extract_first_frame(video_path, work)
+        mask_path = work / "fixed-mask.bin"
+        model = self.image_runner.config.model_root
+        command = [
+            str(self.image_runner.config.pedestrian_driver),
+            "--det-model", str(model / "yolov5nu_coco_rk3568_fp16_20260710.rknn"),
+            "--seg-model", str(model / "mapillary_cplus_ground_4class_v2_rk3568_fp16_20260710.rknn"),
+            "--input-bgrx", str(raw_path), "--width", "1280", "--height", "720",
+            "--display", "1", "--generate-fixed-mask", str(mask_path),
+            "--hold-display",
+        ]
+        try:
+            process = subprocess.Popen(
+                command, cwd=self.image_runner.config.arm_root,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+        except OSError as exc:
+            raise VideoInferenceError("固定 Mask 生成失败") from exc
+        deadline = time.monotonic() + self.image_runner.config.timeout
+        while time.monotonic() < deadline:
+            if mask_path.is_file() and mask_path.stat().st_size == 640 * 640:
+                return {
+                    "raw_path": raw_path,
+                    "mask_path": mask_path,
+                    "preview_process": process,
+                }
+            if process.poll() is not None:
+                break
+            time.sleep(0.05)
+        self._stop_process(process)
+        output = process.stdout.read() if process.stdout else ""
+        raise VideoInferenceError(f"固定 Mask 生成失败: {output[-1000:]}")
+
+    def _probe_video_resolution(self, video_path: Path) -> tuple[int, int]:
+        """Probe the native video resolution via gst-discoverer for the RGA
+        source rect. Falls back to 1920x1080 (the common 1080p case) on failure
+        so fixed-mask playback still works."""
+        try:
+            completed = subprocess.run(
+                ["gst-discoverer-1.0", str(video_path)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=10.0, check=False, text=True,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return 1920, 1080
+        width = height = 0
+        for line in completed.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Width:"):
+                width = int(stripped.split(":", 1)[1].strip())
+            elif stripped.startswith("Height:"):
+                height = int(stripped.split(":", 1)[1].strip())
+        if width <= 0 or height <= 0:
+            return 1920, 1080
+        return width, height
+
+    def _fixed_stream_commands(
+        self, video_path: Path, mask_path: Path,
+    ) -> tuple[list[str], list[str]]:
+        # GStreamer only decodes (mppvideodec) and emits raw NV12 at the source
+        # resolution; the driver's RGA hardware does NV12->BGRX conversion and
+        # letterbox scaling (software videoconvert caps the pipeline at ~3fps).
+        src_width, src_height = self._probe_video_resolution(video_path)
+        gst_command = [
+            self.image_runner.config.gst_launch, "-q", "filesrc",
+            f"location={video_path}", "!", "decodebin", "!",
+            "capsfilter", "caps=video/x-raw,format=NV12", "!",
+            "identity", "sync=true", "!",
+            "queue", "max-size-buffers=1", "max-size-bytes=0",
+            "max-size-time=0", "leaky=downstream", "!",
+            "fdsink", "fd=1", "sync=false",
+        ]
+        model = self.image_runner.config.model_root
+        driver_command = [
+            str(self.image_runner.config.pedestrian_driver),
+            "--det-model", str(model / "yolov5nu_coco_rk3568_fp16_20260710.rknn"),
+            "--seg-model", str(model / "mapillary_cplus_ground_4class_v2_rk3568_fp16_20260710.rknn"),
+            "--input-nv12-stream", "--src-width", str(src_width),
+            "--src-height", str(src_height),
+            "--fixed-mask", str(mask_path),
+            "--width", "1280", "--height", "720", "--frames", "0",
+            "--display", "1", "--display-mask", "1",
+        ]
+        return gst_command, driver_command
+
+    def run_fixed_video_stream(
+        self, video_path: Path, mask_path: Path,
+        result_callback=None, progress_callback=None, acquire_lock: bool = True,
+    ) -> dict[str, Any]:
+        gst_command, driver_command = self._fixed_stream_commands(video_path, mask_path)
+        lock_acquired = False
+        if acquire_lock and not self.image_runner._lock.acquire(blocking=False):
+            raise ImageInferenceBusy("已有推理任务正在运行，请稍后再试")
+        if acquire_lock:
+            lock_acquired = True
+        gst_process = None
+        driver_process = None
+        processed = 0
+        driver_log: list[str] = []
+        try:
+            gst_environment = os.environ.copy()
+            preferred_decoder = "mppvideodec:300"
+            existing_ranks = gst_environment.get("GST_PLUGIN_FEATURE_RANK", "")
+            gst_environment["GST_PLUGIN_FEATURE_RANK"] = ",".join(
+                value for value in (existing_ranks, preferred_decoder) if value
+            )
+            gst_process = subprocess.Popen(
+                gst_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=gst_environment,
+            )
+            assert gst_process.stdout is not None
+            driver_process = subprocess.Popen(
+                driver_command, cwd=self.image_runner.config.arm_root,
+                stdin=gst_process.stdout, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1,
+            )
+            gst_process.stdout.close()
+            assert driver_process.stdout is not None
+            last_driver_output = time.monotonic()
+            while True:
+                readable, _, _ = select.select(
+                    [driver_process.stdout], [], [], 1.0,
+                )
+                if not readable:
+                    if driver_process.poll() is not None:
+                        break
+                    if time.monotonic() - last_driver_output > 20.0:
+                        raise VideoInferenceError(
+                            "视频流超过 20 秒无新帧，已停止并恢复实时车牌"
+                        )
+                    continue
+                line = driver_process.stdout.readline()
+                if not line:
+                    break
+                last_driver_output = time.monotonic()
+                line = line.strip()
+                if line.startswith("[stream] "):
+                    fields = dict(
+                        field.split("=", 1) for field in line.split()[1:]
+                        if "=" in field
+                    )
+                    input_fps = fields.get("input_fps")
+                    display_fps = fields.get("display_fps")
+                    infer_fps = fields.get("infer_fps")
+                    if progress_callback and input_fps and display_fps and infer_fps:
+                        progress_callback(
+                            processed, 0,
+                            f"输入 {input_fps} fps，屏幕 {display_fps} fps，"
+                            f"推理 {infer_fps} fps",
+                        )
+                    driver_log.append(line)
+                    driver_log = driver_log[-20:]
+                    continue
+                if not line.startswith("{"):
+                    if line:
+                        driver_log.append(line)
+                        driver_log = driver_log[-20:]
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(value, dict) or not isinstance(value.get("frame"), int):
+                    continue
+                processed += 1
+                if result_callback:
+                    result_callback(value, 0.0)
+                if progress_callback:
+                    progress_callback(processed, 0, f"已推理 {processed} 帧")
+            try:
+                driver_return = driver_process.wait(timeout=10.0)
+            except subprocess.TimeoutExpired as exc:
+                raise VideoInferenceError("固定 Mask 视频推理结束超时") from exc
+            if gst_process.poll() is None:
+                gst_process.terminate()
+            try:
+                gst_return = gst_process.wait(timeout=10.0)
+            except subprocess.TimeoutExpired as exc:
+                raise VideoInferenceError("视频解码流程结束超时") from exc
+            if driver_return != 0 or gst_return != 0:
+                stderr = gst_process.stderr.read() if gst_process.stderr else b""
+                detail = "\n".join(driver_log)
+                gst_detail = stderr.decode("utf-8", "replace").strip()[-800:]
+                if gst_detail:
+                    detail = f"{detail}\n{gst_detail}".strip()
+                raise VideoInferenceError(f"固定 Mask 视频推理失败: {detail}")
+            return {"processed": processed, "truncated": False}
+        except OSError as exc:
+            raise VideoInferenceError("固定 Mask 视频推理启动失败") from exc
+        finally:
+            for process in (driver_process, gst_process):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+            if lock_acquired:
+                self.image_runner._lock.release()
 
     def _extract_frames(
         self,

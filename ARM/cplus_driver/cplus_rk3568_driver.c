@@ -5,6 +5,7 @@
 #include "cplus_async.h"
 #include "cplus_display_async.h"
 #include "cplus_frame_pool.h"
+#include "cplus_rga.h"
 #include "cplus_rknn.h"
 #include "../pcie_fpga_dma.h"
 
@@ -26,6 +27,8 @@ struct options {
     const char *device_path;
     const char *input_bgrx_path;
     const char *input_frames_dir;
+    const char *fixed_mask_path;
+    const char *generate_fixed_mask_path;
     const char *dump_bgrx_path;
     const char *output_mask_bgrx_path;
     const char *output_frames_dir;
@@ -37,6 +40,12 @@ struct options {
     int frames;
     int fps;
     int always_segment;
+    int input_bgrx_stream;
+    int input_nv12_stream;
+    int src_width;
+    int src_height;
+    int hold_display;
+    int display_mask;
 };
 
 static volatile sig_atomic_t stop_requested;
@@ -75,6 +84,15 @@ static void usage(const char *program)
             "  --input-bgrx PATH      Offline BGRX8888 frame; needs --width and --height\n"
             "  --input-frames-dir PATH Offline BGRX8888 frame directory (frameNNNNN.bgrx);\n"
             "                          loads models once and processes every frame\n"
+            "  --input-bgrx-stream    Read consecutive BGRX8888 frames from stdin\n"
+            "  --input-nv12-stream    Read consecutive NV12 frames from stdin (RGA hardware\n"
+            "                          converts to BGRX with letterbox scaling; needs\n"
+            "                          --src-width/--src-height and --width/--height)\n"
+            "  --src-width N --src-height N  Source video resolution for --input-nv12-stream\n"
+            "  --fixed-mask PATH      Reuse a 640x640 semantic mask; detector only\n"
+            "  --generate-fixed-mask PATH  Generate and save a 640x640 mask from --input-bgrx\n"
+            "  --hold-display         Keep the final offline frame on HDMI until stopped\n"
+            "  --display-mask 0|1    Draw the full semantic mask on HDMI (default 1)\n"
             "  --dump-bgrx PATH       Save the first captured BGRX8888 frame\n"
             "  --output-mask-bgrx PATH  Save the offline frame with the colored mask overlay\n"
             "  --output-frames-dir PATH  Save every processed frame with mask+box overlay\n"
@@ -97,6 +115,14 @@ static int parse_options(int argc, char **argv, struct options *options)
         {"fps", required_argument, NULL, 'F'},
         {"input-bgrx", required_argument, NULL, 'i'},
         {"input-frames-dir", required_argument, NULL, 'I'},
+        {"input-bgrx-stream", no_argument, NULL, 'S'},
+        {"input-nv12-stream", no_argument, NULL, 'N'},
+        {"src-width", required_argument, NULL, 'X'},
+        {"src-height", required_argument, NULL, 'Y'},
+        {"fixed-mask", required_argument, NULL, 'm'},
+        {"generate-fixed-mask", required_argument, NULL, 'g'},
+        {"hold-display", no_argument, NULL, 'H'},
+        {"display-mask", required_argument, NULL, 'M'},
         {"dump-bgrx", required_argument, NULL, 'o'},
         {"output-mask-bgrx", required_argument, NULL, 'O'},
         {"output-frames-dir", required_argument, NULL, 'E'},
@@ -115,9 +141,10 @@ static int parse_options(int argc, char **argv, struct options *options)
     options->frames = 1;
     options->fps = 30;
     options->display = 1;
+    options->display_mask = 1;
     options->drm_card_path = "/dev/dri/card0";
     options->connector_id = -1;
-    while ((argument = getopt_long(argc, argv, "d:s:D:n:F:i:I:o:O:E:w:h:ap:r:c:?",
+    while ((argument = getopt_long(argc, argv, "d:s:D:n:F:i:I:SN:X:Y:m:g:HM:o:O:E:w:h:ap:r:c:?",
                                    long_options, NULL)) != -1) {
         switch (argument) {
         case 'd': options->detector_model = optarg; break;
@@ -127,6 +154,14 @@ static int parse_options(int argc, char **argv, struct options *options)
         case 'F': options->fps = atoi(optarg); break;
         case 'i': options->input_bgrx_path = optarg; break;
         case 'I': options->input_frames_dir = optarg; break;
+        case 'S': options->input_bgrx_stream = 1; break;
+        case 'N': options->input_nv12_stream = 1; break;
+        case 'X': options->src_width = atoi(optarg); break;
+        case 'Y': options->src_height = atoi(optarg); break;
+        case 'm': options->fixed_mask_path = optarg; break;
+        case 'g': options->generate_fixed_mask_path = optarg; break;
+        case 'H': options->hold_display = 1; break;
+        case 'M': options->display_mask = atoi(optarg); break;
         case 'o': options->dump_bgrx_path = optarg; break;
         case 'O': options->output_mask_bgrx_path = optarg; break;
         case 'E': options->output_frames_dir = optarg; break;
@@ -143,11 +178,37 @@ static int parse_options(int argc, char **argv, struct options *options)
         options->fps < 1 || options->fps > 120 ||
         (options->input_bgrx_path && (options->width <= 0 || options->height <= 0)) ||
         (options->input_frames_dir && (options->width <= 0 || options->height <= 0)) ||
-        (options->input_bgrx_path && options->input_frames_dir) ||
+        (options->input_bgrx_stream && (options->width <= 0 || options->height <= 0)) ||
+        (options->input_nv12_stream && (options->width <= 0 || options->height <= 0 ||
+                                       options->src_width <= 0 || options->src_height <= 0)) ||
+        ((options->input_bgrx_path ? 1 : 0) +
+         (options->input_frames_dir ? 1 : 0) +
+         options->input_bgrx_stream + options->input_nv12_stream > 1) ||
         (options->output_mask_bgrx_path && !options->input_bgrx_path) ||
         (options->output_frames_dir && !options->input_frames_dir) ||
+        (options->generate_fixed_mask_path && !options->input_bgrx_path) ||
+        (options->fixed_mask_path && options->generate_fixed_mask_path) ||
+        (options->hold_display && !options->display) ||
+        (options->display_mask != 0 && options->display_mask != 1) ||
         (options->display != 0 && options->display != 1))
         return -1;
+    return 0;
+}
+
+static int read_stream_frame(int fd, uint8_t *buffer, size_t size)
+{
+    size_t used = 0;
+    while (used < size) {
+        ssize_t count = read(fd, buffer + used, size - used);
+        if (count < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (count == 0)
+            return used == 0 ? 1 : -1;
+        used += (size_t)count;
+    }
     return 0;
 }
 
@@ -336,6 +397,14 @@ int main(int argc, char **argv)
     int64_t frame_period_us;
     char *frame_names[1024];
     int frame_names_count = 0;
+    bool fixed_mask_mode;
+    int64_t stream_stats_last_us = 0;
+    uint64_t stream_stats_last_input = 0;
+    uint64_t stream_stats_last_displayed = 0;
+    uint64_t stream_stats_last_inferred = 0;
+    struct cplus_rga *rga = NULL;
+    uint8_t *nv12_input = NULL;
+    size_t nv12_size = 0;
 
     if (parse_options(argc, argv, &options) < 0) {
         usage(argv[0]);
@@ -359,6 +428,18 @@ int main(int argc, char **argv)
             return 1;
         }
         frame_count = frame_names_count;
+    } else if (options.input_bgrx_stream) {
+        width = options.width;
+        height = options.height;
+        frame_size = (size_t)width * height * 4U;
+        frame_count = 0;
+    } else if (options.input_nv12_stream) {
+        width = options.width;
+        height = options.height;
+        /* The pool holds BGRX output frames (after RGA conversion); the raw
+         * NV12 input is read into a separate scratch buffer. */
+        frame_size = (size_t)width * height * 4U;
+        frame_count = 0;
     } else if (open_dma_frame(options.device_path, &fd, &width, &height, &frame_size) == 0) {
         frame_count = options.frames;
     } else {
@@ -370,6 +451,19 @@ int main(int argc, char **argv)
         goto done;
     }
     pool_initialized = 1;
+    if (options.input_nv12_stream) {
+        nv12_size = (size_t)options.src_width * options.src_height * 3U / 2U;
+        nv12_input = malloc(nv12_size);
+        if (!nv12_input) {
+            fprintf(stderr, "NV12 input buffer allocation failed\n");
+            goto done;
+        }
+        if (cplus_rga_init(&rga, options.src_width, options.src_height,
+                           width, height) < 0 || !rga) {
+            fprintf(stderr, "RGA hardware conversion initialization failed\n");
+            goto done;
+        }
+    }
     if (cplus_rknn_model_load(&detector, "detector", options.detector_model) < 0 ||
         cplus_rknn_model_load(&segmenter, "segmenter", options.segmenter_model) < 0) {
         fprintf(stderr, "Model initialization failed\n");
@@ -394,9 +488,27 @@ int main(int argc, char **argv)
                 strerror(errno));
         goto done;
     }
+    fixed_mask_mode = options.fixed_mask_path ||
+                      options.generate_fixed_mask_path;
     if (cplus_async_infer_start(&infer, &pool, width, height, &detector, &segmenter,
-                                &config, options.always_segment != 0) < 0) {
+                                &config, options.always_segment != 0,
+                                fixed_mask_mode) < 0) {
         fprintf(stderr, "Background inference initialization failed\n");
+        goto done;
+    }
+    if (options.fixed_mask_path) {
+        uint8_t fixed_mask[CPLUS_MODEL_PIXELS];
+        if (read_file_exact(options.fixed_mask_path, fixed_mask,
+                            sizeof(fixed_mask)) < 0 ||
+            cplus_async_set_fixed_mask(&infer, fixed_mask,
+                                       sizeof(fixed_mask), 0) < 0) {
+            fprintf(stderr, "Unable to load fixed mask %s\n",
+                    options.fixed_mask_path);
+            goto done;
+        }
+    } else if (options.generate_fixed_mask_path &&
+               cplus_async_request_fixed_mask(&infer) < 0) {
+        fprintf(stderr, "Unable to request fixed mask generation\n");
         goto done;
     }
     fprintf(stderr, "[pipeline] asynchronous capture/display/inference started: "
@@ -404,6 +516,7 @@ int main(int argc, char **argv)
             width, height, options.fps, CPLUS_FRAME_POOL_SLOTS);
     frame_period_us = 1000000LL / options.fps;
     next_frame_us = monotonic_us();
+    stream_stats_last_us = next_frame_us;
 
     for (frame_index = 0; !stop_requested &&
          (frame_count == 0 || frame_index < frame_count); ++frame_index) {
@@ -413,7 +526,9 @@ int main(int argc, char **argv)
         bool have_result;
         bool keep_final;
 
-        if (!options.input_bgrx_path && !options.input_frames_dir && frame_index > 0) {
+        if (!options.input_bgrx_path && !options.input_frames_dir &&
+            !options.input_bgrx_stream && !options.input_nv12_stream &&
+            frame_index > 0) {
             next_frame_us += frame_period_us;
             sleep_until_us(next_frame_us);
             if (stop_requested) break;
@@ -425,7 +540,40 @@ int main(int argc, char **argv)
             fprintf(stderr, "Shared frame pool exhausted at frame %d\n", frame_index);
             goto done;
         }
-        if ((options.input_bgrx_path && read_file_exact(options.input_bgrx_path, frame, frame_size) < 0) ||
+        if (options.input_bgrx_stream) {
+            int read_status = read_stream_frame(STDIN_FILENO, frame, frame_size);
+            if (read_status == 1) {
+                cplus_frame_pool_release(&pool, slot);
+                break;
+            }
+            if (read_status < 0) {
+                cplus_frame_pool_release(&pool, slot);
+                fprintf(stderr, "Unable to read streamed frame %d\n", frame_index);
+                goto done;
+            }
+        } else if (options.input_nv12_stream) {
+            /* Read raw NV12 into the scratch buffer, then let RGA hardware
+             * convert it (NV12 -> BGRX with letterbox scaling) into the pool
+             * slot. After this the slot holds a normal BGRX frame and the rest
+             * of the pipeline (inference/display) is identical to bgrx_stream. */
+            int read_status = read_stream_frame(STDIN_FILENO, nv12_input, nv12_size);
+            if (read_status == 1) {
+                cplus_frame_pool_release(&pool, slot);
+                break;
+            }
+            if (read_status < 0) {
+                cplus_frame_pool_release(&pool, slot);
+                fprintf(stderr, "Unable to read streamed NV12 frame %d\n", frame_index);
+                goto done;
+            }
+            const uint8_t *converted = cplus_rga_convert(rga, nv12_input, nv12_size);
+            if (!converted) {
+                cplus_frame_pool_release(&pool, slot);
+                fprintf(stderr, "RGA conversion failed for frame %d\n", frame_index);
+                goto done;
+            }
+            memcpy(frame, converted, frame_size);
+        } else if ((options.input_bgrx_path && read_file_exact(options.input_bgrx_path, frame, frame_size) < 0) ||
             (options.input_frames_dir && read_file_exact(frame_names[frame_index], frame, frame_size) < 0) ||
             (!options.input_bgrx_path && !options.input_frames_dir && read_dma_frame(fd, frame, frame_size) < 0)) {
             cplus_frame_pool_release(&pool, slot);
@@ -445,7 +593,8 @@ int main(int argc, char **argv)
             (options.display && cplus_display_async_submit(&display, slot,
                                                            latest.results, latest.count,
                                                            have_result, latest.mask,
-                                                           have_result && latest.mask_valid) < 0)) {
+                                                           have_result && latest.mask_valid &&
+                                                               options.display_mask) < 0)) {
             cplus_frame_pool_release(&pool, slot);
             fprintf(stderr, "Unable to submit frame %d to asynchronous pipeline\n", frame_index);
             goto done;
@@ -500,6 +649,46 @@ int main(int argc, char **argv)
             fprintf(stderr, "Asynchronous worker failed\n");
             goto done;
         }
+        if (options.input_bgrx_stream || options.input_nv12_stream) {
+            int64_t now_us = monotonic_us();
+            int64_t elapsed_us = now_us - stream_stats_last_us;
+            if (elapsed_us >= 2000000) {
+                struct cplus_async_stats current_infer = {0};
+                uint64_t current_displayed = 0;
+                uint64_t ignored_replaced = 0;
+                uint64_t current_input = (uint64_t)frame_index + 1U;
+                double scale = 1000000.0 / (double)elapsed_us;
+                cplus_async_get_stats(&infer, &current_infer);
+                cplus_display_async_stats(&display, &current_displayed,
+                                          &ignored_replaced);
+                fprintf(stderr,
+                        "[stream] input_fps=%.1f display_fps=%.1f infer_fps=%.1f "
+                        "input=%llu displayed=%llu inferred=%llu\n",
+                        (double)(current_input - stream_stats_last_input) * scale,
+                        (double)(current_displayed - stream_stats_last_displayed) * scale,
+                        (double)(current_infer.completed - stream_stats_last_inferred) * scale,
+                        (unsigned long long)current_input,
+                        (unsigned long long)current_displayed,
+                        (unsigned long long)current_infer.completed);
+                stream_stats_last_us = now_us;
+                stream_stats_last_input = current_input;
+                stream_stats_last_displayed = current_displayed;
+                stream_stats_last_inferred = current_infer.completed;
+            }
+        }
+    }
+    if (!stop_requested && options.generate_fixed_mask_path) {
+        uint8_t fixed_mask[CPLUS_MODEL_PIXELS];
+        if (cplus_async_wait_for_frame(&infer, 0) < 0 ||
+            !cplus_async_get_result(&infer, &latest) ||
+            cplus_async_copy_fixed_mask(&infer, fixed_mask, sizeof(fixed_mask),
+                                        NULL, NULL) < 0 ||
+            write_file_exact(options.generate_fixed_mask_path, fixed_mask,
+                             sizeof(fixed_mask)) < 0) {
+            fprintf(stderr, "Unable to save fixed mask %s\n",
+                    options.generate_fixed_mask_path);
+            goto done;
+        }
     }
     if (!stop_requested && !options.input_frames_dir && frame_count > 0 && frame_index > 0) {
         uint64_t final_frame = (uint64_t)(frame_index - 1);
@@ -511,7 +700,7 @@ int main(int argc, char **argv)
         if (options.display &&
             cplus_display_async_submit(&display, final_slot, latest.results,
                                        latest.count, true, latest.mask,
-                                       latest.mask_valid) < 0) {
+                                       latest.mask_valid && options.display_mask) < 0) {
             fprintf(stderr, "Unable to submit final result to HDMI display\n");
             goto done;
         }
@@ -547,6 +736,11 @@ int main(int argc, char **argv)
                     latest.mask_valid ? 1 : 0, latest.count);
         }
     }
+    if (!stop_requested && options.hold_display) {
+        fprintf(stderr, "[display] holding final frame until stopped\n");
+        while (!stop_requested)
+            sleep_until_us(monotonic_us() + 100000);
+    }
     status = 0;
 
 done:
@@ -554,6 +748,12 @@ done:
         cplus_frame_pool_release(&pool, final_slot);
         final_slot = -1;
     }
+    if (rga) {
+        cplus_rga_destroy(rga);
+        rga = NULL;
+    }
+    free(nv12_input);
+    nv12_input = NULL;
     cplus_async_get_stats(&infer, &infer_stats);
     cplus_display_async_stats(&display, &display_presented, &display_replaced);
     display_presented = cplus_display_async_stop(&display);

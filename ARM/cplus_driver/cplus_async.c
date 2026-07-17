@@ -105,7 +105,8 @@ static void print_result_json(const struct cplus_async_result *result)
 }
 
 static int infer_frame(struct cplus_async_infer *state, const uint8_t *bgrx,
-                       uint64_t source_frame, struct cplus_async_result *result)
+                       uint64_t source_frame, uint64_t source_generation,
+                       struct cplus_async_result *result)
 {
     struct cplus_detection detections[CPLUS_MAX_DETECTIONS];
     struct cplus_letterbox letterbox;
@@ -128,10 +129,13 @@ static int infer_frame(struct cplus_async_infer *state, const uint8_t *bgrx,
     int detection_count;
     int ordinary_count;
     bool segmented = false;
+    bool generate_fixed_mask = false;
+    bool fixed_mask_ready = false;
 
     memset(result, 0, sizeof(*result));
     memset(&mask_stats, 0, sizeof(mask_stats));
     result->source_frame = source_frame;
+    result->source_generation = source_generation;
     started = monotonic_us();
     bgrx_to_rgb(bgrx, state->width, state->height, state->rgb);
     rgb_done = monotonic_us();
@@ -157,7 +161,26 @@ static int infer_frame(struct cplus_async_infer *state, const uint8_t *bgrx,
     argmax_done = detector_post_done;
     mask_post_done = detector_post_done;
 
-    if (ordinary_count || state->always_segment) {
+    if (state->fixed_mask_mode) {
+        pthread_mutex_lock(&state->result_lock);
+        generate_fixed_mask = state->mask_generate_requested;
+        if (generate_fixed_mask) {
+            state->mask_generate_requested = false;
+            state->mask_generation_in_progress = true;
+        }
+        fixed_mask_ready = state->fixed_mask_ready &&
+                           state->fixed_mask_source_generation ==
+                               source_generation;
+        if (fixed_mask_ready && !generate_fixed_mask) {
+            memcpy(state->mask, state->fixed_mask, CPLUS_MODEL_PIXELS);
+            memcpy(result->mask, state->fixed_mask, CPLUS_MODEL_PIXELS);
+            result->mask_valid = true;
+        }
+        pthread_mutex_unlock(&state->result_lock);
+    }
+
+    if (generate_fixed_mask ||
+        (!state->fixed_mask_mode && (ordinary_count || state->always_segment))) {
         segmented = true;
         cplus_prepare_segmenter_rgb(state->rgb, state->width, state->height,
                                     state->segmenter_rgb);
@@ -181,17 +204,40 @@ static int infer_frame(struct cplus_async_infer *state, const uint8_t *bgrx,
             return -1;
         mask_post_done = monotonic_us();
         mask_class_counts(state->mask, post_counts);
-        memcpy(result->mask, state->mask, CPLUS_MODEL_PIXELS);
-        result->mask_valid = true;
+        if (state->fixed_mask_mode) {
+            pthread_mutex_lock(&state->result_lock);
+            memcpy(state->fixed_mask, state->mask, CPLUS_MODEL_PIXELS);
+            state->fixed_mask_ready = true;
+            state->fixed_mask_source_generation = source_generation;
+            state->mask_generation_in_progress = false;
+            state->fixed_mask_sequence++;
+            if (state->fixed_mask_sequence == 0)
+                state->fixed_mask_sequence = 1;
+            pthread_mutex_unlock(&state->result_lock);
+            result->mask_updated = true;
+            result->fixed_mask_ready = true;
+            memcpy(result->mask, state->mask, CPLUS_MODEL_PIXELS);
+            result->mask_valid = true;
+            fixed_mask_ready = true;
+        } else {
+            memcpy(result->mask, state->mask, CPLUS_MODEL_PIXELS);
+            result->mask_valid = true;
+        }
     } else {
-        memset(state->mask, CPLUS_MASK_OTHER, CPLUS_MODEL_PIXELS);
+        if (!state->fixed_mask_mode)
+            memset(state->mask, CPLUS_MASK_OTHER, CPLUS_MODEL_PIXELS);
     }
 
-    result->count = cplus_evaluate_detections(
-        detections, detection_count, state->mask,
-        CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT,
-        state->width, state->height,
-        result->results, CPLUS_MAX_DETECTIONS);
+    result->fixed_mask_ready = state->fixed_mask_mode && fixed_mask_ready;
+    if (state->fixed_mask_mode && !fixed_mask_ready) {
+        result->count = 0;
+    } else {
+        result->count = cplus_evaluate_detections(
+            detections, detection_count, state->mask,
+            CPLUS_MODEL_WIDTH, CPLUS_MODEL_HEIGHT,
+            state->width, state->height,
+            result->results, CPLUS_MAX_DETECTIONS);
+    }
     if (result->count < 0) return -1;
     result->valid = true;
     finished = monotonic_us();
@@ -248,7 +294,9 @@ static void *infer_thread_main(void *argument)
         struct cplus_async_result result;
         uint64_t source_frame = state->slot_frame[slot];
         const uint8_t *frame = cplus_frame_pool_data(state->pool, slot);
-        int inference_status = infer_frame(state, frame, source_frame, &result);
+        uint64_t source_generation = state->slot_source_generation[slot];
+        int inference_status = infer_frame(state, frame, source_frame,
+                                           source_generation, &result);
         cplus_frame_pool_release(state->pool, slot);
         pthread_mutex_lock(&state->result_lock);
         if (inference_status < 0) {
@@ -282,7 +330,8 @@ int cplus_async_infer_start(struct cplus_async_infer *state,
                             struct cplus_rknn_model *detector,
                             struct cplus_rknn_model *segmenter,
                             const struct cplus_runtime_config *config,
-                            bool always_segment)
+                            bool always_segment,
+                            bool fixed_mask_mode)
 {
     if (!state || !pool || !detector || !segmenter || !config || width <= 0 || height <= 0)
         return -1;
@@ -294,11 +343,15 @@ int cplus_async_infer_start(struct cplus_async_infer *state,
     state->segmenter = segmenter;
     state->config = *config;
     state->always_segment = always_segment;
+    state->fixed_mask_mode = fixed_mask_mode;
     state->rgb = malloc((size_t)width * height * 3U);
     state->detector_rgb = malloc((size_t)CPLUS_MODEL_WIDTH * CPLUS_MODEL_HEIGHT * 3U);
     state->segmenter_rgb = malloc((size_t)CPLUS_MODEL_WIDTH * CPLUS_MODEL_HEIGHT * 3U);
     state->mask = malloc((size_t)CPLUS_MODEL_WIDTH * CPLUS_MODEL_HEIGHT);
-    if (!state->rgb || !state->detector_rgb || !state->segmenter_rgb || !state->mask)
+    state->fixed_mask = fixed_mask_mode ?
+        malloc((size_t)CPLUS_MODEL_WIDTH * CPLUS_MODEL_HEIGHT) : NULL;
+    if (!state->rgb || !state->detector_rgb || !state->segmenter_rgb || !state->mask ||
+        (fixed_mask_mode && !state->fixed_mask))
         goto failed;
     if (cplus_mask_workspace_init(&state->mask_workspace, CPLUS_MODEL_WIDTH,
                                   CPLUS_MODEL_HEIGHT) < 0)
@@ -348,6 +401,7 @@ uint64_t cplus_async_infer_stop(struct cplus_async_infer *state)
     free(state->detector_rgb);
     free(state->segmenter_rgb);
     free(state->mask);
+    free(state->fixed_mask);
     completed = state->completed;
     memset(state, 0, sizeof(*state));
     return completed;
@@ -356,10 +410,108 @@ uint64_t cplus_async_infer_stop(struct cplus_async_infer *state)
 int cplus_async_submit_frame(struct cplus_async_infer *state, int slot,
                              uint64_t source_frame)
 {
+    return cplus_async_submit_frame_epoch(state, slot, source_frame, 0);
+}
+
+int cplus_async_submit_frame_epoch(struct cplus_async_infer *state, int slot,
+                                   uint64_t source_frame,
+                                   uint64_t source_generation)
+{
     if (!state || !state->thread_started || slot < 0 || slot >= CPLUS_FRAME_POOL_SLOTS)
         return -1;
     state->slot_frame[slot] = source_frame;
+    state->slot_source_generation[slot] = source_generation;
     return cplus_latest_queue_submit(&state->queue, slot);
+}
+
+int cplus_async_request_fixed_mask(struct cplus_async_infer *state)
+{
+    if (!state || !state->fixed_mask_mode || !state->result_sync_initialized)
+        return -1;
+    pthread_mutex_lock(&state->result_lock);
+    state->mask_generate_requested = true;
+    pthread_mutex_unlock(&state->result_lock);
+    return 0;
+}
+
+int cplus_async_set_fixed_mask(struct cplus_async_infer *state,
+                               const uint8_t *mask, size_t mask_size,
+                               uint64_t source_generation)
+{
+    if (!state || !mask || mask_size != CPLUS_MODEL_PIXELS ||
+        !state->fixed_mask_mode || !state->result_sync_initialized)
+        return -1;
+    pthread_mutex_lock(&state->result_lock);
+    memcpy(state->fixed_mask, mask, CPLUS_MODEL_PIXELS);
+    state->fixed_mask_ready = true;
+    state->fixed_mask_source_generation = source_generation;
+    state->mask_generate_requested = false;
+    state->mask_generation_in_progress = false;
+    state->fixed_mask_sequence++;
+    if (state->fixed_mask_sequence == 0)
+        state->fixed_mask_sequence = 1;
+    memcpy(state->result.mask, mask, CPLUS_MODEL_PIXELS);
+    state->result.mask_valid = true;
+    state->result.fixed_mask_ready = true;
+    state->result.valid = true;
+    pthread_mutex_unlock(&state->result_lock);
+    return 0;
+}
+
+void cplus_async_clear_fixed_mask(struct cplus_async_infer *state)
+{
+    if (!state || !state->fixed_mask_mode || !state->result_sync_initialized)
+        return;
+    pthread_mutex_lock(&state->result_lock);
+    state->fixed_mask_ready = false;
+    state->fixed_mask_source_generation = 0;
+    state->mask_generate_requested = false;
+    state->mask_generation_in_progress = false;
+    memset(&state->result, 0, sizeof(state->result));
+    pthread_mutex_unlock(&state->result_lock);
+}
+
+bool cplus_async_fixed_mask_status(struct cplus_async_infer *state,
+                                   bool *generating,
+                                   uint64_t *sequence,
+                                   uint64_t *source_generation)
+{
+    bool ready;
+    if (!state || !state->fixed_mask_mode || !state->result_sync_initialized)
+        return false;
+    pthread_mutex_lock(&state->result_lock);
+    ready = state->fixed_mask_ready;
+    if (generating)
+        *generating = state->mask_generate_requested ||
+                      state->mask_generation_in_progress;
+    if (sequence)
+        *sequence = state->fixed_mask_sequence;
+    if (source_generation)
+        *source_generation = state->fixed_mask_source_generation;
+    pthread_mutex_unlock(&state->result_lock);
+    return ready;
+}
+
+int cplus_async_copy_fixed_mask(struct cplus_async_infer *state,
+                                uint8_t *mask, size_t mask_size,
+                                uint64_t *sequence,
+                                uint64_t *source_generation)
+{
+    int status = -1;
+    if (!state || !mask || mask_size < CPLUS_MODEL_PIXELS ||
+        !state->fixed_mask_mode || !state->result_sync_initialized)
+        return -1;
+    pthread_mutex_lock(&state->result_lock);
+    if (state->fixed_mask_ready) {
+        memcpy(mask, state->fixed_mask, CPLUS_MODEL_PIXELS);
+        if (sequence)
+            *sequence = state->fixed_mask_sequence;
+        if (source_generation)
+            *source_generation = state->fixed_mask_source_generation;
+        status = 0;
+    }
+    pthread_mutex_unlock(&state->result_lock);
+    return status;
 }
 
 bool cplus_async_get_result(struct cplus_async_infer *state,
